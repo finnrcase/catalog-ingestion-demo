@@ -161,11 +161,15 @@ EXTRACTION RULES
 2. Product Name = Manufacturer + " " + Description (e.g. "Wolf Microwave", "Sub-Zero 36\" Refrigerator"). Do NOT use a model number as the Product Name unless there is absolutely no usable description.
 3. Brand = manufacturer name only (e.g. "Wolf", "Sub-Zero", "Miele").
 4. Model/SKU = the model or part number from the quote line. Accept any of: serial number, model number, SKU, item number, product code, part number, manufacturer number.
-5. Dimensions: extract if visible (e.g. '30"W × 18"D × 16"H'). Leave empty string if not stated.
+5. Dimensions: extract ONLY if the exact product dimensions are explicitly stated in a specification, table, or labelled field in the document (e.g. '30"W × 18"D × 16"H'). Do NOT infer dimensions from product names — a name like "36-inch refrigerator" or "30\\" range" does not give you H×W×D. Leave empty string "" if dimensions are not explicitly stated — the enrichment step will fill this from the manufacturer spec sheet. If dimensions are partially or ambiguously stated, leave empty string and include "Verify dimensions from spec sheet" in suggested_action.
 6. Finish / Color: extract finish or colour if stated (e.g. "Matte Black", "Stainless Steel"). Leave empty string if not stated.
 7. Quantity: if the line description says "qty 2" or similar, use 2. If no quantity is shown, default to 1.
 8. Price: use the line price exactly as shown on the quote. If the price appears to be a total for multiple units, keep it as shown and add a note: "Price appears to reflect quoted line total."
-9. Room: extract any per-line room annotations (e.g. "Bar", "Kitchen", "Primary", "Laundry Room Floor 2", "Gym", "Mudroom", "Nanny Vestibule", "Exterior"). If not visible for a line, use the default room value above.
+9. Room / Location: Location may appear ANYWHERE near the product row — in a separate column, as a handwritten-style annotation, in red text beside the description, or as an informal phrase. Examples: "Bar - if we can fit it", "laundry room floor 2", "exterior", "primary", "mudroom", "nanny vestibule", "gym", "Nanny Vestibule", "Exterior".
+   - Scan the full row and nearby context for any room or location hint.
+   - Normalise to Title Case (e.g. "laundry room floor 2" → "Laundry Room Floor 2", "exterior" → "Exterior").
+   - If a note contains uncertainty (e.g. "Bar - if we can fit it", "kitchen if it fits"), extract the clean room name ("Bar"), set review_required = true, and include the ORIGINAL note verbatim in the notes field.
+   - If no location is visible for a line, use the default room value above.
 10. Product Category must be exactly one of: {categories_str}. For appliance quotes most items are "Appliance". Leave blank if genuinely uncertain — it can be suggested separately.
 11. Confidence scoring (start at 85, apply deductions):
     - Deduct 20 if Product Name cannot be reliably determined.
