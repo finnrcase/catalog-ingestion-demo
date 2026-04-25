@@ -236,3 +236,78 @@ def test_apply_enrichment_normalises_category():
     }
     updated = _apply_enrichment(row, extracted, "https://example.com", 70)
     assert updated["Product Category"] == "Sofa"
+
+
+# ── _fetch_page_text ───────────────────────────────────────────────────────────
+
+from unittest.mock import patch, MagicMock
+from src.product_enrichment import _fetch_page_text, _extract_with_claude
+
+
+def test_fetch_page_text_returns_stripped_text():
+    mock_resp = MagicMock()
+    mock_resp.text = "<html><body><h1>Wolf Microwave</h1><p>Model MDD30TS</p></body></html>"
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch("src.product_enrichment.httpx.get", return_value=mock_resp):
+        result = _fetch_page_text("https://wolfappliance.com/product")
+
+    assert "Wolf Microwave" in result
+    assert "MDD30TS" in result
+    assert "<html>" not in result
+
+
+def test_fetch_page_text_returns_empty_on_error():
+    with patch("src.product_enrichment.httpx.get", side_effect=Exception("timeout")):
+        result = _fetch_page_text("https://example.com/bad")
+    assert result == ""
+
+
+def test_fetch_page_text_caps_at_6000_chars():
+    mock_resp = MagicMock()
+    mock_resp.text = "<p>" + ("x" * 20000) + "</p>"
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch("src.product_enrichment.httpx.get", return_value=mock_resp):
+        result = _fetch_page_text("https://example.com/long")
+
+    assert len(result) <= 6000
+
+
+# ── _extract_with_claude ───────────────────────────────────────────────────────
+
+def test_extract_with_claude_parses_json():
+    mock_msg = MagicMock()
+    mock_msg.content = [MagicMock(text='{"Product Name": "Wolf Microwave", "Dimensions": "30\\" W", "Finish / Color": "", "Product Category": "Appliance", "materials": "Stainless steel"}')]
+
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "Product Name": "", "Dimensions": "", "Finish / Color": "", "Product Category": ""}
+
+    with patch("src.product_enrichment.ANTHROPIC_API_KEY", "fake_key"), \
+         patch("anthropic.Anthropic") as mock_anthropic:
+        mock_anthropic.return_value.messages.create.return_value = mock_msg
+        result = _extract_with_claude("some page text", row)
+
+    assert result.get("Product Name") == "Wolf Microwave"
+    assert result.get("Dimensions") == '30" W'
+    assert result.get("Product Category") == "Appliance"
+
+
+def test_extract_with_claude_returns_empty_on_missing_key():
+    import src.product_enrichment as pe
+    with patch.object(pe, "ANTHROPIC_API_KEY", ""):
+        result = _extract_with_claude("some page text", {"Brand": "Wolf", "Model/SKU": "MDD30TS"})
+    assert result == {}
+
+
+def test_extract_with_claude_returns_empty_on_bad_response():
+    mock_msg = MagicMock()
+    mock_msg.content = [MagicMock(text="Sorry, I cannot help with that.")]
+
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "Product Name": "", "Dimensions": ""}
+
+    with patch("src.product_enrichment.ANTHROPIC_API_KEY", "fake_key"), \
+         patch("anthropic.Anthropic") as mock_anthropic:
+        mock_anthropic.return_value.messages.create.return_value = mock_msg
+        result = _extract_with_claude("some text", row)
+
+    assert result == {}

@@ -130,6 +130,85 @@ def _apply_enrichment(
     return updated
 
 
+def _fetch_page_text(url: str) -> str:
+    """Fetch URL with httpx and return plain text (max 6 000 chars). Empty string on error."""
+    try:
+        resp = httpx.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; SCH-Intake/1.0)"},
+            timeout=10,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+
+        try:
+            import html2text as _ht
+            h = _ht.HTML2Text()
+            h.ignore_links = True
+            h.ignore_images = True
+            text = h.handle(resp.text)
+        except ImportError:
+            text = re.sub(r"<[^>]+>", " ", resp.text)
+            text = re.sub(r"\s{2,}", " ", text)
+
+        return text[:6000].strip()
+    except Exception:
+        return ""
+
+
+def _build_extraction_prompt(page_text: str, row: dict) -> str:
+    blank = [
+        f for f in ["Product Name", "Dimensions", "Finish / Color", "Product Category"]
+        if not _str_val(row.get(f))
+    ]
+    brand = _str_val(row.get("Brand"))
+    model = _str_val(row.get("Model/SKU"))
+
+    return (
+        f"You are extracting product specification data for {brand} model {model}.\n\n"
+        f"The following fields are currently blank and need to be filled:\n"
+        f"{', '.join(blank)}\n\n"
+        "Also extract: materials (short description of primary construction materials, "
+        "e.g. 'Solid Oak', 'Stainless Steel')\n\n"
+        "Return ONLY a JSON object. No prose. No markdown fences. Example:\n"
+        '{"Product Name": "Wolf 30\\" Drawer Microwave Oven", '
+        '"Dimensions": "29 7/8\\" W x 23 1/2\\" D x 11 7/8\\" H", '
+        '"Finish / Color": "Stainless Steel", '
+        '"Product Category": "Appliance", '
+        '"materials": "Stainless steel exterior"}\n\n'
+        "Rules:\n"
+        "- Only include the fields listed above as blank, plus 'materials'.\n"
+        "- If a field is not clearly stated in the page, return \"\" for that field.\n"
+        "- Never invent values not present in the page.\n"
+        "- Product Category must be one of: Chair, Sofa, Paint, Fabric, Table, "
+        "Lighting, Plumbing, Hardware, Rug, Artwork, Mirror, Appliance, Accessories, Other.\n\n"
+        f"PAGE TEXT:\n---\n{page_text}\n---"
+    )
+
+
+def _extract_with_claude(page_text: str, row: dict) -> dict:
+    """Call Claude Haiku to extract missing fields from page text. Returns {} on any failure."""
+    if not ANTHROPIC_API_KEY:
+        return {}
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            messages=[{"role": "user", "content": _build_extraction_prompt(page_text, row)}],
+        )
+        text = msg.content[0].text.strip()
+        text = re.sub(r"```(?:json)?\s*|```", "", text).strip()
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1:
+            return {}
+        return json.loads(text[start : end + 1])
+    except Exception:
+        return {}
+
+
 def enrich_row(row):
     raise NotImplementedError
 
