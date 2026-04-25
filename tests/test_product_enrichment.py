@@ -51,7 +51,7 @@ def test_qualifies_all_enrichable_fields_present_skipped():
     row = {
         **_base_qualifying_row(),
         "Product Name": "Wolf Microwave",
-        "Dimensions": '30"W',
+        "Dimensions": '30"W x 15"H x 17"D',
         "Finish / Color": "Stainless",
         "Product Category": "Appliance",
         "Product URL": "https://example.com",
@@ -100,24 +100,25 @@ def test_qualifies_missing_url_only():
 # ── _build_search_query ────────────────────────────────────────────────────────
 
 def test_build_search_query_full():
+    """Rows without complete 3D dims get the dimension-focused suffix."""
     row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "Product Name": "Drawer Microwave"}
-    assert _build_search_query(row) == "Wolf MDD30TS Drawer Microwave specifications official"
+    assert _build_search_query(row) == "Wolf MDD30TS Drawer Microwave dimensions width height depth spec sheet official"
 
 
 def test_build_search_query_no_product_name():
     row = {"Brand": "Sub-Zero", "Model/SKU": "ID36R", "Product Name": ""}
-    assert _build_search_query(row) == "Sub-Zero ID36R specifications official"
+    assert _build_search_query(row) == "Sub-Zero ID36R dimensions width height depth spec sheet official"
 
 
 def test_build_search_query_strips_whitespace():
     row = {"Brand": "  Miele  ", "Model/SKU": " CVA7440 ", "Product Name": ""}
     result = _build_search_query(row)
-    assert result == "Miele CVA7440 specifications official"
+    assert result == "Miele CVA7440 dimensions width height depth spec sheet official"
 
 
 def test_build_search_query_none_fields():
     row = {"Brand": "Wolf", "Model/SKU": None, "Product Name": None}
-    assert _build_search_query(row) == "Wolf specifications official"
+    assert _build_search_query(row) == "Wolf dimensions width height depth spec sheet official"
 
 
 # ── _apply_enrichment ──────────────────────────────────────────────────────────
@@ -462,3 +463,60 @@ def test_3d_empty_string():
 def test_3d_none_safe():
     # The function must handle any falsy input without raising
     assert has_complete_3d_dimensions(None) is False  # type: ignore[arg-type]
+
+
+# ── _qualifies with incomplete dimensions ──────────────────────────────────────
+
+def test_qualifies_partial_dimension_qualifies():
+    """Row with a partial dimension string (not full 3D) should qualify."""
+    row = {
+        **_base_qualifying_row(),
+        "Product Name": "Fridge Drawers",
+        "Dimensions": "36 inch",           # partial — not 3D
+        "Finish / Color": "Stainless",
+        "Product Category": "Appliance",
+        "Product URL": "https://example.com",
+    }
+    assert _qualifies(row)
+
+
+def test_qualifies_complete_3d_dimension_does_not_qualify():
+    """Row with full W×H×D dimensions should NOT qualify (nothing to enrich)."""
+    row = {
+        **_base_qualifying_row(),
+        "Product Name": "Fridge",
+        "Dimensions": '36"W x 84"H x 24"D',
+        "Finish / Color": "Stainless",
+        "Product Category": "Appliance",
+        "Product URL": "https://example.com",
+    }
+    assert not _qualifies(row)
+
+
+# ── _build_search_query with dimension intent ──────────────────────────────────
+
+def test_build_query_blank_dimensions_adds_dim_terms():
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "Product Name": "", "Dimensions": ""}
+    query = _build_search_query(row)
+    assert "dimensions" in query.lower()
+    assert "width" in query.lower()
+    assert "depth" in query.lower()
+
+
+def test_build_query_partial_dimensions_adds_dim_terms():
+    row = {"Brand": "Sub-Zero", "Model/SKU": "ID36R", "Product Name": "", "Dimensions": "36 inch"}
+    query = _build_search_query(row)
+    assert "dimensions" in query.lower()
+
+
+def test_build_query_complete_3d_dimensions_uses_general_terms():
+    """When dimensions are already complete 3D, use the general suffix, not dim-specific."""
+    row = {
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product Name": "Microwave",
+        "Dimensions": '30"W x 15"H x 17"D',
+    }
+    query = _build_search_query(row)
+    assert "specifications" in query.lower() or "official" in query.lower()
+    assert "width height depth" not in query.lower()

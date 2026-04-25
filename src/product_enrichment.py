@@ -88,22 +88,32 @@ def _qualifies(row: dict) -> bool:
         return False
     if not _str_val(row.get("Model/SKU")):
         return False
-    blank = [
+    # Qualify if any enrichable field is blank, OR if Dimensions exists but is
+    # not full W×H×D (a partial dimension still needs enrichment).
+    blank_or_incomplete = [
         f for f in _ENRICHABLE_FIELDS
         if not _str_val(row.get(f))
+        or (f == "Dimensions" and not has_complete_3d_dimensions(_str_val(row.get(f))))
     ]
-    return bool(blank)
+    return bool(blank_or_incomplete)
 
 
 def _build_search_query(row: dict) -> str:
-    """Build a Brave Search query from the row's Brand, Model/SKU, and Product Name."""
+    """Build a Brave Search query; prioritise spec sheets when dimensions are needed."""
+    dims = _str_val(row.get("Dimensions"))
+    needs_dims = not dims or not has_complete_3d_dimensions(dims)
+
     parts = [
         _str_val(row.get("Brand")),
         _str_val(row.get("Model/SKU")),
         _str_val(row.get("Product Name")),
-        "specifications official",
     ]
-    return " ".join(p for p in parts if p)
+    suffix = (
+        "dimensions width height depth spec sheet official"
+        if needs_dims
+        else "specifications official"
+    )
+    return " ".join(p for p in parts if p) + " " + suffix
 
 
 def _apply_enrichment(
