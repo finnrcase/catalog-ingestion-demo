@@ -236,7 +236,8 @@ def enrich_row(row: dict) -> tuple[dict, str | None]:
             updated = row.copy()
             existing = _str_val(updated.get("Notes"))
             note = "[Enrichment: no confident source found]"
-            updated["Notes"] = f"{existing} {note}".strip() if existing else note
+            if note not in existing:
+                updated["Notes"] = f"{existing} {note}".strip() if existing else note
             return updated, None
 
         best = results[0]
@@ -247,7 +248,8 @@ def enrich_row(row: dict) -> tuple[dict, str | None]:
             existing = _str_val(updated.get("Notes"))
             domain = urllib.parse.urlparse(best.url).netloc or best.url[:50]
             note = f"[Enrichment: could not fetch {domain}]"
-            updated["Notes"] = f"{existing} {note}".strip() if existing else note
+            if note not in existing:
+                updated["Notes"] = f"{existing} {note}".strip() if existing else note
             return updated, None
 
         extracted = _extract_with_claude(page_text, row)

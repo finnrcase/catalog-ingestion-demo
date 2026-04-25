@@ -339,7 +339,7 @@ if st.session_state.intake_df is not None:
                 st.session_state.intake_df = apply_confidence_checks(_enriched_df)
                 st.session_state.enrichment_errors = _enrich_errors
                 st.session_state.pending_enrichment = False
-                df = st.session_state.intake_df
+            st.rerun()
         else:
             st.session_state.pending_enrichment = False
 
