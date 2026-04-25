@@ -15,6 +15,7 @@ import json
 import os
 import re
 import time
+import urllib.parse
 
 import httpx
 import pandas as pd
@@ -22,6 +23,16 @@ from dotenv import load_dotenv
 
 from src.brave_search import BRAVE_API_KEY, search_product_candidates
 from src.category_ai import _normalise_category
+
+try:
+    import html2text as _html2text
+except ImportError:
+    _html2text = None
+
+try:
+    import anthropic as _anthropic
+except ImportError:
+    _anthropic = None
 
 load_dotenv()
 
@@ -141,13 +152,12 @@ def _fetch_page_text(url: str) -> str:
         )
         resp.raise_for_status()
 
-        try:
-            import html2text as _ht
-            h = _ht.HTML2Text()
+        if _html2text is not None:
+            h = _html2text.HTML2Text()
             h.ignore_links = True
             h.ignore_images = True
             text = h.handle(resp.text)
-        except ImportError:
+        else:
             text = re.sub(r"<[^>]+>", " ", resp.text)
             text = re.sub(r"\s{2,}", " ", text)
 
@@ -157,6 +167,7 @@ def _fetch_page_text(url: str) -> str:
 
 
 def _build_extraction_prompt(page_text: str, row: dict) -> str:
+    """Build the Claude Haiku prompt listing which fields are blank and need filling."""
     blank = [
         f for f in ["Product Name", "Dimensions", "Finish / Color", "Product Category"]
         if not _str_val(row.get(f))
@@ -188,11 +199,10 @@ def _build_extraction_prompt(page_text: str, row: dict) -> str:
 
 def _extract_with_claude(page_text: str, row: dict) -> dict:
     """Call Claude Haiku to extract missing fields from page text. Returns {} on any failure."""
-    if not ANTHROPIC_API_KEY:
+    if not ANTHROPIC_API_KEY or _anthropic is None:
         return {}
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         msg = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=512,
@@ -209,7 +219,7 @@ def _extract_with_claude(page_text: str, row: dict) -> dict:
         return {}
 
 
-def enrich_row(row: dict) -> tuple:
+def enrich_row(row: dict) -> tuple[dict, str | None]:
     """
     Enrich a single row using Brave Search + httpx + Claude.
 
@@ -235,7 +245,7 @@ def enrich_row(row: dict) -> tuple:
         if not page_text:
             updated = row.copy()
             existing = _str_val(updated.get("Notes"))
-            domain = best.url[:50]
+            domain = urllib.parse.urlparse(best.url).netloc or best.url[:50]
             note = f"[Enrichment: could not fetch {domain}]"
             updated["Notes"] = f"{existing} {note}".strip() if existing else note
             return updated, None
@@ -247,13 +257,13 @@ def enrich_row(row: dict) -> tuple:
         return row, str(exc)
 
 
-def enrich_dataframe(df: pd.DataFrame) -> tuple:
+def enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """
     Enrich all qualifying rows in df. Returns (updated_df, error_list).
     Exceptions in individual rows are caught and logged; the row is left unchanged.
     """
     df = df.copy()
-    errors: list = []
+    errors: list[str] = []
 
     for idx, row in df.iterrows():
         r = row.to_dict()
@@ -265,6 +275,9 @@ def enrich_dataframe(df: pd.DataFrame) -> tuple:
             if error:
                 errors.append(error)
             else:
+                # Only write back columns that already exist in the DataFrame.
+                # The intake schema guarantees all expected columns are present;
+                # this guard prevents accidental column creation mid-iteration.
                 for col, val in updated.items():
                     if col in df.columns:
                         df.at[idx, col] = val
