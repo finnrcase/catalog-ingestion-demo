@@ -75,9 +75,59 @@ def _build_search_query(row: dict) -> str:
     return " ".join(p for p in parts if p)
 
 
-# Stubs — implemented in later tasks
-def _apply_enrichment(row, extracted, source_url, domain_score):
-    raise NotImplementedError
+def _apply_enrichment(
+    row: dict,
+    extracted: dict,
+    source_url: str,
+    domain_score: int,
+) -> dict:
+    """
+    Apply extracted fields to a row copy, filling blank fields only.
+    Sets Source Type suffix and confidence flags. Never overwrites existing data.
+    """
+    updated = row.copy()
+
+    for field in _ENRICHABLE_FIELDS:
+        if field == "Product URL":
+            if not _str_val(updated.get("Product URL")):
+                updated["Product URL"] = source_url
+            continue
+
+        # Never overwrite non-empty fields
+        if _str_val(updated.get(field)):
+            continue
+
+        value = _str_val(extracted.get(field))
+        if not value:
+            continue
+
+        if field == "Product Category":
+            value = _normalise_category(value)
+
+        if value:
+            updated[field] = value
+
+    # Materials → Notes (only if not already expressed in Finish / Color)
+    materials = _str_val(extracted.get("materials"))
+    finish = _str_val(updated.get("Finish / Color")).lower()
+    if materials and materials.lower() not in finish:
+        existing_notes = _str_val(updated.get("Notes"))
+        mat_tag = f"[Materials: {materials}]"
+        updated["Notes"] = f"{existing_notes} {mat_tag}".strip() if existing_notes else mat_tag
+
+    # Source Type suffix
+    original = _str_val(updated.get("Source Type"))
+    if original and not original.endswith("_Enriched"):
+        updated["Source Type"] = f"{original}_Enriched"
+    elif not original:
+        updated["Source Type"] = "Enriched"
+
+    # Confidence flagging
+    if domain_score < MIN_CONF_SCORE:
+        updated["Review Required"] = True
+        updated["Suggested Action"] = "Enriched from low-confidence source — verify fields"
+
+    return updated
 
 
 def enrich_row(row):
