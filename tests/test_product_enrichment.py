@@ -311,3 +311,108 @@ def test_extract_with_claude_returns_empty_on_bad_response():
         result = _extract_with_claude("some text", row)
 
     assert result == {}
+
+
+# ── enrich_row ─────────────────────────────────────────────────────────────────
+
+from src.brave_search import SearchResult
+
+
+def _qualifying_row():
+    return {
+        "Source Type": "PDF",
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product Name": "",
+        "Dimensions": "",
+        "Finish / Color": "",
+        "Product Category": "",
+        "Product URL": "",
+        "Notes": "",
+        "Review Required": False,
+        "Suggested Action": "",
+    }
+
+
+def test_enrich_row_no_search_results_leaves_note():
+    with patch("src.product_enrichment.search_product_candidates", return_value=[]):
+        updated, error = enrich_row(_qualifying_row())
+    assert error is None
+    assert "[Enrichment: no confident source found]" in updated["Notes"]
+    assert updated["Product Name"] == ""
+
+
+def test_enrich_row_low_score_result_leaves_note():
+    low_result = SearchResult("title", "https://amazon.com/dp/B001", "desc", 10)
+    with patch("src.product_enrichment.search_product_candidates", return_value=[low_result]):
+        updated, error = enrich_row(_qualifying_row())
+    assert "[Enrichment: no confident source found]" in updated["Notes"]
+
+
+def test_enrich_row_fetch_failure_leaves_note():
+    good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
+    with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
+         patch("src.product_enrichment._fetch_page_text", return_value=""):
+        updated, error = enrich_row(_qualifying_row())
+    assert "could not fetch" in updated["Notes"]
+
+
+def test_enrich_row_fills_fields_on_success():
+    good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
+    extracted = {
+        "Product Name": "Wolf 30\" Drawer Microwave",
+        "Dimensions": "29 7/8\" W",
+        "Finish / Color": "",
+        "Product Category": "Appliance",
+        "materials": "",
+    }
+    with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
+         patch("src.product_enrichment._fetch_page_text", return_value="page content"), \
+         patch("src.product_enrichment._extract_with_claude", return_value=extracted):
+        updated, error = enrich_row(_qualifying_row())
+
+    assert error is None
+    assert updated["Product Name"] == "Wolf 30\" Drawer Microwave"
+    assert updated["Source Type"] == "PDF_Enriched"
+
+
+# ── enrich_dataframe ───────────────────────────────────────────────────────────
+
+def test_enrich_dataframe_skips_non_qualifying():
+    df = pd.DataFrame([{
+        "Source Type": "URL",
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product Name": "",
+        "Dimensions": "",
+        "Finish / Color": "",
+        "Product Category": "",
+        "Product URL": "https://example.com",
+        "Notes": "",
+        "Review Required": False,
+        "Suggested Action": "",
+    }])
+    with patch("src.product_enrichment.search_product_candidates", return_value=[]) as mock_search:
+        updated_df, errors = enrich_dataframe(df)
+    mock_search.assert_not_called()
+    assert errors == []
+
+
+def test_enrich_dataframe_isolates_exceptions():
+    rows = [
+        {**_qualifying_row(), "Brand": "Wolf"},
+        {**_qualifying_row(), "Brand": "Miele", "Model/SKU": "CVA7440"},
+    ]
+    df = pd.DataFrame(rows)
+
+    def bad_enrich_row(row):
+        if row["Brand"] == "Wolf":
+            raise RuntimeError("network error")
+        return row, None
+
+    with patch("src.product_enrichment.enrich_row", side_effect=bad_enrich_row), \
+         patch("src.product_enrichment.time.sleep"):
+        updated_df, errors = enrich_dataframe(df)
+
+    assert len(errors) == 1
+    assert "Wolf" in errors[0]

@@ -209,9 +209,66 @@ def _extract_with_claude(page_text: str, row: dict) -> dict:
         return {}
 
 
-def enrich_row(row):
-    raise NotImplementedError
+def enrich_row(row: dict) -> tuple:
+    """
+    Enrich a single row using Brave Search + httpx + Claude.
+
+    Returns (updated_row, None) on success or graceful no-result.
+    Returns (row_unchanged, error_string) only on unexpected exceptions.
+    """
+    query = _build_search_query(row)
+    brand = _str_val(row.get("Brand"))
+
+    results = search_product_candidates(query, brand)
+
+    if not results or results[0].domain_score < MIN_USE_SCORE:
+        updated = row.copy()
+        existing = _str_val(updated.get("Notes"))
+        note = "[Enrichment: no confident source found]"
+        updated["Notes"] = f"{existing} {note}".strip() if existing else note
+        return updated, None
+
+    best = results[0]
+    page_text = _fetch_page_text(best.url)
+
+    if not page_text:
+        updated = row.copy()
+        existing = _str_val(updated.get("Notes"))
+        domain = best.url[:50]
+        note = f"[Enrichment: could not fetch {domain}]"
+        updated["Notes"] = f"{existing} {note}".strip() if existing else note
+        return updated, None
+
+    extracted = _extract_with_claude(page_text, row)
+    updated = _apply_enrichment(row, extracted, best.url, best.domain_score)
+    return updated, None
 
 
-def enrich_dataframe(df):
-    raise NotImplementedError
+def enrich_dataframe(df: pd.DataFrame) -> tuple:
+    """
+    Enrich all qualifying rows in df. Returns (updated_df, error_list).
+    Exceptions in individual rows are caught and logged; the row is left unchanged.
+    """
+    df = df.copy()
+    errors: list = []
+
+    for idx, row in df.iterrows():
+        r = row.to_dict()
+        if not _qualifies(r):
+            continue
+
+        try:
+            updated, error = enrich_row(r)
+            if error:
+                errors.append(error)
+            else:
+                for col, val in updated.items():
+                    if col in df.columns:
+                        df.at[idx, col] = val
+        except Exception as exc:
+            label = _str_val(r.get("Product Name")) or _str_val(r.get("Brand")) or _str_val(r.get("Model/SKU")) or str(idx)
+            errors.append(f"Row '{label}': {exc}")
+
+        time.sleep(0.5)
+
+    return df, errors
