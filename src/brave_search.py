@@ -62,17 +62,22 @@ def _extract_domain(url: str) -> str:
         return ""
 
 
+def _domain_matches(domain: str, candidate: str) -> bool:
+    """True if domain equals candidate or is a subdomain of it."""
+    return domain == candidate or domain.endswith("." + candidate)
+
+
 def _score_domain(url: str, brand: str) -> int:
     domain = _extract_domain(url)
     brand_slug = brand.lower().replace(" ", "").replace("-", "")
 
-    if any(skip in domain for skip in _SKIP_DOMAINS):
-        return max(0, 50 - 60)  # → 0 (clamped)
+    if any(_domain_matches(domain, skip) for skip in _SKIP_DOMAINS):
+        return 0
 
     score = 50
     if brand_slug and brand_slug in domain.replace("-", "").replace(".", ""):
         score += 40
-    if any(pref in domain for pref in _PREFERRED_DOMAINS):
+    if any(_domain_matches(domain, pref) for pref in _PREFERRED_DOMAINS):
         score += 20
     return min(100, max(0, score))
 
@@ -109,6 +114,6 @@ def search_product_candidates(query: str, brand: str = "") -> list:
             if r.get("url")
         ]
         results.sort(key=lambda r: r.domain_score, reverse=True)
-        return results
+        return results[:5]
     except Exception:
         return []

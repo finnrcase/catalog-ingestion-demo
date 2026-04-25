@@ -31,3 +31,14 @@ def test_search_product_candidates_missing_key(monkeypatch):
     monkeypatch.setattr(bs, "BRAVE_API_KEY", "")
     results = bs.search_product_candidates("Wolf MDD30TS specifications", "Wolf")
     assert results == []
+
+
+def test_search_product_candidates_exception_returns_empty(monkeypatch):
+    import urllib.request
+    monkeypatch.setattr(bs, "BRAVE_API_KEY", "fake_key")
+    original_urlopen = urllib.request.urlopen
+    def raise_exc(*args, **kwargs):
+        raise OSError("network error")
+    monkeypatch.setattr(urllib.request, "urlopen", raise_exc)
+    results = bs.search_product_candidates("Wolf MDD30TS specifications", "Wolf")
+    assert results == []
