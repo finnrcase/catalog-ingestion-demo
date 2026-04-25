@@ -54,6 +54,7 @@ def test_qualifies_all_enrichable_fields_present_skipped():
         "Dimensions": '30"W',
         "Finish / Color": "Stainless",
         "Product Category": "Appliance",
+        "Product URL": "https://example.com",
     }
     assert not _qualifies(row)
 
@@ -73,6 +74,29 @@ def test_qualifies_all_blank_enrichable_fields():
     assert _qualifies(_base_qualifying_row())
 
 
+def test_qualifies_none_brand_skipped():
+    row = {**_base_qualifying_row(), "Brand": None}
+    assert not _qualifies(row)
+
+
+def test_qualifies_whitespace_only_sku_skipped():
+    row = {**_base_qualifying_row(), "Model/SKU": "   "}
+    assert not _qualifies(row)
+
+
+def test_qualifies_missing_url_only():
+    # URL missing but other fields present → should qualify
+    row = {
+        **_base_qualifying_row(),
+        "Product Name": "Wolf Microwave",
+        "Dimensions": '30"W',
+        "Finish / Color": "Stainless",
+        "Product Category": "Appliance",
+        "Product URL": "",  # only URL is blank
+    }
+    assert _qualifies(row)
+
+
 # ── _build_search_query ────────────────────────────────────────────────────────
 
 def test_build_search_query_full():
@@ -89,3 +113,8 @@ def test_build_search_query_strips_whitespace():
     row = {"Brand": "  Miele  ", "Model/SKU": " CVA7440 ", "Product Name": ""}
     result = _build_search_query(row)
     assert result == "Miele CVA7440 specifications official"
+
+
+def test_build_search_query_none_fields():
+    row = {"Brand": "Wolf", "Model/SKU": None, "Product Name": None}
+    assert _build_search_query(row) == "Wolf specifications official"
