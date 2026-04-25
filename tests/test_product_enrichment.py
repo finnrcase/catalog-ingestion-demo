@@ -416,3 +416,49 @@ def test_enrich_dataframe_isolates_exceptions():
 
     assert len(errors) == 1
     assert "Wolf" in errors[0]
+
+
+# ── has_complete_3d_dimensions ─────────────────────────────────────────────────
+
+from src.product_enrichment import has_complete_3d_dimensions
+
+
+def test_3d_complete_standard_format():
+    assert has_complete_3d_dimensions('36"W x 34.5"H x 24"D') is True
+
+
+def test_3d_complete_unicode_times():
+    assert has_complete_3d_dimensions('36"W × 34.5"H × 24"D') is True
+
+
+def test_3d_complete_space_before_letter():
+    assert has_complete_3d_dimensions('29 7/8" W × 23 1/2" D × 11 7/8" H') is True
+
+
+def test_3d_complete_full_words():
+    assert has_complete_3d_dimensions('Width: 30", Height: 84", Depth: 24"') is True
+
+
+def test_3d_incomplete_one_dim():
+    assert has_complete_3d_dimensions('36 inch') is False
+
+
+def test_3d_incomplete_one_label():
+    assert has_complete_3d_dimensions('30"W') is False
+
+
+def test_3d_incomplete_two_dims():
+    assert has_complete_3d_dimensions('36"W x 34.5"H') is False
+
+
+def test_3d_incomplete_missing_height():
+    assert has_complete_3d_dimensions('36"W x 24"D') is False
+
+
+def test_3d_empty_string():
+    assert has_complete_3d_dimensions('') is False
+
+
+def test_3d_none_safe():
+    # The function must handle any falsy input without raising
+    assert has_complete_3d_dimensions(None) is False  # type: ignore[arg-type]

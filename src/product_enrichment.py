@@ -57,6 +57,26 @@ def _str_val(v) -> str:
     return str(v).strip()
 
 
+# Compiled patterns for detecting W, H, D dimension labels.
+# Matches both abbreviated (W, H, D) and full-word (width, height, depth) forms,
+# preceded by a digit, quote, or space — preventing false matches on word fragments.
+_DIM_W = re.compile(r'[\d"\'\s]W\b|\bwidth\b', re.IGNORECASE)
+_DIM_H = re.compile(r'[\d"\'\s]H\b|\bheight\b', re.IGNORECASE)
+_DIM_D = re.compile(r'[\d"\'\s]D\b|\bdepth\b', re.IGNORECASE)
+
+
+def has_complete_3d_dimensions(dimensions) -> bool:
+    """Return True only if dimensions contains explicit W, H, and D measurements."""
+    s = str(dimensions or "").strip()
+    if not s:
+        return False
+    return (
+        bool(_DIM_W.search(s))
+        and bool(_DIM_H.search(s))
+        and bool(_DIM_D.search(s))
+    )
+
+
 def _qualifies(row: dict) -> bool:
     """True if this row should be sent through enrichment."""
     source = _str_val(row.get("Source Type", ""))
