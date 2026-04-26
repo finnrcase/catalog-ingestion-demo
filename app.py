@@ -17,7 +17,7 @@ from src.confidence import apply_confidence_checks
 from src.ai_extraction import extract_products_from_pdf_with_ai
 from src.document_parser import parse_pdf_rows
 from src.category_ai import suggest_categories_batch
-from src.product_enrichment import enrich_dataframe
+from src.product_enrichment import enrich_dataframe, has_complete_3d_dimensions
 from src.brave_search import BRAVE_API_KEY as _BRAVE_API_KEY
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
@@ -414,6 +414,19 @@ if st.session_state.intake_df is not None:
                 "category — suggestions available in AI-Assisted Cleanup below."
             )
 
+    if "Dimensions" in df.columns:
+        _included = df.get("Include", pd.Series([True] * len(df))) == True
+        _incomplete_dims = _included & df["Dimensions"].apply(
+            lambda v: not has_complete_3d_dimensions(str(v or ""))
+        )
+        _complete_dims = _included & ~_incomplete_dims
+        _n_incomplete = int(_incomplete_dims.sum())
+        _n_complete = int(_complete_dims.sum())
+        st.caption(
+            f"Rows with incomplete dimensions: {_n_incomplete} · "
+            f"Rows with complete dimensions: {_n_complete}"
+        )
+
     edited_df = st.data_editor(
         df,
         use_container_width=True,
@@ -500,6 +513,62 @@ if st.session_state.intake_df is not None:
             mime="text/csv",
             use_container_width=True,
         )
+
+    # ── Missing Dimensions ─────────────────────────────────────────────────────
+    if "Dimensions" in edited_df.columns and "Include" in edited_df.columns:
+        _inc_mask = edited_df["Include"] == True
+        _dim_incomplete_mask = edited_df["Dimensions"].apply(
+            lambda v: not has_complete_3d_dimensions(str(v or ""))
+        )
+        _missing_dim_df = edited_df[_inc_mask & _dim_incomplete_mask]
+
+        if not _missing_dim_df.empty:
+            st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+            st.divider()
+            section_label("Missing Dimensions")
+            st.caption(
+                "These items need full width, height, and depth before they can be sent to Programa."
+            )
+
+            dim_updates: dict[int, str] = {}
+            for idx, row in _missing_dim_df.iterrows():
+                with st.container(border=True):
+                    meta_col, input_col = st.columns([3, 2])
+                    with meta_col:
+                        st.markdown(
+                            f"**{row.get('Product Name', '') or '—'}**  \n"
+                            f"{row.get('Brand', '') or ''}  ·  {row.get('Model/SKU', '') or ''}"
+                        )
+                        current_dim = str(row.get("Dimensions") or "").strip()
+                        if current_dim:
+                            st.caption(f"Current: {current_dim}")
+                    with input_col:
+                        new_val = st.text_input(
+                            "Enter Full Dimensions",
+                            key=f"dim_input_{idx}",
+                            placeholder='36"W × 34.5"H × 24"D',
+                            label_visibility="collapsed",
+                        )
+                        if new_val:
+                            dim_updates[idx] = new_val
+
+            save_col, helper_col = st.columns([2, 8])
+            with save_col:
+                save_dims = st.button(
+                    "Save Dimension Updates",
+                    type="secondary",
+                    use_container_width=True,
+                )
+            with helper_col:
+                st.caption('Enter as W × H × D — for example: 36"W × 34.5"H × 24"D')
+
+            if save_dims and dim_updates:
+                _df_copy = st.session_state.intake_df.copy()
+                for idx, val in dim_updates.items():
+                    if has_complete_3d_dimensions(val):
+                        _df_copy.at[idx, "Dimensions"] = val
+                st.session_state.intake_df = apply_confidence_checks(_df_copy)
+                st.rerun()
 
     # ── AI-Assisted Cleanup ────────────────────────────────────────────────────
     st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
@@ -610,60 +679,62 @@ if st.session_state.intake_df is not None:
     st.divider()
     section_label("Programa Automation")
 
-    pdf_present = (
-        (edited_df["Source Type"] == "PDF").any()
-        if "Source Type" in edited_df.columns else False
-    )
-    if pdf_present:
-        st.info(
-            "PDF direct entry will be added in a future version after field mapping is confirmed.",
-            icon="ℹ️",
+    # Eligibility: Include=True, not flagged for review, not in terminal statuses,
+    # has Product Name, Quantity ≥ 1, Product Category, and complete 3D dimensions.
+    _BLOCKED_STATUSES = {"Ignored", "Excluded", "Error"}
+
+    def _is_eligible(row: pd.Series) -> bool:
+        if not row.get("Include", False):
+            return False
+        if row.get("Review Required", False):
+            return False
+        if str(row.get("Status", "")) in _BLOCKED_STATUSES:
+            return False
+        if not str(row.get("Product Name", "") or "").strip():
+            return False
+        try:
+            if int(row.get("Quantity", 0) or 0) < 1:
+                return False
+        except (ValueError, TypeError):
+            return False
+        if not str(row.get("Product Category", "") or "").strip():
+            return False
+        if not has_complete_3d_dimensions(str(row.get("Dimensions", "") or "")):
+            return False
+        return True
+
+    eligible_df = edited_df[edited_df.apply(_is_eligible, axis=1)].copy()
+
+    def _is_url_row(row: pd.Series) -> bool:
+        return (
+            str(row.get("Source Type", "")) == "URL"
+            and bool(str(row.get("Product URL", "") or "").strip())
         )
 
-    if "Source Type" in edited_df.columns:
-        _url_mask = (
-            (edited_df["Include"] == True)
-            & (edited_df["Source Type"] == "URL")
-            & edited_df["Product URL"].notna()
-            & (edited_df["Product URL"].str.strip() != "")
-        )
-        url_sendable = edited_df[_url_mask].copy()
-    else:
-        url_sendable = pd.DataFrame()
+    url_sendable = eligible_df[eligible_df.apply(_is_url_row, axis=1)].copy()
+    schedule_sendable = eligible_df[~eligible_df.apply(_is_url_row, axis=1)].copy()
+    total_sendable = len(eligible_df)
 
-    if "Review Required" in url_sendable.columns and not url_sendable.empty:
-        needs_review_before_send = url_sendable[url_sendable["Review Required"] == True]
-        url_sendable = url_sendable[url_sendable["Review Required"] != True]
-    else:
-        needs_review_before_send = pd.DataFrame()
+    # Blocked included rows: Include=True but failed eligibility
+    _included_df = edited_df[edited_df.get("Include", pd.Series([True] * len(edited_df))) == True]
+    _blocked_df = _included_df[~_included_df.apply(_is_eligible, axis=1)]
 
-    url_count = len(url_sendable)
-    blocked = not needs_review_before_send.empty
-
-    if blocked:
+    if not _blocked_df.empty:
         st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
-        st.warning(
-            f"{len(needs_review_before_send)} selected row(s) need review before they can be sent to Programa. "
-            "Resolve or uncheck them in the table, then re-run the quality check.",
-            icon="⚠️",
-        )
-        problem_cols = [
-            c for c in ["Product URL", "Confidence Score", "Missing Fields", "Suggested Action"]
-            if c in needs_review_before_send.columns
-        ]
-        st.dataframe(
-            needs_review_before_send[problem_cols],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Product URL": st.column_config.LinkColumn("Product URL", width="large"),
-                "Confidence Score": st.column_config.NumberColumn(
-                    "Confidence", width="small", format="%d %%"
-                ),
-                "Missing Fields": st.column_config.TextColumn("Missing Fields", width="large"),
-                "Suggested Action": st.column_config.TextColumn("Suggested Action", width="large"),
-            },
-        )
+        _n_dim = int(_blocked_df["Dimensions"].apply(
+            lambda v: not has_complete_3d_dimensions(str(v or ""))
+        ).sum()) if "Dimensions" in _blocked_df.columns else 0
+        _n_review = int((_blocked_df.get("Review Required", pd.Series([])) == True).sum())
+        if _n_dim > 0:
+            st.warning(
+                f"{_n_dim} item{'s' if _n_dim != 1 else ''} need dimensions before they can be sent.",
+                icon="⚠️",
+            )
+        if _n_review > 0:
+            st.warning(
+                f"{_n_review} item{'s' if _n_review != 1 else ''} still need review before they can be sent.",
+                icon="⚠️",
+            )
         st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
 
     # ── Login / setup ──────────────────────────────────────────────────────────
@@ -706,27 +777,27 @@ if st.session_state.intake_df is not None:
         )
     with send_col:
         send_label = (
-            f"I am logged in — Continue ({url_count} URL{'s' if url_count != 1 else ''})"
-            if url_count > 0 else "No eligible URL rows"
+            f"Send {total_sendable} item{'s' if total_sendable != 1 else ''} to Programa"
+            if total_sendable > 0 else "No eligible items"
         )
         no_project = not selected_project.strip()
         send_to_programa = st.button(
             send_label,
             type="primary",
             use_container_width=True,
-            disabled=(url_count == 0 or no_project),
+            disabled=(total_sendable == 0 or no_project),
         )
 
     if no_project:
         st.warning("Enter a Programa project name above before sending.")
-    elif url_count == 0 and not blocked:
+    elif total_sendable == 0 and _blocked_df.empty:
         st.warning(
-            "No eligible URL rows — check that rows are included, "
-            "have a valid URL, and are not flagged for review."
+            "No eligible items — check that rows are included, have complete dimensions, "
+            "and are not flagged for review."
         )
 
     if send_to_programa:
-        rows_payload = url_sendable.to_dict("records")
+        rows_payload = eligible_df.to_dict("records")
         st.session_state.nav_failed = False
         st.session_state.nav_pending_rows = []
         with st.spinner(
@@ -834,16 +905,20 @@ if st.session_state.intake_df is not None:
                 icon="⚠️",
             )
 
-        results_df = pd.DataFrame(entries)[["timestamp", "product_url", "status", "message"]]
+        _results_entries = pd.DataFrame(entries)
+        _results_entries["Product"] = _results_entries.apply(
+            lambda r: r.get("product_url") or r.get("product_name", ""), axis=1
+        )
+        results_df = _results_entries[["timestamp", "Product", "status", "message"]]
         st.dataframe(
             results_df,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "timestamp":   st.column_config.TextColumn("Time", width="medium"),
-                "product_url": st.column_config.LinkColumn("Product URL", width="large"),
-                "status":      st.column_config.TextColumn("Status", width="medium"),
-                "message":     st.column_config.TextColumn("Message", width="large"),
+                "timestamp": st.column_config.TextColumn("Time", width="medium"),
+                "Product":   st.column_config.TextColumn("Product", width="large"),
+                "status":    st.column_config.TextColumn("Status", width="medium"),
+                "message":   st.column_config.TextColumn("Message", width="large"),
             },
         )
         if log_path:
