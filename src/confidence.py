@@ -14,6 +14,7 @@ import re
 import pandas as pd
 
 from src.intake_schema import IMPORTANT_FIELDS, SOURCE_MANUAL, SOURCE_PDF_AI, SOURCE_URL
+from src.product_enrichment import has_complete_3d_dimensions
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -241,12 +242,14 @@ def _suggested_action(row: dict, missing: list[str]) -> str:
     else:
         action = f"Missing {', '.join(missing[:-1])}, and {missing[-1]}"
 
-    # For PDF_AI rows with blank Dimensions, append a verification note so
-    # reviewers know to source dimensions from the manufacturer's spec sheet.
-    if (source == SOURCE_PDF_AI
-            and not _str(row.get("Dimensions"))
-            and "dimension" not in action.lower()):
-        dim_note = "Verify dimensions from spec sheet"
+    # For PDF_AI rows: flag missing or incomplete W×H×D dimensions so reviewers
+    # know to source them from the official spec sheet before sending to Programa.
+    dims = _str(row.get("Dimensions"))
+    needs_dim_verify = source == SOURCE_PDF_AI and (
+        not dims or not has_complete_3d_dimensions(dims)
+    )
+    if needs_dim_verify and "spec sheet" not in action.lower():
+        dim_note = "Verify full W×H×D dimensions from official spec sheet"
         action = dim_note if action == "Ready for review" else f"{action}; {dim_note}"
 
     return action
