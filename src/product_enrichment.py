@@ -134,7 +134,27 @@ def _apply_enrichment(
                 updated["Product URL"] = source_url
             continue
 
-        # Never overwrite non-empty fields
+        if field == "Dimensions":
+            dim_extracted = _str_val(extracted.get("Dimensions"))
+            if dim_extracted:
+                if has_complete_3d_dimensions(dim_extracted):
+                    # Always accept complete 3D, even if row already had partial dims
+                    updated["Dimensions"] = dim_extracted
+                else:
+                    # Partial found — note it, but do not fill
+                    existing_notes = _str_val(updated.get("Notes"))
+                    partial_note = (
+                        f"[Partial dimension found: {dim_extracted}; "
+                        "full W x H x D still needed]"
+                    )
+                    if partial_note not in existing_notes:
+                        updated["Notes"] = (
+                            f"{existing_notes} {partial_note}".strip()
+                            if existing_notes else partial_note
+                        )
+            continue
+
+        # Never overwrite non-empty fields for all other enrichable fields
         if _str_val(updated.get(field)):
             continue
 
@@ -198,19 +218,42 @@ def _fetch_page_text(url: str) -> str:
 
 def _build_extraction_prompt(page_text: str, row: dict) -> str:
     """Build the Claude Haiku prompt listing which fields are blank and need filling."""
+    dims = _str_val(row.get("Dimensions"))
+    needs_dims = not dims or not has_complete_3d_dimensions(dims)
+
+    # Non-dimension fields that are blank
     blank = [
-        f for f in ["Product Name", "Dimensions", "Finish / Color", "Product Category"]
+        f for f in ["Product Name", "Finish / Color", "Product Category"]
         if not _str_val(row.get(f))
     ]
+    if needs_dims:
+        blank.append("Dimensions")
+
     brand = _str_val(row.get("Brand"))
     model = _str_val(row.get("Model/SKU"))
 
+    if needs_dims:
+        dim_instruction = (
+            "\n\nFor Dimensions: look for the exact product specification "
+            "listing width, height, and depth. "
+            'Format your answer as: 36"W x 34.5"H x 24"D '
+            "(always include the W, H, and D labels). "
+            "Return the combined string ONLY if all three of width, height, "
+            "and depth are explicitly stated on the page. "
+            'If any one of them is missing, return "".'
+        )
+        dims_note = ""
+    else:
+        dim_instruction = ""
+        dims_note = "\n\nNote: Dimensions are already complete — do not extract or overwrite them."
+
     return (
         f"You are extracting product specification data for {brand} model {model}.\n\n"
-        f"The following fields are currently blank and need to be filled:\n"
+        f"The following fields are currently blank or incomplete and need to be filled:\n"
         f"{', '.join(blank)}\n\n"
         "Also extract: materials (short description of primary construction materials, "
-        "e.g. 'Solid Oak', 'Stainless Steel')\n\n"
+        "e.g. 'Solid Oak', 'Stainless Steel')"
+        + dim_instruction + dims_note + "\n\n"
         "Return ONLY a JSON object. No prose. No markdown fences. Example:\n"
         '{"Product Name": "Wolf 30\\" Drawer Microwave Oven", '
         '"Dimensions": "29 7/8\\" W x 23 1/2\\" D x 11 7/8\\" H", '
@@ -218,9 +261,11 @@ def _build_extraction_prompt(page_text: str, row: dict) -> str:
         '"Product Category": "Appliance", '
         '"materials": "Stainless steel exterior"}\n\n'
         "Rules:\n"
-        "- Only include the fields listed above as blank, plus 'materials'.\n"
+        "- Only include the fields listed above as blank/incomplete, plus 'materials'.\n"
         "- If a field is not clearly stated in the page, return \"\" for that field.\n"
         "- Never invent values not present in the page.\n"
+        "- For Dimensions: only return a value when width AND height AND depth "
+        "are all explicitly stated. Never infer from product name alone.\n"
         "- Product Category must be one of: Chair, Sofa, Paint, Fabric, Table, "
         "Lighting, Plumbing, Hardware, Rug, Artwork, Mirror, Appliance, Accessories, Other.\n\n"
         f"PAGE TEXT:\n---\n{page_text}\n---"

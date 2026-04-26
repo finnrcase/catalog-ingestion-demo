@@ -143,14 +143,14 @@ def test_apply_enrichment_fills_blank_fields():
     row = _base_row_for_apply()
     extracted = {
         "Product Name": "Wolf 30\" Drawer Microwave",
-        "Dimensions": "29 7/8\" W × 23 1/2\" D",
+        "Dimensions": '29 7/8" W × 23 1/2" D × 11 7/8" H',
         "Finish / Color": "",
         "Product Category": "Appliance",
         "materials": "",
     }
     updated = _apply_enrichment(row, extracted, "https://wolfappliance.com", 85)
     assert updated["Product Name"] == "Wolf 30\" Drawer Microwave"
-    assert updated["Dimensions"] == "29 7/8\" W × 23 1/2\" D"
+    assert updated["Dimensions"] == '29 7/8" W × 23 1/2" D × 11 7/8" H'
     assert updated["Product Category"] == "Appliance"
     assert updated["Product URL"] == "https://wolfappliance.com"
     assert updated["Source Type"] == "PDF_Enriched"
@@ -520,3 +520,100 @@ def test_build_query_complete_3d_dimensions_uses_general_terms():
     query = _build_search_query(row)
     assert "specifications" in query.lower() or "official" in query.lower()
     assert "width height depth" not in query.lower()
+
+
+# ── _apply_enrichment with 3D dimensions ──────────────────────────────────────
+
+def test_apply_enrichment_fills_complete_3d_dims():
+    """Complete 3D extracted → fill Dimensions."""
+    row = _base_row_for_apply()
+    extracted = {
+        "Product Name": "",
+        "Dimensions": '36"W x 84"H x 24"D',
+        "Finish / Color": "",
+        "Product Category": "",
+        "materials": "",
+    }
+    updated = _apply_enrichment(row, extracted, "https://example.com", 85)
+    assert updated["Dimensions"] == '36"W x 84"H x 24"D'
+
+
+def test_apply_enrichment_overwrites_partial_with_complete_3d():
+    """Complete 3D extracted → overwrite even if row already had partial dims."""
+    row = {**_base_row_for_apply(), "Dimensions": "36 inch"}
+    extracted = {
+        "Product Name": "",
+        "Dimensions": '36"W x 84"H x 24"D',
+        "Finish / Color": "",
+        "Product Category": "",
+        "materials": "",
+    }
+    updated = _apply_enrichment(row, extracted, "https://example.com", 85)
+    assert updated["Dimensions"] == '36"W x 84"H x 24"D'
+
+
+def test_apply_enrichment_partial_extracted_adds_note():
+    """Partial extracted → no fill, note appended to Notes."""
+    row = _base_row_for_apply()
+    extracted = {
+        "Product Name": "",
+        "Dimensions": "36 inch",   # partial
+        "Finish / Color": "",
+        "Product Category": "",
+        "materials": "",
+    }
+    updated = _apply_enrichment(row, extracted, "https://example.com", 85)
+    assert updated["Dimensions"] == ""   # not filled
+    assert "[Partial dimension found:" in updated["Notes"]
+    assert "36 inch" in updated["Notes"]
+    assert "full W x H x D still needed" in updated["Notes"]
+
+
+def test_apply_enrichment_partial_note_not_duplicated():
+    """Partial dim note is not appended twice if already present."""
+    row = _base_row_for_apply()
+    row["Notes"] = "[Partial dimension found: 36 inch; full W x H x D still needed]"
+    extracted = {"Product Name": "", "Dimensions": "36 inch", "Finish / Color": "", "Product Category": "", "materials": ""}
+    updated = _apply_enrichment(row, extracted, "https://example.com", 85)
+    assert updated["Notes"].count("[Partial dimension found:") == 1
+
+
+def test_apply_enrichment_no_dim_extracted_blank_row_unchanged():
+    """No dimensions extracted and row has blank dims → Dimensions stays blank."""
+    row = _base_row_for_apply()
+    extracted = {"Product Name": "", "Dimensions": "", "Finish / Color": "", "Product Category": "", "materials": ""}
+    updated = _apply_enrichment(row, extracted, "https://example.com", 85)
+    assert updated["Dimensions"] == ""
+
+
+# ── _build_extraction_prompt with dimensions ───────────────────────────────────
+
+from src.product_enrichment import _build_extraction_prompt
+
+
+def test_extraction_prompt_requests_3d_when_dims_blank():
+    """When Dimensions is blank, prompt must ask for W, H, D explicitly."""
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "Product Name": "Microwave",
+           "Dimensions": "", "Finish / Color": "", "Product Category": ""}
+    prompt = _build_extraction_prompt("page text", row)
+    assert "width" in prompt.lower()
+    assert "height" in prompt.lower()
+    assert "depth" in prompt.lower()
+
+
+def test_extraction_prompt_requests_3d_when_dims_partial():
+    """When Dimensions is partial, prompt must still ask for full 3D."""
+    row = {"Brand": "Sub-Zero", "Model/SKU": "ID36R", "Product Name": "Fridge",
+           "Dimensions": "36 inch", "Finish / Color": "", "Product Category": ""}
+    prompt = _build_extraction_prompt("page text", row)
+    assert "width" in prompt.lower()
+    assert "depth" in prompt.lower()
+
+
+def test_extraction_prompt_no_dim_request_when_3d_complete():
+    """When 3D dimensions are already complete, prompt should NOT ask for dimensions."""
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "Product Name": "",
+           "Dimensions": '36"W x 84"H x 24"D', "Finish / Color": "", "Product Category": ""}
+    prompt = _build_extraction_prompt("page text", row)
+    # "Dimensions" must not be in the blank-fields list in the prompt
+    assert '"Dimensions"' not in prompt or "already complete" in prompt.lower()
