@@ -1,8 +1,8 @@
 import pytest
-from src.confidence import _suggested_action
+from src.confidence import _suggested_action, _missing_important
 
 
-def _pdf_ai_row(**overrides):
+def _row(**overrides):
     base = {
         "Source Type": "PDF_AI",
         "Product Name": "Wolf Microwave",
@@ -20,42 +20,98 @@ def _pdf_ai_row(**overrides):
     return base
 
 
-def test_pdf_ai_blank_dims_gets_3d_verify_note():
-    """PDF_AI row with blank Dimensions → 'Verify full W×H×D' note."""
-    action = _suggested_action(_pdf_ai_row(), missing=[])
+# ── _suggested_action — dimensions message ─────────────────────────────────────
+
+def test_blank_dims_gets_programa_note():
+    """Any row with blank Dimensions gets the 'Enter full W×H×D' note."""
+    action = _suggested_action(_row(), missing=["Dimensions"])
     assert "W" in action and "H" in action and "D" in action
-    assert "spec sheet" in action.lower()
+    assert "Programa" in action
 
 
-def test_pdf_ai_partial_dims_gets_3d_verify_note():
-    """PDF_AI row with partial dims ('36 inch') → 'Verify full W×H×D' note."""
-    action = _suggested_action(_pdf_ai_row(Dimensions="36 inch"), missing=[])
-    assert "W" in action and "H" in action and "D" in action
-    assert "spec sheet" in action.lower()
+def test_partial_dims_gets_programa_note():
+    """Any row with partial dims ('36 inch') gets the 'Enter full W×H×D' note."""
+    action = _suggested_action(_row(Dimensions="36 inch"), missing=["Dimensions"])
+    assert "Programa" in action
 
 
-def test_pdf_ai_complete_3d_dims_no_verify_note():
-    """PDF_AI row with full 3D dims → no dimension verification note."""
-    action = _suggested_action(_pdf_ai_row(**{"Dimensions": '36"W x 84"H x 24"D'}), missing=[])
-    assert "spec sheet" not in action.lower()
+def test_complete_3d_dims_no_dim_note():
+    """Row with full 3D dims → Dimensions not in missing → no dim note."""
+    action = _suggested_action(_row(**{"Dimensions": '36"W x 84"H x 24"D'}), missing=[])
+    assert "Programa" not in action or action.startswith("Ready for Programa")
+    assert "Enter full" not in action
 
 
-def test_non_pdf_ai_blank_dims_no_verify_note():
-    """Non-PDF_AI rows never get the dimension verification note."""
-    for source in ("PDF", "Manual", "URL"):
-        row = {**_pdf_ai_row(), "Source Type": source}
-        action = _suggested_action(row, missing=[])
-        assert "spec sheet" not in action.lower(), f"Source '{source}' should not get dim note"
+def test_non_pdf_ai_blank_dims_gets_programa_note():
+    """Non-PDF_AI rows also get the dim note when Dimensions is in missing.
+    Manual rows with Model/SKU are routed to enrichment first (early return),
+    so test Manual without a serial number to reach the missing-fields block."""
+    # PDF — straight through to missing-fields logic
+    pdf_row = {**_row(), "Source Type": "PDF"}
+    action = _suggested_action(pdf_row, missing=["Dimensions"])
+    assert "Programa" in action, "PDF source should get dim note"
+
+    # Manual without Model/SKU — falls through to missing-fields block
+    manual_row = {**_row(), "Source Type": "Manual", "Model/SKU": ""}
+    action = _suggested_action(manual_row, missing=["Dimensions"])
+    assert "Programa" in action, "Manual (no SKU) source should get dim note"
 
 
-def test_dim_note_not_duplicated():
-    """The note appears exactly once even if _suggested_action is called twice."""
-    action = _suggested_action(_pdf_ai_row(), missing=[])
-    assert action.lower().count("spec sheet") == 1
+def test_dim_note_appears_once():
+    """The dim note appears exactly once."""
+    action = _suggested_action(_row(), missing=["Dimensions"])
+    assert action.count("Programa upload") == 1
 
 
 def test_missing_fields_and_blank_dims_both_surfaced():
     """Missing fields AND blank dims → both appear in the action string."""
-    action = _suggested_action(_pdf_ai_row(), missing=["Room"])
+    action = _suggested_action(_row(), missing=["Room", "Dimensions"])
     assert "Room" in action
-    assert "spec sheet" in action.lower()
+    assert "Programa" in action
+
+
+def test_no_spec_sheet_reference():
+    """Old 'spec sheet' message is gone entirely."""
+    action = _suggested_action(_row(), missing=["Dimensions"])
+    assert "spec sheet" not in action.lower()
+
+
+# ── _missing_important — Dimensions field ──────────────────────────────────────
+
+def _base_non_url_row(**overrides):
+    base = {
+        "Source Type": "PDF_AI",
+        "Product Name": "Wolf Microwave",
+        "Brand": "Wolf",
+        "Dimensions": "",
+        "Quantity": 1,
+        "Supplier": "AEG",
+        "Room": "Kitchen",
+        "Product Category": "Appliance",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_missing_important_blank_dims_flagged():
+    """Blank Dimensions → included in missing list."""
+    missing = _missing_important(_base_non_url_row(Dimensions=""))
+    assert "Dimensions" in missing
+
+
+def test_missing_important_partial_dims_flagged():
+    """Partial dims ('36 inch') → included in missing list."""
+    missing = _missing_important(_base_non_url_row(Dimensions="36 inch"))
+    assert "Dimensions" in missing
+
+
+def test_missing_important_complete_3d_dims_not_flagged():
+    """Complete 3D dims → NOT in missing list."""
+    missing = _missing_important(_base_non_url_row(Dimensions='36"W x 84"H x 24"D'))
+    assert "Dimensions" not in missing
+
+
+def test_missing_important_unlabeled_triple_not_flagged():
+    """Unlabeled triple (36 x 34.5 x 24) → NOT in missing list."""
+    missing = _missing_important(_base_non_url_row(Dimensions="36 x 34.5 x 24"))
+    assert "Dimensions" not in missing

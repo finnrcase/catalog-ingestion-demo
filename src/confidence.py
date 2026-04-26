@@ -84,13 +84,17 @@ def _is_ignored_row(row: dict) -> bool:
 
 
 def _missing_important(row: dict) -> list[str]:
-    """Return IMPORTANT_FIELDS that are blank in this row."""
+    """Return IMPORTANT_FIELDS that are blank or incomplete in this row."""
     missing = []
     for field in IMPORTANT_FIELDS:
         if field == "Quantity":
             qty = row.get("Quantity")
             if not qty or _str(qty) in ("", "0"):
                 missing.append("Quantity")
+        elif field == "Dimensions":
+            dims = _str(row.get("Dimensions"))
+            if not dims or not has_complete_3d_dimensions(dims):
+                missing.append("Dimensions")
         else:
             if not _str(row.get(field)):
                 missing.append(field)
@@ -242,15 +246,9 @@ def _suggested_action(row: dict, missing: list[str]) -> str:
     else:
         action = f"Missing {', '.join(missing[:-1])}, and {missing[-1]}"
 
-    # For PDF_AI rows: flag missing or incomplete W×H×D dimensions so reviewers
-    # know to source them from the official spec sheet before sending to Programa.
-    dims = _str(row.get("Dimensions"))
-    needs_dim_verify = source == SOURCE_PDF_AI and (
-        not dims or not has_complete_3d_dimensions(dims)
-    )
-    if needs_dim_verify and "spec sheet" not in action.lower():
-        dim_note = "Verify full W×H×D dimensions from official spec sheet"
-        action = dim_note if action == "Ready for review" else f"{action}; {dim_note}"
+    if "Dimensions" in missing:
+        dim_note = "Enter full W × H × D dimensions before Programa upload"
+        action = dim_note if action == f"Missing Dimensions" else f"{action}; {dim_note}"
 
     return action
 
