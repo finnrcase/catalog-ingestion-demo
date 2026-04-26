@@ -617,3 +617,45 @@ def test_extraction_prompt_no_dim_request_when_3d_complete():
     prompt = _build_extraction_prompt("page text", row)
     # "Dimensions" must not be in the blank-fields list in the prompt
     assert '"Dimensions"' not in prompt or "already complete" in prompt.lower()
+
+
+# ── has_complete_3d_dimensions — extended cases ────────────────────────────────
+
+def test_3d_unlabeled_triple_passes():
+    """Three bare numbers separated by x are a valid unlabeled triple."""
+    assert has_complete_3d_dimensions("36 x 34.5 x 24") is True
+
+
+def test_3d_colon_labeled_passes():
+    """W:36 H:34.5 D:24 format must pass."""
+    assert has_complete_3d_dimensions("W:36 H:34.5 D:24") is True
+
+
+def test_3d_mixed_fraction_triple_passes():
+    """Mixed fractions with labels must pass."""
+    assert has_complete_3d_dimensions('29 7/8" W × 23 1/2" D × 11 7/8" H') is True
+
+
+def test_3d_single_number_word_fails():
+    """'36 inch fridge' has only one numeric value — must fail."""
+    assert has_complete_3d_dimensions("36 inch fridge") is False
+
+
+def test_3d_single_number_phrase_fails():
+    """'42 built in' has only one numeric value — must fail."""
+    assert has_complete_3d_dimensions("42 built in") is False
+
+
+def test_3d_warming_drawer_phrase_fails():
+    """'30 warming drawer' has only one numeric value — must fail."""
+    assert has_complete_3d_dimensions("30 warming drawer") is False
+
+
+def test_3d_two_numbers_with_not_fails():
+    """'24 not 36' has two numeric values — must fail."""
+    assert has_complete_3d_dimensions("24 not 36") is False
+
+
+def test_3d_two_number_unlabeled_fails():
+    """'36 x 24' is only two dimensions — must fail."""
+    assert has_complete_3d_dimensions("36 x 24") is False

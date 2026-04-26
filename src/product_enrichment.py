@@ -57,24 +57,16 @@ def _str_val(v) -> str:
     return str(v).strip()
 
 
-# Compiled patterns for detecting W, H, D dimension labels.
-# Matches both abbreviated (W, H, D) and full-word (width, height, depth) forms,
-# preceded by a digit, quote, or space — preventing false matches on word fragments.
-_DIM_W = re.compile(r'[\d"\'\s]W\b|\bwidth\b', re.IGNORECASE)
-_DIM_H = re.compile(r'[\d"\'\s]H\b|\bheight\b', re.IGNORECASE)
-_DIM_D = re.compile(r'[\d"\'\s]D\b|\bdepth\b', re.IGNORECASE)
+# Matches integers, decimals, and mixed fractions (e.g. 29 7/8, 1/2, 36, 34.5).
+_DIM_NUM_RE = re.compile(r'\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?')
 
 
 def has_complete_3d_dimensions(dimensions) -> bool:
-    """Return True only if dimensions contains explicit W, H, and D measurements."""
+    """Return True only if dimensions contains at least 3 distinct numeric values."""
     s = str(dimensions or "").strip()
     if not s:
         return False
-    return (
-        bool(_DIM_W.search(s))
-        and bool(_DIM_H.search(s))
-        and bool(_DIM_D.search(s))
-    )
+    return len(_DIM_NUM_RE.findall(s)) >= 3
 
 
 def _qualifies(row: dict) -> bool:
