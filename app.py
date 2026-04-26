@@ -169,9 +169,8 @@ with right_col:
 
 st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
 
-# ── Manual Product Entry ───────────────────────────────────────────────────────
-with st.container(border=True):
-    section_label("Manual Product Entry")
+# ── Manual Product Entry (collapsed) ──────────────────────────────────────────
+with st.expander("Advanced: Add item manually", expanded=False):
     st.caption(
         "Enter a product directly. Leave fields blank if unknown — "
         "providing a Serial / Model Number lets the system suggest missing details later."
@@ -237,20 +236,9 @@ with st.container(border=True):
 st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
 
 # ── Intake action buttons (PDF + URL path) ─────────────────────────────────────
-btn_col, _, clear_col = st.columns([3, 5, 2])
-
-with btn_col:
+gen_col, _ = st.columns([3, 7])
+with gen_col:
     generate = st.button("Generate Intake Table", type="primary", use_container_width=True)
-with clear_col:
-    clear = st.button("Clear Intake", type="secondary", use_container_width=True)
-
-if clear:
-    st.session_state.intake_df = None
-    st.session_state.automation_results = None
-    st.session_state.ai_errors = []
-    st.session_state.pending_enrichment = False
-    st.session_state.enrichment_errors = []
-    st.rerun()
 
 if generate:
     raw_urls = [u.strip() for u in (url_input or "").splitlines() if u.strip()]
@@ -562,36 +550,19 @@ if st.session_state.intake_df is not None:
             with helper_col:
                 st.caption('Enter as W × H × D — for example: 36"W × 34.5"H × 24"D')
 
-            if save_dims and dim_updates:
+            if save_dims:
                 _df_copy = st.session_state.intake_df.copy()
                 for idx, val in dim_updates.items():
-                    if has_complete_3d_dimensions(val):
+                    if val.strip():
                         _df_copy.at[idx, "Dimensions"] = val
                 st.session_state.intake_df = apply_confidence_checks(_df_copy)
                 st.rerun()
-
-    # ── AI-Assisted Cleanup ────────────────────────────────────────────────────
-    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-    st.divider()
-    section_label("AI-Assisted Cleanup")
-
-    if not _BRAVE_API_KEY:
-        st.caption(
-            "Product enrichment requires BRAVE_API_KEY — add it to .env and restart the app."
-        )
 
     # Show any previous category AI error
     if st.session_state.get("cat_ai_error"):
         st.error(st.session_state.cat_ai_error, icon="❌")
 
-    # ── Category suggestion ────────────────────────────────────────────────────
-    use_cat_ai = st.checkbox(
-        "Use AI to suggest categories",
-        value=False,
-        key="use_cat_ai",
-        help="Sends rows with blank Category to Claude for a single batched suggestion call.",
-    )
-
+    # ── Compute category/enrichment state (needed by Advanced Tools below) ─────
     _included_mask = edited_df.get("Include", pd.Series([True] * len(edited_df))) == True
     if "Product Category" in edited_df.columns:
         _blank_cat_mask = (
@@ -607,36 +578,93 @@ if st.session_state.intake_df is not None:
     _blank_cat_indices = list(edited_df[_blank_cat_mask].index)
     _blank_cat_n = len(_blank_cat_indices)
 
-    _cat_btn_label = (
-        f"Suggest Missing Categories ({_blank_cat_n} row{'s' if _blank_cat_n != 1 else ''})"
-        if _blank_cat_n > 0 else "No blank categories"
-    )
-    cat_col, _, __ = st.columns([2, 6, 2])
-    with cat_col:
-        cat_clicked = st.button(
-            _cat_btn_label,
-            type="secondary",
-            use_container_width=True,
-            disabled=(not use_cat_ai or _blank_cat_n == 0),
+    # ── Advanced Tools ─────────────────────────────────────────────────────────
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    with st.expander("Advanced Tools", expanded=False):
+        # Clear Intake
+        st.markdown("**Reset**")
+        clear_col, _ = st.columns([2, 8])
+        with clear_col:
+            clear = st.button("Clear Intake", type="secondary", use_container_width=True)
+        if clear:
+            st.session_state.intake_df = None
+            st.session_state.automation_results = None
+            st.session_state.ai_errors = []
+            st.session_state.pending_enrichment = False
+            st.session_state.enrichment_errors = []
+            st.rerun()
+
+        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+
+        # Re-run Enrichment
+        st.markdown("**Enrichment**")
+        if not _BRAVE_API_KEY:
+            st.caption("Product enrichment requires BRAVE_API_KEY — add it to .env and restart.")
+        enrich_col, _ = st.columns([3, 7])
+        with enrich_col:
+            enrich_rerun_clicked = st.button(
+                "Re-run Enrichment",
+                type="secondary",
+                use_container_width=True,
+                disabled=not _BRAVE_API_KEY,
+                help="Re-search manufacturer sources for rows still missing product details.",
+            )
+        if enrich_rerun_clicked and _BRAVE_API_KEY:
+            st.session_state.pending_enrichment = True
+            st.rerun()
+
+        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+
+        # AI Category suggestion
+        st.markdown("**AI Category Suggestions**")
+        use_cat_ai = st.checkbox(
+            "Use AI to suggest categories",
+            value=False,
+            key="use_cat_ai",
+            help="Sends rows with blank Category to Claude for a single batched suggestion call.",
         )
-    enrich_col, _, __ = st.columns([2, 6, 2])
-    with enrich_col:
-        enrich_rerun_clicked = st.button(
-            "Re-run Enrichment for Needs Enrichment Rows",
-            type="secondary",
-            use_container_width=True,
-            disabled=not _BRAVE_API_KEY,
-            help="Re-search manufacturer sources for rows still missing product details.",
+        _cat_btn_label = (
+            f"Suggest Missing Categories ({_blank_cat_n} row{'s' if _blank_cat_n != 1 else ''})"
+            if _blank_cat_n > 0 else "No blank categories"
         )
-    if enrich_rerun_clicked and _BRAVE_API_KEY:
-        st.session_state.pending_enrichment = True
-        st.rerun()
+        cat_col, _ = st.columns([3, 7])
+        with cat_col:
+            cat_clicked = st.button(
+                _cat_btn_label,
+                type="secondary",
+                use_container_width=True,
+                disabled=(not use_cat_ai or _blank_cat_n == 0),
+            )
+
+        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+
+        # Programa login
+        st.markdown("**Programa Setup**")
+        st.caption(
+            "First run? Open a Chrome window to log in as "
+            "Assistant@saffroncasehomes.com. Session is saved automatically."
+        )
+        login_col, _ = st.columns([3, 7])
+        with login_col:
+            open_login = st.button(
+                "Open Programa Login Window",
+                type="secondary",
+                use_container_width=True,
+            )
+
+    # Handle Advanced Tool actions that require spinners (outside expander)
+    if open_login:
+        with st.spinner("Chrome is open — log in, then close the browser window to continue."):
+            try:
+                status_msg = open_programa_login_window()
+                st.success(status_msg)
+            except Exception as exc:
+                st.error(f"Could not open Chrome: {exc}")
 
     if cat_clicked and use_cat_ai and _blank_cat_n > 0:
         _blank_rows = edited_df.loc[_blank_cat_indices].to_dict("records")
         with st.spinner(f"Suggesting categories for {_blank_cat_n} row{'s' if _blank_cat_n != 1 else ''}…"):
             _suggestions, _cat_error = suggest_categories_batch(_blank_rows, _blank_cat_indices)
-
         if _cat_error:
             st.session_state.cat_ai_error = _cat_error
             st.rerun()
@@ -653,34 +681,21 @@ if st.session_state.intake_df is not None:
             st.session_state.intake_df = apply_confidence_checks(_updated_df)
             st.rerun()
 
-    # ── Uncertain rows cleanup ─────────────────────────────────────────────────
-    uncertain_rows = (
-        edited_df[(edited_df["Review Required"] == True) & (edited_df["Include"] == True)]
-        if "Review Required" in edited_df.columns
-        else pd.DataFrame()
-    )
-    uncertain_n = len(uncertain_rows)
-
-    ai_label = (
-        f"Use AI to clean {uncertain_n} uncertain row{'s' if uncertain_n != 1 else ''}"
-        if uncertain_n > 0 else "No uncertain rows"
-    )
-    ai_col, _, __ = st.columns([2, 6, 2])
-    with ai_col:
-        ai_clicked = st.button(
-            ai_label, type="secondary", use_container_width=True,
-            disabled=(uncertain_n == 0),
-        )
-    if ai_clicked:
-        st.info("AI cleanup will be added in a future version.", icon="ℹ️")
-
     # ── Programa Automation ────────────────────────────────────────────────────
     st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
     st.divider()
     section_label("Programa Automation")
 
+    allow_missing_dims = st.checkbox(
+        "Allow sending rows with missing dimensions",
+        value=False,
+        key="allow_missing_dims",
+        help="When checked, rows without full W × H × D can still be sent. A warning will appear before sending.",
+    )
+
     # Eligibility: Include=True, not flagged for review, not in terminal statuses,
-    # has Product Name, Quantity ≥ 1, Product Category, and complete 3D dimensions.
+    # has Product Name, Quantity ≥ 1, Product Category.
+    # Dimensions gate is enforced unless allow_missing_dims is checked.
     _BLOCKED_STATUSES = {"Ignored", "Excluded", "Error"}
 
     def _is_eligible(row: pd.Series) -> bool:
@@ -699,8 +714,9 @@ if st.session_state.intake_df is not None:
             return False
         if not str(row.get("Product Category", "") or "").strip():
             return False
-        if not has_complete_3d_dimensions(str(row.get("Dimensions", "") or "")):
-            return False
+        if not allow_missing_dims:
+            if not has_complete_3d_dimensions(str(row.get("Dimensions", "") or "")):
+                return False
         return True
 
     eligible_df = edited_df[edited_df.apply(_is_eligible, axis=1)].copy()
@@ -711,8 +727,6 @@ if st.session_state.intake_df is not None:
             and bool(str(row.get("Product URL", "") or "").strip())
         )
 
-    url_sendable = eligible_df[eligible_df.apply(_is_url_row, axis=1)].copy()
-    schedule_sendable = eligible_df[~eligible_df.apply(_is_url_row, axis=1)].copy()
     total_sendable = len(eligible_df)
 
     # Blocked included rows: Include=True but failed eligibility
@@ -725,7 +739,7 @@ if st.session_state.intake_df is not None:
             lambda v: not has_complete_3d_dimensions(str(v or ""))
         ).sum()) if "Dimensions" in _blocked_df.columns else 0
         _n_review = int((_blocked_df.get("Review Required", pd.Series([])) == True).sum())
-        if _n_dim > 0:
+        if _n_dim > 0 and not allow_missing_dims:
             st.warning(
                 f"{_n_dim} item{'s' if _n_dim != 1 else ''} need dimensions before they can be sent.",
                 icon="⚠️",
@@ -735,33 +749,7 @@ if st.session_state.intake_df is not None:
                 f"{_n_review} item{'s' if _n_review != 1 else ''} still need review before they can be sent.",
                 icon="⚠️",
             )
-        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-
-    # ── Login / setup ──────────────────────────────────────────────────────────
-    with st.container(border=True):
-        section_label("First-time Setup")
-        st.caption(
-            "First run? Open a Chrome window to log in as "
-            "Assistant@saffroncasehomes.com. Close the window when done — "
-            "your session is saved automatically for future runs."
-        )
-        login_col, _, __ = st.columns([2, 5, 3])
-        with login_col:
-            open_login = st.button(
-                "Open Programa Login Window",
-                type="secondary",
-                use_container_width=True,
-            )
-
-    if open_login:
-        with st.spinner("Chrome is open — log in, then close the browser window to continue."):
-            try:
-                status_msg = open_programa_login_window()
-                st.success(status_msg)
-            except Exception as exc:
-                st.error(f"Could not open Chrome: {exc}")
-
-    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
 
     # ── Automation controls ────────────────────────────────────────────────────
     auto_col, send_col, _ = st.columns([3, 3, 4])
@@ -790,10 +778,18 @@ if st.session_state.intake_df is not None:
 
     if no_project:
         st.warning("Enter a Programa project name above before sending.")
+    elif allow_missing_dims and total_sendable > 0:
+        _n_missing = int(eligible_df["Dimensions"].apply(
+            lambda v: not has_complete_3d_dimensions(str(v or ""))
+        ).sum()) if "Dimensions" in eligible_df.columns else 0
+        if _n_missing > 0:
+            st.warning(
+                f"Some items are missing full dimensions. Confirm before sending.",
+                icon="⚠️",
+            )
     elif total_sendable == 0 and _blocked_df.empty:
         st.warning(
-            "No eligible items — check that rows are included, have complete dimensions, "
-            "and are not flagged for review."
+            "No eligible items — check that rows are included and are not flagged for review."
         )
 
     if send_to_programa:
