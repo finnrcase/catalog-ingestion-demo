@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 from src.brave_search import BRAVE_API_KEY, search_product_candidates
 from src.category_ai import _normalise_category
+from src.dimensions import has_complete_3d_dimensions
 
 try:
     import html2text as _html2text
@@ -55,18 +56,6 @@ def _str_val(v) -> str:
     if v is None:
         return ""
     return str(v).strip()
-
-
-# Matches integers, decimals, and mixed fractions (e.g. 29 7/8, 1/2, 36, 34.5).
-_DIM_NUM_RE = re.compile(r'\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?')
-
-
-def has_complete_3d_dimensions(dimensions) -> bool:
-    """Return True only if dimensions contains at least 3 distinct numeric values."""
-    s = str(dimensions or "").strip()
-    if not s:
-        return False
-    return len(_DIM_NUM_RE.findall(s)) >= 3
 
 
 def _qualifies(row: dict) -> bool:
@@ -250,7 +239,7 @@ def _build_extraction_prompt(page_text: str, row: dict) -> str:
         '{"Product Name": "Wolf 30\\" Drawer Microwave Oven", '
         '"Dimensions": "29 7/8\\" W x 23 1/2\\" D x 11 7/8\\" H", '
         '"Finish / Color": "Stainless Steel", '
-        '"Product Category": "Appliance", '
+        '"Product Category": "Appliances", '
         '"materials": "Stainless steel exterior"}\n\n'
         "Rules:\n"
         "- Only include the fields listed above as blank/incomplete, plus 'materials'.\n"
@@ -258,8 +247,10 @@ def _build_extraction_prompt(page_text: str, row: dict) -> str:
         "- Never invent values not present in the page.\n"
         "- For Dimensions: only return a value when width AND height AND depth "
         "are all explicitly stated. Never infer from product name alone.\n"
-        "- Product Category must be one of: Chair, Sofa, Paint, Fabric, Table, "
-        "Lighting, Plumbing, Hardware, Rug, Artwork, Mirror, Appliance, Accessories, Other.\n\n"
+        "- Product Category must be one of: Paint/Wallpaper, Stone/Tile, Seating, "
+        "Hardware, Flooring, Tables, Gym Equipment, Fabrics/Pillows, Lighting, Rugs, "
+        "Mirrors, Beds/Mattresses, Dressers/Drawers/Storage, Appliances, Accessories, "
+        "Artwork, Bedding/Linens/Bath Linens.\n\n"
         f"PAGE TEXT:\n---\n{page_text}\n---"
     )
 

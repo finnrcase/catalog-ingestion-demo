@@ -1,5 +1,5 @@
 import pytest
-from src.confidence import _suggested_action, _missing_important
+from src.confidence import _suggested_action, _missing_important, classify_row_status, identify_missing_fields, should_require_review
 
 
 def _row(**overrides):
@@ -111,7 +111,29 @@ def test_missing_important_complete_3d_dims_not_flagged():
     assert "Dimensions" not in missing
 
 
-def test_missing_important_unlabeled_triple_not_flagged():
-    """Unlabeled triple (36 x 34.5 x 24) → NOT in missing list."""
+def test_missing_important_unlabeled_triple_flagged():
+    """Unlabeled triple (36 x 34.5 x 24) still needs explicit W/H/D labels."""
     missing = _missing_important(_base_non_url_row(Dimensions="36 x 34.5 x 24"))
-    assert "Dimensions" not in missing
+    assert "Dimensions" in missing
+
+
+def test_photo_only_rows_are_not_auto_ignored():
+    row = {
+        "Source Type": "Photo",
+        "Product Name": "",
+        "Brand": "",
+        "Model/SKU": "",
+        "Product URL": "",
+        "Supplier": "",
+        "Quantity": None,
+        "Dimensions": "",
+        "Room": "",
+        "Product Category": "",
+        "Import Type": "Photo Upload",
+        "photo_only": True,
+    }
+
+    assert classify_row_status(row) == "Needs Review"
+    assert should_require_review(row) is False
+    assert identify_missing_fields(row) == []
+    assert "ready to send" in _suggested_action(row, [])

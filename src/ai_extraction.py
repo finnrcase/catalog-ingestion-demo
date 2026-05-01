@@ -138,10 +138,14 @@ def _build_prompt(
         ]
         pre_parse_section = f"""
 STRUCTURED PRE-PARSE
-The following rows were extracted by a rule-based parser before this call.
-Use them as a starting point — correct errors, fill gaps where the document
-supports it, and add any rows the parser missed.
-Do NOT invent dimensions, finish, or brand if not present in the document.
+A rule-based parser produced the {len(compact)} rows below before this call.
+Treat each row as one confirmed product line from the document.
+Rules:
+- Output EXACTLY one JSON object per pre-parsed row (do not split or merge rows).
+- Correct obvious parser errors (e.g. garbled product names) using document text.
+- Fill in fields the parser left blank only when the document explicitly states the value.
+- Add rows for any product lines the parser missed entirely.
+- Do NOT invent dimensions, finish, or brand if not present in the document.
 
 {_json.dumps(compact, indent=2)}
 
@@ -170,7 +174,7 @@ EXTRACTION RULES
    - Normalise to Title Case (e.g. "laundry room floor 2" → "Laundry Room Floor 2", "exterior" → "Exterior").
    - If a note contains uncertainty (e.g. "Bar - if we can fit it", "kitchen if it fits"), extract the clean room name ("Bar"), set review_required = true, and include the ORIGINAL note verbatim in the notes field.
    - If no location is visible for a line, use the default room value above.
-10. Product Category must be exactly one of: {categories_str}. For appliance quotes most items are "Appliance". Leave blank if genuinely uncertain — it can be suggested separately.
+10. Product Category must be exactly one of: {categories_str}. For appliance quotes (Wolf, Sub-Zero, Miele, etc.) use "Appliances". For seating (chairs, sofas, benches) use "Seating". If uncertain, pick the closest category — do not leave blank unless truly no category applies.
 11. Confidence scoring (start at 85, apply deductions):
     - Deduct 20 if Product Name cannot be reliably determined.
     - Deduct 20 if Model/SKU is missing.
@@ -180,6 +184,8 @@ EXTRACTION RULES
 12. Set review_required = true when confidence_score < 75, room is unclear, or quantity is ambiguous.
 13. missing_fields: comma-separated list of field names that are empty or uncertain (e.g. "Room, Quantity").
 14. suggested_action: one short instruction for the reviewer (e.g. "Confirm room assignment", "Verify quantity — description may imply qty 2").
+15. Deduplication: each physical product line in the document must appear EXACTLY ONCE in the output. Do not create two rows for the same line item.
+16. Ambiguity: when a field has two or more plausible values, pick the most likely one, set review_required=true, and explain the ambiguity in suggested_action.
 
 RESPONSE FORMAT
 Return ONLY a raw JSON array. No prose before it. No prose after it. No markdown. No code fences. No explanation. The very first character of your response must be "[" and the very last must be "]". Each element must include every key below:
@@ -413,6 +419,7 @@ def extract_products_from_pdf_with_ai(
         message = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=8192,
+            temperature=0,
             messages=[
                 {"role": "user", "content": _build_prompt(
                     pdf_text, project_name, default_room, supplier, structured_rows

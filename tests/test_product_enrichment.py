@@ -151,7 +151,7 @@ def test_apply_enrichment_fills_blank_fields():
     updated = _apply_enrichment(row, extracted, "https://wolfappliance.com", 85)
     assert updated["Product Name"] == "Wolf 30\" Drawer Microwave"
     assert updated["Dimensions"] == '29 7/8" W × 23 1/2" D × 11 7/8" H'
-    assert updated["Product Category"] == "Appliance"
+    assert updated["Product Category"] == "Appliances"
     assert updated["Product URL"] == "https://wolfappliance.com"
     assert updated["Source Type"] == "PDF_Enriched"
     assert updated["Review Required"] is False
@@ -232,11 +232,11 @@ def test_apply_enrichment_normalises_category():
         "Product Name": "",
         "Dimensions": "",
         "Finish / Color": "",
-        "Product Category": "couch",  # alias → Sofa
+        "Product Category": "couch",  # alias → Seating
         "materials": "",
     }
     updated = _apply_enrichment(row, extracted, "https://example.com", 70)
-    assert updated["Product Category"] == "Sofa"
+    assert updated["Product Category"] == "Seating"
 
 
 # ── _fetch_page_text ───────────────────────────────────────────────────────────
@@ -621,9 +621,9 @@ def test_extraction_prompt_no_dim_request_when_3d_complete():
 
 # ── has_complete_3d_dimensions — extended cases ────────────────────────────────
 
-def test_3d_unlabeled_triple_passes():
-    """Three bare numbers separated by x are a valid unlabeled triple."""
-    assert has_complete_3d_dimensions("36 x 34.5 x 24") is True
+def test_3d_unlabeled_triple_fails():
+    """Three bare numbers are not enough unless W, H, and D are explicit."""
+    assert has_complete_3d_dimensions("36 x 34.5 x 24") is False
 
 
 def test_3d_colon_labeled_passes():

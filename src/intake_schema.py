@@ -28,28 +28,38 @@ ALL_COLUMNS: list[str] = [
     "Notes",
     "Source Type",
     "Status",
+    "Import Type",
+    "photo_only",
     "AI Category Confidence",
     "Category Source",
+    "Image URL",
+    "Local Image Path",
+    "Image Filename",
+    "Image Upload Status",
+    "photo_only",
 ]
 
 # ── Category options ───────────────────────────────────────────────────────────
 # Title-case list shared by the manual-entry form, data editor, and AI prompt.
 
 CATEGORIES: list[str] = [
-    "Chair",
-    "Sofa",
-    "Paint",
-    "Fabric",
-    "Table",
-    "Lighting",
-    "Plumbing",
+    "Paint/Wallpaper",
+    "Stone/Tile",
+    "Seating",
     "Hardware",
-    "Rug",
-    "Artwork",
-    "Mirror",
-    "Appliance",
+    "Flooring",
+    "Tables",
+    "Gym Equipment",
+    "Fabrics/Pillows",
+    "Lighting",
+    "Rugs",
+    "Mirrors",
+    "Beds/Mattresses",
+    "Dressers/Drawers/Storage",
+    "Appliances",
     "Accessories",
-    "Other",
+    "Artwork",
+    "Bedding/Linens/Bath Linens",
 ]
 
 # ── Status options ─────────────────────────────────────────────────────────────
@@ -70,6 +80,14 @@ SOURCE_MANUAL = "Manual"
 SOURCE_URL    = "URL"
 SOURCE_PDF    = "PDF"
 SOURCE_PDF_AI = "PDF_AI"
+SOURCE_PHOTO  = "Photo"
+
+INTERNAL_IMAGE_COLUMNS: list[str] = [
+    "Image URL",
+    "Local Image Path",
+    "Image Filename",
+    "Image Upload Status",
+]
 
 # ── Important fields for confidence scoring ────────────────────────────────────
 # A row missing any of these is flagged for review (unless it has a Model/SKU
@@ -115,6 +133,12 @@ def make_base_row(
         "Notes":            notes,
         "Source Type":           "",
         "Status":                "",
+        "Import Type":           "",
+        "photo_only":            False,
         "AI Category Confidence": 0,
         "Category Source":        "Unknown",
+        "Image URL":              "",
+        "Local Image Path":       "",
+        "Image Filename":         "",
+        "Image Upload Status":    "",
     }

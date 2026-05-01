@@ -1,26 +1,110 @@
+import logging
 import os
+import re
+import hashlib
+import time
+from pathlib import Path
 import streamlit as st
 import pandas as pd
 
+_logger = logging.getLogger("sch_intake")
+
 from src.styling import inject_css, section_label, PAGE_TITLE_HTML
-from src.intake_schema import CATEGORIES, STATUSES
+from src.intake_schema import CATEGORIES, INTERNAL_IMAGE_COLUMNS, STATUSES
 from src.intake import (
     COLUMNS,
     build_intake_dataframe,
-    create_manual_row,
     create_pdf_rows,
+    create_photo_rows,
     create_url_rows,
 )
 from src.export import get_csv_bytes
-from src.programa_automation import open_programa_login_window, run_programa_automation
+from src.programa_automation import (
+    open_programa_login_window,
+    run_programa_automation,
+    run_programa_debug_single_row,
+    run_programa_field_diagnostic,
+)
 from src.confidence import apply_confidence_checks
 from src.ai_extraction import extract_products_from_pdf_with_ai
 from src.document_parser import parse_pdf_rows
 from src.category_ai import suggest_categories_batch
+from src.notes import remove_notes_row_prefix
 from src.product_enrichment import enrich_dataframe, has_complete_3d_dimensions
 from src.brave_search import BRAVE_API_KEY as _BRAVE_API_KEY
+from src.enrichment_debug import debug_enrich_dataframe, save_debug_report
+from src.vendor_call_agent import (
+    build_minimal_call_task,
+    build_call_goal,
+    build_call_script,
+    calls_enabled,
+    extract_vendor_specs_from_transcript,
+    get_call_status,
+    get_call_provider,
+    list_bland_personas,
+    make_json_safe,
+    start_bland_minimal_call,
+    start_custom_retell_test_call,
+    start_vendor_call,
+    test_bland_connection,
+    vendor_call_mock_enabled,
+)
 
 LOGO_PATH = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
+BULK_PHOTO_DIR = Path("temp/product_images/bulk_uploads")
+ACCEPTED_PHOTO_TYPES = ["jpg", "jpeg", "png", "webp", "heic", "heif"]
+DISPLAY_COLUMNS = [
+    "Include",
+    "Confidence Score",
+    "Review Required",
+    "Suggested Action",
+    "Project",
+    "Room",
+    "Product Name",
+    "Brand",
+    "Dimensions",
+    "Finish / Color",
+    "Model/SKU",
+    "Product Category",
+    "Quantity",
+    "Price",
+    "Supplier",
+    "Product URL",
+    "Notes",
+    "Source Type",
+    "Import Type",
+    "Status",
+    "Missing Fields",
+    "AI Category Confidence",
+    "Category Source",
+    "Image Filename",
+    "Image Upload Status",
+]
+
+
+def _safe_uploaded_image_name(filename: str) -> str:
+    stem = Path(filename or "product_photo").stem
+    suffix = Path(filename or "").suffix.lower()
+    if suffix.lstrip(".") not in ACCEPTED_PHOTO_TYPES:
+        suffix = ".jpg"
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-") or "product_photo"
+    return f"{safe_stem[:90]}{suffix}"
+
+
+def _save_bulk_photo_upload(uploaded_file) -> dict:
+    """Persist one uploaded image for later Programa upload without using it as product data."""
+    BULK_PHOTO_DIR.mkdir(parents=True, exist_ok=True)
+    original_name = str(getattr(uploaded_file, "name", "") or "product_photo")
+    safe_name = _safe_uploaded_image_name(original_name)
+    digest = hashlib.sha1(f"{original_name}:{time.time_ns()}".encode("utf-8")).hexdigest()[:10]
+    path = BULK_PHOTO_DIR / f"{Path(safe_name).stem}_{digest}{Path(safe_name).suffix}"
+    with open(path, "wb") as fh:
+        fh.write(uploaded_file.getbuffer())
+    return {
+        "image_filename": original_name,
+        "local_image_path": str(path),
+        "image_upload_status": "Ready",
+    }
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -91,20 +175,37 @@ if "pending_enrichment" not in st.session_state:
     st.session_state.pending_enrichment = False
 if "enrichment_errors" not in st.session_state:
     st.session_state.enrichment_errors = []
+if "vendor_call_panel" not in st.session_state:
+    st.session_state.vendor_call_panel = None
+if "vendor_call_results" not in st.session_state:
+    st.session_state.vendor_call_results = {}
+if "vendor_call_metadata" not in st.session_state:
+    st.session_state.vendor_call_metadata = {}
+if "vendor_call_extractions" not in st.session_state:
+    st.session_state.vendor_call_extractions = {}
+if "custom_retell_test_result" not in st.session_state:
+    st.session_state.custom_retell_test_result = None
 
 # ── Programa Destination ───────────────────────────────────────────────────────
 with st.container(border=True):
     section_label("Programa Destination")
     st.caption(
-        "Enter the exact existing Programa project name. "
-        "This tool only adds items to existing projects and never creates projects."
+        "Open the target schedule in Programa, copy the URL from your browser, and paste it below. "
+        "Items will be entered directly into that schedule."
     )
     dest_col1, dest_col2 = st.columns([3, 2])
 
     with dest_col1:
+        schedule_url = st.text_input(
+            "Programa Schedule Link",
+            placeholder="https://app.programa.design/schedules2/schedules/…",
+            help="Open the desired Programa schedule, copy the URL, and paste it here.",
+        )
+        if schedule_url.strip() and "app.programa.design/schedule" not in schedule_url:
+            st.warning("URL doesn't look like a Programa schedule link — double-check it.", icon="⚠️")
         selected_project = st.text_input(
-            "Existing Programa Project / Property",
-            placeholder="Type exact Programa project name, e.g. 1 Lily Pond Ln",
+            "Project Name (optional — for logging only)",
+            placeholder="e.g. 1 Lily Pond Ln",
         )
     with dest_col2:
         room_options = [
@@ -113,6 +214,98 @@ with st.container(border=True):
             "Outdoor / Terrace", "Other",
         ]
         room = st.selectbox("Default Room / Location", options=room_options)
+
+st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+
+# ── Custom Retell Test Call ───────────────────────────────────────────────────
+with st.container(border=True):
+    section_label("Custom Retell Test Call")
+    st.caption("Use this for demo calls and Retell debugging. This panel only uses Retell.")
+    test_col1, test_col2 = st.columns([1.25, 2.75])
+    with test_col1:
+        custom_test_phone = st.text_input(
+            "Phone number to call",
+            placeholder="+18005551234",
+            key="custom_retell_test_phone",
+        )
+    with test_col2:
+        custom_test_prompt = st.text_area(
+            "Call prompt / objective",
+            placeholder=(
+                "Call this vendor and ask for the dimensions and current price "
+                "of Samsung refrigerator model RF23DB9900QD."
+            ),
+            key="custom_retell_test_prompt",
+            height=94,
+        )
+
+    missing_retell_config = []
+    if not os.getenv("RETELL_PHONE_NUMBER", "").strip():
+        missing_retell_config.append("RETELL_PHONE_NUMBER")
+    if not os.getenv("RETELL_AGENT_ID", "").strip():
+        missing_retell_config.append("RETELL_AGENT_ID")
+
+    start_custom_test = st.button(
+        "Start Custom AI Call",
+        type="secondary",
+        use_container_width=False,
+        key="custom_retell_test_start",
+    )
+    if start_custom_test:
+        if not custom_test_phone.strip():
+            st.error("Enter a phone number before starting the test call.")
+        elif not custom_test_phone.strip().startswith("+"):
+            st.error("Phone number must start with +.")
+        elif not custom_test_prompt.strip():
+            st.error("Enter a call prompt / objective before starting the test call.")
+        elif missing_retell_config:
+            st.error(f"Retell config incomplete: missing {', '.join(missing_retell_config)}.")
+        else:
+            with st.spinner("Starting custom Retell call..."):
+                st.session_state.custom_retell_test_result = start_custom_retell_test_call(
+                    custom_test_phone,
+                    custom_test_prompt,
+                )
+
+    custom_result = st.session_state.custom_retell_test_result
+    if custom_result:
+        if custom_result.get("status") in {"call_started", "registered"}:
+            st.success("Custom Retell call started.")
+            result_cols = st.columns(5)
+            result_cols[0].caption("Call ID")
+            result_cols[0].write(custom_result.get("call_id") or "Pending")
+            result_cols[1].caption("To number")
+            result_cols[1].write(custom_result.get("to_number") or custom_test_phone)
+            result_cols[2].caption("From number")
+            result_cols[2].write(custom_result.get("from_number") or os.getenv("RETELL_PHONE_NUMBER", "").strip())
+            result_cols[3].caption("Agent ID used")
+            result_cols[3].write(custom_result.get("agent_id") or os.getenv("RETELL_AGENT_ID", "").strip())
+            result_cols[4].caption("Provider")
+            result_cols[4].write("Retell")
+        else:
+            st.warning(custom_result.get("message") or "Retell custom test call failed.", icon="⚠️")
+            if custom_result.get("missing_config"):
+                st.caption("Missing Retell configuration")
+                st.json(make_json_safe(custom_result.get("missing_config", [])))
+        with st.expander("Custom test diagnostics"):
+            debug_info = custom_result.get("debug", {})
+            if debug_info:
+                st.caption("Endpoint")
+                st.code(str(debug_info.get("endpoint", "")))
+                st.caption("Sanitized headers")
+                st.json(make_json_safe(debug_info.get("headers", {})))
+                st.caption("Request body")
+                st.json(make_json_safe(debug_info.get("request_body", {})))
+                st.caption("Response status")
+                st.write(debug_info.get("response_status_code", "No HTTP status returned"))
+                response_text = str(debug_info.get("response_text") or "")
+                if response_text:
+                    st.caption("Raw response")
+                    st.code(response_text, language="json")
+                st.caption("Parsed response")
+                st.json(make_json_safe(debug_info.get("response_body", {})))
+            else:
+                st.json(make_json_safe(custom_result))
 
 st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
 
@@ -140,7 +333,7 @@ with left_col:
         st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
         use_ai_pdf = st.checkbox(
             "Use AI to interpret uploaded PDFs",
-            value=False,
+            value=True,
             help=(
                 "AI will review the uploaded file, extract product rows, "
                 "suggest titles, descriptions, and categories, "
@@ -156,82 +349,81 @@ with left_col:
 
 with right_col:
     with st.container(border=True):
-        section_label("Product URLs")
-        url_input = st.text_area(
-            "URLs",
-            height=160,
-            placeholder="Paste one URL per line:\n\nhttps://www.rh.com/product/...\nhttps://www.article.com/...",
-            label_visibility="collapsed",
-        )
-        if url_input.strip():
-            valid_urls = [u.strip() for u in url_input.splitlines() if u.strip()]
-            st.caption(f"{len(valid_urls)} URL{'s' if len(valid_urls) != 1 else ''} detected")
-
-st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
-
-# ── Manual Product Entry (collapsed) ──────────────────────────────────────────
-with st.expander("Advanced: Add item manually", expanded=False):
-    st.caption(
-        "Enter a product directly. Leave fields blank if unknown — "
-        "providing a Serial / Model Number lets the system suggest missing details later."
-    )
-
-    with st.form("manual_entry_form", clear_on_submit=True):
-        # Row 1: Core identity
-        r1c1, r1c2, r1c3, r1c4 = st.columns([3, 2, 2, 2])
-        m_name       = r1c1.text_input("Name of Product", placeholder="e.g. Wolf Microwave")
-        m_brand      = r1c2.text_input("Brand", placeholder="e.g. Wolf")
-        m_dimensions = r1c3.text_input("Dimensions", placeholder='e.g. 30"W × 18"D')
-        m_finish     = r1c4.text_input("Finish / Color", placeholder="e.g. Matte Black")
-
-        # Row 2: Classification, serial, quantity, supplier
-        r2c1, r2c2, r2c3, r2c4 = st.columns([2, 2, 1, 2])
-        m_serial   = r2c1.text_input("Serial / Model Number", placeholder="e.g. MDD30TS")
-        m_category = r2c2.selectbox("Category", options=[""] + CATEGORIES)
-        m_qty      = r2c3.number_input("Qty", min_value=1, value=1, step=1)
-        m_supplier = r2c4.text_input(
-            "Who We Bought It From", placeholder="e.g. RH, Article, Custom"
-        )
-
-        # Row 3: Location, URL, notes
-        r3c1, r3c2, r3c3 = st.columns([2, 3, 3])
-        m_location = r3c1.text_input("Location", placeholder="e.g. Kitchen", value=room)
-        m_url      = r3c2.text_input("Product URL", placeholder="https://...")
-        m_notes    = r3c3.text_input("Notes", placeholder="Any additional context")
-
-        add_manual = st.form_submit_button(
-            "Add Manual Item to Intake Table",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if add_manual:
-        new_row = create_manual_row(
-            project=selected_project,
-            room=m_location or room,
-            supplier=m_supplier or "",
-            notes=m_notes,
-            product_name=m_name,
-            brand=m_brand,
-            dimensions=m_dimensions,
-            finish_color=m_finish,
-            model_sku=m_serial,
-            category=m_category,
-            quantity=int(m_qty),
-            product_url=m_url,
-        )
-        new_df = pd.DataFrame([new_row])
-
-        if st.session_state.intake_df is not None:
-            combined = pd.concat(
-                [st.session_state.intake_df, new_df], ignore_index=True
+        url_tab, photo_tab = st.tabs(["Product URLs", "Bulk Photo Upload"])
+        with url_tab:
+            section_label("Product URLs")
+            url_input = st.text_area(
+                "URLs",
+                height=160,
+                placeholder="Paste one URL per line:\n\nhttps://www.rh.com/product/...\nhttps://www.article.com/...",
+                label_visibility="collapsed",
             )
-        else:
-            combined = new_df
+            if url_input.strip():
+                valid_urls = [u.strip() for u in url_input.splitlines() if u.strip()]
+                st.caption(f"{len(valid_urls)} URL{'s' if len(valid_urls) != 1 else ''} detected")
 
-        st.session_state.intake_df = apply_confidence_checks(combined)
-        st.session_state.pending_enrichment = True
-        st.rerun()
+        with photo_tab:
+            section_label("Bulk Photo Upload")
+            st.caption("Create one blank product row per image. No enrichment or scraping runs for this path.")
+            bulk_photo_files = st.file_uploader(
+                "Upload product photos",
+                type=ACCEPTED_PHOTO_TYPES,
+                accept_multiple_files=True,
+                key="bulk_photo_upload_files",
+                label_visibility="collapsed",
+            )
+            if bulk_photo_files:
+                total_size = sum(getattr(f, "size", 0) or 0 for f in bulk_photo_files)
+                st.markdown(
+                    f"<small><strong>{len(bulk_photo_files)} image{'s' if len(bulk_photo_files) != 1 else ''} ready</strong>"
+                    f" · {round(total_size / (1024 * 1024), 2)} MB</small>",
+                    unsafe_allow_html=True,
+                )
+                preview_files = bulk_photo_files[:6]
+                preview_cols = st.columns(min(3, len(preview_files)))
+                for idx, f in enumerate(preview_files):
+                    with preview_cols[idx % len(preview_cols)]:
+                        if Path(f.name).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+                            st.image(f, caption=f.name, use_container_width=True)
+                        else:
+                            st.caption(f"◆ {f.name}")
+                remaining = len(bulk_photo_files) - len(preview_files)
+                if remaining > 0:
+                    st.caption(f"+ {remaining} more image{'s' if remaining != 1 else ''}")
+
+            create_photo_products = st.button(
+                "Create Products",
+                type="secondary",
+                use_container_width=True,
+                key="create_bulk_photo_products",
+                disabled=not bool(bulk_photo_files),
+            )
+            if create_photo_products:
+                if not bulk_photo_files:
+                    st.warning("Upload at least one product photo first.", icon="⚠️")
+                else:
+                    saved_photos = []
+                    progress = st.progress(0, text="Saving product photos…")
+                    for idx, photo_file in enumerate(bulk_photo_files, start=1):
+                        try:
+                            saved_photos.append(_save_bulk_photo_upload(photo_file))
+                        except Exception as exc:
+                            st.warning(f"Could not save {photo_file.name}: {exc}", icon="⚠️")
+                        progress.progress(idx / len(bulk_photo_files), text=f"Saved {idx} of {len(bulk_photo_files)} photos")
+                    progress.empty()
+                    if saved_photos:
+                        photo_rows = create_photo_rows(saved_photos, selected_project, room)
+                        photo_df = pd.DataFrame(photo_rows)
+                        if st.session_state.intake_df is not None and not st.session_state.intake_df.empty:
+                            combined = pd.concat([st.session_state.intake_df, photo_df], ignore_index=True)
+                        else:
+                            combined = photo_df
+                        st.session_state.intake_df = apply_confidence_checks(combined)
+                        st.session_state.automation_results = None
+                        st.session_state.pending_enrichment = False
+                        st.success(
+                            f"Created {len(saved_photos)} blank product row{'s' if len(saved_photos) != 1 else ''} from photos."
+                        )
 
 st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
 
@@ -318,6 +510,139 @@ if st.session_state.get("ai_errors"):
 # ── Review section ─────────────────────────────────────────────────────────────
 if st.session_state.intake_df is not None:
     df: pd.DataFrame = st.session_state.intake_df
+    if "Notes" in df.columns:
+        df = df.copy()
+        df["Notes"] = df["Notes"].apply(remove_notes_row_prefix)
+        st.session_state.intake_df = df
+
+    def _is_photo_only_row(row: pd.Series | dict) -> bool:
+        value = str(row.get("photo_only", "") or "").strip().lower()
+        return (
+            value in {"true", "1", "yes"}
+            or str(row.get("Import Type", "") or "").strip().lower() == "photo upload"
+            or str(row.get("Source Type", "") or "").strip() == "Photo"
+        )
+
+    def _quantity_is_missing_or_lt_one(value) -> bool:
+        try:
+            text = str(value or "").strip()
+            if not text or text.lower() in {"nan", "none", "null"}:
+                return True
+            return int(float(text)) < 1
+        except (ValueError, TypeError):
+            return True
+
+    def _missing_required_fields(row: pd.Series) -> list[str]:
+        """Return column names of required fields that are missing or incomplete."""
+        if _is_photo_only_row(row):
+            return []
+        missing = []
+        if not str(row.get("Product Name", "") or "").strip():
+            missing.append("Product Name")
+        if not str(row.get("Brand", "") or "").strip():
+            missing.append("Brand")
+        if not has_complete_3d_dimensions(str(row.get("Dimensions", "") or "")):
+            missing.append("Dimensions")
+        if _quantity_is_missing_or_lt_one(row.get("Quantity")):
+            missing.append("Quantity")
+        if not str(row.get("Supplier", "") or "").strip():
+            missing.append("Supplier")
+        if not str(row.get("Room", "") or "").strip():
+            missing.append("Room")
+        return missing
+
+    def _review_column_for_extracted_field(field: str) -> str:
+        normal = field.strip().lower()
+        mapping = {
+            "dimensions": "Dimensions",
+            "width": "Dimensions",
+            "height": "Dimensions",
+            "depth": "Dimensions",
+            "finish": "Finish / Color",
+            "color": "Finish / Color",
+            "finish / color": "Finish / Color",
+            "material": "Notes",
+            "lead time": "Notes",
+            "price": "Price",
+            "sku": "Model/SKU",
+            "model number": "Model/SKU",
+            "model/sku": "Model/SKU",
+            "availability": "Notes",
+            "brand": "Brand",
+            "supplier": "Supplier",
+            "product name": "Product Name",
+            "product category": "Product Category",
+            "category": "Product Category",
+            "quantity": "Quantity",
+            "location": "Room",
+            "room": "Room",
+        }
+        return mapping.get(normal, field)
+
+    def _field_is_missing_for_apply(row: pd.Series, column: str) -> bool:
+        if column == "Dimensions":
+            return not has_complete_3d_dimensions(str(row.get("Dimensions", "") or ""))
+        if column == "Quantity":
+            return _quantity_is_missing_or_lt_one(row.get("Quantity"))
+        return not str(row.get(column, "") or "").strip()
+
+    def _apply_vendor_call_extraction(
+        row_idx: int,
+        extracted_fields: dict,
+        overwrite: bool = False,
+    ) -> tuple[pd.DataFrame, list[str], list[str]]:
+        if st.session_state.intake_df is None or row_idx not in st.session_state.intake_df.index:
+            return st.session_state.intake_df, [], ["No matching product row was found."]
+        df_copy = st.session_state.intake_df.copy()
+        applied: list[str] = []
+        skipped: list[str] = []
+        current_row = df_copy.loc[row_idx]
+        note_bits: list[str] = []
+        for field, detail in extracted_fields.items():
+            if not isinstance(detail, dict):
+                continue
+            value = str(detail.get("value", "") or "").strip()
+            if not value:
+                continue
+            column = _review_column_for_extracted_field(str(field))
+            if column not in df_copy.columns:
+                skipped.append(str(field))
+                continue
+            confidence = str(detail.get("confidence", "") or "").lower()
+            can_overwrite = overwrite and confidence in {"high", "medium"}
+            if not _field_is_missing_for_apply(current_row, column) and not can_overwrite:
+                skipped.append(column)
+                continue
+            if column == "Notes" and field in {"Material", "Lead Time", "Availability"}:
+                existing_note = str(df_copy.at[row_idx, "Notes"] or "").strip()
+                addition = f"{field}: {value}"
+                df_copy.at[row_idx, "Notes"] = f"{existing_note}\n{addition}".strip() if existing_note else addition
+            elif column == "Quantity":
+                try:
+                    df_copy.at[row_idx, column] = int(float(value))
+                except (TypeError, ValueError):
+                    df_copy.at[row_idx, column] = value
+            else:
+                df_copy.at[row_idx, column] = value
+            applied.append(column)
+            evidence = str(detail.get("evidence", "") or "").strip()
+            if evidence:
+                note_bits.append(f"{column} evidence: {evidence}")
+        if applied and "Notes" in df_copy.columns:
+            existing_note = str(df_copy.at[row_idx, "Notes"] or "").strip()
+            source_note = "Filled from Retell call transcript"
+            if source_note not in existing_note:
+                note_bits.insert(0, source_note)
+            if note_bits:
+                df_copy.at[row_idx, "Notes"] = "\n".join([bit for bit in [existing_note, *note_bits] if bit]).strip()
+        return apply_confidence_checks(df_copy), sorted(set(applied)), sorted(set(skipped))
+
+    def apply_extracted_specs_to_review_table(
+        row_id: int,
+        extracted_fields: dict,
+        overwrite: bool = False,
+    ) -> tuple[pd.DataFrame, list[str], list[str]]:
+        return _apply_vendor_call_extraction(row_id, extracted_fields, overwrite=overwrite)
 
     # ── Automatic enrichment pass ──────────────────────────────────────────────
     if st.session_state.pending_enrichment:
@@ -353,20 +678,31 @@ if st.session_state.intake_df is not None:
     has_confidence = "Review Required" in df.columns and "Confidence Score" in df.columns
     total_n = len(df)
 
-    if has_confidence:
-        ignored_mask = df.get("Include", pd.Series([True] * total_n)) == False
-        review_mask  = (df["Review Required"] == True) & ~ignored_mask
-        ready_mask   = (df["Review Required"] == False) & ~ignored_mask
+    photo_only_mask = df.apply(_is_photo_only_row, axis=1)
+    non_photo_mask = ~photo_only_mask
+    photo_only_n = int(photo_only_mask.sum())
+    non_photo_df = df[non_photo_mask]
+    ignored_mask = df.get("Include", pd.Series([True] * total_n)) == False
+    _incl_mask_qc = ~ignored_mask & non_photo_mask
+    ignored_n = int(ignored_mask.sum())
 
-        ignored_n = int(ignored_mask.sum())
-        review_n  = int(review_mask.sum())
-        ready_n   = int(ready_mask.sum())
-        non_ignored_scores = df.loc[~ignored_mask, "Confidence Score"]
+    _needs_review_mask = _incl_mask_qc & df.apply(
+        lambda r: bool(_missing_required_fields(r)), axis=1
+    )
+    review_n = int(_needs_review_mask.sum())
+    ready_n  = int((_incl_mask_qc & ~_needs_review_mask).sum())
+
+    if has_confidence:
+        non_ignored_scores = df.loc[_incl_mask_qc, "Confidence Score"]
         avg_conf = round(non_ignored_scores.mean()) if not non_ignored_scores.empty else 0
     else:
-        ignored_n = review_n = 0
-        ready_n   = total_n
-        avg_conf  = 0
+        avg_conf = 0
+
+    if photo_only_n > 0:
+        st.info(
+            "Photo-only products are ready to send. They will create blank Programa items with images attached.",
+            icon="ℹ️",
+        )
 
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
@@ -382,6 +718,475 @@ if st.session_state.intake_df is not None:
         st.markdown(_qm("Avg Confidence", f"{avg_conf}%", conf_color), unsafe_allow_html=True)
 
     st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
+
+    # ── Programa Automation ────────────────────────────────────────────────────
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    st.divider()
+    section_label("Programa Automation")
+
+    # Eligibility: Include=True, not flagged for review, not in terminal statuses,
+    # has Product Name, Quantity ≥ 1, Product Category.
+    # Dimensions gate is enforced unless the user explicitly bypasses it.
+    _BLOCKED_STATUSES = {"Ignored", "Excluded", "Error"}
+    allow_missing_dims = st.session_state.get("allow_missing_dims_cb", False)
+
+    def _is_eligible(row: pd.Series) -> bool:
+        # Note: Review Required is intentionally NOT a gate here.
+        # A row is eligible if it has the required data fields filled in.
+        if not row.get("Include", False):
+            return False
+        if str(row.get("Status", "")) in _BLOCKED_STATUSES:
+            return False
+        if _is_photo_only_row(row):
+            return True
+        if not str(row.get("Product Name", "") or "").strip():
+            return False
+        try:
+            if _quantity_is_missing_or_lt_one(row.get("Quantity")):
+                return False
+        except (ValueError, TypeError):
+            return False
+        if not str(row.get("Product Category", "") or "").strip():
+            return False
+        if not allow_missing_dims and not has_complete_3d_dimensions(str(row.get("Dimensions", "") or "")):
+            return False
+        return True
+
+    def _block_reason(row: pd.Series) -> str:
+        reasons = []
+        if not row.get("Include", False):
+            reasons.append("Include unchecked")
+        if str(row.get("Status", "")) in _BLOCKED_STATUSES:
+            reasons.append(f"Status: {row.get('Status', '')}")
+        if _is_photo_only_row(row):
+            return "; ".join(reasons) if reasons else "Unknown"
+        if not str(row.get("Product Name", "") or "").strip():
+            reasons.append("No product name")
+        if _quantity_is_missing_or_lt_one(row.get("Quantity")):
+            reasons.append("Quantity < 1")
+        if not str(row.get("Product Category", "") or "").strip():
+            reasons.append("No category")
+        if not allow_missing_dims and not has_complete_3d_dimensions(str(row.get("Dimensions", "") or "")):
+            reasons.append("Missing dimensions")
+        return "; ".join(reasons) if reasons else "Unknown"
+
+    eligible_df = df[df.apply(_is_eligible, axis=1)].copy()
+
+    def _is_url_row(row: pd.Series) -> bool:
+        return (
+            str(row.get("Source Type", "")) == "URL"
+            and bool(str(row.get("Product URL", "") or "").strip())
+        )
+
+    total_sendable = len(eligible_df)
+    _n_url = int(eligible_df.apply(_is_url_row, axis=1).sum()) if total_sendable > 0 else 0
+    _n_schedule = total_sendable - _n_url
+
+    # Blocked included rows: Include=True but failed eligibility
+    _included_mask = df.get("Include", pd.Series([True] * len(df), index=df.index)) == True
+    _included_df = df[_included_mask]
+    _blocked_df = _included_df[~_included_df.apply(_is_eligible, axis=1)].copy()
+
+    if not _blocked_df.empty:
+        _blocked_df["_reason"] = _blocked_df.apply(_block_reason, axis=1)
+        st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
+        _n_dim  = int(_blocked_df["_reason"].str.contains("Missing dimensions").sum())
+        _n_cat  = int(_blocked_df["_reason"].str.contains("No category").sum())
+        _n_other = len(_blocked_df) - _n_dim - _n_cat
+        parts = []
+        if _n_dim   > 0: parts.append(f"{_n_dim} missing dimensions")
+        if _n_cat   > 0: parts.append(f"{_n_cat} missing category")
+        if _n_other > 0: parts.append(f"{_n_other} other")
+        st.warning(
+            f"{len(_blocked_df)} included item{'s' if len(_blocked_df) != 1 else ''} not yet eligible — "
+            + ", ".join(parts) + ". They will be skipped when you send.",
+            icon="⚠️",
+        )
+        st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
+
+    # ── Automation controls ────────────────────────────────────────────────────
+    auto_col, send_col, _ = st.columns([3, 3, 4])
+    with auto_col:
+        auto_done = st.checkbox(
+            "Auto-click Done after filling each item",
+            value=False,
+            help="When unchecked (default), the browser pauses after each item so you can review before saving.",
+        )
+        single_row_test_mode = st.checkbox(
+            "Single-row test mode (process first item only)",
+            value=False,
+            key="single_row_test_mode_cb",
+            help="When checked, only the first selected row is sent. Turn off once field entry is confirmed working.",
+        )
+        if single_row_test_mode:
+            st.caption("Test mode on — only the first item will be sent.")
+        else:
+            st.caption(
+                "For safety, keep Auto-click Done off during testing. "
+                "The automation will pause before final submission."
+            )
+        allow_missing_dims = st.checkbox(
+            "Allow sending rows with missing dimensions",
+            value=False,
+            key="allow_missing_dims_cb",
+            help="By default, rows without complete W×H×D dimensions are blocked. Check this to override.",
+        )
+        upload_product_images = st.checkbox(
+            "Upload product images to Programa",
+            value=True,
+            key="upload_product_images_cb",
+            help="Find a product image online and upload it into the Programa Details panel when possible.",
+        )
+
+    if allow_missing_dims:
+        _eligible_non_photo = eligible_df[~eligible_df.apply(_is_photo_only_row, axis=1)].copy()
+        _n_missing = int(
+            _eligible_non_photo["Dimensions"].apply(
+                lambda v: not has_complete_3d_dimensions(str(v or ""))
+            ).sum()
+        ) if "Dimensions" in _eligible_non_photo.columns else 0
+        if _n_missing > 0:
+            st.warning(
+                f"Dimension bypass is on — {_n_missing} item{'s' if _n_missing != 1 else ''} "
+                "with incomplete dimensions will be sent.",
+                icon="⚠️",
+            )
+
+    _n_included = len(_included_df)
+    _has_any_included = _n_included > 0
+
+    with send_col:
+        no_schedule_url = not schedule_url.strip()
+        if total_sendable > 0:
+            send_label = f"Send {total_sendable} item{'s' if total_sendable != 1 else ''} to Programa"
+            send_caption = (
+                f"{_n_url} via Add-from-URL  ·  {_n_schedule} via Schedule entry"
+                if _n_url > 0 else f"{_n_schedule} via Schedule entry"
+            )
+        elif _has_any_included:
+            send_label = "Send to Programa"
+            send_caption = f"{_n_included} included · {len(_blocked_df)} blocked — see reasons above"
+        else:
+            send_label = "Send to Programa"
+            send_caption = "Add rows to the intake table first."
+        send_to_programa = st.button(
+            send_label,
+            key="send_to_programa_main",
+            type="primary",
+            use_container_width=True,
+            disabled=(not _has_any_included or no_schedule_url),
+        )
+        st.caption(send_caption)
+
+    if no_schedule_url and _has_any_included:
+        st.warning("Paste the Programa schedule link above before sending.", icon="⚠️")
+
+    # ── Send Button Debug expander ─────────────────────────────────────────────
+    with st.expander("Send Button Debug", expanded=False):
+        try:
+            from src.programa_automation import run_programa_automation as _rpa_check
+            _import_ok = True
+        except Exception as _ie:
+            _import_ok = False
+            st.error(f"Import error: {_ie}")
+        _btn_enabled = _has_any_included and not no_schedule_url
+        st.markdown(f"**button_should_be_enabled:** `{_btn_enabled}`")
+        st.markdown(f"**eligible_rows_count:** `{total_sendable}`")
+        st.markdown(f"**blocked_rows_count:** `{len(_blocked_df)}`")
+        st.markdown(f"**included_rows_count:** `{_n_included}`")
+        st.markdown(f"**photo_only_rows_count:** `{photo_only_n}`")
+        st.markdown(f"**schedule_url:** `{schedule_url!r}`")
+        st.markdown(f"**selected_project:** `{selected_project!r}`")
+        st.markdown(f"**allow_missing_dimensions:** `{st.session_state.get('allow_missing_dims_cb', False)}`")
+        st.markdown(f"**url_path_count:** `{_n_url}`")
+        st.markdown(f"**schedule_path_count:** `{_n_schedule}`")
+        st.markdown(f"**programa_automation_importable:** `{_import_ok}`")
+        if not _blocked_df.empty and "_reason" in _blocked_df.columns:
+            st.markdown("**First 5 blocked row reasons:**")
+            for _, _dbr in _blocked_df.head(5).iterrows():
+                st.caption(f"• {_dbr.get('Product Name', 'Unnamed')} — {_dbr.get('_reason', '?')}")
+        if total_sendable > 0:
+            st.markdown("**Eligible rows:**")
+            _elig_cols = ["Product Name", "Brand", "Dimensions", "Product Category", "Source Type", "Product URL"]
+            _elig_show = [c for c in _elig_cols if c in eligible_df.columns]
+            st.dataframe(eligible_df[_elig_show], use_container_width=True, hide_index=True)
+        if st.session_state.get("automation_results"):
+            st.markdown("**Last automation log:**")
+            _last_entries = st.session_state.automation_results.get("entries", [])
+            st.dataframe(pd.DataFrame(_last_entries), use_container_width=True, hide_index=True)
+        if st.session_state.get("_automation_traceback"):
+            st.markdown("**Last error traceback:**")
+            st.code(st.session_state["_automation_traceback"])
+
+        st.divider()
+        st.markdown("**Single-Row Debug Mode** (slow_mo=1000, screenshots after each step)")
+        _first_included = None
+        if not _included_df.empty:
+            _first_included = _included_df.iloc[0].to_dict()
+        if _first_included:
+            st.caption(
+                f"Test row: **{_first_included.get('Product Name') or '(no name)'}** "
+                f"/ {_first_included.get('Brand') or '(no brand)'}  "
+                f"· Project: {selected_project!r}"
+            )
+        _debug_single_disabled = (not _first_included) or (not schedule_url.strip())
+        _debug_single_btn = st.button(
+            "Test Single Row (Debug)",
+            key="debug_single_row_btn",
+            type="secondary",
+            use_container_width=True,
+            disabled=_debug_single_disabled,
+            help="Runs one row through the full Schedule → Custom Product → field-entry flow with slow_mo=1000 and a screenshot at every step.",
+        )
+        if _debug_single_btn and _first_included and schedule_url.strip():
+            st.info("Starting single-row debug — Chrome will open shortly. Watch the terminal for step-by-step logs.")
+            with st.spinner("Debug run in progress…"):
+                try:
+                    _debug_steps = run_programa_debug_single_row(
+                        _first_included,
+                        project_name=selected_project,
+                        screenshots_dir="data/enrichment_debug/programa_steps",
+                    )
+                    _debug_failed = [s for s in _debug_steps if not s["success"]]
+                    if _debug_failed:
+                        st.warning(f"{len(_debug_failed)} step(s) failed — see details below and terminal output.")
+                    else:
+                        st.success(f"All {len(_debug_steps)} steps passed.")
+                    st.dataframe(pd.DataFrame(_debug_steps), use_container_width=True, hide_index=True)
+                except Exception as _dbe:
+                    import traceback as _dbtb
+                    st.error(f"Debug run error: {_dbe}")
+                    st.code(_dbtb.format_exc())
+
+        st.divider()
+        st.markdown("**Field Entry Diagnostic** (slow_mo=1500, browser stays open on failure, stops at first failed step)")
+        st.caption("Diagnoses exactly where Product Name entry breaks — runs 13 steps with a screenshot at every one.")
+        _diag_btn = st.button(
+            "Run Programa Diagnostic Test",
+            key="programa_field_diagnostic_btn",
+            type="secondary",
+            use_container_width=True,
+            disabled=_debug_single_disabled,
+            help="Step-by-step diagnostic for Product Name entry. Browser stays open on failure for inspection.",
+        )
+        if _diag_btn and _first_included and schedule_url.strip():
+            st.info("Starting field diagnostic — Chrome will open. Browser stays open if any step fails.", icon="🔍")
+            with st.spinner("Diagnostic running — watch the browser and terminal…"):
+                try:
+                    _diag_steps = run_programa_field_diagnostic(
+                        _first_included,
+                        project_name=selected_project,
+                        out_dir="data/programa_diagnostics",
+                    )
+                    _diag_failed = [s for s in _diag_steps if not s["success"]]
+                    if _diag_failed:
+                        first_fail = _diag_failed[0]
+                        st.error(
+                            f"Diagnostic stopped at: **{first_fail['step']}** — {first_fail['message']}",
+                            icon="🛑",
+                        )
+                    else:
+                        st.success("All diagnostic steps passed — Product Name entry is working.")
+                    st.dataframe(pd.DataFrame(_diag_steps), use_container_width=True, hide_index=True)
+                    st.caption("Full report saved to data/programa_diagnostics/")
+                except Exception as _de:
+                    import traceback as _dtb
+                    st.error(f"Diagnostic error: {_de}")
+                    st.code(_dtb.format_exc())
+
+    if send_to_programa:
+        # ── Step 4: Immediate feedback ─────────────────────────────────────────
+        st.info("Send button clicked — preparing Programa transfer.", icon="ℹ️")
+
+        rows_payload = eligible_df.to_dict("records")
+
+        if len(rows_payload) == 0:
+            st.error(
+                "No items are ready to send. Review the required fields above.",
+                icon="🚫",
+            )
+            if not _blocked_df.empty:
+                reasons_preview = _blocked_df["_reason"].dropna().head(5).tolist()
+                st.markdown("**Blocked reasons (first 5):**")
+                for _r in reasons_preview:
+                    st.markdown(f"- {_r}")
+        else:
+            # ── Step 5: Backend call verification logging ──────────────────────
+            _logger.info(
+                "Programa send triggered — project=%r rows=%d (url=%d schedule=%d)",
+                selected_project, len(rows_payload), _n_url, _n_schedule,
+            )
+            for _row in rows_payload:
+                _path = "URL" if _is_url_row(_row) else "Schedule/New"
+                _logger.info(
+                    "  Sending: %r via %s path",
+                    _row.get("Product Name", "?"),
+                    _path,
+                )
+            for _br in (_blocked_df.itertuples() if not _blocked_df.empty else []):
+                _logger.info(
+                    "  Blocked: %s — %s",
+                    getattr(_br, "Product Name", "?"),
+                    getattr(_br, "_reason", "?"),
+                )
+
+            _dest_label = selected_project or schedule_url
+            st.info(
+                f"Starting automation — {len(rows_payload)} item{'s' if len(rows_payload) != 1 else ''} "
+                f"({_n_url} URL + {_n_schedule} Schedule) → **{_dest_label}**. "
+                "Chrome will open shortly.",
+                icon="ℹ️",
+            )
+
+            st.session_state.nav_failed = False
+            st.session_state.nav_pending_rows = []
+            st.session_state["_automation_traceback"] = ""
+            with st.spinner(
+                f"Chrome is open — navigating to schedule, then adding {len(rows_payload)} item(s). "
+                "Follow any prompts in the browser window."
+            ):
+                try:
+                    log_entries, log_path = run_programa_automation(
+                        rows=rows_payload,
+                        project_name=selected_project,
+                        auto_done=auto_done,
+                        skip_navigation=False,
+                        single_row_test_mode=single_row_test_mode,
+                        schedule_url=schedule_url,
+                        upload_product_images=upload_product_images,
+                    )
+                    _logger.info(
+                        "Automation complete — %d log entries, log_path=%r",
+                        len(log_entries), log_path,
+                    )
+                    st.session_state.automation_results = {
+                        "entries": log_entries,
+                        "log_path": log_path,
+                    }
+                    if any(e["status"] == "nav_failed" for e in log_entries):
+                        st.session_state.nav_failed = True
+                        st.session_state.nav_pending_rows = rows_payload
+                except Exception as exc:
+                    import traceback as _tb
+                    _full_tb = _tb.format_exc()
+                    _logger.exception("Unhandled exception in run_programa_automation: %s", exc)
+                    print(_full_tb)  # also surface in terminal
+                    st.session_state["_automation_traceback"] = _full_tb
+                    from src.automation_logs import make_log_entry
+                    st.session_state.automation_results = {
+                        "entries": [make_log_entry(
+                            "", "error",
+                            f"Unhandled exception: {exc} — check that Chrome and Playwright are installed.",
+                        )],
+                        "log_path": "",
+                    }
+            st.rerun()
+
+    # ── Navigation failure — manual continue flow ──────────────────────────────
+    if st.session_state.nav_failed:
+        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+        _nav_target = selected_project or "the project"
+        st.warning(
+            f"**{_nav_target}** was not found automatically. "
+            "Please open the correct project in Programa manually, then click **Continue** below.",
+            icon="⚠️",
+        )
+        st.markdown(
+            '<div style="font-size:0.78rem;color:#7A7068;margin-bottom:0.75rem;">'
+            "The browser closed after the failed navigation attempt. "
+            "Clicking Continue will reopen Chrome — navigate to the project inside Programa, "
+            "then click OK in the browser dialog to begin adding items."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        cont_col, _ = st.columns([3, 7])
+        with cont_col:
+            continue_nav = st.button(
+                "Continue After Manual Project Open",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if continue_nav:
+            st.session_state.nav_failed = False
+            pending_rows = st.session_state.nav_pending_rows or []
+            _logger.info("Manual-continue triggered — project=%r rows=%d", selected_project, len(pending_rows))
+            with st.spinner(
+                f"Chrome is open — navigate to the project in Programa, "
+                "click OK in the browser dialog, then wait for items to be added."
+            ):
+                try:
+                    log_entries, log_path = run_programa_automation(
+                        rows=pending_rows,
+                        project_name=selected_project,
+                        auto_done=auto_done,
+                        skip_navigation=True,
+                        single_row_test_mode=single_row_test_mode,
+                        schedule_url=schedule_url,
+                        upload_product_images=upload_product_images,
+                    )
+                    _logger.info("Manual-continue complete — %d log entries", len(log_entries))
+                    st.session_state.automation_results = {
+                        "entries": log_entries,
+                        "log_path": log_path,
+                    }
+                    st.session_state.nav_pending_rows = []
+                except Exception as exc:
+                    _logger.exception("Unhandled exception in manual-continue: %s", exc)
+                    from src.automation_logs import make_log_entry
+                    st.session_state.automation_results = {
+                        "entries": [make_log_entry(
+                            "", "error",
+                            f"Unhandled exception during manual-continue run: {exc}",
+                        )],
+                        "log_path": "",
+                    }
+            st.rerun()
+
+    # ── Automation Results ─────────────────────────────────────────────────────
+    if st.session_state.automation_results:
+        results  = st.session_state.automation_results
+        entries: list[dict] = results["entries"]
+        log_path: str       = results["log_path"]
+
+        success_n = sum(1 for e in entries if e["status"] == "success")
+        filled_n  = sum(1 for e in entries if e["status"] == "filled_awaiting_confirm")
+        error_n   = sum(1 for e in entries if e["status"] == "error")
+        total_run = len(entries)
+
+        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+        if error_n == 0:
+            st.success(
+                f"Automation complete — {success_n + filled_n} of {total_run} item(s) processed.",
+            )
+        else:
+            st.warning(
+                f"Automation finished with {error_n} error(s). "
+                f"{success_n + filled_n} of {total_run} item(s) processed.",
+                icon="⚠️",
+            )
+
+        _results_entries = pd.DataFrame(entries)
+        _results_entries["Product"] = _results_entries.apply(
+            lambda r: r.get("product_url") or r.get("product_name", ""), axis=1
+        )
+        results_df = _results_entries[["timestamp", "Product", "status", "message"]]
+        st.dataframe(
+            results_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "timestamp": st.column_config.TextColumn("Time", width="medium"),
+                "Product":   st.column_config.TextColumn("Product", width="large"),
+                "status":    st.column_config.TextColumn("Status", width="medium"),
+                "message":   st.column_config.TextColumn("Message", width="large"),
+            },
+        )
+        if log_path:
+            st.caption(f"Full log saved → {log_path}")
+
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    st.divider()
 
     # ── Review Table ───────────────────────────────────────────────────────────
     row_count = len(df)
@@ -402,24 +1207,12 @@ if st.session_state.intake_df is not None:
                 "category — suggestions available in AI-Assisted Cleanup below."
             )
 
-    if "Dimensions" in df.columns:
-        _included = df.get("Include", pd.Series([True] * len(df))) == True
-        _incomplete_dims = _included & df["Dimensions"].apply(
-            lambda v: not has_complete_3d_dimensions(str(v or ""))
-        )
-        _complete_dims = _included & ~_incomplete_dims
-        _n_incomplete = int(_incomplete_dims.sum())
-        _n_complete = int(_complete_dims.sum())
-        st.caption(
-            f"Rows with incomplete dimensions: {_n_incomplete} · "
-            f"Rows with complete dimensions: {_n_complete}"
-        )
-
     edited_df = st.data_editor(
         df,
         use_container_width=True,
         hide_index=True,
         num_rows="dynamic",
+        column_order=[c for c in DISPLAY_COLUMNS if c in df.columns],
         column_config={
             # ── Confidence / status columns ──
             "Include": st.column_config.CheckboxColumn(
@@ -462,6 +1255,9 @@ if st.session_state.intake_df is not None:
             "Source Type": st.column_config.TextColumn(
                 "Source", width="small", disabled=True
             ),
+            "Import Type": st.column_config.TextColumn(
+                "Import Type", width="small", disabled=True
+            ),
             "Status": st.column_config.SelectboxColumn(
                 "Status", options=STATUSES, width="medium"
             ),
@@ -475,8 +1271,20 @@ if st.session_state.intake_df is not None:
             "Category Source": st.column_config.TextColumn(
                 "Category Source", width="small", disabled=True
             ),
+            "Image Filename": st.column_config.TextColumn(
+                "Image Filename", width="medium", disabled=True
+            ),
+            "Image Upload Status": st.column_config.TextColumn(
+                "Image Status", width="small", disabled=True
+            ),
+            "Image URL": None,
+            "Local Image Path": None,
+            "photo_only": None,
         },
     )
+    for _hidden_col in INTERNAL_IMAGE_COLUMNS:
+        if _hidden_col in df.columns and _hidden_col not in edited_df.columns:
+            edited_df[_hidden_col] = df[_hidden_col]
 
     st.session_state.intake_df = edited_df
 
@@ -502,61 +1310,536 @@ if st.session_state.intake_df is not None:
             use_container_width=True,
         )
 
-    # ── Missing Dimensions ─────────────────────────────────────────────────────
-    if "Dimensions" in edited_df.columns and "Include" in edited_df.columns:
-        _inc_mask = edited_df["Include"] == True
-        _dim_incomplete_mask = edited_df["Dimensions"].apply(
-            lambda v: not has_complete_3d_dimensions(str(v or ""))
-        )
-        _missing_dim_df = edited_df[_inc_mask & _dim_incomplete_mask]
+    # ── Needs Review ───────────────────────────────────────────────────────────
+    _incl_mask_nr = (
+        edited_df.get("Include", pd.Series([True] * len(edited_df), index=edited_df.index)) == True
+    )
+    _needs_review_rows = edited_df[
+        _incl_mask_nr & edited_df.apply(lambda r: bool(_missing_required_fields(r)), axis=1)
+    ]
 
-        if not _missing_dim_df.empty:
-            st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-            st.divider()
-            section_label("Missing Dimensions")
-            st.caption(
-                "These items need full width, height, and depth before they can be sent to Programa."
+    if not _needs_review_rows.empty:
+        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+        st.divider()
+        section_label("Needs Review")
+        st.caption(
+            f"{len(_needs_review_rows)} item{'s' if len(_needs_review_rows) != 1 else ''} "
+            "with missing required fields — fill in the values below to complete them."
+        )
+
+        _FIELD_PLACEHOLDERS = {
+            "Product Name": "Enter product name",
+            "Brand":        "Enter manufacturer / brand",
+            "Dimensions":   "Enter full W × H × D dimensions",
+            "Quantity":     "Enter quantity",
+            "Supplier":     "Enter who bought this from",
+            "Room":         "Enter location",
+        }
+        _FIELD_LABELS = {
+            "Product Name": "Product Name",
+            "Brand":        "Brand",
+            "Dimensions":   "Dimensions",
+            "Quantity":     "Quantity",
+            "Supplier":     "Supplier",
+            "Room":         "Location",
+        }
+
+        def _render_vendor_call_panel(row_idx: int, row_data: pd.Series, missing_field: str) -> None:
+            row_dict = row_data.to_dict()
+            field_label = _FIELD_LABELS.get(missing_field, missing_field)
+            _pname = str(row_dict.get("Product Name", "") or "").strip() or "Unnamed item"
+            _brand = str(row_dict.get("Brand", "") or "").strip() or "Not provided"
+            _sku = str(row_dict.get("Model/SKU", "") or "").strip() or "Not provided"
+            call_key = f"{row_idx}_{missing_field}"
+            default_goal = build_call_goal(row_dict, [field_label])
+
+            st.markdown("<div style='height:0.35rem'></div>", unsafe_allow_html=True)
+            with st.container(border=True):
+                st.markdown("**Vendor Call**")
+                info_cols = st.columns(4)
+                info_cols[0].caption("Product Name")
+                info_cols[0].write(_pname)
+                info_cols[1].caption("Brand")
+                info_cols[1].write(_brand)
+                info_cols[2].caption("SKU / Model")
+                info_cols[2].write(_sku)
+                info_cols[3].caption("Missing Field Needed")
+                info_cols[3].write(field_label)
+
+                phone_col, goal_col = st.columns([1, 2])
+                with phone_col:
+                    phone_number = st.text_input(
+                        "Phone number",
+                        key=f"vendor_call_phone_{call_key}",
+                        placeholder="+12223334444",
+                    )
+                    phone_is_e164 = bool(re.fullmatch(r"\+[1-9]\d{7,14}", phone_number.strip()))
+                    if phone_number.strip() and not phone_is_e164:
+                        st.caption("Use format +1XXXXXXXXXX")
+                with goal_col:
+                    call_goal = st.text_area(
+                        "Call goal",
+                        key=f"vendor_call_goal_{call_key}",
+                        value=default_goal,
+                        height=86,
+                    )
+
+                script = build_call_script(
+                    row_dict,
+                    [field_label],
+                    phone_number,
+                    custom_goal=call_goal,
+                )
+                st.caption("Generated call script preview")
+                st.info(script)
+
+                provider_ready = calls_enabled()
+                provider_name = "mock" if vendor_call_mock_enabled() else get_call_provider()
+                if provider_name == "bland":
+                    if st.button(
+                        "Test Connection",
+                        key=f"vendor_call_test_connection_{call_key}",
+                        use_container_width=False,
+                    ):
+                        st.session_state.vendor_call_results[f"{call_key}_connection"] = test_bland_connection()
+                    if st.button(
+                        "List Bland Personas/Agents",
+                        key=f"vendor_call_personas_{call_key}",
+                        use_container_width=False,
+                    ):
+                        st.session_state.vendor_call_results[f"{call_key}_personas"] = list_bland_personas()
+
+                connection_result = st.session_state.vendor_call_results.get(f"{call_key}_connection")
+                with st.container(border=True):
+                    st.markdown("**Provider Diagnostics**")
+                    diag_cols = st.columns(4)
+                    account_status = (
+                        connection_result.get("account_connection", "not tested")
+                        if connection_result else "not tested"
+                    )
+                    reachable = (
+                        connection_result.get("provider_reachable", "unknown")
+                        if connection_result else "unknown"
+                    )
+                    outbound_enabled = (
+                        connection_result.get("outbound_enabled", "unknown")
+                        if connection_result else "unknown"
+                    )
+                    billing_status = (
+                        connection_result.get("billing_status", "unknown")
+                        if connection_result else "unknown"
+                    )
+                    diag_cols[0].caption("Account connection")
+                    diag_cols[0].write(account_status)
+                    diag_cols[1].caption("Provider reachable")
+                    diag_cols[1].write(reachable)
+                    diag_cols[2].caption("Outbound enabled")
+                    diag_cols[2].write(outbound_enabled)
+                    diag_cols[3].caption("Billing status")
+                    diag_cols[3].write(billing_status)
+                    if connection_result:
+                        response_text = str(connection_result.get("provider_response_text") or "").strip()
+                        if response_text:
+                            with st.expander("Exact provider response text"):
+                                st.code(response_text, language="json")
+                    personas_result = st.session_state.vendor_call_results.get(f"{call_key}_personas")
+                    if personas_result:
+                        with st.expander("Available Bland personas"):
+                            if personas_result.get("status") != "connected":
+                                st.warning(
+                                    "Bland did not allow the app to list personas. "
+                                    "Calls can still work, but Alley needs BLAND_PERSONA_ID set manually.",
+                                    icon="⚠️",
+                                )
+                            matched_persona = personas_result.get("matched_persona") or {}
+                            st.markdown(
+                                "\n".join(
+                                    [
+                                        f"- Requested agent: `{personas_result.get('requested_agent_name') or 'None'}`",
+                                        f"- Alley persona ID: `{personas_result.get('matched_persona_id') or 'Not found'}`",
+                                        f"- Alley voice: `{personas_result.get('matched_voice') or 'Bland default / not shown'}`",
+                                    ]
+                                )
+                            )
+                            if personas_result.get("env_suggestion"):
+                                st.caption("Add this to .env to pin the correct persona:")
+                                st.code(str(personas_result["env_suggestion"]), language="bash")
+                            if matched_persona:
+                                st.caption("Matched Alley config")
+                                st.json(make_json_safe(matched_persona))
+                            st.json(make_json_safe(personas_result.get("personas", [])))
+                            response_text = str(personas_result.get("provider_response_text") or "").strip()
+                            if response_text:
+                                st.caption("Raw personas response")
+                                st.code(response_text, language="json")
+                            if personas_result.get("attempts"):
+                                st.caption("Persona lookup attempts")
+                                st.json(make_json_safe(personas_result.get("attempts", [])))
+
+                st.caption(f"Call recording and transcript will appear here after {provider_name.title()} returns them.")
+                placeholder_cols = st.columns(2)
+                placeholder_cols[0].info("Recording: pending")
+                placeholder_cols[1].info("Transcript: pending review")
+
+                call_cols = st.columns([1.15, 2.85])
+                with call_cols[0]:
+                    start_call = st.button(
+                        "Start AI Call",
+                        key=f"vendor_call_start_{call_key}",
+                        disabled=not provider_ready or not phone_number.strip() or not phone_is_e164,
+                        use_container_width=True,
+                    )
+                    minimal_call = False
+                    minimal_self_call = False
+                    if provider_name == "bland":
+                        minimal_call = st.button(
+                            "Test Bland Minimal Call",
+                            key=f"vendor_call_minimal_{call_key}",
+                            disabled=not provider_ready or not phone_number.strip() or not phone_is_e164,
+                            use_container_width=True,
+                            help="Places a real Bland call with only phone_number and task.",
+                        )
+                        minimal_self_call = st.button(
+                            "Minimal Self Call",
+                            key=f"vendor_call_minimal_self_{call_key}",
+                            disabled=not provider_ready,
+                            use_container_width=True,
+                            help="Places a real Bland call to +19174990300 with only phone_number and task.",
+                        )
+                with call_cols[1]:
+                    if provider_ready:
+                        st.caption(f"Provider: {provider_name}")
+                        if provider_name == "bland":
+                            st.caption("Minimal test sends only phone_number and task. No from/persona/voice/metadata.")
+                        elif provider_name == "retell":
+                            st.caption("Uses Retell agent variables and the configured outbound number.")
+                        if vendor_call_mock_enabled():
+                            st.caption("Mock mode is enabled. No real call will be placed.")
+                        if phone_number.strip() and not phone_is_e164:
+                            st.caption("Use format +1XXXXXXXXXX")
+                    else:
+                        st.caption("Call provider not configured.")
+
+                if start_call:
+                    result = start_vendor_call(
+                        row_dict,
+                        [field_label],
+                        phone_number,
+                        custom_goal=call_goal,
+                    )
+                    st.session_state.vendor_call_results[call_key] = result
+                    if result.get("call_id"):
+                        st.session_state.vendor_call_metadata[call_key] = {
+                            "call_id": result.get("call_id"),
+                            "row_index": row_idx,
+                            "product_name": _pname,
+                            "brand": _brand,
+                            "model": _sku,
+                            "missing_fields": [field_label],
+                            "phone_number": phone_number.strip(),
+                            "provider": result.get("provider", provider_name),
+                            "status": "in_progress",
+                        }
+                if minimal_call:
+                    minimal_task = build_minimal_call_task(row_dict, [field_label])
+                    result = start_bland_minimal_call(phone_number, minimal_task)
+                    st.session_state.vendor_call_results[call_key] = result
+                if minimal_self_call:
+                    result = start_bland_minimal_call(
+                        "+19174990300",
+                        "Say hello and confirm this is a test call.",
+                    )
+                    st.session_state.vendor_call_results[call_key] = result
+
+                result = st.session_state.vendor_call_results.get(call_key)
+                if result:
+                    status = result.get("status", "unknown")
+                    message = result.get("message") or ""
+                    call_id = result.get("call_id")
+                    if status == "call_started":
+                        st.success(f"Call started. Call ID: {call_id}", icon="☎️")
+                        if result.get("warning"):
+                            st.warning(result["warning"], icon="⚠️")
+                        dashboard_name = "Retell" if result.get("provider") == "retell" else "Bland"
+                        st.caption(
+                            f"To view transcript and recording, open {dashboard_name} Dashboard → Calls, "
+                            f"then search for call ID `{call_id}` after the call completes."
+                        )
+                        if result.get("log_error"):
+                            st.caption(f"Call log could not be saved: {result['log_error']}")
+                    elif status == "mock_call_completed":
+                        st.success(f"Mock call completed. Call ID: {call_id}", icon="☎️")
+                        st.info("Recording: mock placeholder  \n\nTranscript: mock transcript available in diagnostics.")
+                    else:
+                        friendly = (
+                            result.get("friendly_message")
+                            or result.get("message")
+                            or "Provider rejected outbound call. Likely payload, caller number, credits, or account permissions."
+                        )
+                        st.warning(friendly, icon="⚠️")
+                        if result.get("missing_config"):
+                            st.caption("Missing Retell configuration")
+                            st.json(make_json_safe(result.get("missing_config", [])))
+                        if message:
+                            st.caption(message)
+                        provider_response = result.get("provider_response")
+                        debug_info = result.get("debug")
+                    provider_response = result.get("provider_response")
+                    debug_info = result.get("debug")
+
+                    if call_id:
+                        status_cols = st.columns([1.1, 1.1, 2.8])
+                        check_result = status_cols[0].button(
+                            "Check Call Result",
+                            key=f"vendor_call_check_{call_key}",
+                            use_container_width=True,
+                        )
+                        overwrite_existing = status_cols[1].checkbox(
+                            "Overwrite existing values if extracted value is higher confidence",
+                            key=f"vendor_call_overwrite_{call_key}",
+                            value=False,
+                        )
+                        status_cols[2].caption(f"Call ID: {call_id}")
+                        if check_result:
+                            call_status = get_call_status(call_id, provider=result.get("provider", provider_name))
+                            transcript = str(call_status.get("transcript") or "")
+                            extracted_specs = (
+                                extract_vendor_specs_from_transcript(transcript, row_dict, [field_label])
+                                if transcript
+                                else {
+                                    "extracted_fields": {},
+                                    "unresolved_fields": [field_label],
+                                    "notes": "No transcript available yet.",
+                                }
+                            )
+                            st.session_state.vendor_call_extractions[call_key] = {
+                                "call_status": make_json_safe(call_status),
+                                "extracted_specs": make_json_safe(extracted_specs),
+                            }
+                            if call_status.get("status") == "call_completed":
+                                st.session_state.vendor_call_metadata.get(call_key, {})["status"] = "completed"
+                        extraction_bundle = st.session_state.vendor_call_extractions.get(call_key)
+                        if extraction_bundle:
+                            call_status = extraction_bundle.get("call_status", {})
+                            extracted_specs = extraction_bundle.get("extracted_specs", {})
+                            transcript = str(call_status.get("transcript") or "")
+                            st.caption(f"Call status: {call_status.get('provider_status') or call_status.get('status') or 'unknown'}")
+                            recording_url = str(call_status.get("recording_url") or "")
+                            if recording_url:
+                                st.caption(f"Recording: {recording_url}")
+                            if transcript:
+                                with st.expander("Transcript preview"):
+                                    st.text(transcript[:2500])
+                            else:
+                                st.info("Transcript is not available yet. Check again after the call ends.")
+                            extracted_fields = extracted_specs.get("extracted_fields", {})
+                            if extracted_fields:
+                                display_rows = [
+                                    {
+                                        "Field": field,
+                                        "Suggested Value": detail.get("value"),
+                                        "Confidence": detail.get("confidence"),
+                                        "Evidence": detail.get("evidence"),
+                                    }
+                                    for field, detail in extracted_fields.items()
+                                    if isinstance(detail, dict)
+                                ]
+                                st.caption("Extracted values for review")
+                                st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+                                if st.button(
+                                    "Apply Extracted Info to Product Row",
+                                    key=f"vendor_call_apply_{call_key}",
+                                    use_container_width=True,
+                                ):
+                                    updated_df, applied, skipped = apply_extracted_specs_to_review_table(
+                                        row_idx,
+                                        extracted_fields,
+                                        overwrite=overwrite_existing,
+                                    )
+                                    st.session_state.intake_df = updated_df
+                                    if applied:
+                                        st.success(f"Updated {', '.join(applied)} from vendor call.")
+                                    if skipped:
+                                        st.caption(f"Skipped existing or unsupported fields: {', '.join(skipped)}")
+                                    st.rerun()
+                            unresolved = extracted_specs.get("unresolved_fields", [])
+                            if unresolved:
+                                st.caption(f"Unresolved fields: {', '.join(map(str, unresolved))}")
+                            with st.expander("Call result diagnostics"):
+                                st.json(
+                                    make_json_safe(
+                                        {
+                                            "call_id": call_id,
+                                            "call_status": call_status.get("status"),
+                                            "transcript_found": bool(transcript),
+                                            "extracted_fields_count": len(extracted_fields or {}),
+                                            "unresolved_fields": unresolved,
+                                            "provider": call_status.get("provider", result.get("provider")),
+                                        }
+                                    )
+                                )
+
+                    if provider_response or debug_info:
+                        with st.expander("Provider diagnostics"):
+                            if debug_info:
+                                st.caption("Endpoint")
+                                st.code(str(debug_info.get("endpoint", "")))
+                                st.caption("Auth header name used")
+                                st.code(str(debug_info.get("auth_header_name", "")))
+                                st.caption("Sanitized headers")
+                                st.json(make_json_safe(debug_info.get("headers", {})))
+                                st.caption("Request body keys")
+                                st.json(make_json_safe(debug_info.get("request_body_keys") or debug_info.get("minimal_payload_fields") or []))
+                                provider_label = str(debug_info.get("provider") or result.get("provider") or "provider").title()
+                                st.caption(f"Exact JSON body sent to {provider_label}")
+                                st.json(make_json_safe(debug_info.get("request_body", {})))
+                                attempts = debug_info.get("attempts") or []
+                                if attempts:
+                                    st.caption("Auth/header attempts")
+                                    st.json(make_json_safe(attempts))
+                                st.caption("Response status")
+                                st.write(debug_info.get("response_status_code", "No HTTP status returned"))
+                                st.caption(f"Exact response body from {provider_label}")
+                                response_text = str(debug_info.get("response_text") or "")
+                                st.code(response_text or "(empty)", language="json")
+                                st.caption("Parsed response")
+                                st.json(make_json_safe(debug_info.get("response_body", {})))
+                                provider_config = (
+                                    debug_info.get("provider_config")
+                                    or debug_info.get("resolved_agent_fields", {}).get("provider_config")
+                                    or result.get("provider_config")
+                                )
+                                if provider_config:
+                                    st.caption("Resolved provider config")
+                                    if provider_label.lower() == "retell":
+                                        st.markdown(
+                                            "\n".join(
+                                                [
+                                                    "- Provider: `retell`",
+                                                    f"- Agent ID used: `{debug_info.get('agent_id_used') or result.get('agent_id') or 'None'}`",
+                                                    f"- Phone number used: `{debug_info.get('phone_number_used') or 'None'}`",
+                                                    f"- From number used: `{debug_info.get('from_number_used') or 'None'}`",
+                                                    f"- Call ID: `{result.get('call_id') or debug_info.get('call_id') or 'None'}`",
+                                                ]
+                                            )
+                                        )
+                                    else:
+                                        st.markdown(
+                                            "\n".join(
+                                                [
+                                                    f"- Calling from: `{provider_config.get('from') or 'Bland default'}`",
+                                                    f"- Requested agent: `{provider_config.get('requested_agent_name') or provider_config.get('agent_name') or 'None'}`",
+                                                    f"- Resolved persona ID: `{provider_config.get('resolved_persona_id') or provider_config.get('persona_id') or 'None'}`",
+                                                    f"- Resolved voice: `{provider_config.get('resolved_voice') or provider_config.get('voice') or 'Bland default'}`",
+                                                    f"- Voice override enabled: `{provider_config.get('voice_override_enabled')}`",
+                                                    f"- Voice field sent: `{debug_info.get('voice_field_sent', bool((debug_info.get('request_body') or {}).get('voice')))} `",
+                                                    f"- Voice ID used: `{debug_info.get('voice_id_used') or (debug_info.get('request_body') or {}).get('voice') or 'None'}`",
+                                                    f"- Persona ID sent: `{debug_info.get('persona_id_sent', bool((debug_info.get('request_body') or {}).get('persona_id')))} `",
+                                                    f"- Call ID: `{result.get('call_id') or 'None'}`",
+                                                    f"- Fallback used: `{debug_info.get('fallback_used', False)}`",
+                                                    f"- Persona publication: `{(provider_config.get('persona_publication') or {}).get('status') or 'unknown'}`",
+                                                    f"- Alley applied: `{'yes' if provider_config.get('resolved_persona_id') and not provider_config.get('default_bland_agent_used') else 'no'}`",
+                                                ]
+                                            )
+                                        )
+                                    st.json(make_json_safe(provider_config))
+                                    if provider_label.lower() != "retell":
+                                        publication = provider_config.get("persona_publication") or {}
+                                        if publication.get("draft_changes_pending"):
+                                            st.warning("Promote Alley to Production in Bland. Draft changes are not guaranteed to affect API calls until promoted.")
+                                        if provider_config.get("default_bland_agent_used"):
+                                            st.warning("Using Bland default agent/voice because no persona_id, pathway_id, or voice is configured.")
+                                        elif provider_config.get("resolved_persona_id"):
+                                            st.success(f"Using Bland persona: {provider_config.get('resolved_persona_id')}")
+                                        if provider_config.get("caller_number_sent"):
+                                            st.caption(f"Calling from: {provider_config.get('from')}")
+                                if debug_info.get("configured_agent_rejected"):
+                                    st.warning("Alley agent not accepted by provider, used default Bland voice.")
+                                    st.caption("Configured agent attempt")
+                                    st.json(make_json_safe(debug_info.get("configured_agent_attempt", {})))
+                                if debug_info.get("configured_voice_rejected"):
+                                    st.warning("Bland rejected the explicit voice override, so the call used the Alley persona without the voice field.")
+                                    st.caption("Configured voice attempt")
+                                    st.json(make_json_safe(debug_info.get("configured_voice_attempt", {})))
+                                if debug_info.get("rejected_attempts"):
+                                    st.caption("Rejected Bland payload attempts")
+                                    st.json(make_json_safe(debug_info.get("rejected_attempts", [])))
+                                st.caption(
+                                    "If direct voice override still does not sound like Alley, next step is to create a Bland Pathway "
+                                    "using the Alley persona/voice and call with BLAND_USE_PATHWAY=true + BLAND_PATHWAY_ID."
+                                )
+                            elif provider_response:
+                                st.caption("Provider response")
+                                st.json(make_json_safe(provider_response))
+
+        review_updates: dict[int, dict[str, str]] = {}
+
+        for idx, row in _needs_review_rows.iterrows():
+            missing_fields = _missing_required_fields(row)
+            with st.container(border=True):
+                meta_col, input_col = st.columns([2, 3])
+                with meta_col:
+                    _pname = str(row.get("Product Name", "") or "").strip()
+                    _brand = str(row.get("Brand", "") or "").strip()
+                    _sku   = str(row.get("Model/SKU", "") or "").strip()
+                    _ident_parts = [p for p in [_brand, _sku] if p]
+                    st.markdown(
+                        f"**{_pname or 'Unnamed item'}**"
+                        + (f"  \n{'  ·  '.join(_ident_parts)}" if _ident_parts else "")
+                    )
+                    _current_dim = str(row.get("Dimensions") or "").strip()
+                    if "Dimensions" in missing_fields and _current_dim:
+                        st.caption(f"Current: {_current_dim}")
+                with input_col:
+                    review_updates[idx] = {}
+                    for field in missing_fields:
+                        field_input_col, phone_col = st.columns([12, 1])
+                        with field_input_col:
+                            entered = st.text_input(
+                                _FIELD_LABELS[field],
+                                key=f"nr_{field}_{idx}",
+                                placeholder=_FIELD_PLACEHOLDERS[field],
+                                label_visibility="collapsed",
+                            )
+                        with phone_col:
+                            st.markdown("<div style='height:0.12rem'></div>", unsafe_allow_html=True)
+                            if st.button(
+                                "☎",
+                                key=f"vendor_call_open_{field}_{idx}",
+                                help=f"Call vendor for {_FIELD_LABELS[field]}",
+                                use_container_width=True,
+                            ):
+                                panel_key = f"{idx}_{field}"
+                                current_panel = st.session_state.get("vendor_call_panel")
+                                st.session_state.vendor_call_panel = (
+                                    None if current_panel == panel_key else panel_key
+                                )
+                        if entered.strip():
+                            review_updates[idx][field] = entered.strip()
+                        if st.session_state.get("vendor_call_panel") == f"{idx}_{field}":
+                            _render_vendor_call_panel(idx, row, field)
+
+        save_col, _ = st.columns([2, 8])
+        with save_col:
+            save_review = st.button(
+                "Save Review Updates",
+                type="secondary",
+                use_container_width=True,
             )
 
-            dim_updates: dict[int, str] = {}
-            for idx, row in _missing_dim_df.iterrows():
-                with st.container(border=True):
-                    meta_col, input_col = st.columns([3, 2])
-                    with meta_col:
-                        st.markdown(
-                            f"**{row.get('Product Name', '') or '—'}**  \n"
-                            f"{row.get('Brand', '') or ''}  ·  {row.get('Model/SKU', '') or ''}"
-                        )
-                        current_dim = str(row.get("Dimensions") or "").strip()
-                        if current_dim:
-                            st.caption(f"Current: {current_dim}")
-                    with input_col:
-                        new_val = st.text_input(
-                            "Enter Full Dimensions",
-                            key=f"dim_input_{idx}",
-                            placeholder='36"W × 34.5"H × 24"D',
-                            label_visibility="collapsed",
-                        )
-                        if new_val:
-                            dim_updates[idx] = new_val
-
-            save_col, helper_col = st.columns([2, 8])
-            with save_col:
-                save_dims = st.button(
-                    "Save Dimension Updates",
-                    type="secondary",
-                    use_container_width=True,
-                )
-            with helper_col:
-                st.caption('Enter as W × H × D — for example: 36"W × 34.5"H × 24"D')
-
-            if save_dims:
-                _df_copy = st.session_state.intake_df.copy()
-                for idx, val in dim_updates.items():
-                    if val.strip():
-                        _df_copy.at[idx, "Dimensions"] = val
-                st.session_state.intake_df = apply_confidence_checks(_df_copy)
-                st.rerun()
+        if save_review:
+            _df_copy = st.session_state.intake_df.copy()
+            for idx, field_map in review_updates.items():
+                for field, val in field_map.items():
+                    if field == "Quantity":
+                        try:
+                            _df_copy.at[idx, field] = int(float(val))
+                        except (ValueError, TypeError):
+                            _df_copy.at[idx, field] = val
+                    else:
+                        _df_copy.at[idx, field] = val
+            st.session_state.intake_df = apply_confidence_checks(_df_copy)
+            st.rerun()
 
     # Show any previous category AI error
     if st.session_state.get("cat_ai_error"):
@@ -612,6 +1895,59 @@ if st.session_state.intake_df is not None:
         if enrich_rerun_clicked and _BRAVE_API_KEY:
             st.session_state.pending_enrichment = True
             st.rerun()
+
+        # ── Enrichment debug ───────────────────────────────────────────────────
+        debug_col, _ = st.columns([3, 7])
+        with debug_col:
+            debug_enrich_clicked = st.button(
+                "Debug Enrichment (dimensions)",
+                type="secondary",
+                use_container_width=True,
+                disabled=not _BRAVE_API_KEY,
+                help="Traces every step of enrichment for each row and saves results to data/enrichment_debug/.",
+            )
+        if debug_enrich_clicked:
+            with st.spinner("Running enrichment diagnostics — this may take a minute…"):
+                _debug_traces = debug_enrich_dataframe(edited_df)
+                _debug_path   = save_debug_report(_debug_traces)
+            st.success(f"Debug report saved to {_debug_path}")
+            _qualifying = [t for t in _debug_traces if t.get("qualifies")]
+            if not _qualifying:
+                st.warning("No rows qualified for enrichment — check Brand and Model/SKU columns.")
+            for _t in _debug_traces:
+                _label = _t.get("product_name") or _t.get("brand") or _t.get("model_sku") or "—"
+                with st.expander(f"{'OK' if not _t.get('failure_reason') else 'FAIL'} — {_label}", expanded=bool(_t.get("failure_reason"))):
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.markdown(f"**Brand:** {_t.get('brand') or '—'}")
+                        st.markdown(f"**Model/SKU:** {_t.get('model_sku') or '—'}")
+                        st.markdown(f"**Qualifies:** {_t.get('qualifies')}")
+                        st.markdown(f"**BRAVE_API_KEY loaded:** {_t.get('brave_api_key_loaded')}")
+                        st.markdown(f"**ANTHROPIC_API_KEY loaded:** {_t.get('anthropic_api_key_loaded')}")
+                        st.markdown(f"**Search query:** `{_t.get('search_query') or '—'}`")
+                        st.markdown(f"**Selected URL:** {_t.get('selected_url') or '—'}")
+                        st.markdown(f"**Selected score:** {_t.get('selected_score', '—')}")
+                    with col_b:
+                        st.markdown(f"**Fetch success:** {_t.get('fetch_success')}")
+                        st.markdown(f"**Page text length:** {_t.get('page_text_length', 0):,} chars")
+                        st.markdown(f"**Dimension terms found:** {_t.get('dimension_terms_found')}")
+                        st.markdown(f"**Claude asked for dims:** {_t.get('claude_prompt_includes_dimensions')}")
+                        st.markdown(f"**Claude raw dims:** `{_t.get('claude_raw_dimensions') or '(empty)'}`")
+                        st.markdown(f"**Apply accepted:** {_t.get('apply_accepted_dimensions')}")
+                        st.markdown(f"**Final dimensions:** `{_t.get('final_dimensions') or '(blank)'}`")
+                    if _t.get("failure_reason"):
+                        st.error(f"Failure reason: {_t['failure_reason']}")
+                    _results = _t.get("search_results", [])
+                    if _results:
+                        st.markdown("**Search results:**")
+                        for _r in _results:
+                            st.markdown(f"- score={_r['domain_score']} [{_r['title'][:80]}]({_r['url']})")
+                    if _t.get("page_text_preview"):
+                        st.markdown("**Page text preview (first 500 chars):**")
+                        st.code(_t["page_text_preview"], language=None)
+                    if _t.get("claude_raw_output"):
+                        st.markdown("**Claude raw output:**")
+                        st.code(_t["claude_raw_output"], language="json")
 
         st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
 
@@ -680,245 +2016,6 @@ if st.session_state.intake_df is not None:
                     _updated_df.at[_row_idx, "Suggested Action"] = "Review AI category suggestion"
             st.session_state.intake_df = apply_confidence_checks(_updated_df)
             st.rerun()
-
-    # ── Programa Automation ────────────────────────────────────────────────────
-    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-    st.divider()
-    section_label("Programa Automation")
-
-    allow_missing_dims = st.checkbox(
-        "Allow sending rows with missing dimensions",
-        value=False,
-        key="allow_missing_dims",
-        help="When checked, rows without full W × H × D can still be sent. A warning will appear before sending.",
-    )
-
-    # Eligibility: Include=True, not flagged for review, not in terminal statuses,
-    # has Product Name, Quantity ≥ 1, Product Category.
-    # Dimensions gate is enforced unless allow_missing_dims is checked.
-    _BLOCKED_STATUSES = {"Ignored", "Excluded", "Error"}
-
-    def _is_eligible(row: pd.Series) -> bool:
-        if not row.get("Include", False):
-            return False
-        if row.get("Review Required", False):
-            return False
-        if str(row.get("Status", "")) in _BLOCKED_STATUSES:
-            return False
-        if not str(row.get("Product Name", "") or "").strip():
-            return False
-        try:
-            if int(row.get("Quantity", 0) or 0) < 1:
-                return False
-        except (ValueError, TypeError):
-            return False
-        if not str(row.get("Product Category", "") or "").strip():
-            return False
-        if not allow_missing_dims:
-            if not has_complete_3d_dimensions(str(row.get("Dimensions", "") or "")):
-                return False
-        return True
-
-    eligible_df = edited_df[edited_df.apply(_is_eligible, axis=1)].copy()
-
-    def _is_url_row(row: pd.Series) -> bool:
-        return (
-            str(row.get("Source Type", "")) == "URL"
-            and bool(str(row.get("Product URL", "") or "").strip())
-        )
-
-    total_sendable = len(eligible_df)
-
-    # Blocked included rows: Include=True but failed eligibility
-    _included_df = edited_df[edited_df.get("Include", pd.Series([True] * len(edited_df))) == True]
-    _blocked_df = _included_df[~_included_df.apply(_is_eligible, axis=1)]
-
-    if not _blocked_df.empty:
-        st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
-        _n_dim = int(_blocked_df["Dimensions"].apply(
-            lambda v: not has_complete_3d_dimensions(str(v or ""))
-        ).sum()) if "Dimensions" in _blocked_df.columns else 0
-        _n_review = int((_blocked_df.get("Review Required", pd.Series([])) == True).sum())
-        if _n_dim > 0 and not allow_missing_dims:
-            st.warning(
-                f"{_n_dim} item{'s' if _n_dim != 1 else ''} need dimensions before they can be sent.",
-                icon="⚠️",
-            )
-        if _n_review > 0:
-            st.warning(
-                f"{_n_review} item{'s' if _n_review != 1 else ''} still need review before they can be sent.",
-                icon="⚠️",
-            )
-        st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
-
-    # ── Automation controls ────────────────────────────────────────────────────
-    auto_col, send_col, _ = st.columns([3, 3, 4])
-    with auto_col:
-        auto_done = st.checkbox(
-            "Auto-click Done after filling each item",
-            value=False,
-            help="When unchecked (default), the browser pauses after each item so you can review before saving.",
-        )
-        st.caption(
-            "For safety, keep Auto-click Done off during testing. "
-            "The automation will pause before final submission."
-        )
-    with send_col:
-        send_label = (
-            f"Send {total_sendable} item{'s' if total_sendable != 1 else ''} to Programa"
-            if total_sendable > 0 else "No eligible items"
-        )
-        no_project = not selected_project.strip()
-        send_to_programa = st.button(
-            send_label,
-            type="primary",
-            use_container_width=True,
-            disabled=(total_sendable == 0 or no_project),
-        )
-
-    if no_project:
-        st.warning("Enter a Programa project name above before sending.")
-    elif allow_missing_dims and total_sendable > 0:
-        _n_missing = int(eligible_df["Dimensions"].apply(
-            lambda v: not has_complete_3d_dimensions(str(v or ""))
-        ).sum()) if "Dimensions" in eligible_df.columns else 0
-        if _n_missing > 0:
-            st.warning(
-                f"Some items are missing full dimensions. Confirm before sending.",
-                icon="⚠️",
-            )
-    elif total_sendable == 0 and _blocked_df.empty:
-        st.warning(
-            "No eligible items — check that rows are included and are not flagged for review."
-        )
-
-    if send_to_programa:
-        rows_payload = eligible_df.to_dict("records")
-        st.session_state.nav_failed = False
-        st.session_state.nav_pending_rows = []
-        with st.spinner(
-            f"Chrome is open — automatically navigating to project '{selected_project}', "
-            "then adding items. Follow any on-screen prompts in the browser."
-        ):
-            try:
-                log_entries, log_path = run_programa_automation(
-                    rows=rows_payload,
-                    selected_project=selected_project,
-                    auto_done=auto_done,
-                    skip_navigation=False,
-                )
-                st.session_state.automation_results = {
-                    "entries": log_entries,
-                    "log_path": log_path,
-                }
-                if any(e["status"] == "nav_failed" for e in log_entries):
-                    st.session_state.nav_failed = True
-                    st.session_state.nav_pending_rows = rows_payload
-            except Exception as exc:
-                from src.automation_logs import make_log_entry
-                st.session_state.automation_results = {
-                    "entries": [make_log_entry(
-                        "", "error",
-                        f"Unhandled exception: {exc} — check that Chrome and Playwright are installed.",
-                    )],
-                    "log_path": "",
-                }
-
-    # ── Navigation failure — manual continue flow ──────────────────────────────
-    if st.session_state.nav_failed:
-        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-        st.warning(
-            f"Project **{selected_project}** was not found automatically. "
-            "Please open the correct project in Programa manually, then click **Continue** below.",
-            icon="⚠️",
-        )
-        st.markdown(
-            '<div style="font-size:0.78rem;color:#7A7068;margin-bottom:0.75rem;">'
-            "The browser closed after the failed navigation attempt. "
-            "Clicking Continue will reopen Chrome — navigate to the project inside Programa, "
-            "then click OK in the browser dialog to begin adding items."
-            "</div>",
-            unsafe_allow_html=True,
-        )
-        cont_col, _ = st.columns([3, 7])
-        with cont_col:
-            continue_nav = st.button(
-                "Continue After Manual Project Open",
-                type="primary",
-                use_container_width=True,
-            )
-
-        if continue_nav:
-            st.session_state.nav_failed = False
-            pending_rows = st.session_state.nav_pending_rows or []
-            with st.spinner(
-                f"Chrome is open — navigate to '{selected_project}' in Programa, "
-                "click OK in the browser dialog, then wait for items to be added."
-            ):
-                try:
-                    log_entries, log_path = run_programa_automation(
-                        rows=pending_rows,
-                        selected_project=selected_project,
-                        auto_done=auto_done,
-                        skip_navigation=True,
-                    )
-                    st.session_state.automation_results = {
-                        "entries": log_entries,
-                        "log_path": log_path,
-                    }
-                    st.session_state.nav_pending_rows = []
-                except Exception as exc:
-                    from src.automation_logs import make_log_entry
-                    st.session_state.automation_results = {
-                        "entries": [make_log_entry(
-                            "", "error",
-                            f"Unhandled exception during manual-continue run: {exc}",
-                        )],
-                        "log_path": "",
-                    }
-
-    # ── Automation Results ─────────────────────────────────────────────────────
-    if st.session_state.automation_results:
-        results  = st.session_state.automation_results
-        entries: list[dict] = results["entries"]
-        log_path: str       = results["log_path"]
-
-        success_n = sum(1 for e in entries if e["status"] == "success")
-        filled_n  = sum(1 for e in entries if e["status"] == "filled_awaiting_confirm")
-        error_n   = sum(1 for e in entries if e["status"] == "error")
-        total_run = len(entries)
-
-        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-        if error_n == 0:
-            st.success(
-                f"Automation complete — {success_n + filled_n} of {total_run} item(s) processed.",
-                icon="✓",
-            )
-        else:
-            st.warning(
-                f"Automation finished with {error_n} error(s). "
-                f"{success_n + filled_n} of {total_run} item(s) processed.",
-                icon="⚠️",
-            )
-
-        _results_entries = pd.DataFrame(entries)
-        _results_entries["Product"] = _results_entries.apply(
-            lambda r: r.get("product_url") or r.get("product_name", ""), axis=1
-        )
-        results_df = _results_entries[["timestamp", "Product", "status", "message"]]
-        st.dataframe(
-            results_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "timestamp": st.column_config.TextColumn("Time", width="medium"),
-                "Product":   st.column_config.TextColumn("Product", width="large"),
-                "status":    st.column_config.TextColumn("Status", width="medium"),
-                "message":   st.column_config.TextColumn("Message", width="large"),
-            },
-        )
-        if log_path:
-            st.caption(f"Full log saved → {log_path}")
 
     # ── Footer ─────────────────────────────────────────────────────────────────
     st.markdown("<div style='height:2.5rem'></div>", unsafe_allow_html=True)

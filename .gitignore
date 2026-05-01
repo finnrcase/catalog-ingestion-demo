@@ -1,0 +1,76 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+!backend/.env.example
+!frontend/.env.example
+.streamlit/secrets.toml
+
+# Python caches and virtualenvs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Local app data, browser sessions, uploads, logs, and exports
+data/
+uploads/
+exports/
+downloads/
+temp/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.pdf
+*.zip
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Browser / Playwright state can contain cookies and session tokens
+playwright/.auth/
+playwright-report/
+test-results/
+storage_state*.json
+*.storage-state.json
+cookies*.json
+localStorage*.json
+sessionStorage*.json
+
+# Credential files
+*credential*.json
+*credentials*.json
+*service-account*.json
+*service_account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.vercel/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local nested clone created during GitHub setup; do not commit as a sub-repo.
+SaffronCaseHomes/
+
+# OS/editor noise
+.DS_Store
+.vscode/
+.idea/

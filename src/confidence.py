@@ -13,7 +13,7 @@ Entry point: apply_confidence_checks(df) → pd.DataFrame
 import re
 import pandas as pd
 
-from src.intake_schema import IMPORTANT_FIELDS, SOURCE_MANUAL, SOURCE_PDF_AI, SOURCE_URL
+from src.intake_schema import IMPORTANT_FIELDS, SOURCE_MANUAL, SOURCE_PDF_AI, SOURCE_PHOTO, SOURCE_URL
 from src.product_enrichment import has_complete_3d_dimensions
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -61,6 +61,15 @@ def _str(value) -> str:
     return str(value or "").strip()
 
 
+def _is_photo_only(row: dict) -> bool:
+    value = str(row.get("photo_only", "") or "").strip().lower()
+    return (
+        value in {"true", "1", "yes"}
+        or _str(row.get("Import Type")).lower() == "photo upload"
+        or _str(row.get("Source Type")) == SOURCE_PHOTO
+    )
+
+
 def _is_valid_url(value) -> bool:
     return bool(value and _URL_RE.match(_str(value)))
 
@@ -71,8 +80,8 @@ def _is_ignored_row(row: dict) -> bool:
     # These source types are never auto-ignored:
     # - URL: missing product name is expected
     # - PDF_AI: AI already filtered non-product lines
-    # - Manual: user explicitly added the row
-    if source in (SOURCE_URL, SOURCE_PDF_AI, SOURCE_MANUAL):
+    # - Manual/Photo: user explicitly added the row
+    if source in (SOURCE_URL, SOURCE_PDF_AI, SOURCE_MANUAL, SOURCE_PHOTO):
         return False
 
     useful_fields = ("Product Name", "Brand", "Model/SKU", "Product URL", "Supplier")
@@ -111,6 +120,8 @@ def identify_missing_fields(row: dict) -> list[str]:
     For all other rows, IMPORTANT_FIELDS are checked.
     """
     source = _str(row.get("Source Type"))
+    if _is_photo_only(row):
+        return []
 
     if source == SOURCE_URL:
         missing = []
@@ -132,6 +143,9 @@ def identify_missing_fields(row: dict) -> list[str]:
 
 def calculate_row_confidence(row: dict) -> int:
     """Return a confidence score between 0 and 100."""
+    if _is_photo_only(row):
+        return 0
+
     if _is_ignored_row(row):
         return 0
 
@@ -178,6 +192,9 @@ def calculate_row_confidence(row: dict) -> int:
 
 def should_require_review(row: dict) -> bool:
     """True if this row needs a human to verify it before sending to Programa."""
+    if _is_photo_only(row):
+        return False
+
     if _is_ignored_row(row):
         return False
 
@@ -192,6 +209,9 @@ def should_require_review(row: dict) -> bool:
 
 def classify_row_status(row: dict) -> str:
     """Return a descriptive status label derived from the row's data."""
+    if _is_photo_only(row):
+        return "Needs Review"
+
     if _is_ignored_row(row):
         return "Ignored"
 
@@ -210,6 +230,9 @@ def classify_row_status(row: dict) -> str:
 
 def _suggested_action(row: dict, missing: list[str]) -> str:
     """Build a short, actionable string for the Suggested Action column."""
+    if _is_photo_only(row):
+        return "Photo-only products are ready to send as blank Programa items with images attached"
+
     if _is_ignored_row(row):
         name = _str(row.get("Product Name"))
         if name:
