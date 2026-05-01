@@ -5,6 +5,8 @@
 !backend/.env.example
 !frontend/.env.example
 .streamlit/secrets.toml
+frontend/.env.local
+frontend/.env.*.local
 
 # Python caches and virtualenvs
 __pycache__/
@@ -21,9 +23,13 @@ env/
 # Local app data, browser sessions, uploads, logs, and exports
 data/
 uploads/
+uploaded_files/
 exports/
 downloads/
 temp/
+automation_logs/
+logs/
+*.log
 *.csv
 *.tsv
 *.xlsx
@@ -58,10 +64,14 @@ sessionStorage*.json
 *.pfx
 
 # Frontend build artifacts
+node_modules/
 frontend/node_modules/
 frontend/.next/
 frontend/out/
 frontend/.vercel/
+dist/
+build/
+.cache/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -69,6 +79,7 @@ pnpm-debug.log*
 
 # Local nested clone created during GitHub setup; do not commit as a sub-repo.
 SaffronCaseHomes/
+SCHDATAINGEST/
 
 # OS/editor noise
 .DS_Store

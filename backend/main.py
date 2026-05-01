@@ -119,6 +119,29 @@ app.add_middleware(
 )
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _real_integrations_enabled() -> bool:
+    """Public demo safety: external side effects are opt-in only."""
+    return _env_flag("ENABLE_REAL_INTEGRATIONS", False) and not _env_flag("DEMO_MODE", True)
+
+
+def _demo_mode_response(action: str, rows: int = 0) -> dict:
+    return {
+        "status": "demo_mode",
+        "message": (
+            f"Demo mode: {action} is disabled. "
+            "No browser automation, phone call, or external API request was made."
+        ),
+        "rows_received": rows,
+    }
+
+
 def _df_response(df: pd.DataFrame, errors: list[str] | None = None) -> IntakeResponse:
     df = df.copy()
     if "Notes" in df.columns:
@@ -225,6 +248,8 @@ def programa_eligible(payload: RowsPayload) -> dict:
 
 @app.post("/programa/login")
 def programa_login() -> dict:
+    if not _real_integrations_enabled():
+        return _demo_mode_response("Programa login")
     message = open_programa_login_window()
     return {"status": "complete", "message": message}
 
@@ -254,6 +279,14 @@ def vendor_call_script(payload: VendorCallPayload) -> dict:
 
 @app.get("/vendor-call/status")
 def vendor_call_status() -> dict:
+    if not _real_integrations_enabled():
+        return {
+            "enabled": False,
+            "provider": "disabled",
+            "api_key_configured": False,
+            "demo_mode": True,
+            "message": "Demo mode: vendor calls are disabled.",
+        }
     return {
         "enabled": calls_enabled(),
         "provider": get_call_provider(),
@@ -277,6 +310,8 @@ def vendor_call_status() -> dict:
 
 @app.post("/vendor-call/start")
 def vendor_call_start(payload: VendorCallPayload) -> dict:
+    if not _real_integrations_enabled():
+        return _demo_mode_response("vendor calls", rows=1)
     if not payload.phone_number.strip():
         raise HTTPException(status_code=400, detail="Enter a phone number before starting a vendor call.")
     result = start_vendor_call(
@@ -299,6 +334,8 @@ def vendor_call_start(payload: VendorCallPayload) -> dict:
 
 @app.post("/vendor-call/custom-retell-test")
 def vendor_call_custom_retell_test(payload: CustomRetellTestCallPayload) -> dict:
+    if not _real_integrations_enabled():
+        return _demo_mode_response("custom Retell test calls", rows=1)
     if not payload.phone_number.strip():
         raise HTTPException(status_code=400, detail="Enter a phone number before starting a custom test call.")
     if not payload.phone_number.strip().startswith("+"):
@@ -367,6 +404,20 @@ def _looks_like_programa_schedule_url(value: str) -> bool:
 
 @app.post("/programa/send")
 def send_to_programa(payload: ProgramaPayload) -> dict:
+    if not _real_integrations_enabled():
+        return {
+            **_demo_mode_response("Programa send", rows=len(payload.rows)),
+            "allow_blank_fields": payload.allow_blank_fields,
+            "entries": [
+                {
+                    "product_name": row.get("Product Name") or row.get("Name of Product") or "",
+                    "status": "skipped",
+                    "message": "Demo mode: this row was not sent to Programa.",
+                }
+                for row in payload.rows
+            ],
+            "blocked": [],
+        }
     if not payload.schedule_url.strip():
         raise HTTPException(status_code=400, detail="Paste the Programa schedule link before sending.")
     if not _looks_like_programa_schedule_url(payload.schedule_url):

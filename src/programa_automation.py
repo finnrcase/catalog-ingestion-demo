@@ -61,6 +61,18 @@ PROFILE_DIR = Path(
 
 # ── Automation safety flags ───────────────────────────────────────────────────
 
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _real_integrations_enabled() -> bool:
+    """Public demo safety: Programa browser/API side effects are opt-in only."""
+    return _env_flag("ENABLE_REAL_INTEGRATIONS", False) and not _env_flag("DEMO_MODE", True)
+
 # When True: keep the browser open on any failure so you can inspect the UI.
 # Show a blocking alert then close only after the user clicks OK.
 # Set to False to close immediately on failure (original behaviour).
@@ -6615,6 +6627,12 @@ def open_programa_login_window() -> str:
 
     Returns a plain-text status message suitable for display in Streamlit.
     """
+    if not _real_integrations_enabled():
+        return (
+            "Demo mode: Programa login is disabled. No browser window was opened. "
+            "Set DEMO_MODE=false and ENABLE_REAL_INTEGRATIONS=true only in a private environment."
+        )
+
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -6699,6 +6717,16 @@ def send_urls_to_programa(
     URLs).  The Streamlit UI detects this status and shows the "Continue After Manual
     Project Open" button, which re-calls this function with skip_navigation=True.
     """
+    if not _real_integrations_enabled():
+        return [
+            make_log_entry(
+                row.get("Product Name") or row.get("Name of Product") or "",
+                "skipped",
+                "Demo mode: Programa send is disabled. No browser automation or external API request was made.",
+            )
+            for row in rows
+        ]
+
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -7178,6 +7206,17 @@ def run_programa_automation(
     Full orchestrator — runs the automation and persists a JSON log.
     Returns (log_entries, log_file_path).
     """
+    if not _real_integrations_enabled():
+        entries = [
+            make_log_entry(
+                row.get("Product Name") or row.get("Name of Product") or "",
+                "skipped",
+                "Demo mode: Programa send is disabled. No browser automation or external API request was made.",
+            )
+            for row in rows
+        ]
+        return entries, ""
+
     entries = send_urls_to_programa(
         rows,
         project_name=project_name,
