@@ -811,6 +811,43 @@ def test_export_xlsx_no_merged_cells():
     df = build_programa_import_dataframe(_make_rows([{}]))
     wb = openpyxl.load_workbook(io.BytesIO(export_programa_xlsx(df)))
     assert len(wb.active.merged_cells.ranges) == 0
+
+
+# ── Golden test ───────────────────────────────────────────────────────────────
+
+def test_golden_csv_exact_columns_and_no_nan():
+    """
+    Golden test: one clean product → CSV has exact column order,
+    no extra columns, no NaN strings, and correct values in data row.
+    """
+    import csv as _csv
+
+    row = _scotsman_row()
+    df = build_programa_import_dataframe([row])
+    csv_bytes = export_programa_csv(df)
+    csv_text = csv_bytes.decode("utf-8")
+
+    # Exact column count and order
+    assert len(df.columns) == len(PROGRAMA_COLUMNS)
+    assert list(df.columns) == PROGRAMA_COLUMNS
+
+    # No NaN strings anywhere in output
+    assert "nan" not in csv_text.lower()
+
+    # Parse and verify structure
+    parsed_rows = list(_csv.reader(csv_text.splitlines()))
+    assert len(parsed_rows) == 2  # header + 1 data row
+    assert parsed_rows[0] == PROGRAMA_COLUMNS
+
+    data = parsed_rows[1]
+    assert data[PROGRAMA_COLUMNS.index("Section")] == "Appliances"
+    assert data[PROGRAMA_COLUMNS.index("Product Name")] == "Scotsman Icemaker Built-In Pump"
+    assert data[PROGRAMA_COLUMNS.index("SKU")] == "SCN60PA1SU"
+    assert data[PROGRAMA_COLUMNS.index("Width (in)")] == "14.875"
+    assert data[PROGRAMA_COLUMNS.index("Height (in)")] == "33.375"
+    assert data[PROGRAMA_COLUMNS.index("Depth (in)")] == "22"
+    assert data[PROGRAMA_COLUMNS.index("Material")] == "Stainless Steel"
+    assert "[Materials:" not in data[PROGRAMA_COLUMNS.index("Notes")]
 ```
 
 - [ ] **Step 7.2: Run to verify they fail**
