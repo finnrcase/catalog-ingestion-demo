@@ -97,3 +97,117 @@ def test_clean_notes_empty_string():
 def test_clean_notes_only_system_tag_returns_empty():
     result = _clean_notes("[Enrichment: no confident source found]")
     assert result == ""
+
+
+# ── _row_to_programa_dict ─────────────────────────────────────────────────────
+
+def test_scotsman_section_maps_to_product_category():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["Section"] == "Appliances"
+
+def test_scotsman_sku_mapped():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["SKU"] == "SCN60PA1SU"
+
+def test_scotsman_model_blank():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["Model"] == ""
+
+def test_scotsman_dimensions_direct():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["Dimensions"] == "14.875 in W x 22 in D x 33.375 in H"
+
+def test_scotsman_width_parsed():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["Width (in)"] == "14.875"
+
+def test_scotsman_height_parsed():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["Height (in)"] == "33.375"
+
+def test_scotsman_depth_parsed():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["Depth (in)"] == "22"
+
+def test_scotsman_length_blank_when_absent():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["Length (in)"] == ""
+
+def test_scotsman_finish_from_finish_color():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["Finish"] == "Stainless Steel"
+
+def test_scotsman_color_blank():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["Color"] == ""
+
+def test_scotsman_material_extracted_from_notes():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["Material"] == "Stainless Steel"
+
+def test_scotsman_notes_cleaned():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert "[Materials:" not in result["Notes"]
+    assert "[Enrichment:" not in result["Notes"]
+    assert "Verify delivery date." in result["Notes"]
+
+def test_scotsman_location_from_room():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["Location"] == "Kitchen"
+
+def test_section_fallback_to_general_when_category_blank():
+    from src.programa_export import _row_to_programa_dict
+    row = _scotsman_row()
+    row["Product Category"] = ""
+    result = _row_to_programa_dict(row)
+    assert result["Section"] == "General"
+
+def test_material_explicit_field_takes_priority():
+    from src.programa_export import _row_to_programa_dict
+    row = _scotsman_row()
+    row["Material"] = "Cast Iron"
+    result = _row_to_programa_dict(row)
+    assert result["Material"] == "Cast Iron"
+
+def test_lead_time_blank_when_no_field():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["Lead Time"] == ""
+
+def test_lead_time_explicit_field_used():
+    from src.programa_export import _row_to_programa_dict
+    row = _scotsman_row()
+    row["Lead Time"] = "8-10 weeks"
+    result = _row_to_programa_dict(row)
+    assert result["Lead Time"] == "8-10 weeks"
+
+def test_quantity_coerced_to_int():
+    from src.programa_export import _row_to_programa_dict
+    result = _row_to_programa_dict(_scotsman_row())
+    assert result["Quantity"] == 1
+
+def test_quantity_string_input_coerced():
+    from src.programa_export import _row_to_programa_dict
+    row = _scotsman_row()
+    row["Quantity"] = "3"
+    result = _row_to_programa_dict(row)
+    assert result["Quantity"] == 3
+
+def test_output_has_all_programa_columns():
+    from src.programa_export import _row_to_programa_dict, PROGRAMA_COLUMNS
+    result = _row_to_programa_dict(_scotsman_row())
+    for col in PROGRAMA_COLUMNS:
+        assert col in result, f"Missing column: {col}"
