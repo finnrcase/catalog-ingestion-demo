@@ -85,6 +85,7 @@ def _str_val(v) -> str:
 
 def _extract_material_from_notes(notes: str) -> str:
     """Return the value from the first [Materials: ...] tag, or empty string."""
+    notes = notes or ""
     m = _MATERIAL_TAG_RE.search(notes)
     return m.group(1).strip() if m else ""
 
