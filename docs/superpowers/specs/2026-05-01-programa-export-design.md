@@ -35,8 +35,8 @@ Internal schema → Programa import columns (fixed output order):
 | 15 | `Image URL` | `Image URL` | Direct |
 | 16 | `Finish` | `Finish / Color` | Direct; no Color/Finish split |
 | 17 | `Color` | *(blank)* | Reserved; only populated if source explicitly separates |
-| 18 | `Material` | extracted from `Notes` | Strip `[Materials: ...]` tag; `Material` is not in current internal schema so Notes is always the source |
-| 19 | `Lead Time` | `Lead Time` field if present; else blank | No extraction fallback |
+| 18 | `Material` | `Material` field if present → else `[Materials: ...]` tag in `Notes` → else blank | Strip tag from Notes after extraction |
+| 19 | `Lead Time` | `Lead Time` field if present → else blank | No extraction fallback |
 | 20 | `Notes` | `Notes` | Strip all `[...]` system tags + row-number prefix |
 | 21 | `Location` | `Room` | Direct; NOT used as Section |
 
@@ -68,7 +68,7 @@ Single worksheet, no merged cells. Uses `openpyxl` engine. Returns bytes.
 Applied in order:
 
 1. **Filter**: keep only `Include == True` rows (same as existing CSV export)
-2. **Material extraction**: parse `[Materials: <value>]` tag from `Notes` → populate `Material` column (`Material` is not in the current internal schema, so Notes is always the source)
+2. **Material extraction**: use explicit `Material` field if present and non-blank; else parse `[Materials: <value>]` tag from `Notes`; else leave blank. Strip the tag from `Notes` after extraction regardless.
 3. **Notes cleanup**: strip all `[...]` bracket-enclosed system tags from `Notes`, then `remove_notes_row_prefix()`
 4. **Section fallback**: if `Product Category` is blank, use `"General"` and mark row for warning
 5. **Dimension parsing**: call `extract_labeled_dimensions(dimensions_str)` → populate `Width (in)`, `Height (in)`, `Depth (in)`, `Length (in)` as raw parsed strings (fractions like `"14 7/8"` are preserved as written; empty string if not found)
