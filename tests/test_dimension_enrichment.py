@@ -521,7 +521,9 @@ def test_fetch_and_parse_url_html_page():
     mock_resp.content = mock_resp.text.encode()
     mock_resp.raise_for_status = MagicMock()
 
-    with patch("httpx.get", return_value=mock_resp):
+    mock_httpx = MagicMock()
+    mock_httpx.get.return_value = mock_resp
+    with patch("src.dimension_enrichment._httpx", mock_httpx):
         product_dims, cutout_dims, source_type_suffix = _fetch_and_parse_url(
             "https://example.com/product"
         )
@@ -536,7 +538,9 @@ def test_fetch_and_parse_url_pdf_content_type():
     mock_resp.content = b"%PDF fake"
     mock_resp.raise_for_status = MagicMock()
 
-    with patch("httpx.get", return_value=mock_resp):
+    mock_httpx = MagicMock()
+    mock_httpx.get.return_value = mock_resp
+    with patch("src.dimension_enrichment._httpx", mock_httpx):
         with patch(
             "src.dimension_enrichment._parse_pdf_for_dimensions",
             return_value=('36"W x 34.5"H x 24"D', None),
@@ -549,7 +553,9 @@ def test_fetch_and_parse_url_pdf_content_type():
 
 
 def test_fetch_and_parse_url_returns_none_on_http_error():
-    with patch("httpx.get", side_effect=Exception("connection error")):
+    mock_httpx = MagicMock()
+    mock_httpx.get.side_effect = Exception("connection error")
+    with patch("src.dimension_enrichment._httpx", mock_httpx):
         product_dims, cutout_dims, source_type_suffix = _fetch_and_parse_url(
             "https://example.com/product"
         )

@@ -583,6 +583,9 @@ def _fetch_and_parse_url(
     if _urlparse.urlparse(url).path.lower().endswith(tuple(_PDF_EXTENSIONS)):
         suffix = "pdf"
 
+    if _httpx is None:
+        return None, None, suffix
+
     try:
         resp = _httpx.get(url, headers=_REQUEST_HEADERS, timeout=12, follow_redirects=True)
         resp.raise_for_status()
