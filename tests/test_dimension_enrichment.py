@@ -500,3 +500,9 @@ def test_parse_pdf_returns_none_on_corrupt_bytes():
     product_dims, cutout_dims = _parse_pdf_for_dimensions(b"not a pdf at all")
     assert product_dims is None
     assert cutout_dims is None
+
+
+def test_parse_text_pages_empty_list_returns_none():
+    product_dims, cutout_dims = _parse_text_pages_for_dimensions([])
+    assert product_dims is None
+    assert cutout_dims is None

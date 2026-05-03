@@ -466,7 +466,7 @@ def _parse_html_for_dimensions(
             if c == product_dims or not has_complete_3d_dimensions(c):
                 continue
             pos = text.find(c)
-            if pos >= 0 and "cutout" in text[max(0, pos - 20): pos].lower():
+            if pos >= 0 and "cutout" in text[max(0, pos - 30): pos].lower():
                 cutout_dims = c
                 break
 
@@ -546,15 +546,15 @@ def _parse_pdf_for_dimensions(
         return None, None
 
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        pages = [doc[i].get_text() for i in range(min(10, doc.page_count))]
-        return _parse_text_pages_for_dimensions(
-            pages,
-            is_appliance=is_appliance,
-            include_shipping_fallback=True,
-        )
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            pages = [doc[i].get_text() for i in range(min(10, doc.page_count))]
     except Exception:
         return None, None
+    return _parse_text_pages_for_dimensions(
+        pages,
+        is_appliance=is_appliance,
+        include_shipping_fallback=True,
+    )
 
 
 def find_dimensions(row: dict) -> DimensionResult:
