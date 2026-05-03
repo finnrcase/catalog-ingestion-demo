@@ -1,10 +1,12 @@
 # tests/test_dimension_enrichment.py
+from unittest.mock import MagicMock, patch
 from src.dimension_enrichment import (
     DimensionResult,
     BRAND_DOMAIN_TABLE,
     RETAILER_DOMAINS,
     _make_not_found_result,
     _normalize_model_variants,
+    _fetch_and_parse_url,
 )
 
 
@@ -506,3 +508,50 @@ def test_parse_text_pages_empty_list_returns_none():
     product_dims, cutout_dims = _parse_text_pages_for_dimensions([])
     assert product_dims is None
     assert cutout_dims is None
+
+
+def test_fetch_and_parse_url_html_page():
+    mock_resp = MagicMock()
+    mock_resp.headers = {"content-type": "text/html"}
+    mock_resp.text = (
+        "<html><body>"
+        '<p>Product Dimensions: 36"W x 34.5"H x 24"D</p>'
+        "</body></html>"
+    )
+    mock_resp.content = mock_resp.text.encode()
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch("httpx.get", return_value=mock_resp):
+        product_dims, cutout_dims, source_type_suffix = _fetch_and_parse_url(
+            "https://example.com/product"
+        )
+    assert product_dims is not None
+    assert "36" in product_dims
+    assert source_type_suffix == "page"
+
+
+def test_fetch_and_parse_url_pdf_content_type():
+    mock_resp = MagicMock()
+    mock_resp.headers = {"content-type": "application/pdf"}
+    mock_resp.content = b"%PDF fake"
+    mock_resp.raise_for_status = MagicMock()
+
+    with patch("httpx.get", return_value=mock_resp):
+        with patch(
+            "src.dimension_enrichment._parse_pdf_for_dimensions",
+            return_value=('36"W x 34.5"H x 24"D', None),
+        ):
+            product_dims, cutout_dims, source_type_suffix = _fetch_and_parse_url(
+                "https://example.com/spec.pdf"
+            )
+    assert product_dims is not None
+    assert source_type_suffix == "pdf"
+
+
+def test_fetch_and_parse_url_returns_none_on_http_error():
+    with patch("httpx.get", side_effect=Exception("connection error")):
+        product_dims, cutout_dims, source_type_suffix = _fetch_and_parse_url(
+            "https://example.com/product"
+        )
+    assert product_dims is None
+    assert source_type_suffix == "page"

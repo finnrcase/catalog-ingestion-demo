@@ -25,6 +25,11 @@ try:
 except ImportError:
     _BeautifulSoup = None
 
+try:
+    import httpx as _httpx
+except ImportError:
+    _httpx = None
+
 
 # ── Result type ────────────────────────────────────────────────────────────────
 
@@ -555,6 +560,39 @@ def _parse_pdf_for_dimensions(
         is_appliance=is_appliance,
         include_shipping_fallback=True,
     )
+
+
+# ── URL fetch + parser routing ─────────────────────────────────────────────────
+
+_PDF_EXTENSIONS = frozenset({".pdf"})
+_REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SCH-Intake/1.0)"}
+
+
+def _fetch_and_parse_url(
+    url: str,
+    *,
+    is_appliance: bool = False,
+) -> tuple[str | None, str | None, str]:
+    """
+    Fetch a URL and route to the correct parser.
+    Returns (product_dims, cutout_dims, source_type_suffix).
+    source_type_suffix is "page" or "pdf".
+    Both dimension values are None on fetch failure.
+    """
+    suffix = "page"
+    if _urlparse.urlparse(url).path.lower().endswith(tuple(_PDF_EXTENSIONS)):
+        suffix = "pdf"
+
+    try:
+        resp = _httpx.get(url, headers=_REQUEST_HEADERS, timeout=12, follow_redirects=True)
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "").lower()
+        if "pdf" in content_type or suffix == "pdf":
+            suffix = "pdf"
+            return (*_parse_pdf_for_dimensions(resp.content, is_appliance=is_appliance), suffix)
+        return (*_parse_html_for_dimensions(resp.text, is_appliance=is_appliance), suffix)
+    except Exception:
+        return None, None, suffix
 
 
 def find_dimensions(row: dict) -> DimensionResult:
