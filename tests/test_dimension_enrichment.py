@@ -85,3 +85,11 @@ def test_normalize_model_single_char_suffix_stripped():
 def test_normalize_model_deduplicates():
     result = _normalize_model_variants("MODEL")
     assert result == list(dict.fromkeys(result))  # no duplicates, order preserved
+
+
+def test_normalize_model_empty_string_returns_empty_list():
+    assert _normalize_model_variants("") == []
+
+
+def test_normalize_model_whitespace_only_returns_empty_list():
+    assert _normalize_model_variants("   ") == []

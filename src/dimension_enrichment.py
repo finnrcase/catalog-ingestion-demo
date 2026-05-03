@@ -106,6 +106,8 @@ def _normalize_model_variants(model: str) -> list[str]:
     """Return up to 4 model variants to try in order: exact, no-spaces, dashes, suffix-stripped."""
     # Strip whitespace and non-printable characters
     model = "".join(c for c in model.strip() if c.isprintable())
+    if not model:
+        return []
     seen: list[str] = [model]
 
     no_spaces = re.sub(r"\s+", "", model)
@@ -119,8 +121,7 @@ def _normalize_model_variants(model: str) -> list[str]:
     # Suffix strip: last dash/space token of 1–3 chars
     tokens = re.split(r"[-\s]+", model)
     if len(tokens) > 1 and 1 <= len(tokens[-1]) <= 3:
-        suffix_start = model.rfind(tokens[-1])
-        without_suffix = model[:suffix_start].rstrip(" -")
+        without_suffix = model[: -len(tokens[-1])].rstrip(" -")
         if without_suffix and without_suffix not in seen:
             seen.append(without_suffix)
     elif len(tokens) == 1:
