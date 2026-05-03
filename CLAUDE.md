@@ -49,13 +49,16 @@ src/ (Python business logic — shared by backend and app.py)
     confidence.py       ← 0–100 scoring, REVIEW_THRESHOLD=75
     dimensions.py       ← W×H×D completeness validation
     eligibility.py      ← Programa send gating
-    programa_automation.py ← Playwright automation (largest module)
+    programa_export.py  ← primary Programa output: CSV/XLSX for Programa "Import Products"
+    programa_automation.py ← legacy Playwright automation
     vendor_call_agent.py   ← Bland.ai / Retell.ai integration
 ```
 
 ## Key Patterns
 
-**Two-path Programa automation:** URL-sourced rows use Programa's "Add from URL" flow; PDF/AI-sourced rows go through direct Schedule row creation. Source type is tracked via constants in `intake_schema.py` (`SOURCE_MANUAL`, `SOURCE_URL`, `SOURCE_PDF`, `SOURCE_PDF_AI`).
+**Primary Programa output is CSV/XLSX (`src/programa_export.py`):** `build_programa_import_dataframe()` maps internal intake rows to Programa's 21-column import schema, extracting `[Materials: ...]` tags from Notes, stripping system tags, and parsing labeled dimensions. `programa_automation.py` (Playwright) is the legacy path, labelled as such in the UI.
+
+**Two-path Programa automation (legacy):** URL-sourced rows use Programa's "Add from URL" flow; PDF/AI-sourced rows go through direct Schedule row creation. Source type is tracked via constants in `intake_schema.py` (`SOURCE_MANUAL`, `SOURCE_URL`, `SOURCE_PDF`, `SOURCE_PDF_AI`).
 
 **Confidence gate:** Every row gets a 0–100 confidence score (`src/confidence.py`). Rows below 75 or missing any `IMPORTANT_FIELDS` are flagged for review and blocked from Programa send.
 
