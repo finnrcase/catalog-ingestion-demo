@@ -79,6 +79,19 @@ const missingFieldPlaceholders: Record<string, string> = {
   Category: "Enter category",
 };
 
+const fallbackSections = [
+  "Appliances",
+  "Lighting",
+  "Plumbing",
+  "Cabinetry",
+  "Flooring",
+  "Furniture",
+  "Decor",
+  "Hardware",
+  "Exterior",
+  "General",
+];
+
 function rowText(row: IntakeRow, key: string) {
   return String(row[key] ?? "");
 }
@@ -169,6 +182,8 @@ export function IntakeWorkspace() {
   const [debugMode, setDebugMode] = useState(false);
   const [rows, setRows] = useState<IntakeRow[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
+  const [sections, setSections] = useState<string[]>(fallbackSections);
+  const [bulkSection, setBulkSection] = useState("General");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState<"generate" | "validate" | "vendorCall" | "export" | "">("");
   const [exportSummary, setExportSummary] = useState({
@@ -178,6 +193,12 @@ export function IntakeWorkspace() {
     missing_product_url: 0,
     missing_image_url: 0,
     export_count: 0,
+    unique_sections: [] as string[],
+    section_counts: {} as Record<string, number>,
+    section_equals_product_name: [] as { index: number; product_name: string; section: string }[],
+    section_too_long: [] as { index: number; product_name: string; section: string }[],
+    too_many_unique_sections: false,
+    canonical_sections: fallbackSections,
   });
   const [errors, setErrors] = useState<string[]>([]);
   const [vendorCall, setVendorCall] = useState<{
@@ -192,8 +213,15 @@ export function IntakeWorkspace() {
 
   useEffect(() => {
     fetchSchema()
-      .then((schema) => setCategories(schema.categories))
-      .catch(() => setCategories([]));
+      .then((schema) => {
+        setCategories(schema.categories);
+        setSections(schema.sections?.length ? schema.sections : fallbackSections);
+        setBulkSection(schema.sections?.[0] || "General");
+      })
+      .catch(() => {
+        setCategories([]);
+        setSections(fallbackSections);
+      });
   }, []);
 
   const bulkImagePreviews = useMemo(
@@ -232,6 +260,12 @@ export function IntakeWorkspace() {
         missing_product_url: 0,
         missing_image_url: 0,
         export_count: 0,
+        unique_sections: [],
+        section_counts: {},
+        section_equals_product_name: [],
+        section_too_long: [],
+        too_many_unique_sections: false,
+        canonical_sections: sections,
       });
       return;
     }
@@ -255,10 +289,19 @@ export function IntakeWorkspace() {
     return () => {
       cancelled = true;
     };
-  }, [includedRows]);
+  }, [includedRows, sections]);
 
   function updateRow(index: number, key: string, value: unknown) {
     setRows((current) => current.map((row, i) => (i === index ? { ...row, [key]: value } : row)));
+  }
+
+  function applyBulkSection() {
+    setRows((current) =>
+      current.map((row) =>
+        row.Include === false ? row : { ...row, "Product Category": bulkSection },
+      ),
+    );
+    setMessage(`Applied ${bulkSection} to included rows.`);
   }
 
   function handleFileSelection(selectedFiles: FileList | null) {
@@ -713,6 +756,34 @@ export function IntakeWorkspace() {
                       Rows without Product Name are excluded from the Programa import file.
                     </p>
                   ) : null}
+                  <div className="mt-4 border-t border-linen pt-4">
+                    <h4 className="text-xs font-semibold uppercase text-charcoal/55">Section Distribution</h4>
+                    {Object.keys(exportSummary.section_counts).length ? (
+                      <div className="mt-2 grid gap-2">
+                        {Object.entries(exportSummary.section_counts).map(([section, count]) => (
+                          <div key={section} className="flex items-center justify-between rounded-lg bg-white px-3 py-2 text-sm">
+                            <span className="font-medium text-charcoal">{section}</span>
+                            <span className="text-charcoal/60">{count} item{count === 1 ? "" : "s"}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="mt-2 text-sm text-taupe">No exportable rows yet.</p>
+                    )}
+                    {exportSummary.section_equals_product_name.length ||
+                    exportSummary.section_too_long.length ||
+                    exportSummary.too_many_unique_sections ? (
+                      <div className="mt-3 rounded-lg border border-orangeBorder bg-orangeSoft px-3 py-2 text-xs font-medium text-bronze">
+                        {exportSummary.section_equals_product_name.length ? (
+                          <div>{exportSummary.section_equals_product_name.length} row(s) have a raw section matching the product name.</div>
+                        ) : null}
+                        {exportSummary.section_too_long.length ? (
+                          <div>{exportSummary.section_too_long.length} row(s) have a raw section longer than 30 characters.</div>
+                        ) : null}
+                        {exportSummary.too_many_unique_sections ? <div>Too many unique sections.</div> : null}
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
                 <div className="rounded-lg border border-linen bg-white p-4">
                   <h3 className="text-sm font-semibold text-charcoal">Download Files</h3>
@@ -756,6 +827,33 @@ export function IntakeWorkspace() {
                       </button>
                     ) : null}
                   </div>
+                  <div className="mt-5 border-t border-linen pt-4">
+                    <h3 className="text-sm font-semibold text-charcoal">Bulk Section Override</h3>
+                    <p className="mt-1 text-xs leading-5 text-taupe">
+                      Sections are controlled. Exports always map to the canonical Programa list.
+                    </p>
+                    <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                      <select
+                        className="h-10 rounded-lg border border-linen bg-white px-3 text-sm text-charcoal"
+                        value={bulkSection}
+                        onChange={(event) => setBulkSection(event.target.value)}
+                      >
+                        {sections.map((section) => (
+                          <option key={section} value={section}>
+                            {section}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        className="inline-flex h-10 items-center justify-center rounded-lg border border-charcoal/15 bg-white px-4 text-sm font-semibold text-charcoal shadow-sm hover:bg-ivory disabled:cursor-not-allowed disabled:text-taupe/60"
+                        disabled={includedRows.length === 0}
+                        onClick={applyBulkSection}
+                        type="button"
+                      >
+                        Apply to Included Rows
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </div>
             </Panel>
@@ -797,6 +895,7 @@ export function IntakeWorkspace() {
                               row={row}
                               column={column}
                               categories={categories}
+                              sections={sections}
                               onChange={(value) => updateRow(index, column, value)}
                               onVendorCall={(fields) => openVendorCall(row, fields)}
                             />
@@ -1181,12 +1280,14 @@ function Cell({
   row,
   column,
   categories,
+  sections,
   onChange,
   onVendorCall,
 }: {
   row: IntakeRow;
   column: string;
   categories: string[];
+  sections: string[];
   onChange: (value: unknown) => void;
   onVendorCall: (missingFields: string[]) => void;
 }) {
@@ -1220,8 +1321,7 @@ function Cell({
           value={rowText(row, column)}
           onChange={(event) => onChange(event.target.value)}
         >
-          <option value="">Select</option>
-          {categories.map((category) => (
+          {sections.map((category) => (
             <option key={category} value={category}>
               {category}
             </option>

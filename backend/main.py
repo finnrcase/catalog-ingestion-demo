@@ -26,6 +26,7 @@ from src.intake_schema import CATEGORIES, STATUSES
 from src.notes import remove_notes_row_prefix
 from src.product_enrichment import enrich_dataframe
 from src.programa_export import (
+    CANONICAL_SECTIONS,
     build_programa_debug_dataframe,
     build_programa_import_dataframe,
     export_programa_csv,
@@ -172,6 +173,7 @@ def health() -> dict:
 def schema() -> dict:
     return {
         "categories": CATEGORIES,
+        "sections": CANONICAL_SECTIONS,
         "statuses": STATUSES,
         "reviewFields": [
             "Include",

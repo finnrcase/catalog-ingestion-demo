@@ -34,6 +34,26 @@ def test_programa_export_validate_endpoint():
     data = response.json()
     assert data["export_count"] == 1
     assert len(data["skipped"]) == 1
+    assert data["section_counts"] == {"Decor": 1}
+    assert "canonical_sections" in data
+
+
+def test_schema_exposes_canonical_sections():
+    response = client.get("/schema")
+
+    assert response.status_code == 200
+    assert response.json()["sections"] == [
+        "Appliances",
+        "Lighting",
+        "Plumbing",
+        "Cabinetry",
+        "Flooring",
+        "Furniture",
+        "Decor",
+        "Hardware",
+        "Exterior",
+        "General",
+    ]
 
 
 def test_programa_export_csv_endpoint_uses_programa_columns():

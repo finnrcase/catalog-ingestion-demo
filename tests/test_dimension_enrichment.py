@@ -4,6 +4,7 @@ from src.dimension_enrichment import (
     BRAND_DOMAIN_TABLE,
     RETAILER_DOMAINS,
     _make_not_found_result,
+    _normalize_model_variants,
 )
 
 
@@ -47,3 +48,40 @@ def test_make_not_found_result_carries_diagnostics():
     assert r.confidence == "none"
     assert r.queries_tried == ["q1", "q2"]
     assert r.failure_reason == "no results found"
+
+
+def test_normalize_model_no_spaces_unchanged():
+    result = _normalize_model_variants("SCN60PA1SU")
+    assert result[0] == "SCN60PA1SU"
+    # No spaces → no-spaces variant is the same, no dashes variant either
+    assert len(result) == 1
+
+
+def test_normalize_model_with_spaces_generates_variants():
+    result = _normalize_model_variants("HV 48 SS")
+    assert "HV 48 SS" in result
+    assert "HV48SS" in result
+    assert "HV-48-SS" in result
+
+
+def test_normalize_model_suffix_stripped_when_short():
+    # Last token "SS" is 2 chars → stripped variant included
+    result = _normalize_model_variants("HV48SS")
+    assert "HV48SS" in result
+    assert "HV48" in result
+
+
+def test_normalize_model_no_suffix_strip_for_long_token():
+    # Last token "PA1SU" is > 3 chars → no suffix stripping
+    result = _normalize_model_variants("SCN60PA1SU")
+    assert "SCN60" not in result
+
+
+def test_normalize_model_single_char_suffix_stripped():
+    result = _normalize_model_variants("MODEL-W")
+    assert "MODEL" in result
+
+
+def test_normalize_model_deduplicates():
+    result = _normalize_model_variants("MODEL")
+    assert result == list(dict.fromkeys(result))  # no duplicates, order preserved

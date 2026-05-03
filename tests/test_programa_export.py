@@ -236,7 +236,7 @@ def test_photo_only_export_allows_blank_brand_sku_model_url_dimensions():
     assert df.iloc[0]["Model"] == ""
     assert df.iloc[0]["Product URL"] == ""
     assert df.iloc[0]["Dimensions"] == ""
-    assert df.iloc[0]["Section"] == "Accessories"
+    assert df.iloc[0]["Section"] == "Decor"
     assert df.iloc[0]["Image URL"].startswith("https://")
 
 
@@ -352,7 +352,32 @@ def test_validate_result_keys():
     assert set(result.keys()) == {
         "skipped", "missing_section", "missing_dimensions",
         "missing_product_url", "missing_image_url", "export_count",
+        "unique_sections", "section_counts", "section_equals_product_name",
+        "section_too_long", "too_many_unique_sections", "canonical_sections",
     }
+
+
+def test_validate_returns_section_distribution():
+    rows = _make_rows([
+        {"Product Category": "Seating"},
+        {"Product Category": "Lighting"},
+        {"Product Category": "Accessories"},
+    ])
+    result = validate_for_export(rows)
+    assert result["unique_sections"] == ["Decor", "Furniture", "Lighting"]
+    assert result["section_counts"] == {"Decor": 1, "Furniture": 1, "Lighting": 1}
+
+
+def test_validate_flags_section_equal_product_name_and_long_raw_section():
+    long_section = "This Section Name Is Definitely Too Long"
+    rows = _make_rows([
+        {"Product Name": "Lamp", "Product Category": "Lamp"},
+        {"Product Name": "Long Raw", "Product Category": long_section},
+    ])
+    result = validate_for_export(rows)
+    assert result["section_equals_product_name"][0]["product_name"] == "Lamp"
+    assert result["section_too_long"][0]["section"] == long_section
+    assert result["too_many_unique_sections"] is False
 
 
 # ── build_programa_import_dataframe ───────────────────────────────────────────
@@ -363,7 +388,9 @@ from src.programa_export import (
     export_programa_csv,
     export_programa_xlsx,
     PROGRAMA_COLUMNS,
+    CANONICAL_SECTIONS,
     _DEBUG_EXTRA_COLUMNS,
+    normalize_section,
 )
 
 
@@ -401,6 +428,24 @@ def test_build_scotsman_acceptance_case():
     assert df.iloc[0]["Depth (in)"] == "22"
     assert "[Materials:" not in df.iloc[0]["Notes"]
     assert df.iloc[0]["Material"] == "Stainless Steel"
+
+
+def test_section_normalization_maps_legacy_categories_to_canonical_sections():
+    assert normalize_section("Seating") == "Furniture"
+    assert normalize_section("Stone/Tile") == "Flooring"
+    assert normalize_section("Accessories") == "Decor"
+    assert normalize_section("Totally Custom One-Off") == "General"
+
+
+def test_export_contains_only_canonical_sections():
+    rows = _make_rows([
+        {"Product Category": "Seating"},
+        {"Product Category": "Stone/Tile"},
+        {"Product Category": "Product Name As Section", "Product Name": "Product Name As Section"},
+    ])
+    df = build_programa_import_dataframe(rows)
+    assert set(df["Section"]).issubset(set(CANONICAL_SECTIONS))
+    assert list(df["Section"]) == ["Furniture", "Flooring", "General"]
 
 
 def test_build_accepts_dataframe_input():

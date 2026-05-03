@@ -29,6 +29,7 @@ export type IntakeResponse = {
 
 export type SchemaResponse = {
   categories: string[];
+  sections: string[];
   statuses: string[];
   reviewFields: string[];
 };
@@ -40,6 +41,12 @@ export type ProgramaExportValidation = {
   missing_product_url: number;
   missing_image_url: number;
   export_count: number;
+  unique_sections: string[];
+  section_counts: Record<string, number>;
+  section_equals_product_name: { index: number; product_name: string; section: string }[];
+  section_too_long: { index: number; product_name: string; section: string }[];
+  too_many_unique_sections: boolean;
+  canonical_sections: string[];
 };
 
 export type VendorCallResponse = {
