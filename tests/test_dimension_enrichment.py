@@ -312,3 +312,20 @@ def test_find_dimension_candidates_shipping_not_included_when_product_found():
     candidates = _find_dimension_candidates(text, include_shipping=True)
     assert not any("18" in c for c in candidates)
     assert any("14" in c for c in candidates)
+
+
+def test_find_dimension_candidates_inline_inside_cutout_span_excluded():
+    # A cutout label with inline W×H×D values — should not appear without include_cutout
+    text = 'Cutout Dimensions: 13.5"W x 32.5"H x 21.5"D'
+    candidates = _find_dimension_candidates(text)
+    assert candidates == []
+
+
+def test_find_dimension_candidates_bare_dimensions_excluded_when_inside_product_span():
+    # "Product Dimensions: ..." contains the word "dimensions" — bare _DIM_LABEL
+    # must not double-capture it as a Priority 2 candidate
+    text = 'Product Dimensions: 14"W x 33"H x 22"D'
+    candidates = _find_dimension_candidates(text)
+    # Should have exactly 1 candidate (from Product Dimensions), not 2
+    assert len(candidates) == 1
+    assert "14" in candidates[0]

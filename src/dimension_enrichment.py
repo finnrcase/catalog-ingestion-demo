@@ -305,14 +305,14 @@ def _find_dimension_candidates(
         _add(m.group(1))
 
     # Priority 2: bare "Dimensions:" — exclude matches already captured by
-    # product/overall/cutout/shipping labels
-    product_spans = {m.start() for m in _PRODUCT_DIM_LABELS.finditer(text)}
-    cutout_spans = {m.start() for m in _CUTOUT_DIM_LABEL.finditer(text)}
-    shipping_spans = {m.start() for m in _SHIPPING_DIM_LABEL.finditer(text)}
-    excluded_spans = product_spans | cutout_spans | shipping_spans
+    # product/overall/cutout/shipping labels (use span containment, not proximity)
+    excluded_ranges = [
+        (m.start(), m.end())
+        for pat in (_PRODUCT_DIM_LABELS, _CUTOUT_DIM_LABEL, _SHIPPING_DIM_LABEL)
+        for m in pat.finditer(text)
+    ]
     for m in _DIM_LABEL.finditer(text):
-        # Skip if this match's start is within 30 chars of a priority-label match
-        if any(abs(m.start() - s) < 30 for s in excluded_spans):
+        if any(r_start <= m.start() < r_end for r_start, r_end in excluded_ranges):
             continue
         _add(m.group(1))
 
