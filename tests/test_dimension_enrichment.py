@@ -133,3 +133,83 @@ def test_get_domain_discovery_failure_returns_none():
         return []
     result = _get_manufacturer_domain("NoResultsBrand", _search_fn=_empty_search)
     assert result is None
+
+
+from src.dimension_enrichment import _generate_queries, _generate_retailer_queries
+
+
+def test_generate_queries_with_domain_produces_site_queries():
+    queries = _generate_queries(
+        brand="Scotsman",
+        model="SCN60PA1SU",
+        domain="scotsman-ice.com",
+    )
+    assert 'site:scotsman-ice.com "SCN60PA1SU" dimensions' in queries
+    assert 'site:scotsman-ice.com "SCN60PA1SU" specifications' in queries
+    assert 'site:scotsman-ice.com "SCN60PA1SU" spec sheet' in queries
+    assert 'site:scotsman-ice.com "SCN60PA1SU" installation guide' in queries
+
+
+def test_generate_queries_always_includes_general_queries():
+    queries = _generate_queries(brand="Scotsman", model="SCN60PA1SU", domain=None)
+    assert '"Scotsman" "SCN60PA1SU" "dimensions"' in queries
+    assert '"Scotsman" "SCN60PA1SU" "specifications"' in queries
+
+
+def test_generate_queries_without_domain_skips_site_queries():
+    queries = _generate_queries(brand="Unknown", model="XYZ", domain=None)
+    assert not any(q.startswith("site:") for q in queries)
+
+
+def test_generate_queries_fallbacks_with_product_name():
+    queries = _generate_queries(
+        brand="Scotsman",
+        model="SCN60PA1SU",
+        domain=None,
+        product_name="Icemaker Built-In",
+        sku="SCN60PA1SU",
+    )
+    assert '"Scotsman" "Icemaker Built-In" dimensions' in queries
+    assert '"SCN60PA1SU" dimensions specifications' in queries
+
+
+def test_generate_queries_order_site_before_general():
+    queries = _generate_queries(
+        brand="Kohler",
+        model="K-3999",
+        domain="kohler.com",
+    )
+    first_site = next(i for i, q in enumerate(queries) if q.startswith("site:"))
+    first_general = next(i for i, q in enumerate(queries) if '"Kohler"' in q and "site:" not in q)
+    assert first_site < first_general
+
+
+def test_generate_queries_deduplicates():
+    # When sku == model, the fallback sku query should not duplicate the broad query
+    queries = _generate_queries(
+        brand="Scotsman",
+        model="SCN60PA1SU",
+        domain=None,
+        sku="SCN60PA1SU",
+    )
+    assert queries == list(dict.fromkeys(queries))
+
+
+def test_generate_queries_bounded():
+    # With all optional args, query count stays reasonable
+    queries = _generate_queries(
+        brand="Kohler",
+        model="K-3999",
+        domain="kohler.com",
+        product_name="Highline Toilet",
+        sku="K-3999",
+    )
+    assert len(queries) <= 9
+
+
+def test_generate_retailer_queries():
+    queries = _generate_retailer_queries(brand="Kohler", model="K-3999")
+    assert any("build.com" in q for q in queries)
+    assert any("ajmadison.com" in q for q in queries)
+    assert all(q.startswith("site:") for q in queries)
+    assert len(queries) == len(RETAILER_DOMAINS)

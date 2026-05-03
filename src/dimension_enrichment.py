@@ -172,6 +172,56 @@ def _get_manufacturer_domain(
     return None
 
 
+def _generate_queries(
+    brand: str,
+    model: str,
+    domain: str | None,
+    product_name: str = "",
+    sku: str = "",
+) -> list[str]:
+    """
+    Return search queries in priority order: manufacturer site-targeted (phase 1),
+    general brand (phase 2), final fallbacks (phase 4).
+    Retailer queries (phase 3) are generated separately by _generate_retailer_queries.
+    Bounded to <= 9 queries (deduplication may reduce further).
+    """
+    queries: list[str] = []
+    seen: set[str] = set()
+
+    def _add(q: str) -> None:
+        if q not in seen:
+            seen.add(q)
+            queries.append(q)
+
+    # Phase 1 — manufacturer site-targeted
+    if domain:
+        _add(f'site:{domain} "{model}" dimensions')
+        _add(f'site:{domain} "{model}" specifications')
+        _add(f'site:{domain} "{model}" spec sheet')
+        _add(f'site:{domain} "{model}" installation guide')
+
+    # Phase 2 — general brand queries
+    _add(f'"{brand}" "{model}" "dimensions"')
+    _add(f'"{brand}" "{model}" "specifications"')
+
+    # Phase 4 — final fallbacks
+    if product_name:
+        _add(f'"{brand}" "{product_name}" dimensions')
+    if sku:
+        _add(f'"{sku}" dimensions specifications')
+    _add(f'"{brand}" "{model}" dimensions')
+
+    return queries
+
+
+def _generate_retailer_queries(brand: str, model: str) -> list[str]:
+    """Return one site: query per trusted retailer domain (phase 3)."""
+    return [
+        f'site:{domain} "{brand}" "{model}" dimensions'
+        for domain in RETAILER_DOMAINS
+    ]
+
+
 def find_dimensions(row: dict) -> DimensionResult:
     """Perform full dimension lookup for a single intake row. Stub — implemented in Task 11."""
     return _make_not_found_result(failure_reason="not implemented")
