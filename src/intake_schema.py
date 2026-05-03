@@ -52,6 +52,7 @@ CATEGORIES: list[str] = [
     "Tables",
     "Gym Equipment",
     "Fabrics/Pillows",
+    "Furniture",
     "Lighting",
     "Rugs",
     "Mirrors",
@@ -59,7 +60,10 @@ CATEGORIES: list[str] = [
     "Dressers/Drawers/Storage",
     "Appliances",
     "Accessories",
+    "Decor",
+    "Art",
     "Artwork",
+    "General",
     "Bedding/Linens/Bath Linens",
 ]
 
