@@ -38,32 +38,39 @@ ALL_COLUMNS: list[str] = [
     "Local Image Path",
     "Image Filename",
     "Image Upload Status",
+    "Dimension Source URL",
+    "Dimension Confidence",
+    "Dimension Source Type",
+    "Dimension Lookup Status",
 ]
 
 # ── Category options ───────────────────────────────────────────────────────────
 # Title-case list shared by the manual-entry form, data editor, and AI prompt.
 
 CATEGORIES: list[str] = [
+    "Appliances",
+    "Lighting",
+    "Plumbing",
+    "Cabinetry",
+    "Flooring",
+    "Furniture",
+    "Decor",
+    "Hardware",
+    "Exterior",
+    "General",
     "Paint/Wallpaper",
     "Stone/Tile",
     "Seating",
-    "Hardware",
-    "Flooring",
     "Tables",
     "Gym Equipment",
     "Fabrics/Pillows",
-    "Furniture",
-    "Lighting",
     "Rugs",
     "Mirrors",
     "Beds/Mattresses",
     "Dressers/Drawers/Storage",
-    "Appliances",
     "Accessories",
-    "Decor",
     "Art",
     "Artwork",
-    "General",
     "Bedding/Linens/Bath Linens",
 ]
 
@@ -148,4 +155,8 @@ def make_base_row(
         "Local Image Path":       "",
         "Image Filename":         "",
         "Image Upload Status":    "",
+        "Dimension Source URL":   "",
+        "Dimension Confidence":   "",
+        "Dimension Source Type":  "",
+        "Dimension Lookup Status": "",
     }

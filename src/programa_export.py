@@ -61,16 +61,94 @@ PROGRAMA_COLUMNS: list[str] = [
     "Location",
 ]
 
+CANONICAL_SECTIONS: list[str] = [
+    "Appliances",
+    "Lighting",
+    "Plumbing",
+    "Cabinetry",
+    "Flooring",
+    "Furniture",
+    "Decor",
+    "Hardware",
+    "Exterior",
+    "General",
+]
+
 _DEBUG_EXTRA_COLUMNS: list[str] = [
     "Confidence Score",
     "Source Type",
     "AI Category Confidence",
     "Category Source",
     "Local Image Path",
+    "Dimension Source URL",
+    "Dimension Confidence",
+    "Dimension Source Type",
+    "Dimension Lookup Status",
 ]
 
 _MATERIAL_TAG_RE = re.compile(r"\[Materials:\s*([^\]]+)\]", re.IGNORECASE)
 _SYSTEM_TAG_RE = re.compile(r"\[[^\]]*\]")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+_SECTION_ALIASES: dict[str, str] = {
+    "": "General",
+    "accessories": "Decor",
+    "accessory": "Decor",
+    "appliance": "Appliances",
+    "appliances": "Appliances",
+    "art": "Decor",
+    "artwork": "Decor",
+    "bath": "Plumbing",
+    "bath linens": "Decor",
+    "bathroom": "Plumbing",
+    "bedding": "Decor",
+    "bedding linens bath linens": "Decor",
+    "beds": "Furniture",
+    "beds mattresses": "Furniture",
+    "cabinet": "Cabinetry",
+    "cabinets": "Cabinetry",
+    "cabinetry": "Cabinetry",
+    "casework": "Cabinetry",
+    "chairs": "Furniture",
+    "decor": "Decor",
+    "decoration": "Decor",
+    "decorative": "Decor",
+    "dresser": "Furniture",
+    "dressers drawers storage": "Furniture",
+    "electrical": "Lighting",
+    "exterior": "Exterior",
+    "fabric": "Decor",
+    "fabrics pillows": "Decor",
+    "flooring": "Flooring",
+    "furniture": "Furniture",
+    "general": "General",
+    "gym equipment": "Furniture",
+    "hardware": "Hardware",
+    "lighting": "Lighting",
+    "lights": "Lighting",
+    "linen": "Decor",
+    "linens": "Decor",
+    "millwork": "Cabinetry",
+    "mirror": "Decor",
+    "mirrors": "Decor",
+    "outdoor": "Exterior",
+    "paint": "Decor",
+    "paint wallpaper": "Decor",
+    "pillow": "Decor",
+    "pillows": "Decor",
+    "plumbing": "Plumbing",
+    "rug": "Decor",
+    "rugs": "Decor",
+    "seating": "Furniture",
+    "sofa": "Furniture",
+    "stone": "Flooring",
+    "stone tile": "Flooring",
+    "storage": "Furniture",
+    "table": "Furniture",
+    "tables": "Furniture",
+    "tile": "Flooring",
+    "wallpaper": "Decor",
+}
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -81,6 +159,58 @@ def _str_val(v) -> str:
         return ""
     s = str(v).strip()
     return "" if s.lower() in {"nan", "none", "null"} else s
+
+
+def _section_key(value: str) -> str:
+    return _NON_ALNUM_RE.sub(" ", value.strip().lower()).strip()
+
+
+def normalize_section(value: object) -> str:
+    """Map any inferred category/section to the controlled Programa section list."""
+    raw = _str_val(value)
+    key = _section_key(raw)
+    if not key:
+        return "General"
+    canonical_lookup = {_section_key(section): section for section in CANONICAL_SECTIONS}
+    if key in canonical_lookup:
+        return canonical_lookup[key]
+    if key in _SECTION_ALIASES:
+        return _SECTION_ALIASES[key]
+
+    # Keyword fallback catches verbose AI labels like "decorative table lamp".
+    keyword_map = [
+        ("appliance", "Appliances"),
+        ("light", "Lighting"),
+        ("lamp", "Lighting"),
+        ("plumb", "Plumbing"),
+        ("sink", "Plumbing"),
+        ("faucet", "Plumbing"),
+        ("cabinet", "Cabinetry"),
+        ("millwork", "Cabinetry"),
+        ("floor", "Flooring"),
+        ("tile", "Flooring"),
+        ("stone", "Flooring"),
+        ("chair", "Furniture"),
+        ("seat", "Furniture"),
+        ("sofa", "Furniture"),
+        ("table", "Furniture"),
+        ("bed", "Furniture"),
+        ("dresser", "Furniture"),
+        ("rug", "Decor"),
+        ("mirror", "Decor"),
+        ("pillow", "Decor"),
+        ("decor", "Decor"),
+        ("art", "Decor"),
+        ("hardware", "Hardware"),
+        ("knob", "Hardware"),
+        ("pull", "Hardware"),
+        ("exterior", "Exterior"),
+        ("outdoor", "Exterior"),
+    ]
+    for needle, section in keyword_map:
+        if needle in key:
+            return section
+    return "General"
 
 
 def _extract_material_from_notes(notes: str) -> str:
@@ -129,7 +259,7 @@ def _is_exportable(row: dict) -> bool:
     if not (_is_included(row) and _str_val(row.get("Product Name"))):
         return False
     if _is_photo_only(row):
-        return bool(_str_val(row.get("Product Category")) and _str_val(row.get("Image URL")))
+        return bool(_str_val(row.get("Image URL")))
     return True
 
 
@@ -153,7 +283,7 @@ def _row_to_programa_dict(row: dict) -> dict:
     material = _str_val(row.get("Material")) or _extract_material_from_notes(_str_val(row.get("Notes")))
 
     return {
-        "Section": _str_val(row.get("Product Category")) or "General",
+        "Section": normalize_section(row.get("Product Category") or row.get("Section")),
         "Product Name": _str_val(row.get("Product Name")),
         "Brand": _str_val(row.get("Brand")),
         "SKU": _str_val(row.get("Model/SKU")),
@@ -193,21 +323,29 @@ def validate_for_export(rows) -> dict:
     missing_product_url = 0
     missing_image_url = 0
     export_count = 0
+    section_counts: dict[str, int] = {}
+    section_equals_product_name: list[dict] = []
+    section_too_long: list[dict] = []
 
     for i, row in enumerate(included):
         name = _str_val(row.get("Product Name"))
         if not name:
             skipped.append({"index": i, "product_name": "(no name)"})
             continue
-        if _is_photo_only(row) and (
-            not _str_val(row.get("Product Category")) or not _str_val(row.get("Image URL"))
-        ):
+        raw_section = _str_val(row.get("Product Category") or row.get("Section"))
+        section = normalize_section(raw_section)
+        if _is_photo_only(row) and not _str_val(row.get("Image URL")):
             skipped.append({"index": i, "product_name": name})
             continue
 
         export_count += 1
-        if not _str_val(row.get("Product Category")):
+        section_counts[section] = section_counts.get(section, 0) + 1
+        if not raw_section:
             missing_section.append({"index": i, "product_name": name})
+        if raw_section and _section_key(raw_section) == _section_key(name):
+            section_equals_product_name.append({"index": i, "product_name": name, "section": raw_section})
+        if len(raw_section) > 30:
+            section_too_long.append({"index": i, "product_name": name, "section": raw_section})
         if not has_complete_3d_dimensions(_str_val(row.get("Dimensions"))):
             missing_dimensions += 1
         if not _str_val(row.get("Product URL")):
@@ -222,6 +360,12 @@ def validate_for_export(rows) -> dict:
         "missing_product_url": missing_product_url,
         "missing_image_url": missing_image_url,
         "export_count": export_count,
+        "unique_sections": sorted(section_counts),
+        "section_counts": dict(sorted(section_counts.items())),
+        "section_equals_product_name": section_equals_product_name,
+        "section_too_long": section_too_long,
+        "too_many_unique_sections": len(section_counts) > len(CANONICAL_SECTIONS),
+        "canonical_sections": CANONICAL_SECTIONS,
     }
 
 
