@@ -19,6 +19,8 @@ ALL_COLUMNS: list[str] = [
     "Brand",
     "Dimensions",
     "Finish / Color",
+    "Color",
+    "Material",
     "Model/SKU",        # display label → "Serial / Model Number"
     "Product Category",
     "Quantity",
@@ -36,7 +38,6 @@ ALL_COLUMNS: list[str] = [
     "Local Image Path",
     "Image Filename",
     "Image Upload Status",
-    "photo_only",
 ]
 
 # ── Category options ───────────────────────────────────────────────────────────
@@ -124,6 +125,8 @@ def make_base_row(
         "Brand":            "",
         "Dimensions":       "",
         "Finish / Color":   "",
+        "Color":            "",
+        "Material":         "",
         "Model/SKU":        "",
         "Product Category": "",
         "Quantity":         1,

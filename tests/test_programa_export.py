@@ -211,3 +211,45 @@ def test_output_has_all_programa_columns():
     result = _row_to_programa_dict(_scotsman_row())
     for col in PROGRAMA_COLUMNS:
         assert col in result, f"Missing column: {col}"
+
+
+def test_photo_only_export_allows_blank_brand_sku_model_url_dimensions():
+    from src.programa_export import build_programa_import_dataframe
+
+    row = {
+        "Include": True,
+        "Source Type": "Photo",
+        "Import Type": "Photo Inventory Upload",
+        "photo_only": True,
+        "Product Name": "Handmade Ceramic Bowl",
+        "Product Category": "Accessories",
+        "Image URL": "https://res.cloudinary.com/demo/image/upload/bowl.jpg",
+        "Color": "Ivory",
+        "Material": "Ceramic",
+        "Notes": "Photo-only item; details generated from uploaded image.",
+    }
+
+    df = build_programa_import_dataframe([row])
+    assert len(df) == 1
+    assert df.iloc[0]["Brand"] == ""
+    assert df.iloc[0]["SKU"] == ""
+    assert df.iloc[0]["Model"] == ""
+    assert df.iloc[0]["Product URL"] == ""
+    assert df.iloc[0]["Dimensions"] == ""
+    assert df.iloc[0]["Section"] == "Accessories"
+    assert df.iloc[0]["Image URL"].startswith("https://")
+
+
+def test_photo_only_export_skips_missing_image_url():
+    from src.programa_export import build_programa_import_dataframe
+
+    row = {
+        "Include": True,
+        "Source Type": "Photo",
+        "photo_only": True,
+        "Product Name": "Handmade Bowl",
+        "Product Category": "Accessories",
+        "Image URL": "",
+    }
+
+    assert build_programa_import_dataframe([row]).empty

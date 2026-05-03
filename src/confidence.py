@@ -121,7 +121,14 @@ def identify_missing_fields(row: dict) -> list[str]:
     """
     source = _str(row.get("Source Type"))
     if _is_photo_only(row):
-        return []
+        missing = []
+        if not _str(row.get("Product Name")):
+            missing.append("Product Name")
+        if not _str(row.get("Product Category")):
+            missing.append("Product Category")
+        if not _str(row.get("Image URL")):
+            missing.append("Image URL")
+        return missing
 
     if source == SOURCE_URL:
         missing = []
@@ -144,7 +151,14 @@ def identify_missing_fields(row: dict) -> list[str]:
 def calculate_row_confidence(row: dict) -> int:
     """Return a confidence score between 0 and 100."""
     if _is_photo_only(row):
-        return 0
+        score = 85
+        if not _str(row.get("Product Name")):
+            score -= 35
+        if not _str(row.get("Product Category")):
+            score -= 25
+        if not _str(row.get("Image URL")):
+            score -= 25
+        return max(0, score)
 
     if _is_ignored_row(row):
         return 0
@@ -193,7 +207,7 @@ def calculate_row_confidence(row: dict) -> int:
 def should_require_review(row: dict) -> bool:
     """True if this row needs a human to verify it before sending to Programa."""
     if _is_photo_only(row):
-        return False
+        return bool(identify_missing_fields(row))
 
     if _is_ignored_row(row):
         return False
@@ -210,7 +224,7 @@ def should_require_review(row: dict) -> bool:
 def classify_row_status(row: dict) -> str:
     """Return a descriptive status label derived from the row's data."""
     if _is_photo_only(row):
-        return "Needs Review"
+        return "Ready for Review" if not identify_missing_fields(row) else "Needs Review"
 
     if _is_ignored_row(row):
         return "Ignored"
@@ -231,7 +245,10 @@ def classify_row_status(row: dict) -> str:
 def _suggested_action(row: dict, missing: list[str]) -> str:
     """Build a short, actionable string for the Suggested Action column."""
     if _is_photo_only(row):
-        return "Photo-only products are ready to send as blank Programa items with images attached"
+        missing = identify_missing_fields(row)
+        if missing:
+            return f"Photo-only item missing {', '.join(missing)}"
+        return "Review AI-generated photo details before Programa export"
 
     if _is_ignored_row(row):
         name = _str(row.get("Product Name"))

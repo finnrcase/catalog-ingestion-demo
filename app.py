@@ -15,10 +15,20 @@ from src.intake import (
     COLUMNS,
     build_intake_dataframe,
     create_pdf_rows,
-    create_photo_rows,
     create_url_rows,
 )
 from src.export import get_csv_bytes
+from src.photo_inventory import (
+    analyze_photo_with_ai,
+    create_photo_inventory_row,
+    upload_image_to_cloudinary,
+)
+from src.programa_export import (
+    build_programa_import_dataframe,
+    export_programa_csv,
+    export_programa_xlsx,
+    validate_for_export,
+)
 from src.programa_automation import (
     open_programa_login_window,
     run_programa_automation,
@@ -64,6 +74,8 @@ DISPLAY_COLUMNS = [
     "Brand",
     "Dimensions",
     "Finish / Color",
+    "Color",
+    "Material",
     "Model/SKU",
     "Product Category",
     "Quantity",
@@ -79,6 +91,7 @@ DISPLAY_COLUMNS = [
     "Category Source",
     "Image Filename",
     "Image Upload Status",
+    "Image URL",
 ]
 
 
@@ -349,7 +362,7 @@ with left_col:
 
 with right_col:
     with st.container(border=True):
-        url_tab, photo_tab = st.tabs(["Product URLs", "Bulk Photo Upload"])
+        url_tab, photo_tab = st.tabs(["Product URLs", "Photo Inventory Upload"])
         with url_tab:
             section_label("Product URLs")
             url_input = st.text_area(
@@ -363,10 +376,13 @@ with right_col:
                 st.caption(f"{len(valid_urls)} URL{'s' if len(valid_urls) != 1 else ''} detected")
 
         with photo_tab:
-            section_label("Bulk Photo Upload")
-            st.caption("Create one blank product row per image. No enrichment or scraping runs for this path.")
+            section_label("Photo Inventory Upload")
+            st.caption(
+                "Upload handmade or one-off item photos. AI drafts one Programa row per image, "
+                "then Cloudinary stores the public Image URL."
+            )
             bulk_photo_files = st.file_uploader(
-                "Upload product photos",
+                "Upload inventory photos",
                 type=ACCEPTED_PHOTO_TYPES,
                 accept_multiple_files=True,
                 key="bulk_photo_upload_files",
@@ -392,7 +408,7 @@ with right_col:
                     st.caption(f"+ {remaining} more image{'s' if remaining != 1 else ''}")
 
             create_photo_products = st.button(
-                "Create Products",
+                "AI-Generate Draft Product Rows",
                 type="secondary",
                 use_container_width=True,
                 key="create_bulk_photo_products",
@@ -402,18 +418,37 @@ with right_col:
                 if not bulk_photo_files:
                     st.warning("Upload at least one product photo first.", icon="⚠️")
                 else:
-                    saved_photos = []
+                    draft_rows = []
                     progress = st.progress(0, text="Saving product photos…")
                     for idx, photo_file in enumerate(bulk_photo_files, start=1):
                         try:
-                            saved_photos.append(_save_bulk_photo_upload(photo_file))
+                            photo_meta = _save_bulk_photo_upload(photo_file)
+                            ai_fields, ai_error = analyze_photo_with_ai(
+                                photo_meta["local_image_path"],
+                                photo_meta["image_filename"],
+                            )
+                            image_url, upload_error = upload_image_to_cloudinary(photo_meta["local_image_path"])
+                            status_bits = [msg for msg in [ai_error, upload_error] if msg]
+                            if image_url:
+                                photo_meta["image_upload_status"] = "Uploaded"
+                            elif upload_error:
+                                photo_meta["image_upload_status"] = "Needs Cloudinary"
+                            draft_rows.append(
+                                create_photo_inventory_row(
+                                    photo_meta,
+                                    selected_project,
+                                    room,
+                                    ai_fields=ai_fields,
+                                    image_url=image_url,
+                                    status_note=" ".join(status_bits),
+                                )
+                            )
                         except Exception as exc:
                             st.warning(f"Could not save {photo_file.name}: {exc}", icon="⚠️")
                         progress.progress(idx / len(bulk_photo_files), text=f"Saved {idx} of {len(bulk_photo_files)} photos")
                     progress.empty()
-                    if saved_photos:
-                        photo_rows = create_photo_rows(saved_photos, selected_project, room)
-                        photo_df = pd.DataFrame(photo_rows)
+                    if draft_rows:
+                        photo_df = pd.DataFrame(draft_rows)
                         if st.session_state.intake_df is not None and not st.session_state.intake_df.empty:
                             combined = pd.concat([st.session_state.intake_df, photo_df], ignore_index=True)
                         else:
@@ -422,7 +457,7 @@ with right_col:
                         st.session_state.automation_results = None
                         st.session_state.pending_enrichment = False
                         st.success(
-                            f"Created {len(saved_photos)} blank product row{'s' if len(saved_photos) != 1 else ''} from photos."
+                            f"Created {len(draft_rows)} photo inventory draft row{'s' if len(draft_rows) != 1 else ''}."
                         )
 
 st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
@@ -535,7 +570,14 @@ if st.session_state.intake_df is not None:
     def _missing_required_fields(row: pd.Series) -> list[str]:
         """Return column names of required fields that are missing or incomplete."""
         if _is_photo_only_row(row):
-            return []
+            missing = []
+            if not str(row.get("Product Name", "") or "").strip():
+                missing.append("Product Name")
+            if not str(row.get("Product Category", "") or "").strip():
+                missing.append("Product Category")
+            if not str(row.get("Image URL", "") or "").strip():
+                missing.append("Image URL")
+            return missing
         missing = []
         if not str(row.get("Product Name", "") or "").strip():
             missing.append("Product Name")
@@ -700,7 +742,7 @@ if st.session_state.intake_df is not None:
 
     if photo_only_n > 0:
         st.info(
-            "Photo-only products are ready to send. They will create blank Programa items with images attached.",
+            "Photo-only products use Product Name, Section, and hosted Image URL as their required fields.",
             icon="ℹ️",
         )
 
@@ -738,7 +780,11 @@ if st.session_state.intake_df is not None:
         if str(row.get("Status", "")) in _BLOCKED_STATUSES:
             return False
         if _is_photo_only_row(row):
-            return True
+            return (
+                bool(str(row.get("Product Name", "") or "").strip())
+                and bool(str(row.get("Product Category", "") or "").strip())
+                and bool(str(row.get("Image URL", "") or "").strip())
+            )
         if not str(row.get("Product Name", "") or "").strip():
             return False
         try:
@@ -759,6 +805,12 @@ if st.session_state.intake_df is not None:
         if str(row.get("Status", "")) in _BLOCKED_STATUSES:
             reasons.append(f"Status: {row.get('Status', '')}")
         if _is_photo_only_row(row):
+            if not str(row.get("Product Name", "") or "").strip():
+                reasons.append("No product name")
+            if not str(row.get("Product Category", "") or "").strip():
+                reasons.append("No category")
+            if not str(row.get("Image URL", "") or "").strip():
+                reasons.append("No hosted image URL")
             return "; ".join(reasons) if reasons else "Unknown"
         if not str(row.get("Product Name", "") or "").strip():
             reasons.append("No product name")
@@ -1236,6 +1288,8 @@ if st.session_state.intake_df is not None:
             "Brand": st.column_config.TextColumn("Brand", width="medium"),
             "Dimensions": st.column_config.TextColumn("Dimensions", width="medium"),
             "Finish / Color": st.column_config.TextColumn("Finish / Color", width="medium"),
+            "Color": st.column_config.TextColumn("Color", width="medium"),
+            "Material": st.column_config.TextColumn("Material", width="medium"),
             "Model/SKU": st.column_config.TextColumn(
                 "Serial / Model Number", width="medium"
             ),
@@ -1277,7 +1331,7 @@ if st.session_state.intake_df is not None:
             "Image Upload Status": st.column_config.TextColumn(
                 "Image Status", width="small", disabled=True
             ),
-            "Image URL": None,
+            "Image URL": st.column_config.LinkColumn("Image URL", width="medium"),
             "Local Image Path": None,
             "photo_only": None,
         },
@@ -1309,6 +1363,26 @@ if st.session_state.intake_df is not None:
             mime="text/csv",
             use_container_width=True,
         )
+        export_summary = validate_for_export(included)
+        programa_df = build_programa_import_dataframe(included)
+        if export_summary["missing_image_url"] > 0:
+            st.caption(f"{export_summary['missing_image_url']} Programa export row(s) are missing Image URL.")
+        st.download_button(
+            label="Export Programa CSV",
+            data=export_programa_csv(programa_df),
+            file_name=f"{safe_name}_programa_import.csv",
+            mime="text/csv",
+            use_container_width=True,
+            disabled=programa_df.empty,
+        )
+        st.download_button(
+            label="Export Programa XLSX",
+            data=export_programa_xlsx(programa_df),
+            file_name=f"{safe_name}_programa_import.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            disabled=programa_df.empty,
+        )
 
     # ── Needs Review ───────────────────────────────────────────────────────────
     _incl_mask_nr = (
@@ -1334,6 +1408,8 @@ if st.session_state.intake_df is not None:
             "Quantity":     "Enter quantity",
             "Supplier":     "Enter who bought this from",
             "Room":         "Enter location",
+            "Product Category": "Choose section/category",
+            "Image URL":     "Paste hosted image URL",
         }
         _FIELD_LABELS = {
             "Product Name": "Product Name",
@@ -1342,6 +1418,8 @@ if st.session_state.intake_df is not None:
             "Quantity":     "Quantity",
             "Supplier":     "Supplier",
             "Room":         "Location",
+            "Product Category": "Section",
+            "Image URL":     "Image URL",
         }
 
         def _render_vendor_call_panel(row_idx: int, row_data: pd.Series, missing_field: str) -> None:
@@ -1792,6 +1870,7 @@ if st.session_state.intake_df is not None:
                         st.caption(f"Current: {_current_dim}")
                 with input_col:
                     review_updates[idx] = {}
+                    _can_vendor_lookup = bool(_brand and _sku)
                     for field in missing_fields:
                         field_input_col, phone_col = st.columns([12, 1])
                         with field_input_col:
@@ -1808,6 +1887,7 @@ if st.session_state.intake_df is not None:
                                 key=f"vendor_call_open_{field}_{idx}",
                                 help=f"Call vendor for {_FIELD_LABELS[field]}",
                                 use_container_width=True,
+                                disabled=not _can_vendor_lookup,
                             ):
                                 panel_key = f"{idx}_{field}"
                                 current_panel = st.session_state.get("vendor_call_panel")

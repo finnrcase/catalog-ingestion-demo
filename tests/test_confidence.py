@@ -134,6 +134,6 @@ def test_photo_only_rows_are_not_auto_ignored():
     }
 
     assert classify_row_status(row) == "Needs Review"
-    assert should_require_review(row) is False
-    assert identify_missing_fields(row) == []
-    assert "ready to send" in _suggested_action(row, [])
+    assert should_require_review(row) is True
+    assert identify_missing_fields(row) == ["Product Name", "Product Category", "Image URL"]
+    assert "Photo-only item missing Product Name, Product Category, Image URL" == _suggested_action(row, [])
