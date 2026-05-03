@@ -25,6 +25,13 @@ from src.intake import build_intake_dataframe, create_pdf_rows, create_url_rows
 from src.intake_schema import CATEGORIES, STATUSES
 from src.notes import remove_notes_row_prefix
 from src.product_enrichment import enrich_dataframe
+from src.programa_export import (
+    build_programa_debug_dataframe,
+    build_programa_import_dataframe,
+    export_programa_csv,
+    export_programa_xlsx,
+    validate_for_export,
+)
 from src.programa_automation import open_programa_login_window, run_programa_automation
 from src.vendor_call_agent import (
     build_call_script,
@@ -456,4 +463,39 @@ def export_csv(payload: RowsPayload) -> Response:
         content=get_csv_bytes(df),
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="sch-intake.csv"'},
+    )
+
+
+@app.post("/export/programa/validate")
+def export_programa_validate(payload: RowsPayload) -> dict:
+    return validate_for_export(payload.rows)
+
+
+@app.post("/export/programa/csv")
+def export_programa_import_csv(payload: RowsPayload) -> Response:
+    df = build_programa_import_dataframe(payload.rows)
+    return Response(
+        content=export_programa_csv(df),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="programa-import.csv"'},
+    )
+
+
+@app.post("/export/programa/xlsx")
+def export_programa_import_xlsx(payload: RowsPayload) -> Response:
+    df = build_programa_import_dataframe(payload.rows)
+    return Response(
+        content=export_programa_xlsx(df),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="programa-import.xlsx"'},
+    )
+
+
+@app.post("/export/programa/debug-csv")
+def export_programa_import_debug_csv(payload: RowsPayload) -> Response:
+    df = build_programa_debug_dataframe(payload.rows)
+    return Response(
+        content=export_programa_csv(df),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="programa-import-debug.csv"'},
     )

@@ -1,6 +1,7 @@
 import type {
   IntakeResponse,
   IntakeRow,
+  ProgramaExportValidation,
   SchemaResponse,
   VendorCallRefreshResponse,
   VendorCallResponse,
@@ -179,3 +180,35 @@ export async function exportReviewCsv(rows: IntakeRow[]): Promise<Blob> {
 }
 
 export const downloadCsv = exportReviewCsv;
+
+export async function validateProgramaExport(rows: IntakeRow[]): Promise<ProgramaExportValidation> {
+  return parseJson<ProgramaExportValidation>(
+    await apiFetch(`${API_BASE}/export/programa/validate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rows }),
+    }),
+  );
+}
+
+async function exportProgramaFile(rows: IntakeRow[], path: string, fallbackMessage: string): Promise<Blob> {
+  const response = await apiFetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rows }),
+  });
+  if (!response.ok) throw new Error(fallbackMessage);
+  return response.blob();
+}
+
+export async function exportProgramaCsv(rows: IntakeRow[]): Promise<Blob> {
+  return exportProgramaFile(rows, "/export/programa/csv", "Could not export Programa CSV.");
+}
+
+export async function exportProgramaXlsx(rows: IntakeRow[]): Promise<Blob> {
+  return exportProgramaFile(rows, "/export/programa/xlsx", "Could not export Programa XLSX.");
+}
+
+export async function exportProgramaDebugCsv(rows: IntakeRow[]): Promise<Blob> {
+  return exportProgramaFile(rows, "/export/programa/debug-csv", "Could not export Debug CSV.");
+}

@@ -33,6 +33,15 @@ export type SchemaResponse = {
   reviewFields: string[];
 };
 
+export type ProgramaExportValidation = {
+  skipped: { index: number; product_name: string }[];
+  missing_section: { index: number; product_name: string }[];
+  missing_dimensions: number;
+  missing_product_url: number;
+  missing_image_url: number;
+  export_count: number;
+};
+
 export type VendorCallResponse = {
   status: string;
   script: string;

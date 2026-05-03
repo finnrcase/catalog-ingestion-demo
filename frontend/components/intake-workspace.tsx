@@ -10,7 +10,6 @@ import {
   ImageIcon,
   Loader2,
   Phone,
-  Send,
   Upload,
   X,
 } from "lucide-react";
@@ -18,15 +17,16 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import {
-  exportReviewCsv,
+  exportProgramaCsv,
+  exportProgramaDebugCsv,
+  exportProgramaXlsx,
   fetchSchema,
   fetchVendorCallStatus,
   generateIntakeTable,
   generateVendorCallScript,
-  openProgramaLogin,
   refreshVendorCall,
-  sendToPrograma,
   startVendorCall,
+  validateProgramaExport,
   validateRows,
 } from "@/lib/api";
 import { hasComplete3dDimensions } from "@/lib/dimensions";
@@ -137,10 +137,6 @@ function isColumnMissing(row: IntakeRow, column: string) {
   return missingFieldsForRow(row).includes(label);
 }
 
-function looksLikeProgramaScheduleUrl(value: string) {
-  return value.trim().toLowerCase().includes("app.programa.design/");
-}
-
 function LogoMark() {
   return (
     <div className="flex items-center gap-4">
@@ -162,7 +158,6 @@ function LogoMark() {
 
 export function IntakeWorkspace() {
   const [project, setProject] = useState("");
-  const [scheduleUrl, setScheduleUrl] = useState("");
   const [room, setRoom] = useState("");
   const [urls, setUrls] = useState("");
   const [files, setFiles] = useState<File[]>([]);
@@ -171,11 +166,19 @@ export function IntakeWorkspace() {
   const [isImageDragActive, setIsImageDragActive] = useState(false);
   const [uploadError, setUploadError] = useState("");
   const [useAiPdf, setUseAiPdf] = useState(true);
-  const [allowBlankFields, setAllowBlankFields] = useState(true);
+  const [debugMode, setDebugMode] = useState(false);
   const [rows, setRows] = useState<IntakeRow[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
   const [message, setMessage] = useState("");
-  const [busy, setBusy] = useState<"generate" | "validate" | "send" | "login" | "vendorCall" | "export" | "">("");
+  const [busy, setBusy] = useState<"generate" | "validate" | "vendorCall" | "export" | "">("");
+  const [exportSummary, setExportSummary] = useState({
+    skipped: [] as { index: number; product_name: string }[],
+    missing_section: [] as { index: number; product_name: string }[],
+    missing_dimensions: 0,
+    missing_product_url: 0,
+    missing_image_url: 0,
+    export_count: 0,
+  });
   const [errors, setErrors] = useState<string[]>([]);
   const [vendorCall, setVendorCall] = useState<{
     row: IntakeRow;
@@ -209,15 +212,7 @@ export function IntakeWorkspace() {
   }, [bulkImagePreviews]);
 
   const includedRows = useMemo(() => rows.filter((row) => row.Include !== false), [rows]);
-  const readyRows = useMemo(() => rows.filter(isEligible), [rows]);
-  const sendableRows = useMemo(
-    () =>
-      rows.filter(
-        (row) =>
-          row.Include !== false && !["Ignored", "Excluded", "Error"].includes(rowText(row, "Status")),
-      ),
-    [rows],
-  );
+  const readyRows = exportSummary.export_count;
   const missingInputRows = useMemo(
     () => includedRows.filter((row) => missingFieldsForRow(row).length > 0),
     [includedRows],
@@ -227,7 +222,40 @@ export function IntakeWorkspace() {
     [includedRows],
   );
   const ignored = useMemo(() => rows.filter((row) => row.Include === false || row.Status === "Ignored").length, [rows]);
-  const scheduleUrlWarning = scheduleUrl.trim() && !looksLikeProgramaScheduleUrl(scheduleUrl);
+
+  useEffect(() => {
+    if (includedRows.length === 0) {
+      setExportSummary({
+        skipped: [],
+        missing_section: [],
+        missing_dimensions: 0,
+        missing_product_url: 0,
+        missing_image_url: 0,
+        export_count: 0,
+      });
+      return;
+    }
+    let cancelled = false;
+    validateProgramaExport(includedRows)
+      .then((summary) => {
+        if (!cancelled) setExportSummary(summary);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setExportSummary((current) => ({
+            ...current,
+            export_count: includedRows.filter((row) => rowText(row, "Product Name").trim()).length,
+            skipped: includedRows
+              .map((row, index) => ({ row, index }))
+              .filter(({ row }) => !rowText(row, "Product Name").trim())
+              .map(({ index }) => ({ index, product_name: "(no name)" })),
+          }));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [includedRows]);
 
   function updateRow(index: number, key: string, value: unknown) {
     setRows((current) => current.map((row, i) => (i === index ? { ...row, [key]: value } : row)));
@@ -314,61 +342,31 @@ export function IntakeWorkspace() {
     }
   }
 
-  async function handleSend() {
-    if (!scheduleUrl.trim()) {
-      setMessage("Paste the Project URL before sending.");
-      return;
-    }
-    if (scheduleUrlWarning) {
-      setMessage("This does not look like a Programa URL. Please double-check it before sending.");
-      return;
-    }
-    setBusy("send");
-    try {
-      const rowsToSend = allowBlankFields ? sendableRows : readyRows;
-      const result = await sendToPrograma({
-        projectName: project,
-        scheduleUrl,
-        rows: rowsToSend,
-        allowBlankFields,
-      });
-      if (result.status === "blocked") {
-        setMessage(result.message || "Some rows need review before sending.");
-      } else {
-        setMessage("Programa send started. Review the browser window to complete the flow.");
-      }
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not send to Programa.");
-    } finally {
-      setBusy("");
-    }
+  function downloadBlob(blob: Blob, filename: string) {
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.click();
+    URL.revokeObjectURL(url);
   }
 
-  async function handleProgramaLogin() {
-    setBusy("login");
-    setMessage("");
-    try {
-      const result = await openProgramaLogin();
-      setMessage(result.message || "Programa login window closed.");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not open Programa login.");
-    } finally {
-      setBusy("");
-    }
-  }
-
-  async function handleExport() {
+  async function handleProgramaExport(format: "csv" | "xlsx" | "debug-csv") {
     setBusy("export");
     try {
-      const blob = await exportReviewCsv(includedRows);
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = `${project.trim().replaceAll(" ", "_") || "sch"}_intake.csv`;
-      anchor.click();
-      URL.revokeObjectURL(url);
+      const safeProject = project.trim().replaceAll(" ", "_") || "sch";
+      const blob =
+        format === "xlsx"
+          ? await exportProgramaXlsx(includedRows)
+          : format === "debug-csv"
+            ? await exportProgramaDebugCsv(includedRows)
+            : await exportProgramaCsv(includedRows);
+      const suffix = format === "xlsx" ? "xlsx" : "csv";
+      const label = format === "debug-csv" ? "programa_debug" : "programa_import";
+      downloadBlob(blob, `${safeProject}_${label}.${suffix}`);
+      setMessage("Programa import file downloaded.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not export CSV.");
+      setMessage(error instanceof Error ? error.message : "Could not export Programa import file.");
     } finally {
       setBusy("");
     }
@@ -414,86 +412,45 @@ export function IntakeWorkspace() {
           </div>
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
             <div className="grid grid-cols-3 gap-2 text-center">
-              <Metric label="Ready" value={readyRows.length} tone="ready" />
+              <Metric label="Export Rows" value={readyRows} tone="ready" />
               <Metric label="Needs Review" value={needsReview} tone="warn" />
               <Metric label="Ignored" value={ignored} tone="muted" />
             </div>
             <div className="flex flex-col items-stretch gap-2">
               <button
                 className="inline-flex h-11 items-center justify-center gap-2 rounded-lg border border-bronze bg-bronze px-5 text-sm font-semibold text-white shadow-sm transition hover:border-orangeHover hover:bg-orangeHover disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze disabled:shadow-none"
-                disabled={Boolean(scheduleUrlWarning) || (allowBlankFields ? sendableRows.length === 0 : readyRows.length === 0) || busy === "send" || busy === "login"}
-                onClick={handleSend}
+                disabled={busy === "export" || exportSummary.export_count === 0}
+                onClick={() => handleProgramaExport("csv")}
               >
-                {busy === "send" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                Send to Programa
+                {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                Download Programa CSV
               </button>
-              <label className="flex items-center justify-center gap-2 text-xs font-medium text-taupe">
-                <input
-                  type="checkbox"
-                  checked={allowBlankFields}
-                  onChange={(event) => setAllowBlankFields(event.target.checked)}
-                  className="h-4 w-4 accent-bronze"
-                />
-                Allow blank fields
-              </label>
-              <p className="text-center text-[11px] text-taupe">allow_blank_fields: {String(allowBlankFields)}</p>
-              {allowBlankFields && missingInputRows.length > 0 ? (
-                <p className="text-center text-xs font-medium text-bronze">
-                  Some selected rows have blank fields and will be sent incomplete.
-                </p>
-              ) : missingInputRows.length > 0 ? (
-                <p className="text-center text-xs font-medium text-bronze">Some items still have missing inputs.</p>
-              ) : null}
-              {!scheduleUrl.trim() ? (
-                <p className="text-center text-xs font-medium text-bronze">Paste the Project URL before sending.</p>
-              ) : null}
-              <button
-                className="inline-flex h-9 items-center justify-center rounded-lg border border-linen bg-white px-4 text-xs font-semibold text-taupe shadow-sm transition hover:bg-ivory hover:text-charcoal disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
-                disabled={busy === "login" || busy === "send"}
-                onClick={handleProgramaLogin}
-                type="button"
-              >
-                {busy === "login" ? "Opening Programa..." : "Login to Programa"}
-              </button>
+              <p className="text-center text-xs font-medium text-taupe">
+                Use Programa&apos;s native Import Products tool for most imports.
+              </p>
             </div>
           </div>
         </header>
 
         <section className="grid gap-5">
-          <Panel title="Project Setup" subtitle="Paste the Programa URL where rows should be entered.">
-            <div className="grid gap-4">
-              <Field label="Project URL">
+          <Panel title="Project Setup" subtitle="Set default metadata for parsed rows. No Programa URL is required.">
+            <div className="grid gap-4 md:grid-cols-2">
+              <Field label="Default Room / Location">
                 <input
                   className="h-11 w-full rounded-lg border border-linen bg-white px-3 text-sm text-charcoal shadow-sm"
-                  value={scheduleUrl}
-                  onChange={(event) => setScheduleUrl(event.target.value)}
-                  placeholder="Paste Programa project URL here"
+                  value={room}
+                  onChange={(event) => setRoom(event.target.value)}
+                  placeholder="Kitchen"
                 />
-                <span className="mt-2 block text-xs leading-5 text-taupe">
-                  Open the desired Programa project or schedule, copy the URL, and paste it here.
-                </span>
-                {scheduleUrlWarning ? (
-                  <span className="mt-2 block text-xs font-medium text-bronze">This does not look like a Programa URL.</span>
-                ) : null}
               </Field>
-              <div className="grid gap-4 md:grid-cols-2">
-                <Field label="Default Room / Location">
-                  <input
-                    className="h-11 w-full rounded-lg border border-linen bg-white px-3 text-sm text-charcoal shadow-sm"
-                    value={room}
-                    onChange={(event) => setRoom(event.target.value)}
-                    placeholder="Kitchen"
-                  />
-                </Field>
-                <Field label="Display Name (optional)">
-                  <input
-                    className="h-11 w-full rounded-lg border border-linen bg-white px-3 text-sm text-charcoal shadow-sm"
-                    value={project}
-                    onChange={(event) => setProject(event.target.value)}
-                    placeholder="For display or logs"
-                  />
-                </Field>
-              </div>
+              <Field label="Display Name (optional)">
+                <input
+                  className="h-11 w-full rounded-lg border border-linen bg-white px-3 text-sm text-charcoal shadow-sm"
+                  value={project}
+                  onChange={(event) => setProject(event.target.value)}
+                  placeholder="For file names and review context"
+                />
+              </Field>
             </div>
           </Panel>
 
@@ -736,7 +693,74 @@ export function IntakeWorkspace() {
               )}
             </Panel>
 
-            <Panel title="Review Table" subtitle="Review each row before sending. Missing inputs stay flagged.">
+            <Panel
+              title="Export for Programa Import"
+              subtitle="Download a Programa-compatible CSV or XLSX file, then upload it through Programa's Import Products tool."
+            >
+              <div className="grid gap-4 lg:grid-cols-[1.1fr_0.9fr]">
+                <div className="rounded-lg border border-linen bg-ivory p-4">
+                  <h3 className="text-sm font-semibold text-charcoal">Validation Summary</h3>
+                  <div className="mt-3 grid gap-2 text-sm text-charcoal/75 sm:grid-cols-2">
+                    <SummaryLine label="Rows ready for export" value={exportSummary.export_count} tone="ready" />
+                    <SummaryLine label="Skipped: missing Product Name" value={exportSummary.skipped.length} tone="warn" />
+                    <SummaryLine label="Missing Section" value={exportSummary.missing_section.length} tone="warn" />
+                    <SummaryLine label="Missing Dimensions" value={exportSummary.missing_dimensions} tone="warn" />
+                    <SummaryLine label="Missing Product URL" value={exportSummary.missing_product_url} tone="warn" />
+                    <SummaryLine label="Missing Image URL" value={exportSummary.missing_image_url} tone="warn" />
+                  </div>
+                  {exportSummary.skipped.length > 0 ? (
+                    <p className="mt-3 text-xs font-medium text-bronze">
+                      Rows without Product Name are excluded from the Programa import file.
+                    </p>
+                  ) : null}
+                </div>
+                <div className="rounded-lg border border-linen bg-white p-4">
+                  <h3 className="text-sm font-semibold text-charcoal">Download Files</h3>
+                  <p className="mt-1 text-sm leading-6 text-taupe">
+                    Legacy direct-upload workflow is deprecated. Use CSV/XLSX export for most imports.
+                  </p>
+                  <div className="mt-4 grid gap-2">
+                    <button
+                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-bronze bg-bronze px-4 text-sm font-semibold text-white shadow-sm hover:bg-orangeHover disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
+                      disabled={busy === "export" || exportSummary.export_count === 0}
+                      onClick={() => handleProgramaExport("csv")}
+                    >
+                      {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                      Download Programa CSV
+                    </button>
+                    <button
+                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-charcoal/15 bg-white px-4 text-sm font-semibold text-charcoal shadow-sm hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                      disabled={busy === "export" || exportSummary.export_count === 0}
+                      onClick={() => handleProgramaExport("xlsx")}
+                    >
+                      <Download className="h-4 w-4" />
+                      Download Programa XLSX
+                    </button>
+                    <label className="mt-1 flex items-center gap-2 text-xs font-medium text-taupe">
+                      <input
+                        type="checkbox"
+                        checked={debugMode}
+                        onChange={(event) => setDebugMode(event.target.checked)}
+                        className="h-4 w-4 accent-bronze"
+                      />
+                      Enable debug export
+                    </label>
+                    {debugMode ? (
+                      <button
+                        className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-linen bg-ivory px-4 text-sm font-semibold text-taupe shadow-sm hover:bg-white disabled:cursor-not-allowed disabled:text-taupe/60"
+                        disabled={busy === "export" || exportSummary.export_count === 0}
+                        onClick={() => handleProgramaExport("debug-csv")}
+                      >
+                        <Download className="h-4 w-4" />
+                        Download Debug CSV
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+            </Panel>
+
+            <Panel title="Review Table" subtitle="Review each row before exporting. Missing inputs stay flagged.">
               <div className="overflow-x-auto">
                 <table className="min-w-[1180px] w-full border-separate border-spacing-0 text-left text-sm">
                   <thead>
@@ -786,16 +810,8 @@ export function IntakeWorkspace() {
               <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex items-center gap-2 text-sm text-charcoal/60">
                   <AlertTriangle className="h-4 w-4 text-bronze" />
-                  {readyRows.length} ready. {missingInputRows.length} have missing inputs.
+                  {readyRows} ready for export. {missingInputRows.length} have missing inputs.
                 </div>
-                <button
-                  className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-charcoal/15 bg-white px-4 text-sm font-semibold text-charcoal shadow-sm hover:bg-ivory"
-                  disabled={busy === "export"}
-                  onClick={handleExport}
-                >
-                  {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                  Export Review CSV
-                </button>
               </div>
             </Panel>
           </>
@@ -829,6 +845,16 @@ function Metric({ label, value, tone }: { label: string; value: number; tone: "r
     <div className={`min-w-24 rounded-lg border px-3 py-2 ${colors[tone]}`}>
       <div className="text-lg font-semibold leading-none">{value}</div>
       <div className="mt-1 text-[11px] font-medium">{label}</div>
+    </div>
+  );
+}
+
+function SummaryLine({ label, value, tone }: { label: string; value: number; tone: "ready" | "warn" }) {
+  const valueClass = tone === "ready" ? "text-sage" : value > 0 ? "text-bronze" : "text-charcoal/50";
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-lg border border-linen bg-white px-3 py-2">
+      <span>{label}</span>
+      <span className={`font-semibold ${valueClass}`}>{value}</span>
     </div>
   );
 }
