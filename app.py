@@ -20,6 +20,7 @@ from src.intake import (
 from src.export import get_csv_bytes
 from src.photo_inventory import (
     analyze_photo_with_ai,
+    create_photo_only_bulk_rows,
     create_photo_inventory_row,
     upload_image_to_cloudinary,
 )
