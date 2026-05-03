@@ -15,9 +15,15 @@ BRAND_DOMAIN_TABLE : dict[str, str]
 
 from __future__ import annotations
 
+import json as _json
 import re
 import urllib.parse as _urlparse
 from dataclasses import dataclass, field
+
+try:
+    from bs4 import BeautifulSoup as _BeautifulSoup
+except ImportError:
+    _BeautifulSoup = None
 
 
 # ── Result type ────────────────────────────────────────────────────────────────
@@ -83,6 +89,11 @@ _APPLIANCE_CATEGORIES: frozenset[str] = frozenset({
 
 # Simple session-scoped cache — not a cross-process or persistent cache.
 _discovered_domains: dict[str, str] = {}
+
+_SPEC_LABEL_KEYWORDS = frozenset({
+    "width", "height", "depth", "dimensions", "overall dimensions",
+    "product dimensions", "w×h×d", "w x h x d",
+})
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -336,6 +347,117 @@ def _find_dimension_candidates(
             _add(m.group(1))
 
     return candidates
+
+
+def _parse_html_for_dimensions(
+    html: str,
+    *,
+    is_appliance: bool = False,
+) -> tuple[str | None, str | None]:
+    """
+    Extract (product_dimensions, cutout_dimensions) from an HTML page.
+    Three passes: JSON-LD → spec tables/dl → visible text.
+    Returns (None, None) if no complete 3D dimensions found.
+    """
+    from src.dimensions import has_complete_3d_dimensions
+
+    product_dims: str | None = None
+    cutout_dims: str | None = None
+
+    # ── Pass 1: JSON-LD ────────────────────────────────────────────────────────
+    if _BeautifulSoup:
+        soup = _BeautifulSoup(html, "html.parser")
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = _json.loads(script.string or "")
+                blob = str(data)
+            except Exception:
+                continue
+            candidates = _find_dimension_candidates(blob, include_cutout=is_appliance)
+            for c in candidates:
+                if has_complete_3d_dimensions(c):
+                    product_dims = c
+                    break
+            if product_dims:
+                break
+
+    # ── Pass 2: spec tables / dl ───────────────────────────────────────────────
+    if not product_dims and _BeautifulSoup:
+        soup = _BeautifulSoup(html, "html.parser")
+
+        # dl elements
+        assembled: dict[str, str] = {}
+        for dl in soup.find_all("dl"):
+            items = dl.find_all(["dt", "dd"])
+            label = ""
+            for item in items:
+                text = item.get_text(strip=True).lower()
+                if item.name == "dt":
+                    label = text
+                elif item.name == "dd" and label in _SPEC_LABEL_KEYWORDS:
+                    assembled[label] = item.get_text(strip=True)
+                    # Check if the dd value itself is a complete 3D string
+                    if label in ("dimensions", "overall dimensions", "product dimensions"):
+                        val = item.get_text(strip=True)
+                        if has_complete_3d_dimensions(val):
+                            product_dims = val
+                            break
+                    label = ""
+            if product_dims:
+                break
+
+        if not product_dims:
+            # Try assembling W/H/D from separate dl labels
+            w = assembled.get("width", "")
+            h = assembled.get("height", "")
+            d = assembled.get("depth", "")
+            if w and h and d:
+                candidate = f"{w} W x {h} H x {d} D"
+                if has_complete_3d_dimensions(candidate):
+                    product_dims = candidate
+
+        if not product_dims:
+            # table th→td or td→td pairs
+            for table in soup.find_all("table"):
+                for row in table.find_all("tr"):
+                    cells = row.find_all(["th", "td"])
+                    if len(cells) >= 2:
+                        label = cells[0].get_text(strip=True).lower()
+                        value = cells[1].get_text(strip=True)
+                        if label in _SPEC_LABEL_KEYWORDS and has_complete_3d_dimensions(value):
+                            product_dims = value
+                            break
+                if product_dims:
+                    break
+
+    # ── Pass 3: visible text ───────────────────────────────────────────────────
+    if not product_dims:
+        if _BeautifulSoup:
+            text = _BeautifulSoup(html, "html.parser").get_text(" ")
+        else:
+            text = re.sub(r"<[^>]+>", " ", html)
+        candidates = _find_dimension_candidates(text, include_cutout=is_appliance)
+        for c in candidates:
+            if has_complete_3d_dimensions(c):
+                product_dims = c
+                break
+
+    # ── Cutout pass (appliances only) ──────────────────────────────────────────
+    if is_appliance and product_dims:
+        if _BeautifulSoup:
+            text = _BeautifulSoup(html, "html.parser").get_text(" ")
+        else:
+            text = re.sub(r"<[^>]+>", " ", html)
+        cutout_candidates = _find_dimension_candidates(text, include_cutout=True)
+        for c in cutout_candidates:
+            if c == product_dims or not has_complete_3d_dimensions(c):
+                continue
+            pos = text.find(c)
+            if pos >= 0 and "cutout" in text[max(0, pos - 20): pos].lower():
+                cutout_dims = c
+                break
+
+    return product_dims, cutout_dims
 
 
 def find_dimensions(row: dict) -> DimensionResult:

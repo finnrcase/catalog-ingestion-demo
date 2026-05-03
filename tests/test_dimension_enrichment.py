@@ -329,3 +329,93 @@ def test_find_dimension_candidates_bare_dimensions_excluded_when_inside_product_
     # Should have exactly 1 candidate (from Product Dimensions), not 2
     assert len(candidates) == 1
     assert "14" in candidates[0]
+
+
+from src.dimension_enrichment import _parse_html_for_dimensions
+
+
+def test_parse_html_json_ld_product_dimensions():
+    html = """
+    <html><body>
+    <script type="application/ld+json">
+    {"@type": "Product", "name": "Scotsman Icemaker",
+     "description": "Product Dimensions: 14 7/8\\"W x 22\\"D x 33 3/8\\"H"}
+    </script>
+    </body></html>
+    """
+    product_dims, cutout_dims = _parse_html_for_dimensions(html)
+    assert product_dims is not None
+    assert "14" in product_dims
+    assert cutout_dims is None
+
+
+def test_parse_html_spec_table_dl():
+    html = """
+    <html><body>
+    <dl>
+      <dt>Width</dt><dd>14.875 in</dd>
+      <dt>Height</dt><dd>33.375 in</dd>
+      <dt>Depth</dt><dd>22 in</dd>
+    </dl>
+    </body></html>
+    """
+    product_dims, _ = _parse_html_for_dimensions(html)
+    assert product_dims is not None
+    assert "14.875" in product_dims or "Width" in product_dims
+
+
+def test_parse_html_spec_table_tr():
+    html = """
+    <html><body>
+    <table>
+      <tr><th>Product Dimensions</th><td>36"W x 34.5"H x 24"D</td></tr>
+    </table>
+    </body></html>
+    """
+    product_dims, _ = _parse_html_for_dimensions(html)
+    assert product_dims is not None
+    assert "36" in product_dims
+
+
+def test_parse_html_visible_text_inline():
+    html = """
+    <html><body>
+    <p>The refrigerator measures 35.75"W x 69.875"H x 28.75"D.</p>
+    </body></html>
+    """
+    product_dims, _ = _parse_html_for_dimensions(html)
+    assert product_dims is not None
+    assert "35.75" in product_dims
+
+
+def test_parse_html_appliance_cutout_stored_separately():
+    html = """
+    <html><body>
+    <p>Product Dimensions: 23.875"W x 33.375"H x 22"D</p>
+    <p>Cutout Dimensions: 23"W x 33"H x 21"D</p>
+    </body></html>
+    """
+    product_dims, cutout_dims = _parse_html_for_dimensions(html, is_appliance=True)
+    assert product_dims is not None
+    assert "23.875" in product_dims
+    assert cutout_dims is not None
+    assert "23" in cutout_dims
+
+
+def test_parse_html_no_dimensions_returns_none():
+    html = "<html><body><p>No specifications here.</p></body></html>"
+    product_dims, cutout_dims = _parse_html_for_dimensions(html)
+    assert product_dims is None
+    assert cutout_dims is None
+
+
+def test_parse_html_non_appliance_cutout_not_returned():
+    html = """
+    <html><body>
+    <p>Product Dimensions: 23.875"W x 33.375"H x 22"D</p>
+    <p>Cutout Dimensions: 23"W x 33"H x 21"D</p>
+    </body></html>
+    """
+    product_dims, cutout_dims = _parse_html_for_dimensions(html, is_appliance=False)
+    assert product_dims is not None
+    assert cutout_dims is None
