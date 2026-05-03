@@ -419,3 +419,84 @@ def test_parse_html_non_appliance_cutout_not_returned():
     product_dims, cutout_dims = _parse_html_for_dimensions(html, is_appliance=False)
     assert product_dims is not None
     assert cutout_dims is None
+
+
+from src.dimension_enrichment import _parse_text_pages_for_dimensions, _parse_pdf_for_dimensions
+
+
+def test_parse_text_pages_product_dimensions_label():
+    pages = ['Product Dimensions: 14 7/8"W x 22"D x 33 3/8"H\nSome other text.']
+    product_dims, cutout_dims = _parse_text_pages_for_dimensions(pages)
+    assert product_dims is not None
+    assert "14 7/8" in product_dims
+    assert cutout_dims is None
+
+
+def test_parse_text_pages_appliance_extracts_cutout():
+    pages = [
+        'Product Dimensions: 23.875"W x 33.375"H x 22"D\n'
+        'Cutout Dimensions: 23"W x 33"H x 21"D'
+    ]
+    product_dims, cutout_dims = _parse_text_pages_for_dimensions(pages, is_appliance=True)
+    assert product_dims is not None
+    assert cutout_dims is not None
+    assert "23.875" in product_dims
+    assert "23" in cutout_dims
+
+
+def test_parse_text_pages_ignores_shipping_when_product_found():
+    pages = [
+        'Product Dimensions: 14"W x 33"H x 22"D\n'
+        'Shipping Dimensions: 18"W x 40"H x 28"D'
+    ]
+    product_dims, _ = _parse_text_pages_for_dimensions(pages)
+    assert "14" in product_dims
+    assert "18" not in product_dims
+
+
+def test_parse_text_pages_falls_back_to_shipping_when_nothing_else():
+    pages = ['Shipping Dimensions: 18"W x 40"H x 28"D']
+    product_dims, _ = _parse_text_pages_for_dimensions(pages, include_shipping_fallback=True)
+    assert product_dims is not None
+    assert "18" in product_dims
+
+
+def test_parse_text_pages_no_dimensions_returns_none():
+    pages = ["Installation instructions. Plug into outlet. Done."]
+    product_dims, cutout_dims = _parse_text_pages_for_dimensions(pages)
+    assert product_dims is None
+    assert cutout_dims is None
+
+
+def test_parse_text_pages_stops_at_first_match_across_pages():
+    pages = [
+        "No dimensions on page 1.",
+        'Product Dimensions: 36"W x 34.5"H x 24"D',
+        'Another page with 50"W x 50"H x 50"D',
+    ]
+    product_dims, _ = _parse_text_pages_for_dimensions(pages)
+    assert "36" in product_dims
+    assert "50" not in product_dims
+
+
+def test_parse_text_pages_shipping_not_used_when_product_found():
+    # Even with include_shipping_fallback, shipping must not appear when product dims found
+    pages = [
+        'Product Dimensions: 14"W x 33"H x 22"D\n'
+        'Shipping Dimensions: 18"W x 40"H x 28"D'
+    ]
+    product_dims, _ = _parse_text_pages_for_dimensions(pages, include_shipping_fallback=True)
+    assert "14" in product_dims
+    assert "18" not in product_dims
+
+
+def test_parse_pdf_returns_none_on_empty_bytes():
+    product_dims, cutout_dims = _parse_pdf_for_dimensions(b"")
+    assert product_dims is None
+    assert cutout_dims is None
+
+
+def test_parse_pdf_returns_none_on_corrupt_bytes():
+    product_dims, cutout_dims = _parse_pdf_for_dimensions(b"not a pdf at all")
+    assert product_dims is None
+    assert cutout_dims is None

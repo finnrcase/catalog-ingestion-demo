@@ -473,6 +473,90 @@ def _parse_html_for_dimensions(
     return product_dims, cutout_dims
 
 
+def _parse_text_pages_for_dimensions(
+    pages: list[str],
+    *,
+    is_appliance: bool = False,
+    include_shipping_fallback: bool = False,
+) -> tuple[str | None, str | None]:
+    """
+    Find dimensions in a list of page text strings (from PDF extraction).
+    Stops at first page yielding a complete 3D result.
+    Returns (product_dims, cutout_dims).
+    """
+    from src.dimensions import has_complete_3d_dimensions
+
+    product_dims: str | None = None
+    cutout_dims: str | None = None
+    shipping_fallback: str | None = None
+
+    for page_text in pages:
+        candidates = _find_dimension_candidates(
+            page_text, include_cutout=is_appliance
+        )
+        for c in candidates:
+            if has_complete_3d_dimensions(c):
+                product_dims = c
+                break
+
+        if product_dims:
+            # Look for cutout on same page if appliance
+            if is_appliance:
+                cutout_candidates = _find_dimension_candidates(
+                    page_text, include_cutout=True
+                )
+                for c in cutout_candidates:
+                    if c == product_dims or not has_complete_3d_dimensions(c):
+                        continue
+                    pos = page_text.find(c)
+                    if pos >= 0 and "cutout" in page_text[max(0, pos - 30): pos].lower():
+                        cutout_dims = c
+                        break
+            break  # stop searching pages once product dims found
+
+        # Collect shipping fallback while scanning (only when no product dims yet)
+        if include_shipping_fallback and not shipping_fallback:
+            shipping_candidates = _find_dimension_candidates(
+                page_text, include_shipping=True
+            )
+            for c in shipping_candidates:
+                if has_complete_3d_dimensions(c):
+                    shipping_fallback = c
+                    break
+
+    # Use shipping fallback only when nothing better found
+    if not product_dims and include_shipping_fallback and shipping_fallback:
+        product_dims = shipping_fallback
+
+    return product_dims, cutout_dims
+
+
+def _parse_pdf_for_dimensions(
+    pdf_bytes: bytes,
+    *,
+    is_appliance: bool = False,
+) -> tuple[str | None, str | None]:
+    """
+    Extract dimension text from a PDF using PyMuPDF. Scans first 10 pages.
+    Returns (product_dims, cutout_dims). Returns (None, None) on any error.
+    """
+    try:
+        import fitz  # PyMuPDF  # noqa: PLC0415
+    except ImportError:
+        return None, None
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pages = [doc[i].get_text() for i in range(min(10, doc.page_count))]
+        return _parse_text_pages_for_dimensions(
+            pages,
+            is_appliance=is_appliance,
+            include_shipping_fallback=True,
+        )
+    except Exception:
+        return None, None
+
+
 def find_dimensions(row: dict) -> DimensionResult:
     """Perform full dimension lookup for a single intake row. Stub — implemented in Task 11."""
     return _make_not_found_result(failure_reason="not implemented")
