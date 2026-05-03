@@ -93,3 +93,42 @@ def test_normalize_model_empty_string_returns_empty_list():
 
 def test_normalize_model_whitespace_only_returns_empty_list():
     assert _normalize_model_variants("   ") == []
+
+
+from src.dimension_enrichment import _get_manufacturer_domain, _discovered_domains
+
+
+def test_get_domain_known_brand():
+    assert _get_manufacturer_domain("Scotsman") == "scotsman-ice.com"
+
+
+def test_get_domain_known_brand_case_insensitive():
+    assert _get_manufacturer_domain("KOHLER") == "kohler.com"
+    assert _get_manufacturer_domain("kohler") == "kohler.com"
+
+
+def test_get_domain_wolf_and_subzero():
+    assert _get_manufacturer_domain("Wolf") == "subzero-wolf.com"
+    assert _get_manufacturer_domain("Sub-Zero") == "subzero-wolf.com"
+
+
+def test_get_domain_unknown_brand_returns_none_without_search():
+    result = _get_manufacturer_domain("UnknownBrandXYZ")
+    assert result is None
+
+
+def test_get_domain_unknown_brand_discovered_via_injected_search():
+    import src.dimension_enrichment as _mod
+    def _mock_search(query):
+        return ["https://unknownbrandxyz.com/products/spec"]
+    result = _get_manufacturer_domain("UnknownBrandXYZ2", _search_fn=_mock_search)
+    assert result == "unknownbrandxyz.com"
+    # Cached
+    assert _mod._discovered_domains.get("unknownbrandxyz2") == "unknownbrandxyz.com"
+
+
+def test_get_domain_discovery_failure_returns_none():
+    def _empty_search(query):
+        return []
+    result = _get_manufacturer_domain("NoResultsBrand", _search_fn=_empty_search)
+    assert result is None

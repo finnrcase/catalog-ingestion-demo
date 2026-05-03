@@ -81,7 +81,7 @@ _APPLIANCE_CATEGORIES: frozenset[str] = frozenset({
     "Kitchen Appliance", "Built-in Appliances",
 })
 
-# Session-scoped domain discovery cache
+# Simple session-scoped cache — not a cross-process or persistent cache.
 _discovered_domains: dict[str, str] = {}
 
 
@@ -136,6 +136,36 @@ def _normalize_model_variants(model: str) -> list[str]:
                 seen.append(without_suffix)
 
     return seen
+
+
+def _get_manufacturer_domain(
+    brand: str,
+    *,
+    _search_fn=None,
+) -> str | None:
+    """
+    Return official manufacturer domain for a brand, or None.
+    Checks BRAND_DOMAIN_TABLE first, then _discovered_domains cache,
+    then optionally runs a discovery search via _search_fn(query) -> list[str].
+    """
+    key = brand.strip().lower()
+    if key in BRAND_DOMAIN_TABLE:
+        return BRAND_DOMAIN_TABLE[key]
+    if key in _discovered_domains:
+        return _discovered_domains[key]
+    if _search_fn is None:
+        return None
+    try:
+        urls = _search_fn(f'"{brand}" official website product specifications')
+        if not urls:
+            return None
+        domain = _urlparse.urlparse(urls[0]).netloc.lstrip("www.")
+        if domain:
+            _discovered_domains[key] = domain
+            return domain
+    except Exception:
+        pass
+    return None
 
 
 def find_dimensions(row: dict) -> DimensionResult:
