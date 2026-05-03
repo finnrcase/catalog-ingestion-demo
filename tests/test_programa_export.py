@@ -253,3 +253,260 @@ def test_photo_only_export_skips_missing_image_url():
     }
 
     assert build_programa_import_dataframe([row]).empty
+
+
+def test_photo_only_bulk_export_contains_public_urls_only():
+    from src.photo_inventory import create_photo_only_bulk_rows
+    from src.programa_export import build_programa_import_dataframe
+
+    rows = create_photo_only_bulk_rows(
+        [
+            {"image_filename": "lamp.jpg", "local_image_path": "C:/tmp/lamp.jpg"},
+            {"image_filename": "handmade_doll.jpg", "local_image_path": "C:/tmp/handmade_doll.jpg"},
+            {"image_filename": "vase.jpg", "local_image_path": "C:/tmp/vase.jpg"},
+        ],
+        project="",
+        room="",
+        section="Decor",
+        naming_mode="Filename",
+        image_urls=[
+            "https://cdn.example.com/lamp.jpg",
+            "https://cdn.example.com/handmade_doll.jpg",
+            "https://cdn.example.com/vase.jpg",
+        ],
+    )
+
+    df = build_programa_import_dataframe(rows)
+    assert list(df["Section"]) == ["Decor", "Decor", "Decor"]
+    assert list(df["Product Name"]) == ["lamp", "handmade_doll", "vase"]
+    assert list(df["Quantity"]) == [1, 1, 1]
+    assert "Local Image Path" not in df.columns
+    assert all(url.startswith("https://cdn.example.com/") for url in df["Image URL"])
+    for blank_col in ["Brand", "SKU", "Model", "Dimensions", "Width (in)", "Height (in)", "Depth (in)", "Length (in)", "Price", "Supplier", "Product URL", "Material", "Finish", "Color", "Lead Time"]:
+        assert list(df[blank_col]) == ["", "", ""]
+
+
+# ── validate_for_export ───────────────────────────────────────────────────────
+
+from src.programa_export import validate_for_export
+
+
+def test_validate_counts_export_rows():
+    rows = _make_rows([{}, {}, {}])
+    result = validate_for_export(rows)
+    assert result["export_count"] == 3
+
+
+def test_validate_skips_rows_missing_product_name():
+    rows = _make_rows([{"Product Name": ""}, {"Product Name": "Real Product"}])
+    result = validate_for_export(rows)
+    assert result["export_count"] == 1
+    assert len(result["skipped"]) == 1
+
+
+def test_validate_skips_excluded_rows():
+    rows = _make_rows([{"Include": False}, {}])
+    result = validate_for_export(rows)
+    assert result["export_count"] == 1
+
+
+def test_validate_flags_missing_section():
+    rows = _make_rows([{"Product Category": ""}, {}])
+    result = validate_for_export(rows)
+    assert len(result["missing_section"]) == 1
+    assert result["missing_section"][0]["product_name"] == "Test Product"
+
+
+def test_validate_flags_missing_dimensions():
+    rows = _make_rows([{"Dimensions": ""}, {}])
+    result = validate_for_export(rows)
+    assert result["missing_dimensions"] == 1
+
+
+def test_validate_flags_partial_dimensions():
+    rows = _make_rows([{"Dimensions": "12 in W x 10 in H"}, {}])
+    result = validate_for_export(rows)
+    assert result["missing_dimensions"] == 1
+
+
+def test_validate_flags_missing_product_url():
+    rows = _make_rows([{"Product URL": ""}, {}])
+    result = validate_for_export(rows)
+    assert result["missing_product_url"] == 1
+
+
+def test_validate_flags_missing_image_url():
+    rows = _make_rows([{"Image URL": ""}, {}])
+    result = validate_for_export(rows)
+    assert result["missing_image_url"] == 1
+
+
+def test_validate_accepts_dataframe_input():
+    df = pd.DataFrame(_make_rows([{}, {}]))
+    result = validate_for_export(df)
+    assert result["export_count"] == 2
+
+
+def test_validate_result_keys():
+    result = validate_for_export([])
+    assert set(result.keys()) == {
+        "skipped", "missing_section", "missing_dimensions",
+        "missing_product_url", "missing_image_url", "export_count",
+    }
+
+
+# ── build_programa_import_dataframe ───────────────────────────────────────────
+
+from src.programa_export import (
+    build_programa_import_dataframe,
+    build_programa_debug_dataframe,
+    export_programa_csv,
+    export_programa_xlsx,
+    PROGRAMA_COLUMNS,
+    _DEBUG_EXTRA_COLUMNS,
+)
+
+
+def test_build_returns_dataframe():
+    rows = _make_rows([{}])
+    df = build_programa_import_dataframe(rows)
+    assert isinstance(df, pd.DataFrame)
+
+
+def test_build_has_exactly_programa_columns():
+    rows = _make_rows([{}])
+    df = build_programa_import_dataframe(rows)
+    assert list(df.columns) == PROGRAMA_COLUMNS
+
+
+def test_build_excludes_rows_missing_product_name():
+    rows = _make_rows([{"Product Name": ""}, {}])
+    df = build_programa_import_dataframe(rows)
+    assert len(df) == 1
+
+
+def test_build_excludes_not_included_rows():
+    rows = _make_rows([{"Include": False}, {}])
+    df = build_programa_import_dataframe(rows)
+    assert len(df) == 1
+
+
+def test_build_scotsman_acceptance_case():
+    row = _scotsman_row()
+    df = build_programa_import_dataframe([row])
+    assert len(df) == 1
+    assert df.iloc[0]["Section"] == "Appliances"
+    assert df.iloc[0]["Width (in)"] == "14.875"
+    assert df.iloc[0]["Height (in)"] == "33.375"
+    assert df.iloc[0]["Depth (in)"] == "22"
+    assert "[Materials:" not in df.iloc[0]["Notes"]
+    assert df.iloc[0]["Material"] == "Stainless Steel"
+
+
+def test_build_accepts_dataframe_input():
+    df_in = pd.DataFrame(_make_rows([{}, {}]))
+    df_out = build_programa_import_dataframe(df_in)
+    assert len(df_out) == 2
+
+
+def test_build_empty_input_returns_empty_dataframe():
+    df = build_programa_import_dataframe([])
+    assert isinstance(df, pd.DataFrame)
+    assert list(df.columns) == PROGRAMA_COLUMNS
+    assert len(df) == 0
+
+
+# ── build_programa_debug_dataframe ────────────────────────────────────────────
+
+def test_debug_build_has_programa_plus_debug_columns():
+    rows = _make_rows([{}])
+    df = build_programa_debug_dataframe(rows)
+    expected = PROGRAMA_COLUMNS + _DEBUG_EXTRA_COLUMNS
+    assert list(df.columns) == expected
+
+
+# ── export_programa_csv ───────────────────────────────────────────────────────
+
+def test_export_csv_returns_bytes():
+    df = build_programa_import_dataframe(_make_rows([{}]))
+    result = export_programa_csv(df)
+    assert isinstance(result, bytes)
+
+
+def test_export_csv_contains_header_row():
+    df = build_programa_import_dataframe(_make_rows([{}]))
+    text = export_programa_csv(df).decode("utf-8")
+    assert "Section" in text
+    assert "Product Name" in text
+
+
+def test_export_csv_one_row_per_product():
+    rows = _make_rows([{}, {}])
+    df = build_programa_import_dataframe(rows)
+    text = export_programa_csv(df).decode("utf-8")
+    lines = [l for l in text.splitlines() if l.strip()]
+    assert len(lines) == 3  # header + 2 rows
+
+
+# ── export_programa_xlsx ──────────────────────────────────────────────────────
+
+def test_export_xlsx_returns_bytes():
+    df = build_programa_import_dataframe(_make_rows([{}]))
+    result = export_programa_xlsx(df)
+    assert isinstance(result, bytes)
+
+
+def test_export_xlsx_is_valid_xlsx():
+    import openpyxl
+    df = build_programa_import_dataframe(_make_rows([{}]))
+    xlsx_bytes = export_programa_xlsx(df)
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
+    assert len(wb.sheetnames) == 1
+    ws = wb.active
+    headers = [ws.cell(1, c).value for c in range(1, len(PROGRAMA_COLUMNS) + 1)]
+    assert headers[0] == "Section"
+    assert headers[1] == "Product Name"
+
+
+def test_export_xlsx_no_merged_cells():
+    import openpyxl
+    df = build_programa_import_dataframe(_make_rows([{}]))
+    wb = openpyxl.load_workbook(io.BytesIO(export_programa_xlsx(df)))
+    assert len(wb.active.merged_cells.ranges) == 0
+
+
+# ── Golden test ───────────────────────────────────────────────────────────────
+
+def test_golden_csv_exact_columns_and_no_nan():
+    """
+    Golden test: one clean product → CSV has exact column order,
+    no extra columns, no NaN strings, and correct values in data row.
+    """
+    import csv as _csv
+
+    row = _scotsman_row()
+    df = build_programa_import_dataframe([row])
+    csv_bytes = export_programa_csv(df)
+    csv_text = csv_bytes.decode("utf-8")
+
+    # Exact column count and order
+    assert len(df.columns) == len(PROGRAMA_COLUMNS)
+    assert list(df.columns) == PROGRAMA_COLUMNS
+
+    # No NaN strings anywhere in output
+    assert "nan" not in csv_text.lower()
+
+    # Parse and verify structure
+    parsed_rows = list(_csv.reader(csv_text.splitlines()))
+    assert len(parsed_rows) == 2  # header + 1 data row
+    assert parsed_rows[0] == PROGRAMA_COLUMNS
+
+    data = parsed_rows[1]
+    assert data[PROGRAMA_COLUMNS.index("Section")] == "Appliances"
+    assert data[PROGRAMA_COLUMNS.index("Product Name")] == "Scotsman Icemaker Built-In Pump"
+    assert data[PROGRAMA_COLUMNS.index("SKU")] == "SCN60PA1SU"
+    assert data[PROGRAMA_COLUMNS.index("Width (in)")] == "14.875"
+    assert data[PROGRAMA_COLUMNS.index("Height (in)")] == "33.375"
+    assert data[PROGRAMA_COLUMNS.index("Depth (in)")] == "22"
+    assert data[PROGRAMA_COLUMNS.index("Material")] == "Stainless Steel"
+    assert "[Materials:" not in data[PROGRAMA_COLUMNS.index("Notes")]
