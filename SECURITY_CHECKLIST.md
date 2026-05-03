@@ -1,69 +1,76 @@
 # Security Checklist
 
-Audit date: 2026-04-26
+Audit date: 2026-04-30
 
 ## What Was Checked
 
-- Working tree file inventory, including ignored files.
-- Git-tracked file list.
-- Sensitive filename scan for:
-  - `.env` and `.env.*`
-  - `.streamlit/secrets.toml`
-  - credential, token, secret, service-account, key, PEM, P12, and PFX files
-  - Chrome/Playwright cookies, login data, local state, preferences, and profile databases
-  - generated CSV/PDF/XLSX files
-  - screenshots and automation logs
-- Sensitive string scan for:
-  - `ANTHROPIC_API_KEY`
-  - `BRAVE_API_KEY`
-  - `PROGRAMA_*`
-  - API key, secret, token, cookie, password, authorization, bearer, localStorage, and sessionStorage references
-  - common concrete key formats such as Anthropic-style keys, GitHub tokens, Google API keys, Slack tokens, and private key blocks
-- Current `HEAD` scan for concrete secret-looking values.
-- Git history scan for concrete secret-looking values.
-- Git history path scan for `.env`, browser profiles, automation logs, screenshots, PDFs, CSVs, and key/certificate files.
-- `.gitignore` behavior check with `git check-ignore`.
-- Frontend production dependency audit with `npm audit --omit=dev`.
+- Whole-repo sensitive string scan for API keys, secrets, tokens, cookies, CSRF/authenticity tokens, AWS/S3 terms, database URLs, Programa references, Retell/Bland references, SCH/Saffron branding, and private-data terms.
+- High-risk file inventory for `.env*`, Streamlit secrets, JSON credentials, key/certificate files, PDFs, CSVs, images, browser profiles, screenshots, automation logs, vendor-call logs, build artifacts, nested repositories, and local caches.
+- Git state checks:
+  - `git status --short`
+  - `git diff --cached --stat`
+  - `git log --all --full-history --oneline -- .env`
+  - `git check-ignore` for local secret/session/artifact paths
+- Frontend exposure review for `NEXT_PUBLIC_*` variables and local frontend env files.
+- Backend and automation side-effect review for Programa sends, Programa login, Retell/Bland calls, and public-demo defaults.
 
 ## What Was Found
 
-- A local `.env` file exists and appears to contain real local configuration values. It is ignored and should never be committed.
-- Local Chrome/Programa profile data exists under `data/browser_profiles/`, including cookie/login/profile databases. It is ignored.
-- Local automation logs and screenshots exist under `data/automation_logs/`. They are ignored.
-- Local frontend build artifacts and dependencies exist under `frontend/.next/` and `frontend/node_modules/`. They are ignored.
-- A local nested repository folder exists at `SaffronCaseHomes/`. It is ignored to avoid accidental sub-repo commits.
-- No concrete secret-looking values were found in tracked `HEAD` files.
-- No concrete secret-looking values were found in searched git history.
-- No `.env`, browser profile, automation log, screenshot, PDF, CSV, key, or credential paths appeared in searched git history.
-- `npm audit --omit=dev` reported 2 moderate advisories through Next.js' nested PostCSS dependency. This is not a secret-exposure issue; review before production deployment and update Next.js when a safe upstream fix is available.
+- `.env` exists locally and contains real private integration values. It is ignored and must not be committed.
+- Local Programa browser profile data existed under `data/browser_profiles/`, including cookie/login/profile databases.
+- Local automation JSON logs and screenshots existed under `data/automation_logs/`.
+- Local vendor-call records existed under `data/vendor_calls/`.
+- Local product image staging existed under `temp/product_images/`.
+- Local frontend build/dependency/deployment artifacts existed under `frontend/.next/`, `frontend/node_modules/`, and `frontend/.vercel/`.
+- Nested local repository folders existed at `SCHDATAINGEST/` and `SaffronCaseHomes/`.
+- SCH/Saffron branding and Programa integration references remain in source code, docs, README, tests, and UI copy because this project is branded as SCH DesignOps Intake.
+- No `.env` commits were found in git history by path scan.
+- No staged files were present during this audit.
 
 ## What Was Changed
 
-- Strengthened `.gitignore` to cover:
-  - real environment files
-  - Streamlit secrets
-  - Python caches and virtualenvs
-  - all local `data/`
-  - uploads, exports, downloads
-  - generated CSV/XLS/XLSX/PDF/ZIP files
-  - SQLite/database files
-  - Playwright auth state, browser cookies, and storage-state JSON files
-  - credential and service-account JSON files
-  - private key/certificate files
-  - frontend dependencies and build artifacts
-  - local nested `SaffronCaseHomes/` clone
-  - editor and OS noise
-- Confirmed `.env.example`, `backend/.env.example`, and `frontend/.env.example` remain unignored and contain placeholders only for API keys.
+- Strengthened ignore coverage for:
+  - `.env`, `.env.*`, frontend local env files, and Streamlit secrets
+  - local data folders, uploads, exports, downloads, logs, browser profiles, screenshots, and product image staging
+  - generated CSV/PDF/XLS/ZIP/database files
+  - Playwright auth state, cookies, localStorage/sessionStorage, and storage-state JSON files
+  - credential/service-account JSON files and private key/certificate files
+  - Python caches/virtualenvs and frontend build/dependency artifacts
+  - nested local clones `SCHDATAINGEST/` and `SaffronCaseHomes/`
+- Updated `.env.example` and `backend/.env.example` so they contain placeholders and demo-safe defaults only.
+- Added demo-safe backend defaults:
+  - `DEMO_MODE=true`
+  - `ENABLE_REAL_INTEGRATIONS=false`
+  - Programa send/login routes return demo responses unless real integrations are explicitly enabled.
+  - Vendor-call start/test routes return demo responses unless real integrations are explicitly enabled.
+- Added demo-safe Programa automation defaults so direct Streamlit automation calls are skipped unless real integrations are explicitly enabled.
+- Removed local generated/private artifacts from the working tree:
+  - `data/browser_profiles/`
+  - `data/automation_logs/`
+  - `data/vendor_calls/`
+  - `temp/product_images/`
+  - `frontend/node_modules/`
+  - `frontend/.next/`
+  - `frontend/.vercel/`
+  - Python cache folders
+  - nested local clones `SCHDATAINGEST/` and `SaffronCaseHomes/`
 
 ## Ignored Files And Folders
 
 - `.env`
 - `.env.*` except committed example templates
+- `frontend/.env.local`
+- `frontend/.env.*.local`
 - `.streamlit/secrets.toml`
 - `data/`
 - `uploads/`
+- `uploaded_files/`
 - `exports/`
 - `downloads/`
+- `temp/`
+- `automation_logs/`
+- `logs/`
+- `*.log`
 - `*.csv`, `*.tsv`, `*.xlsx`, `*.xls`, `*.pdf`, `*.zip`
 - `*.sqlite`, `*.sqlite3`, `*.db`, `*.db-journal`, `*.db-wal`, `*.db-shm`
 - `playwright/.auth/`
@@ -78,32 +85,31 @@ Audit date: 2026-04-26
 - `*credentials*.json`
 - `*service-account*.json`
 - `*service_account*.json`
-- `*.pem`, `*.key`, `*.p12`, `*.pfx`
+- `*.pem`, `*.key`, `*.crt`, `*.p12`, `*.pfx`
+- `node_modules/`
 - `frontend/node_modules/`
 - `frontend/.next/`
 - `frontend/out/`
 - `frontend/.vercel/`
+- `dist/`, `build/`, `.cache/`
 - `__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`
 - `.venv/`, `venv/`, `env/`
 - `SaffronCaseHomes/`
+- `SCHDATAINGEST/`
 - `.DS_Store`, `.vscode/`, `.idea/`
 
-## Manual Review Before Deployment
+## Manual Review Before Public Deployment
 
-- Verify GitHub/Vercel/Render/Railway environment variables are set through platform secret managers, not committed files.
-- Rotate any local API keys if there is any chance they were copied outside `.env`.
-- Do not use `git add -f` on ignored paths.
-- Do not upload `data/`, Chrome profile folders, automation screenshots, logs, uploaded vendor PDFs, receipts, or generated CSV exports.
-- Review any future sample fixtures before committing them; use synthetic data only.
-- Review the current frontend dependency audit before production deployment. Do not apply the suggested major downgrade automatically.
-- For deployment, create fresh platform environment variables for:
-  - `ANTHROPIC_API_KEY`
-  - `BRAVE_API_KEY`
-  - `PROGRAMA_URL`
-  - `PROGRAMA_BROWSER_PROFILE`
-  - `FRONTEND_ORIGINS`
-  - `NEXT_PUBLIC_API_BASE_URL`
+- Rotate any local keys if there is any chance they were copied outside `.env`.
+- Keep `DEMO_MODE=true` and `ENABLE_REAL_INTEGRATIONS=false` in public demo environments.
+- Do not add secrets to `NEXT_PUBLIC_*`; those values are browser-visible.
+- Do not use `git add -f` on ignored files or folders.
+- Do not upload Chrome profiles, Programa screenshots, automation logs, vendor-call records, uploaded PDFs, receipts, generated CSVs, or product image staging folders.
+- Decide whether the public demo is allowed to use SCH/Saffron branding. If not, rebrand README, UI copy, prompts, tests, and docs before making the repo public.
+- Review docs under `docs/superpowers/` before public release; they contain internal planning history, local paths, and branded implementation notes.
 
 ## Verdict
 
-Safe to push with normal `git add` / `git commit` usage. Do not force-add ignored local files.
+Safe to push to a private/internal repository with normal `git add` usage.
+
+Not safe for a public demo repository yet if SCH/Saffron branding, internal planning docs, or product/vendor examples must be removed. The code is now demo-safe by default for external side effects, but brand/content sanitization still needs a product decision before public release.
