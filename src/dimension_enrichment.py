@@ -102,6 +102,41 @@ def _make_not_found_result(
     )
 
 
+def _normalize_model_variants(model: str) -> list[str]:
+    """Return up to 4 model variants to try in order: exact, no-spaces, dashes, suffix-stripped."""
+    # Strip whitespace and non-printable characters
+    model = "".join(c for c in model.strip() if c.isprintable())
+    seen: list[str] = [model]
+
+    no_spaces = re.sub(r"\s+", "", model)
+    if no_spaces not in seen:
+        seen.append(no_spaces)
+
+    with_dashes = re.sub(r"\s+", "-", model)
+    if with_dashes not in seen:
+        seen.append(with_dashes)
+
+    # Suffix strip: last dash/space token of 1–3 chars
+    tokens = re.split(r"[-\s]+", model)
+    if len(tokens) > 1 and 1 <= len(tokens[-1]) <= 3:
+        suffix_start = model.rfind(tokens[-1])
+        without_suffix = model[:suffix_start].rstrip(" -")
+        if without_suffix and without_suffix not in seen:
+            seen.append(without_suffix)
+    elif len(tokens) == 1:
+        # No delimiters: strip a trailing 1–3 alpha color-code suffix only when
+        # the string has the simple form  <alpha><digits><alpha 1-3>
+        # (e.g. "HV48SS" → "HV48").  More complex models like "SCN60PA1SU"
+        # (alpha–digit–alpha–digit–alpha) are left untouched.
+        m = re.match(r"^([A-Za-z]+\d+)([A-Za-z]{1,3})$", model)
+        if m:
+            without_suffix = m.group(1)
+            if without_suffix and without_suffix not in seen:
+                seen.append(without_suffix)
+
+    return seen
+
+
 def find_dimensions(row: dict) -> DimensionResult:
     """Perform full dimension lookup for a single intake row. Stub — implemented in Task 11."""
     return _make_not_found_result(failure_reason="not implemented")
