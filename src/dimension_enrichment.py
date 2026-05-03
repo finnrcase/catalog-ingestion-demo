@@ -222,6 +222,122 @@ def _generate_retailer_queries(brand: str, model: str) -> list[str]:
     ]
 
 
+# ── Dimension text patterns ────────────────────────────────────────────────────
+
+_PRODUCT_DIM_LABELS = re.compile(
+    r"(?:product|overall)\s+dimensions?\s*[:\-]\s*([^\n]{5,100})",
+    re.IGNORECASE,
+)
+_CUTOUT_DIM_LABEL = re.compile(
+    r"cutout\s+dimensions?\s*[:\-]\s*([^\n]{5,100})",
+    re.IGNORECASE,
+)
+_SHIPPING_DIM_LABEL = re.compile(
+    r"shipping\s+(?:dimensions?|size)\s*[:\-]\s*([^\n]{5,100})",
+    re.IGNORECASE,
+)
+# Bare "Dimensions:" — matched after the priority labels above exclude their ranges
+_DIM_LABEL = re.compile(
+    r"\bdimensions?\s*[:\-]\s*([^\n]{5,100})",
+    re.IGNORECASE,
+)
+# Inline W×H×D — supports fractions, decimals, integers; × or x or X or space
+_INLINE_DIM = re.compile(
+    r"[\d][\d ./]*\"?\s*[WwHhDd]\b[\s×xX]+[\d][\d ./]*\"?\s*[WwHhDd]\b[\s×xX]+[\d][\d ./]*\"?\s*[WwHhDd]\b",
+)
+
+
+def _fraction_to_decimal(s: str) -> str:
+    """Convert fraction strings like '14 7/8' → '14.875'. Returns input unchanged if not parseable."""
+    s = s.strip()
+    if not s:
+        return s
+    # Mixed number: "14 7/8"
+    m = re.match(r"^(\d+)\s+(\d+)/(\d+)$", s)
+    if m:
+        whole, num, den = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if den == 0:
+            return s
+        val = whole + num / den
+        # Format: strip trailing zeros, at most 6 decimal places
+        result = f"{val:.6f}".rstrip("0").rstrip(".")
+        return result
+    # Simple fraction: "3/4"
+    m = re.match(r"^(\d+)/(\d+)$", s)
+    if m:
+        num, den = int(m.group(1)), int(m.group(2))
+        if den == 0:
+            return s
+        val = num / den
+        result = f"{val:.6f}".rstrip("0").rstrip(".")
+        return result
+    # Already a decimal or integer
+    try:
+        float(s)
+        # Return as-is if it's already a clean decimal string
+        return s
+    except ValueError:
+        return s
+
+
+def _find_dimension_candidates(
+    text: str,
+    *,
+    include_cutout: bool = False,
+    include_shipping: bool = False,
+) -> list[str]:
+    """
+    Return candidate dimension strings from plain text, in priority order.
+    Shipping excluded by default; cutout excluded unless include_cutout=True.
+    Shipping only included when include_shipping=True AND no other candidates found.
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(s: str) -> None:
+        s = s.strip().rstrip(".,;:")
+        if s and s not in seen:
+            seen.add(s)
+            candidates.append(s)
+
+    # Priority 1: "Product Dimensions" / "Overall Dimensions"
+    for m in _PRODUCT_DIM_LABELS.finditer(text):
+        _add(m.group(1))
+
+    # Priority 2: bare "Dimensions:" — exclude matches already captured by
+    # product/overall/cutout/shipping labels
+    product_spans = {m.start() for m in _PRODUCT_DIM_LABELS.finditer(text)}
+    cutout_spans = {m.start() for m in _CUTOUT_DIM_LABEL.finditer(text)}
+    shipping_spans = {m.start() for m in _SHIPPING_DIM_LABEL.finditer(text)}
+    excluded_spans = product_spans | cutout_spans | shipping_spans
+    for m in _DIM_LABEL.finditer(text):
+        # Skip if this match's start is within 30 chars of a priority-label match
+        if any(abs(m.start() - s) < 30 for s in excluded_spans):
+            continue
+        _add(m.group(1))
+
+    # Priority 3: inline W×H×D pattern — skip if inside a cutout/shipping label span
+    cutout_ranges = [(m.start(), m.end()) for m in _CUTOUT_DIM_LABEL.finditer(text)]
+    shipping_ranges = [(m.start(), m.end()) for m in _SHIPPING_DIM_LABEL.finditer(text)]
+    excluded_ranges = cutout_ranges + shipping_ranges
+    for m in _INLINE_DIM.finditer(text):
+        in_excluded = any(r_start <= m.start() < r_end for r_start, r_end in excluded_ranges)
+        if not in_excluded:
+            _add(m.group(0))
+
+    # Priority 4: cutout (optional)
+    if include_cutout:
+        for m in _CUTOUT_DIM_LABEL.finditer(text):
+            _add(m.group(1))
+
+    # Priority 5: shipping — only when flag set AND no higher-priority candidates found
+    if include_shipping and not candidates:
+        for m in _SHIPPING_DIM_LABEL.finditer(text):
+            _add(m.group(1))
+
+    return candidates
+
+
 def find_dimensions(row: dict) -> DimensionResult:
     """Perform full dimension lookup for a single intake row. Stub — implemented in Task 11."""
     return _make_not_found_result(failure_reason="not implemented")

@@ -213,3 +213,102 @@ def test_generate_retailer_queries():
     assert any("ajmadison.com" in q for q in queries)
     assert all(q.startswith("site:") for q in queries)
     assert len(queries) == len(RETAILER_DOMAINS)
+
+
+from src.dimension_enrichment import _fraction_to_decimal, _find_dimension_candidates
+
+
+def test_fraction_to_decimal_mixed_number():
+    assert _fraction_to_decimal("14 7/8") == "14.875"
+
+
+def test_fraction_to_decimal_33_3_8():
+    assert _fraction_to_decimal("33 3/8") == "33.375"
+
+
+def test_fraction_to_decimal_simple_fraction():
+    assert _fraction_to_decimal("3/4") == "0.75"
+
+
+def test_fraction_to_decimal_half():
+    assert _fraction_to_decimal("1/2") == "0.5"
+
+
+def test_fraction_to_decimal_whole_number():
+    assert _fraction_to_decimal("22") == "22"
+
+
+def test_fraction_to_decimal_decimal_string():
+    assert _fraction_to_decimal("14.875") == "14.875"
+
+
+def test_fraction_to_decimal_empty():
+    assert _fraction_to_decimal("") == ""
+
+
+def test_fraction_to_decimal_invalid_returns_input():
+    assert _fraction_to_decimal("abc") == "abc"
+
+
+def test_find_dimension_candidates_product_dimensions_label():
+    text = 'Product Dimensions: 14 7/8"W x 22"D x 33 3/8"H\nOther info'
+    candidates = _find_dimension_candidates(text)
+    assert len(candidates) >= 1
+    assert any("14 7/8" in c for c in candidates)
+
+
+def test_find_dimension_candidates_overall_dimensions_label():
+    text = 'Overall Dimensions: 36"W x 34.5"H x 24"D'
+    candidates = _find_dimension_candidates(text)
+    assert any("36" in c for c in candidates)
+
+
+def test_find_dimension_candidates_inline_pattern():
+    text = 'The unit measures 14.875"W × 22"D × 33.375"H in the installed position.'
+    candidates = _find_dimension_candidates(text)
+    assert any("14.875" in c for c in candidates)
+
+
+def test_find_dimension_candidates_returns_empty_for_no_match():
+    candidates = _find_dimension_candidates("No dimensions here at all.")
+    assert candidates == []
+
+
+def test_find_dimension_candidates_product_dims_before_cutout():
+    text = (
+        'Product Dimensions: 14"W x 33"H x 22"D\n'
+        'Cutout Dimensions: 13.5"W x 32.5"H x 21.5"D'
+    )
+    candidates = _find_dimension_candidates(text)
+    # Product Dimensions candidate comes first; cutout excluded by default
+    assert candidates[0].startswith("14")
+    assert not any("13.5" in c for c in candidates)
+
+
+def test_find_dimension_candidates_cutout_labeled():
+    text = 'Cutout Dimensions: 13.5"W x 32.5"H x 21.5"D'
+    candidates = _find_dimension_candidates(text, include_cutout=True)
+    assert any("13.5" in c for c in candidates)
+
+
+def test_find_dimension_candidates_excludes_shipping_by_default():
+    text = 'Shipping Dimensions: 18"W x 40"H x 28"D\nNo other dimensions listed.'
+    candidates = _find_dimension_candidates(text)
+    assert candidates == []
+
+
+def test_find_dimension_candidates_includes_shipping_when_flag_set():
+    text = 'Shipping Dimensions: 18"W x 40"H x 28"D\nNo other dimensions listed.'
+    candidates = _find_dimension_candidates(text, include_shipping=True)
+    assert any("18" in c for c in candidates)
+
+
+def test_find_dimension_candidates_shipping_not_included_when_product_found():
+    text = (
+        'Product Dimensions: 14"W x 33"H x 22"D\n'
+        'Shipping Dimensions: 18"W x 40"H x 28"D'
+    )
+    # include_shipping=True but product found — shipping should NOT appear
+    candidates = _find_dimension_candidates(text, include_shipping=True)
+    assert not any("18" in c for c in candidates)
+    assert any("14" in c for c in candidates)
