@@ -1,3 +1,4 @@
+import datetime
 import logging
 import os
 import re
@@ -25,6 +26,7 @@ from src.photo_inventory import (
     upload_image_to_cloudinary,
 )
 from src.programa_export import (
+    build_programa_debug_dataframe,
     build_programa_import_dataframe,
     export_programa_csv,
     export_programa_xlsx,
@@ -363,7 +365,11 @@ with left_col:
 
 with right_col:
     with st.container(border=True):
-        url_tab, photo_tab = st.tabs(["Product URLs", "Photo Inventory Upload"])
+        url_tab, photo_tab, bulk_photo_tab = st.tabs([
+            "Product URLs",
+            "Photo Inventory Upload",
+            "Photo-only Bulk Import",
+        ])
         with url_tab:
             section_label("Product URLs")
             url_input = st.text_area(
@@ -459,6 +465,131 @@ with right_col:
                         st.session_state.pending_enrichment = False
                         st.success(
                             f"Created {len(draft_rows)} photo inventory draft row{'s' if len(draft_rows) != 1 else ''}."
+                        )
+
+        with bulk_photo_tab:
+            section_label("Photo-only Bulk Import")
+            st.caption("Fast path: upload images, host them, and create one Programa row per photo without AI.")
+            bulk_only_files = st.file_uploader(
+                "Upload photo-only inventory images",
+                type=ACCEPTED_PHOTO_TYPES,
+                accept_multiple_files=True,
+                key="photo_only_bulk_files",
+                label_visibility="collapsed",
+            )
+            bulk_section_options = ["Decor", "Art", "Furniture", "Accessories", "General", "Custom"]
+            bulk_section_choice = st.selectbox(
+                "Default Section",
+                options=bulk_section_options,
+                key="photo_only_bulk_section_choice",
+            )
+            bulk_section_custom = ""
+            if bulk_section_choice == "Custom":
+                bulk_section_custom = st.text_input(
+                    "Custom Section",
+                    key="photo_only_bulk_section_custom",
+                    placeholder="e.g. Vintage Objects",
+                )
+            bulk_section = bulk_section_custom.strip() if bulk_section_choice == "Custom" else bulk_section_choice
+            bulk_naming_mode = st.selectbox(
+                "Naming Mode",
+                options=["Filename", "Generated names"],
+                key="photo_only_bulk_naming_mode",
+            )
+            bulk_use_ai = st.checkbox(
+                "Use AI to describe photos",
+                value=False,
+                key="photo_only_bulk_use_ai",
+                help="Optional slower pass. Default off for fast bulk imports.",
+            )
+
+            if bulk_only_files:
+                total_size = sum(getattr(f, "size", 0) or 0 for f in bulk_only_files)
+                st.caption(
+                    f"{len(bulk_only_files)} image{'s' if len(bulk_only_files) != 1 else ''} ready "
+                    f"- {round(total_size / (1024 * 1024), 2)} MB"
+                )
+                preview_files = bulk_only_files[:6]
+                preview_cols = st.columns(min(3, len(preview_files)))
+                for idx, f in enumerate(preview_files):
+                    with preview_cols[idx % len(preview_cols)]:
+                        if Path(f.name).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+                            st.image(f, caption=f.name, use_container_width=True)
+                        else:
+                            st.caption(f"• {f.name}")
+                if len(bulk_only_files) > len(preview_files):
+                    st.caption(f"+ {len(bulk_only_files) - len(preview_files)} more")
+
+            create_bulk_only_rows = st.button(
+                "Upload and Create Rows",
+                type="secondary",
+                use_container_width=True,
+                key="create_photo_only_bulk_rows",
+                disabled=not bool(bulk_only_files) or not bool(bulk_section.strip()),
+            )
+            if create_bulk_only_rows:
+                if not bulk_only_files:
+                    st.warning("Upload at least one photo first.", icon="⚠️")
+                elif not bulk_section.strip():
+                    st.warning("Choose or enter a default section first.", icon="⚠️")
+                else:
+                    saved_photos = []
+                    image_urls = []
+                    upload_statuses = []
+                    progress = st.progress(0, text="Uploading photos to public hosting...")
+                    for idx, photo_file in enumerate(bulk_only_files, start=1):
+                        try:
+                            photo_meta = _save_bulk_photo_upload(photo_file)
+                            image_url, upload_error = upload_image_to_cloudinary(photo_meta["local_image_path"])
+                            saved_photos.append(photo_meta)
+                            image_urls.append(image_url)
+                            upload_statuses.append("Uploaded" if image_url else "Needs Cloudinary")
+                            if upload_error:
+                                st.warning(upload_error, icon="⚠️")
+                        except Exception as exc:
+                            st.warning(f"Could not process {photo_file.name}: {exc}", icon="⚠️")
+                        progress.progress(
+                            idx / len(bulk_only_files),
+                            text=f"Uploaded {idx} of {len(bulk_only_files)} photos",
+                        )
+                    progress.empty()
+
+                    if saved_photos:
+                        photo_rows = create_photo_only_bulk_rows(
+                            saved_photos,
+                            project=selected_project,
+                            room=room,
+                            section=bulk_section,
+                            naming_mode=bulk_naming_mode,
+                            image_urls=image_urls,
+                            upload_statuses=upload_statuses,
+                        )
+                        if bulk_use_ai:
+                            for row in photo_rows:
+                                local_path = str(row.get("Local Image Path", "") or "")
+                                filename = str(row.get("Image Filename", "") or "")
+                                ai_fields, ai_error = analyze_photo_with_ai(local_path, filename)
+                                description = str(ai_fields.get("description", "") or "").strip()
+                                if description:
+                                    row["Notes"] = f"{row['Notes']} {description}"
+                                if ai_error:
+                                    row["Notes"] = f"{row['Notes']} {ai_error}"
+                        photo_df = pd.DataFrame(photo_rows)
+                        preview_cols = ["Product Category", "Product Name", "Image URL", "Quantity", "Notes"]
+                        st.dataframe(
+                            photo_df[[c for c in preview_cols if c in photo_df.columns]],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                        if st.session_state.intake_df is not None and not st.session_state.intake_df.empty:
+                            combined = pd.concat([st.session_state.intake_df, photo_df], ignore_index=True)
+                        else:
+                            combined = photo_df
+                        st.session_state.intake_df = apply_confidence_checks(combined)
+                        st.session_state.automation_results = None
+                        st.session_state.pending_enrichment = False
+                        st.success(
+                            f"Created {len(photo_rows)} photo-only bulk import row{'s' if len(photo_rows) != 1 else ''}."
                         )
 
 st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
@@ -766,6 +897,7 @@ if st.session_state.intake_df is not None:
     st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
     st.divider()
     section_label("Programa Automation")
+    st.caption("Legacy path — use the CSV/XLSX export below for most imports.")
 
     # Eligibility: Include=True, not flagged for review, not in terminal statuses,
     # has Product Name, Quantity ≥ 1, Product Category.
@@ -1350,8 +1482,8 @@ if st.session_state.intake_df is not None:
     st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
 
     # ── Export CSV ─────────────────────────────────────────────────────────────
-    export_col, _, __ = st.columns([2, 6, 2])
-    with export_col:
+    _export_col, _, __ = st.columns([2, 6, 2])
+    with _export_col:
         included = (
             edited_df[edited_df["Include"] == True]
             if "Include" in edited_df.columns else edited_df
@@ -1364,25 +1496,72 @@ if st.session_state.intake_df is not None:
             mime="text/csv",
             use_container_width=True,
         )
-        export_summary = validate_for_export(included)
-        programa_df = build_programa_import_dataframe(included)
-        if export_summary["missing_image_url"] > 0:
-            st.caption(f"{export_summary['missing_image_url']} Programa export row(s) are missing Image URL.")
+
+    # ── Export for Programa Import ─────────────────────────────────────────────
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    st.divider()
+    section_label("Export for Programa Import")
+
+    _export_summary = validate_for_export(included)
+    _programa_df = build_programa_import_dataframe(included)
+    _today = datetime.date.today().isoformat()
+
+    _export_count = _export_summary["export_count"]
+    _skipped = _export_summary["skipped"]
+    _missing_section = _export_summary["missing_section"]
+    _missing_dims = _export_summary["missing_dimensions"]
+    _missing_url = _export_summary["missing_product_url"]
+    _missing_img = _export_summary["missing_image_url"]
+
+    if _export_count > 0:
+        st.success(f"✓  {_export_count} row{'s' if _export_count != 1 else ''} ready for export", icon=None)
+    else:
+        st.info("No rows ready for export.", icon=None)
+
+    if _missing_section:
+        with st.expander(f"⚠  {len(_missing_section)} row{'s' if len(_missing_section) != 1 else ''} missing Section — using \"General\""):
+            for item in _missing_section:
+                st.markdown(f"- {item['product_name']}")
+    if _missing_dims > 0:
+        st.warning(f"⚠  {_missing_dims} row{'s' if _missing_dims != 1 else ''} missing Dimensions", icon=None)
+    if _missing_url > 0:
+        st.warning(f"⚠  {_missing_url} row{'s' if _missing_url != 1 else ''} missing Product URL", icon=None)
+    if _missing_img > 0:
+        st.warning(f"⚠  {_missing_img} row{'s' if _missing_img != 1 else ''} missing Image URL", icon=None)
+    if _skipped:
+        with st.expander(f"✕  {len(_skipped)} row{'s' if len(_skipped) != 1 else ''} skipped (no Product Name)"):
+            for item in _skipped:
+                st.markdown(f"- Row {item['index']}")
+
+    _dl_col1, _dl_col2, _dl_spacer = st.columns([1, 1, 4])
+    with _dl_col1:
         st.download_button(
-            label="Export Programa CSV",
-            data=export_programa_csv(programa_df),
-            file_name=f"{safe_name}_programa_import.csv",
+            label="Download CSV",
+            data=export_programa_csv(_programa_df),
+            file_name=f"programa_import_{_today}.csv",
             mime="text/csv",
             use_container_width=True,
-            disabled=programa_df.empty,
+            disabled=_programa_df.empty,
         )
+    with _dl_col2:
         st.download_button(
-            label="Export Programa XLSX",
-            data=export_programa_xlsx(programa_df),
-            file_name=f"{safe_name}_programa_import.xlsx",
+            label="Download XLSX",
+            data=export_programa_xlsx(_programa_df),
+            file_name=f"programa_import_{_today}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
-            disabled=programa_df.empty,
+            disabled=_programa_df.empty,
+        )
+
+    _include_debug = st.checkbox("Include debug columns", key="programa_debug_export")
+    if _include_debug:
+        _debug_df = build_programa_debug_dataframe(included)
+        st.download_button(
+            label="Download Debug CSV",
+            data=export_programa_csv(_debug_df),
+            file_name=f"programa_import_debug_{_today}.csv",
+            mime="text/csv",
+            disabled=_debug_df.empty,
         )
 
     # ── Needs Review ───────────────────────────────────────────────────────────
