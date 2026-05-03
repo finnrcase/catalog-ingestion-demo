@@ -17,6 +17,7 @@ from src.intake_schema import SOURCE_PHOTO, make_base_row
 load_dotenv()
 
 PHOTO_ONLY_NOTE = "Photo-only item; details generated from uploaded image."
+PHOTO_ONLY_BULK_NOTE = "Photo-only inventory item."
 
 _SUPPORTED_AI_MEDIA_TYPES = {
     "image/jpeg",
@@ -30,6 +31,16 @@ def filename_to_product_name(filename: str) -> str:
     stem = Path(filename or "Photo item").stem
     cleaned = stem.replace("_", " ").replace("-", " ").strip()
     return " ".join(cleaned.split()).title() or "Photo Item"
+
+
+def filename_stem_as_product_name(filename: str) -> str:
+    """Return the original filename stem for fast photo-only imports."""
+    stem = Path(filename or "").stem.strip()
+    return stem or "photo_item"
+
+
+def generated_photo_item_name(index: int) -> str:
+    return f"Photo Item {max(1, int(index)):03d}"
 
 
 def _photo_prompt(filename: str) -> str:
@@ -222,3 +233,76 @@ def create_photo_inventory_row(
         }
     )
     return row
+
+
+def create_photo_only_bulk_row(
+    photo: dict,
+    project: str,
+    room: str,
+    section: str,
+    product_name: str,
+    image_url: str,
+    image_upload_status: str = "",
+) -> dict:
+    """Create one fast photo-only Programa import row without AI analysis."""
+    row = make_base_row(project, room, "", "")
+    row.update(
+        {
+            "Product Name": product_name.strip() or filename_stem_as_product_name(str(photo.get("image_filename", ""))),
+            "Brand": "",
+            "Dimensions": "",
+            "Finish / Color": "",
+            "Color": "",
+            "Material": "",
+            "Model/SKU": "",
+            "Product Category": section.strip() or "General",
+            "Quantity": 1,
+            "Price": "",
+            "Supplier": "",
+            "Product URL": "",
+            "Notes": PHOTO_ONLY_BULK_NOTE,
+            "Source Type": SOURCE_PHOTO,
+            "Import Type": "Photo-only Bulk Import",
+            "photo_only": True,
+            "Status": "Needs Review",
+            "Image URL": image_url.strip(),
+            "Local Image Path": str(photo.get("local_image_path", "") or ""),
+            "Image Filename": str(photo.get("image_filename", "") or ""),
+            "Image Upload Status": image_upload_status or ("Uploaded" if image_url else "Needs Cloudinary"),
+        }
+    )
+    return row
+
+
+def create_photo_only_bulk_rows(
+    photos: list[dict],
+    project: str,
+    room: str,
+    section: str,
+    naming_mode: str,
+    image_urls: list[str],
+    upload_statuses: list[str] | None = None,
+) -> list[dict]:
+    """Create one fast photo-only row per photo, preserving input order."""
+    rows: list[dict] = []
+    statuses = upload_statuses or []
+    for idx, photo in enumerate(photos, start=1):
+        filename = str(photo.get("image_filename", "") or "")
+        if naming_mode == "Generated names":
+            product_name = generated_photo_item_name(idx)
+        else:
+            product_name = filename_stem_as_product_name(filename)
+        image_url = image_urls[idx - 1] if idx - 1 < len(image_urls) else ""
+        status = statuses[idx - 1] if idx - 1 < len(statuses) else ""
+        rows.append(
+            create_photo_only_bulk_row(
+                photo,
+                project=project,
+                room=room,
+                section=section,
+                product_name=product_name,
+                image_url=image_url,
+                image_upload_status=status,
+            )
+        )
+    return rows
