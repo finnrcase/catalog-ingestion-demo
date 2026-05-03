@@ -119,12 +119,13 @@ def test_get_domain_unknown_brand_returns_none_without_search():
 
 def test_get_domain_unknown_brand_discovered_via_injected_search():
     import src.dimension_enrichment as _mod
+    _mod._discovered_domains.pop("unknownbrandxyz2", None)  # pre-clean
     def _mock_search(query):
         return ["https://unknownbrandxyz.com/products/spec"]
     result = _get_manufacturer_domain("UnknownBrandXYZ2", _search_fn=_mock_search)
     assert result == "unknownbrandxyz.com"
-    # Cached
     assert _mod._discovered_domains.get("unknownbrandxyz2") == "unknownbrandxyz.com"
+    _mod._discovered_domains.pop("unknownbrandxyz2", None)  # post-clean
 
 
 def test_get_domain_discovery_failure_returns_none():

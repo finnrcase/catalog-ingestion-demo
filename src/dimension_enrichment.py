@@ -148,7 +148,10 @@ def _get_manufacturer_domain(
     Checks BRAND_DOMAIN_TABLE first, then _discovered_domains cache,
     then optionally runs a discovery search via _search_fn(query) -> list[str].
     """
-    key = brand.strip().lower()
+    brand_stripped = brand.strip()
+    key = brand_stripped.lower()
+    if not key:
+        return None
     if key in BRAND_DOMAIN_TABLE:
         return BRAND_DOMAIN_TABLE[key]
     if key in _discovered_domains:
@@ -156,10 +159,11 @@ def _get_manufacturer_domain(
     if _search_fn is None:
         return None
     try:
-        urls = _search_fn(f'"{brand}" official website product specifications')
+        urls = _search_fn(f'"{brand_stripped}" official website product specifications')
         if not urls:
             return None
-        domain = _urlparse.urlparse(urls[0]).netloc.lstrip("www.")
+        netloc = _urlparse.urlparse(urls[0]).netloc.lower()
+        domain = netloc[4:] if netloc.startswith("www.") else netloc
         if domain:
             _discovered_domains[key] = domain
             return domain
