@@ -566,6 +566,7 @@ def _parse_pdf_for_dimensions(
 
 _PDF_EXTENSIONS = frozenset({".pdf"})
 _REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SCH-Intake/1.0)"}
+_REQUEST_TIMEOUT_S: int = 12
 
 
 def _fetch_and_parse_url(
@@ -587,14 +588,17 @@ def _fetch_and_parse_url(
         return None, None, suffix
 
     try:
-        resp = _httpx.get(url, headers=_REQUEST_HEADERS, timeout=12, follow_redirects=True)
+        resp = _httpx.get(url, headers=_REQUEST_HEADERS, timeout=_REQUEST_TIMEOUT_S, follow_redirects=True)
         resp.raise_for_status()
         content_type = resp.headers.get("content-type", "").lower()
-        if "pdf" in content_type or suffix == "pdf":
+        if "pdf" in content_type:
             suffix = "pdf"
             return (*_parse_pdf_for_dimensions(resp.content, is_appliance=is_appliance), suffix)
+        if "html" not in content_type and suffix == "pdf":
+            # No HTML signal from content-type; URL extension suggests PDF
+            return (*_parse_pdf_for_dimensions(resp.content, is_appliance=is_appliance), suffix)
         return (*_parse_html_for_dimensions(resp.text, is_appliance=is_appliance), suffix)
-    except Exception:
+    except Exception:  # network errors, redirects, and parser failures all return no-result
         return None, None, suffix
 
 

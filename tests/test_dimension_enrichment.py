@@ -529,6 +529,7 @@ def test_fetch_and_parse_url_html_page():
         )
     assert product_dims is not None
     assert "36" in product_dims
+    assert cutout_dims is None
     assert source_type_suffix == "page"
 
 
@@ -561,3 +562,29 @@ def test_fetch_and_parse_url_returns_none_on_http_error():
         )
     assert product_dims is None
     assert source_type_suffix == "page"
+
+
+def test_fetch_and_parse_url_returns_none_when_httpx_unavailable():
+    with patch("src.dimension_enrichment._httpx", None):
+        product_dims, cutout_dims, source_type_suffix = _fetch_and_parse_url(
+            "https://example.com/product"
+        )
+    assert product_dims is None
+    assert cutout_dims is None
+    assert source_type_suffix == "page"
+
+
+def test_fetch_and_parse_url_returns_none_on_http_status_error():
+    import httpx
+    mock_httpx = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "404", request=MagicMock(), response=MagicMock()
+    )
+    mock_httpx.get.return_value = mock_resp
+    with patch("src.dimension_enrichment._httpx", mock_httpx):
+        product_dims, cutout_dims, source_type_suffix = _fetch_and_parse_url(
+            "https://example.com/product"
+        )
+    assert product_dims is None
+    assert cutout_dims is None
