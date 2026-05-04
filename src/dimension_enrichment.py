@@ -609,7 +609,6 @@ def _assign_confidence(
     primary_model: str,
     *,
     is_manufacturer: bool,
-    source_type_suffix: str,
 ) -> str:
     """
     Assign confidence tier based on model match quality and source authority.

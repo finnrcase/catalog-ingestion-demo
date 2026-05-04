@@ -598,7 +598,6 @@ def test_confidence_exact_model_manufacturer_page_is_high():
         model_variant="SCN60PA1SU",
         primary_model="SCN60PA1SU",
         is_manufacturer=True,
-        source_type_suffix="page",
     ) == "high"
 
 
@@ -607,7 +606,6 @@ def test_confidence_exact_model_manufacturer_pdf_is_high():
         model_variant="SCN60PA1SU",
         primary_model="SCN60PA1SU",
         is_manufacturer=True,
-        source_type_suffix="pdf",
     ) == "high"
 
 
@@ -616,7 +614,6 @@ def test_confidence_exact_model_retailer_is_medium():
         model_variant="SCN60PA1SU",
         primary_model="SCN60PA1SU",
         is_manufacturer=False,
-        source_type_suffix="page",
     ) == "medium"
 
 
@@ -626,7 +623,15 @@ def test_confidence_variant_match_manufacturer_is_medium():
         model_variant="HV48SS",    # variant (spaces removed)
         primary_model="HV 48 SS",  # primary
         is_manufacturer=True,
-        source_type_suffix="page",
+    ) == "medium"
+
+
+def test_confidence_variant_match_retailer_is_medium():
+    # Spaces-removed variant matches primary on retailer → medium
+    assert _assign_confidence(
+        model_variant="HV48SS",
+        primary_model="HV 48 SS",
+        is_manufacturer=False,
     ) == "medium"
 
 
@@ -635,7 +640,6 @@ def test_confidence_suffix_stripped_variant_is_low():
         model_variant="HV48",      # suffix stripped — partial
         primary_model="HV48SS",
         is_manufacturer=True,
-        source_type_suffix="page",
     ) == "low"
 
 
@@ -644,5 +648,4 @@ def test_confidence_suffix_stripped_variant_retailer_is_low():
         model_variant="HV48",
         primary_model="HV48SS",
         is_manufacturer=False,
-        source_type_suffix="page",
     ) == "low"
