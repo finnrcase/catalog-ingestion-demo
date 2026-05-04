@@ -104,6 +104,7 @@ class IntakeResponse(BaseModel):
     errors: list[str] = Field(default_factory=list)
     eligible_count: int = 0
     blocked_count: int = 0
+    dimension_diagnostics: list[dict] = Field(default_factory=list)
 
 
 app = FastAPI(
@@ -150,7 +151,11 @@ def _demo_mode_response(action: str, rows: int = 0) -> dict:
     }
 
 
-def _df_response(df: pd.DataFrame, errors: list[str] | None = None) -> IntakeResponse:
+def _df_response(
+    df: pd.DataFrame,
+    errors: list[str] | None = None,
+    dimension_diagnostics: list[dict] | None = None,
+) -> IntakeResponse:
     df = df.copy()
     if "Notes" in df.columns:
         df["Notes"] = df["Notes"].apply(remove_notes_row_prefix)
@@ -161,6 +166,7 @@ def _df_response(df: pd.DataFrame, errors: list[str] | None = None) -> IntakeRes
         errors=errors or [],
         eligible_count=len(eligible),
         blocked_count=len(blocked),
+        dimension_diagnostics=dimension_diagnostics or [],
     )
 
 
@@ -244,9 +250,9 @@ def validate_intake(payload: RowsPayload) -> IntakeResponse:
 
 @app.post("/intake/enrich", response_model=IntakeResponse)
 def enrich_intake(payload: RowsPayload) -> IntakeResponse:
-    df, errors = enrich_dataframe(pd.DataFrame(payload.rows))
+    df, errors, dimension_diagnostics = enrich_dataframe(pd.DataFrame(payload.rows))
     df = apply_confidence_checks(df)
-    return _df_response(df, errors)
+    return _df_response(df, errors, dimension_diagnostics)
 
 
 @app.post("/programa/eligible")

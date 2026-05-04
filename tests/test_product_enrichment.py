@@ -394,7 +394,7 @@ def test_enrich_dataframe_skips_non_qualifying():
         "Suggested Action": "",
     }])
     with patch("src.product_enrichment.search_product_candidates", return_value=[]) as mock_search:
-        updated_df, errors = enrich_dataframe(df)
+        updated_df, errors, diagnostics = enrich_dataframe(df)
     mock_search.assert_not_called()
     assert errors == []
 
@@ -413,7 +413,7 @@ def test_enrich_dataframe_isolates_exceptions():
 
     with patch("src.product_enrichment.enrich_row", side_effect=bad_enrich_row), \
          patch("src.product_enrichment.time.sleep"):
-        updated_df, errors = enrich_dataframe(df)
+        updated_df, errors, diagnostics = enrich_dataframe(df)
 
     assert len(errors) == 1
     assert "Wolf" in errors[0]

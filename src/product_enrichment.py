@@ -8,7 +8,7 @@ Claude Haiku. Never overwrites existing data.
 Public API
 ----------
 enrich_row(row: dict) -> tuple[dict, str | None]
-enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]
+enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[dict]]
 """
 
 import json
@@ -345,13 +345,14 @@ def enrich_row(row: dict) -> tuple[dict, str | None]:
         return row, str(exc)
 
 
-def enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+def enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[dict]]:
     """
-    Enrich all qualifying rows in df. Returns (updated_df, error_list).
+    Enrich all qualifying rows in df. Returns (updated_df, error_list, dimension_diagnostics).
     Exceptions in individual rows are caught and logged; the row is left unchanged.
     """
     df = df.copy()
     errors: list[str] = []
+    dimension_diagnostics: list[dict] = []
 
     for idx, row in df.iterrows():
         r = row.to_dict()
@@ -369,10 +370,26 @@ def enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
                 for col, val in updated.items():
                     if col in df.columns:
                         df.at[idx, col] = val
+
+                # Collect dimension diagnostics if lookup ran
+                lookup_status = updated.get("Dimension Lookup Status", "")
+                if lookup_status:
+                    dimension_diagnostics.append({
+                        "row_index": int(idx),
+                        "product_name": _str_val(updated.get("Product Name")),
+                        "model_searched": _str_val(updated.get("Model/SKU")),
+                        "domain_used": urllib.parse.urlparse(
+                            _str_val(updated.get("Dimension Source URL", ""))
+                        ).netloc or "",
+                        "confidence": _str_val(updated.get("Dimension Confidence")),
+                        "status": lookup_status,
+                        "source_url": _str_val(updated.get("Dimension Source URL")),
+                        "failure_reason": "",
+                    })
         except Exception as exc:
             label = _str_val(r.get("Product Name")) or _str_val(r.get("Brand")) or _str_val(r.get("Model/SKU")) or str(idx)
             errors.append(f"Row '{label}': {exc}")
 
         time.sleep(0.5)
 
-    return df, errors
+    return df, errors, dimension_diagnostics
