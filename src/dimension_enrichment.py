@@ -755,6 +755,7 @@ def find_dimensions(row: dict) -> DimensionResult:
         low_confidence_result.width = ""
         low_confidence_result.height = ""
         low_confidence_result.depth = ""
+        low_confidence_result.length = ""
         return low_confidence_result
 
     return _make_not_found_result(

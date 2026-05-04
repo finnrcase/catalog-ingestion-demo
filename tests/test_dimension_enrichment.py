@@ -7,6 +7,7 @@ from src.dimension_enrichment import (
     _make_not_found_result,
     _normalize_model_variants,
     _fetch_and_parse_url,
+    _generate_retailer_queries,
 )
 
 
@@ -752,3 +753,29 @@ def test_find_dimensions_appliance_cutout_in_evidence():
     assert result.status == "found"
     assert result.evidence_text != ""
     assert "13.5" not in result.dimensions
+
+
+def test_find_dimensions_retailer_phase_not_called_when_manufacturer_succeeds():
+    def _mock_search(query):
+        # Return a result for any non-retailer query
+        if "site:" not in query or "scotsman-ice.com" in query:
+            return ["https://scotsman-ice.com/products/scn60pa1su"]
+        return []
+
+    def _mock_fetch(url, *, is_appliance=False):
+        return ('14 7/8"W x 22"D x 33 3/8"H', None, "page")
+
+    retailer_called = []
+    original_retailer_queries = _generate_retailer_queries
+
+    def _mock_retailer_queries(brand, model):
+        retailer_called.append((brand, model))
+        return original_retailer_queries(brand, model)
+
+    with patch("src.dimension_enrichment._brave_search_urls", side_effect=_mock_search):
+        with patch("src.dimension_enrichment._fetch_and_parse_url", side_effect=_mock_fetch):
+            with patch("src.dimension_enrichment._generate_retailer_queries", side_effect=_mock_retailer_queries):
+                result = find_dimensions(_scotsman_row())
+
+    assert result.status == "found"
+    assert retailer_called == []  # retailer phase must not have fired
