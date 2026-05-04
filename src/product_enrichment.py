@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 
 from src.brave_search import BRAVE_API_KEY, search_product_candidates
 from src.category_ai import _normalise_category
+from src.dimension_enrichment import find_dimensions as _find_dimensions
 from src.dimensions import has_complete_3d_dimensions
 
 try:
@@ -296,22 +297,48 @@ def enrich_row(row: dict) -> tuple[dict, str | None]:
             note = "[Enrichment: no confident source found]"
             if note not in existing:
                 updated["Notes"] = f"{existing} {note}".strip() if existing else note
-            return updated, None
+        else:
+            best = results[0]
+            page_text = _fetch_page_text(best.url)
 
-        best = results[0]
-        page_text = _fetch_page_text(best.url)
+            if not page_text:
+                updated = row.copy()
+                existing = _str_val(updated.get("Notes"))
+                domain = urllib.parse.urlparse(best.url).netloc or best.url[:50]
+                note = f"[Enrichment: could not fetch {domain}]"
+                if note not in existing:
+                    updated["Notes"] = f"{existing} {note}".strip() if existing else note
+            else:
+                extracted = _extract_with_claude(page_text, row)
+                updated = _apply_enrichment(row, extracted, best.url, best.domain_score)
 
-        if not page_text:
-            updated = row.copy()
-            existing = _str_val(updated.get("Notes"))
-            domain = urllib.parse.urlparse(best.url).netloc or best.url[:50]
-            note = f"[Enrichment: could not fetch {domain}]"
-            if note not in existing:
-                updated["Notes"] = f"{existing} {note}".strip() if existing else note
-            return updated, None
+        # ── Dimension enrichment pass ──────────────────────────────────────────
+        brand_val = _str_val(updated.get("Brand"))
+        model_val = _str_val(updated.get("Model/SKU"))
+        dims_val = _str_val(updated.get("Dimensions"))
+        if brand_val and model_val and not has_complete_3d_dimensions(dims_val):
+            dim_result = _find_dimensions(updated)
+            if dim_result.status == "found" and dim_result.confidence in ("high", "medium"):
+                updated["Dimensions"] = dim_result.dimensions
+                if dim_result.width:
+                    updated["Width (in)"] = dim_result.width
+                if dim_result.height:
+                    updated["Height (in)"] = dim_result.height
+                if dim_result.depth:
+                    updated["Depth (in)"] = dim_result.depth
+                if dim_result.length:
+                    updated["Length (in)"] = dim_result.length
+                if "Cutout:" in dim_result.evidence_text:
+                    cutout_part = dim_result.evidence_text.split("Cutout:")[-1].strip()
+                    existing_notes = _str_val(updated.get("Notes"))
+                    tag = f"[Cutout Dimensions: {cutout_part}]"
+                    if tag not in existing_notes:
+                        updated["Notes"] = f"{existing_notes} {tag}".strip() if existing_notes else tag
+            updated["Dimension Source URL"] = dim_result.source_url
+            updated["Dimension Confidence"] = dim_result.confidence if dim_result.confidence != "none" else ""
+            updated["Dimension Source Type"] = dim_result.source_type if dim_result.source_type != "none" else ""
+            updated["Dimension Lookup Status"] = dim_result.status
 
-        extracted = _extract_with_claude(page_text, row)
-        updated = _apply_enrichment(row, extracted, best.url, best.domain_score)
         return updated, None
     except Exception as exc:
         return row, str(exc)
