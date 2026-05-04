@@ -103,3 +103,25 @@ def test_enrich_row_does_not_overwrite_existing_complete_dims():
             updated, error = enrich_row(row)
 
     assert updated["Dimensions"] == original_dims
+
+
+def test_enrich_row_low_confidence_does_not_write_dimensions():
+    mock_result = DimensionResult(
+        dimensions='28"W x 30"H x 17"D',  # found but low confidence
+        width="28",
+        height="30",
+        depth="17",
+        source_url="https://example.com/k-3999",
+        confidence="low",
+        source_type="retailer_page",
+        status="low_confidence_skipped",
+    )
+    with patch("src.product_enrichment.search_product_candidates", return_value=[]):
+        with patch("src.product_enrichment._find_dimensions", return_value=mock_result):
+            updated, error = enrich_row(_row_missing_dims())
+
+    assert error is None
+    assert updated.get("Dimensions", "") == ""
+    assert updated["Dimension Lookup Status"] == "low_confidence_skipped"
+    assert updated["Dimension Confidence"] == "low"
+    assert updated["Dimension Source URL"] == "https://example.com/k-3999"
