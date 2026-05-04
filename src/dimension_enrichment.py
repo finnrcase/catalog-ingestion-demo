@@ -30,6 +30,22 @@ try:
 except ImportError:
     _httpx = None
 
+try:
+    from src.brave_search import search_product_candidates as _brave_candidates
+except ImportError:
+    _brave_candidates = None
+
+
+def _brave_search_urls(query: str, limit: int = 5) -> list[str]:
+    """Call Brave Search and return up to `limit` result URLs."""
+    if _brave_candidates is None:
+        return []
+    try:
+        results = _brave_candidates(query, "")
+        return [r.url for r in results[:limit]]
+    except Exception:
+        return []
+
 
 # ── Result type ────────────────────────────────────────────────────────────────
 
@@ -643,5 +659,106 @@ def _assign_confidence(
 
 
 def find_dimensions(row: dict) -> DimensionResult:
-    """Perform full dimension lookup for a single intake row. Stub — implemented in Task 11."""
-    return _make_not_found_result(failure_reason="not implemented")
+    """
+    Perform full dimension lookup for one intake row.
+    Returns DimensionResult with status "found", "not_found", or "low_confidence_skipped".
+    Only rows with Brand + Model/SKU that are missing complete 3D dimensions are processed.
+    """
+    from src.dimensions import has_complete_3d_dimensions, extract_labeled_dimensions
+
+    brand = (row.get("Brand") or "").strip()
+    model = (row.get("Model/SKU") or "").strip()
+    product_name = (row.get("Product Name") or "").strip()
+    category = (row.get("Product Category") or "").strip()
+    current_dims = (row.get("Dimensions") or "").strip()
+    is_appliance = category in _APPLIANCE_CATEGORIES
+
+    if has_complete_3d_dimensions(current_dims):
+        return _make_not_found_result(failure_reason="dimensions already complete")
+    if not brand:
+        return _make_not_found_result(failure_reason="brand required for dimension lookup")
+    if not model:
+        return _make_not_found_result(failure_reason="model/sku required for dimension lookup")
+
+    domain = _get_manufacturer_domain(brand, _search_fn=_brave_search_urls)
+    model_variants = _normalize_model_variants(model)
+
+    queries_tried: list[str] = []
+    urls_checked: list[str] = []
+    low_confidence_result: DimensionResult | None = None
+
+    def _try_queries(query_list: list[str], is_manufacturer: bool) -> DimensionResult | None:
+        nonlocal low_confidence_result
+        for query in query_list:
+            queries_tried.append(query)
+            search_urls = _brave_search_urls(query)
+            for url in search_urls:
+                urls_checked.append(url)
+                product_dims, cutout_dims, src_suffix = _fetch_and_parse_url(
+                    url, is_appliance=is_appliance
+                )
+                if not product_dims or not has_complete_3d_dimensions(product_dims):
+                    continue
+                matched_variant = model_variants[0]
+                for v in model_variants:
+                    if v.lower() in product_dims.lower() or v.lower() in url.lower():
+                        matched_variant = v
+                        break
+                src_type_key = "manufacturer" if is_manufacturer else "retailer"
+                source_type = f"{src_type_key}_{src_suffix}"
+                conf = _assign_confidence(
+                    matched_variant,
+                    model,
+                    is_manufacturer=is_manufacturer,
+                )
+                parts = extract_labeled_dimensions(product_dims)
+                evidence = product_dims
+                if cutout_dims:
+                    evidence += f" | Cutout: {cutout_dims}"
+                result = DimensionResult(
+                    dimensions=product_dims,
+                    width=_fraction_to_decimal(parts.get("width", "")),
+                    height=_fraction_to_decimal(parts.get("height", "")),
+                    depth=_fraction_to_decimal(parts.get("depth", "")),
+                    length=_fraction_to_decimal(parts.get("length", "")),
+                    source_url=url,
+                    confidence=conf,
+                    source_type=source_type,
+                    status="found" if conf in ("high", "medium") else "low_confidence_skipped",
+                    queries_tried=list(queries_tried),
+                    urls_checked=list(urls_checked),
+                    evidence_text=evidence,
+                    failure_reason="",
+                )
+                if conf == "low":
+                    if low_confidence_result is None:
+                        low_confidence_result = result
+                    continue
+                return result
+        return None
+
+    for variant in model_variants:
+        variant_queries = _generate_queries(brand, variant, domain, product_name, model)
+        result = _try_queries(variant_queries, is_manufacturer=bool(domain))
+        if result:
+            return result
+
+    retailer_queries = _generate_retailer_queries(brand, model)
+    result = _try_queries(retailer_queries, is_manufacturer=False)
+    if result:
+        return result
+
+    if low_confidence_result:
+        low_confidence_result.queries_tried = list(queries_tried)
+        low_confidence_result.urls_checked = list(urls_checked)
+        low_confidence_result.dimensions = ""
+        low_confidence_result.width = ""
+        low_confidence_result.height = ""
+        low_confidence_result.depth = ""
+        return low_confidence_result
+
+    return _make_not_found_result(
+        queries_tried=queries_tried,
+        urls_checked=urls_checked,
+        failure_reason=f"no dimensions found after {len(queries_tried)} queries and {len(urls_checked)} URLs checked",
+    )

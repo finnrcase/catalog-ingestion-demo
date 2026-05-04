@@ -650,3 +650,105 @@ def test_confidence_suffix_stripped_variant_retailer_is_low():
         primary_model="HV48SS",
         is_manufacturer=False,
     ) == "low"
+
+
+from src.dimension_enrichment import find_dimensions
+from src.dimensions import has_complete_3d_dimensions
+
+
+def _scotsman_row() -> dict:
+    return {
+        "Brand": "Scotsman",
+        "Model/SKU": "SCN60PA1SU",
+        "Product Name": "Scotsman Icemaker Built-In Pump",
+        "Product Category": "Appliances",
+        "Dimensions": "",
+    }
+
+
+def test_find_dimensions_skips_row_with_complete_dims():
+    row = _scotsman_row()
+    row["Dimensions"] = '14 7/8"W x 22"D x 33 3/8"H'
+    result = find_dimensions(row)
+    assert result.status == "not_found"
+    assert result.failure_reason == "dimensions already complete"
+
+
+def test_find_dimensions_skips_row_missing_brand():
+    row = _scotsman_row()
+    row["Brand"] = ""
+    result = find_dimensions(row)
+    assert result.status == "not_found"
+    assert "brand" in result.failure_reason.lower()
+
+
+def test_find_dimensions_skips_row_missing_sku():
+    row = _scotsman_row()
+    row["Model/SKU"] = ""
+    result = find_dimensions(row)
+    assert result.status == "not_found"
+    assert "model" in result.failure_reason.lower()
+
+
+def test_find_dimensions_returns_found_on_high_confidence_result():
+    def _mock_search(query):
+        return ["https://scotsman-ice.com/products/scn60pa1su"]
+
+    def _mock_fetch(url, *, is_appliance=False):
+        return ('14 7/8"W x 22"D x 33 3/8"H', None, "page")
+
+    with patch("src.dimension_enrichment._brave_search_urls", side_effect=_mock_search):
+        with patch("src.dimension_enrichment._fetch_and_parse_url", side_effect=_mock_fetch):
+            result = find_dimensions(_scotsman_row())
+
+    assert result.status == "found"
+    assert result.confidence == "high"
+    assert result.source_type == "manufacturer_page"
+    assert has_complete_3d_dimensions(result.dimensions)
+    assert result.source_url == "https://scotsman-ice.com/products/scn60pa1su"
+    assert len(result.queries_tried) >= 1
+    assert len(result.urls_checked) >= 1
+
+
+def test_find_dimensions_returns_not_found_when_no_results():
+    with patch("src.dimension_enrichment._brave_search_urls", return_value=[]):
+        result = find_dimensions(_scotsman_row())
+    assert result.status == "not_found"
+    assert result.failure_reason != ""
+
+
+def test_find_dimensions_records_low_confidence_skipped():
+    def _mock_search(query):
+        return ["https://scotsman-ice.com/other"]
+
+    def _mock_fetch(url, *, is_appliance=False):
+        return ('14 7/8"W x 22"D x 33 3/8"H', None, "page")
+
+    row = _scotsman_row()
+    row["Model/SKU"] = "SCN60SS"
+
+    with patch("src.dimension_enrichment._brave_search_urls", side_effect=_mock_search):
+        with patch("src.dimension_enrichment._fetch_and_parse_url", side_effect=_mock_fetch):
+            with patch(
+                "src.dimension_enrichment._assign_confidence",
+                return_value="low",
+            ):
+                result = find_dimensions(row)
+    assert result.status == "low_confidence_skipped"
+    assert result.dimensions == ""
+
+
+def test_find_dimensions_appliance_cutout_in_evidence():
+    def _mock_search(query):
+        return ["https://scotsman-ice.com/products/scn60pa1su"]
+
+    def _mock_fetch(url, *, is_appliance=False):
+        return ('14 7/8"W x 22"D x 33 3/8"H', '13.5"W x 21.5"D x 32"H', "page")
+
+    with patch("src.dimension_enrichment._brave_search_urls", side_effect=_mock_search):
+        with patch("src.dimension_enrichment._fetch_and_parse_url", side_effect=_mock_fetch):
+            result = find_dimensions(_scotsman_row())
+
+    assert result.status == "found"
+    assert result.evidence_text != ""
+    assert "13.5" not in result.dimensions
