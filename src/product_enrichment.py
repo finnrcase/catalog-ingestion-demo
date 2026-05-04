@@ -282,8 +282,8 @@ def enrich_row(row: dict) -> tuple[dict, str | None, _DimensionResult | None]:
     """
     Enrich a single row using Brave Search + httpx + Claude.
 
-    Returns (updated_row, None, dim_result_or_none) on success.
-    Returns (row_unchanged, error_string, None) only on unexpected exceptions.
+    Returns (updated_row, None, dim_result_or_none) on success or graceful no-result.
+    Returns (row_as_given, error_string, None) only on unexpected exceptions.
     dim_result_or_none is the DimensionResult when a dimension lookup ran, else None.
     """
     try:
@@ -373,7 +373,9 @@ def enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[di
                     if col in df.columns:
                         df.at[idx, col] = val
 
-                # Collect dimension diagnostics if lookup ran
+                # Collect dimension diagnostics if lookup ran.
+                # Diagnostic is built from DimensionResult directly (not from row dict),
+                # so it is accurate even if dimension columns are absent from the DataFrame.
                 if dim_result is not None:
                     dimension_diagnostics.append({
                         "row_index": int(idx),

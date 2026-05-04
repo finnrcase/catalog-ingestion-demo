@@ -76,6 +76,7 @@ def test_enrich_dataframe_diagnostics_populated_when_lookup_ran():
     assert isinstance(d["queries_tried"], list)
     assert isinstance(d["urls_checked"], list)
     assert "evidence_text" in d
+    assert d["domain_used"] == "kohler.com"
 
 
 def test_enrich_dataframe_no_diagnostics_when_lookup_not_triggered():
@@ -84,6 +85,7 @@ def test_enrich_dataframe_no_diagnostics_when_lookup_not_triggered():
         df, errors, diagnostics = enrich_dataframe(_make_df(dims='28"W x 30"H x 17"D'))
 
     assert diagnostics == []
+    assert errors == []
 
 
 def test_enrich_dataframe_diagnostics_failure_reason_on_not_found():
@@ -102,3 +104,5 @@ def test_enrich_dataframe_diagnostics_failure_reason_on_not_found():
     assert diagnostics[0]["status"] == "not_found"
     assert diagnostics[0]["failure_reason"] == "no dimensions found after 5 queries and 3 URLs checked"
     assert diagnostics[0]["queries_tried"] == ["query1"]
+    assert diagnostics[0]["urls_checked"] == ["https://example.com"]
+    assert diagnostics[0]["domain_used"] == ""  # no source URL for not_found
