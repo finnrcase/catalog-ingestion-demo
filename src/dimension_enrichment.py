@@ -36,12 +36,12 @@ except ImportError:
     _brave_candidates = None
 
 
-def _brave_search_urls(query: str, limit: int = 5) -> list[str]:
+def _brave_search_urls(query: str, limit: int = 5, brand: str = "") -> list[str]:
     """Call Brave Search and return up to `limit` result URLs."""
     if _brave_candidates is None:
         return []
     try:
-        results = _brave_candidates(query, "")
+        results = _brave_candidates(query, brand)
         return [r.url for r in results[:limit]]
     except Exception:
         return []
@@ -691,7 +691,7 @@ def find_dimensions(row: dict) -> DimensionResult:
         nonlocal low_confidence_result
         for query in query_list:
             queries_tried.append(query)
-            search_urls = _brave_search_urls(query)
+            search_urls = _brave_search_urls(query, limit=5, brand=brand)
             for url in search_urls:
                 urls_checked.append(url)
                 product_dims, cutout_dims, src_suffix = _fetch_and_parse_url(
@@ -699,18 +699,21 @@ def find_dimensions(row: dict) -> DimensionResult:
                 )
                 if not product_dims or not has_complete_3d_dimensions(product_dims):
                     continue
-                matched_variant = model_variants[0]
+                matched_variant = None
                 for v in model_variants:
                     if v.lower() in product_dims.lower() or v.lower() in url.lower():
                         matched_variant = v
                         break
                 src_type_key = "manufacturer" if is_manufacturer else "retailer"
                 source_type = f"{src_type_key}_{src_suffix}"
-                conf = _assign_confidence(
-                    matched_variant,
-                    model,
-                    is_manufacturer=is_manufacturer,
-                )
+                if matched_variant is None:
+                    conf = "low"
+                else:
+                    conf = _assign_confidence(
+                        matched_variant,
+                        model,
+                        is_manufacturer=is_manufacturer,
+                    )
                 parts = extract_labeled_dimensions(product_dims)
                 evidence = product_dims
                 if cutout_dims:
@@ -737,8 +740,10 @@ def find_dimensions(row: dict) -> DimensionResult:
                 return result
         return None
 
-    for variant in model_variants:
-        variant_queries = _generate_queries(brand, variant, domain, product_name, model)
+    for i, variant in enumerate(model_variants):
+        # Pass sku only on primary variant to avoid duplicate Phase-4 fallback queries
+        sku_arg = model if i == 0 else ""
+        variant_queries = _generate_queries(brand, variant, domain, product_name, sku_arg)
         result = _try_queries(variant_queries, is_manufacturer=bool(domain))
         if result:
             return result
@@ -751,6 +756,7 @@ def find_dimensions(row: dict) -> DimensionResult:
     if low_confidence_result:
         low_confidence_result.queries_tried = list(queries_tried)
         low_confidence_result.urls_checked = list(urls_checked)
+        # Spec: do not fill dimension fields for low confidence — preserve evidence_text for audit
         low_confidence_result.dimensions = ""
         low_confidence_result.width = ""
         low_confidence_result.height = ""

@@ -692,7 +692,7 @@ def test_find_dimensions_skips_row_missing_sku():
 
 
 def test_find_dimensions_returns_found_on_high_confidence_result():
-    def _mock_search(query):
+    def _mock_search(query, **kwargs):
         return ["https://scotsman-ice.com/products/scn60pa1su"]
 
     def _mock_fetch(url, *, is_appliance=False):
@@ -719,7 +719,7 @@ def test_find_dimensions_returns_not_found_when_no_results():
 
 
 def test_find_dimensions_records_low_confidence_skipped():
-    def _mock_search(query):
+    def _mock_search(query, **kwargs):
         return ["https://scotsman-ice.com/other"]
 
     def _mock_fetch(url, *, is_appliance=False):
@@ -740,7 +740,7 @@ def test_find_dimensions_records_low_confidence_skipped():
 
 
 def test_find_dimensions_appliance_cutout_in_evidence():
-    def _mock_search(query):
+    def _mock_search(query, **kwargs):
         return ["https://scotsman-ice.com/products/scn60pa1su"]
 
     def _mock_fetch(url, *, is_appliance=False):
@@ -755,8 +755,36 @@ def test_find_dimensions_appliance_cutout_in_evidence():
     assert "13.5" not in result.dimensions
 
 
+def test_find_dimensions_retailer_phase_succeeds_when_manufacturer_fails():
+    def _mock_search(query, **kwargs):
+        # Only retailer queries get results
+        for retailer in ["build.com", "ajmadison.com", "bestbuy.com"]:
+            if retailer in query:
+                return ["https://build.com/kohler-k-3999-toilet"]
+        return []
+
+    def _mock_fetch(url, *, is_appliance=False):
+        return ('28"W x 30"H x 17"D', None, "page")
+
+    row = {
+        "Brand": "Kohler",
+        "Model/SKU": "K-3999",
+        "Product Name": "Highline Toilet",
+        "Product Category": "Plumbing",
+        "Dimensions": "",
+    }
+
+    with patch("src.dimension_enrichment._brave_search_urls", side_effect=_mock_search):
+        with patch("src.dimension_enrichment._fetch_and_parse_url", side_effect=_mock_fetch):
+            result = find_dimensions(row)
+
+    assert result.status == "found"
+    assert result.confidence == "medium"
+    assert "retailer" in result.source_type
+
+
 def test_find_dimensions_retailer_phase_not_called_when_manufacturer_succeeds():
-    def _mock_search(query):
+    def _mock_search(query, **kwargs):
         # Return a result for any non-retailer query
         if "site:" not in query or "scotsman-ice.com" in query:
             return ["https://scotsman-ice.com/products/scn60pa1su"]
