@@ -601,9 +601,10 @@ def test_confidence_exact_model_manufacturer_page_is_high():
     ) == "high"
 
 
-def test_confidence_exact_model_manufacturer_pdf_is_high():
+def test_confidence_exact_model_case_insensitive():
+    # .lower() normalization — mixed-case variant matches primary
     assert _assign_confidence(
-        model_variant="SCN60PA1SU",
+        model_variant="scn60pa1su",
         primary_model="SCN60PA1SU",
         is_manufacturer=True,
     ) == "high"

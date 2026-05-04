@@ -613,9 +613,13 @@ def _assign_confidence(
     """
     Assign confidence tier based on model match quality and source authority.
 
-    Exact match: model_variant is primary model (exact string, no spaces/dashes removed).
-    Normalized match: model_variant matches primary after spaces/dashes normalization.
-    Partial match: model_variant is a suffix-stripped version (shorter, loses info).
+    The caller passes the specific model variant that was matched on the source page.
+    Comparison is case-insensitive and strips spaces/dashes for normalization.
+
+    - Normalized exact match + manufacturer → "high"
+    - Normalized exact match + retailer → "medium"
+    - Space/dash-normalized variant (still the same model) → "medium" regardless of source
+    - Suffix-stripped partial match → "low" regardless of source
     """
     primary_clean = primary_model.strip().lower()
     variant_clean = model_variant.strip().lower()
@@ -631,7 +635,7 @@ def _assign_confidence(
     variant_norm = re.sub(r"[\s-]+", "", variant_clean)
 
     if variant_norm == primary_norm:
-        # Normalized match but not exact — lower confidence than exact
+        # normalized variant (spaces/dashes removed) — medium regardless of source authority
         return "medium"
 
     # No match (includes partial/suffix-stripped)
