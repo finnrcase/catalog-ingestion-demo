@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pytest tests/ --ignore=tests/test_programa_automation.py -q)",
+      "Bash(python -m pytest tests/test_dimension_enrichment.py::test_generate_queries_with_domain_produces_site_queries tests/test_dimension_enrichment.py::test_generate_queries_always_includes_general_queries tests/test_dimension_enrichment.py::test_generate_queries_without_domain_skips_site_queries tests/test_dimension_enrichment.py::test_generate_queries_fallbacks_with_product_name tests/test_dimension_enrichment.py::test_generate_queries_order_site_before_general tests/test_dimension_enrichment.py::test_generate_queries_deduplicates tests/test_dimension_enrichment.py::test_generate_queries_bounded tests/test_dimension_enrichment.py::test_generate_retailer_queries -v)",
+      "Bash(python3 -m pytest tests/test_dimension_enrichment.py::test_generate_queries_with_domain_produces_site_queries tests/test_dimension_enrichment.py::test_generate_queries_always_includes_general_queries tests/test_dimension_enrichment.py::test_generate_queries_without_domain_skips_site_queries tests/test_dimension_enrichment.py::test_generate_queries_fallbacks_with_product_name tests/test_dimension_enrichment.py::test_generate_queries_order_site_before_general tests/test_dimension_enrichment.py::test_generate_queries_deduplicates tests/test_dimension_enrichment.py::test_generate_queries_bounded tests/test_dimension_enrichment.py::test_generate_retailer_queries -v)",
+      "Bash(pytest tests/test_dimension_enrichment_integration.py tests/test_dimension_enrichment.py -v --tb=short)",
+      "Bash(pytest tests/ -v --ignore=tests/test_programa_automation.py --tb=short)",
+      "Bash(python3 -m pytest tests/test_enrich_dataframe_diagnostics.py tests/test_dimension_enrichment_integration.py -v)",
+      "Bash(pytest tests/test_enrich_dataframe_diagnostics.py tests/test_dimension_enrichment_integration.py tests/test_dimension_enrichment.py -v --tb=short)"
+    ]
+  }
+}
