@@ -588,3 +588,61 @@ def test_fetch_and_parse_url_returns_none_on_http_status_error():
         )
     assert product_dims is None
     assert cutout_dims is None
+
+
+from src.dimension_enrichment import _assign_confidence
+
+
+def test_confidence_exact_model_manufacturer_page_is_high():
+    assert _assign_confidence(
+        model_variant="SCN60PA1SU",
+        primary_model="SCN60PA1SU",
+        is_manufacturer=True,
+        source_type_suffix="page",
+    ) == "high"
+
+
+def test_confidence_exact_model_manufacturer_pdf_is_high():
+    assert _assign_confidence(
+        model_variant="SCN60PA1SU",
+        primary_model="SCN60PA1SU",
+        is_manufacturer=True,
+        source_type_suffix="pdf",
+    ) == "high"
+
+
+def test_confidence_exact_model_retailer_is_medium():
+    assert _assign_confidence(
+        model_variant="SCN60PA1SU",
+        primary_model="SCN60PA1SU",
+        is_manufacturer=False,
+        source_type_suffix="page",
+    ) == "medium"
+
+
+def test_confidence_variant_match_manufacturer_is_medium():
+    # No-spaces variant matches — not exact primary model
+    assert _assign_confidence(
+        model_variant="HV48SS",    # variant (spaces removed)
+        primary_model="HV 48 SS",  # primary
+        is_manufacturer=True,
+        source_type_suffix="page",
+    ) == "medium"
+
+
+def test_confidence_suffix_stripped_variant_is_low():
+    assert _assign_confidence(
+        model_variant="HV48",      # suffix stripped — partial
+        primary_model="HV48SS",
+        is_manufacturer=True,
+        source_type_suffix="page",
+    ) == "low"
+
+
+def test_confidence_suffix_stripped_variant_retailer_is_low():
+    assert _assign_confidence(
+        model_variant="HV48",
+        primary_model="HV48SS",
+        is_manufacturer=False,
+        source_type_suffix="page",
+    ) == "low"

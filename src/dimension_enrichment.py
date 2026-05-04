@@ -602,6 +602,43 @@ def _fetch_and_parse_url(
         return None, None, suffix
 
 
+# ── Confidence assignment ──────────────────────────────────────────────────────
+
+def _assign_confidence(
+    model_variant: str,
+    primary_model: str,
+    *,
+    is_manufacturer: bool,
+    source_type_suffix: str,
+) -> str:
+    """
+    Assign confidence tier based on model match quality and source authority.
+
+    Exact match: model_variant is primary model (exact string, no spaces/dashes removed).
+    Normalized match: model_variant matches primary after spaces/dashes normalization.
+    Partial match: model_variant is a suffix-stripped version (shorter, loses info).
+    """
+    primary_clean = primary_model.strip().lower()
+    variant_clean = model_variant.strip().lower()
+
+    # Exact string match (no normalization)
+    if variant_clean == primary_clean:
+        if is_manufacturer:
+            return "high"
+        return "medium"
+
+    # Normalized match (spaces/dashes removed)
+    primary_norm = re.sub(r"[\s-]+", "", primary_clean)
+    variant_norm = re.sub(r"[\s-]+", "", variant_clean)
+
+    if variant_norm == primary_norm:
+        # Normalized match but not exact — lower confidence than exact
+        return "medium"
+
+    # No match (includes partial/suffix-stripped)
+    return "low"
+
+
 def find_dimensions(row: dict) -> DimensionResult:
     """Perform full dimension lookup for a single intake row. Stub — implemented in Task 11."""
     return _make_not_found_result(failure_reason="not implemented")
