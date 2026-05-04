@@ -337,7 +337,7 @@ def _qualifying_row():
 
 def test_enrich_row_no_search_results_leaves_note():
     with patch("src.product_enrichment.search_product_candidates", return_value=[]):
-        updated, error = enrich_row(_qualifying_row())
+        updated, error, _ = enrich_row(_qualifying_row())
     assert error is None
     assert "[Enrichment: no confident source found]" in updated["Notes"]
     assert updated["Product Name"] == ""
@@ -346,7 +346,7 @@ def test_enrich_row_no_search_results_leaves_note():
 def test_enrich_row_low_score_result_leaves_note():
     low_result = SearchResult("title", "https://amazon.com/dp/B001", "desc", 10)
     with patch("src.product_enrichment.search_product_candidates", return_value=[low_result]):
-        updated, error = enrich_row(_qualifying_row())
+        updated, error, _ = enrich_row(_qualifying_row())
     assert "[Enrichment: no confident source found]" in updated["Notes"]
 
 
@@ -354,7 +354,7 @@ def test_enrich_row_fetch_failure_leaves_note():
     good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
     with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
          patch("src.product_enrichment._fetch_page_text", return_value=""):
-        updated, error = enrich_row(_qualifying_row())
+        updated, error, _ = enrich_row(_qualifying_row())
     assert "could not fetch" in updated["Notes"]
 
 
@@ -370,7 +370,7 @@ def test_enrich_row_fills_fields_on_success():
     with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
          patch("src.product_enrichment._fetch_page_text", return_value="page content"), \
          patch("src.product_enrichment._extract_with_claude", return_value=extracted):
-        updated, error = enrich_row(_qualifying_row())
+        updated, error, _ = enrich_row(_qualifying_row())
 
     assert error is None
     assert updated["Product Name"] == "Wolf 30\" Drawer Microwave"
@@ -409,7 +409,7 @@ def test_enrich_dataframe_isolates_exceptions():
     def bad_enrich_row(row):
         if row["Brand"] == "Wolf":
             raise RuntimeError("network error")
-        return row, None
+        return row, None, None
 
     with patch("src.product_enrichment.enrich_row", side_effect=bad_enrich_row), \
          patch("src.product_enrichment.time.sleep"):

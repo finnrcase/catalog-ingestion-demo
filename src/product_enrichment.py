@@ -7,7 +7,7 @@ Claude Haiku. Never overwrites existing data.
 
 Public API
 ----------
-enrich_row(row: dict) -> tuple[dict, str | None]
+enrich_row(row: dict) -> tuple[dict, str | None, DimensionResult | None]
 enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[dict]]
 """
 
@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 
 from src.brave_search import BRAVE_API_KEY, search_product_candidates
 from src.category_ai import _normalise_category
-from src.dimension_enrichment import find_dimensions as _find_dimensions
+from src.dimension_enrichment import DimensionResult as _DimensionResult, find_dimensions as _find_dimensions
 from src.dimensions import has_complete_3d_dimensions
 
 try:
@@ -278,12 +278,13 @@ def _extract_with_claude(page_text: str, row: dict) -> dict:
         return {}
 
 
-def enrich_row(row: dict) -> tuple[dict, str | None]:
+def enrich_row(row: dict) -> tuple[dict, str | None, _DimensionResult | None]:
     """
     Enrich a single row using Brave Search + httpx + Claude.
 
-    Returns (updated_row, None) on success or graceful no-result.
-    Returns (row_unchanged, error_string) only on unexpected exceptions.
+    Returns (updated_row, None, dim_result_or_none) on success.
+    Returns (row_unchanged, error_string, None) only on unexpected exceptions.
+    dim_result_or_none is the DimensionResult when a dimension lookup ran, else None.
     """
     try:
         query = _build_search_query(row)
@@ -316,6 +317,7 @@ def enrich_row(row: dict) -> tuple[dict, str | None]:
         brand_val = _str_val(updated.get("Brand"))
         model_val = _str_val(updated.get("Model/SKU"))
         dims_val = _str_val(updated.get("Dimensions"))
+        dim_result: _DimensionResult | None = None
         if brand_val and model_val and not has_complete_3d_dimensions(dims_val):
             dim_result = _find_dimensions(updated)
             if dim_result.status == "found" and dim_result.confidence in ("high", "medium"):
@@ -340,9 +342,9 @@ def enrich_row(row: dict) -> tuple[dict, str | None]:
             updated["Dimension Source Type"] = dim_result.source_type if dim_result.source_type not in ("", "none", None) else ""
             updated["Dimension Lookup Status"] = dim_result.status
 
-        return updated, None
+        return updated, None, dim_result
     except Exception as exc:
-        return row, str(exc)
+        return row, str(exc), None
 
 
 def enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[dict]]:
@@ -360,7 +362,7 @@ def enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[di
             continue
 
         try:
-            updated, error = enrich_row(r)
+            updated, error, dim_result = enrich_row(r)
             if error:
                 errors.append(error)
             else:
@@ -372,19 +374,21 @@ def enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[di
                         df.at[idx, col] = val
 
                 # Collect dimension diagnostics if lookup ran
-                lookup_status = updated.get("Dimension Lookup Status", "")
-                if lookup_status:
+                if dim_result is not None:
                     dimension_diagnostics.append({
                         "row_index": int(idx),
                         "product_name": _str_val(updated.get("Product Name")),
                         "model_searched": _str_val(updated.get("Model/SKU")),
                         "domain_used": urllib.parse.urlparse(
-                            _str_val(updated.get("Dimension Source URL", ""))
+                            dim_result.source_url
                         ).netloc or "",
-                        "confidence": _str_val(updated.get("Dimension Confidence")),
-                        "status": lookup_status,
-                        "source_url": _str_val(updated.get("Dimension Source URL")),
-                        "failure_reason": "",
+                        "queries_tried": list(dim_result.queries_tried),
+                        "urls_checked": list(dim_result.urls_checked),
+                        "evidence_text": dim_result.evidence_text,
+                        "confidence": dim_result.confidence if dim_result.confidence not in ("", "none", None) else "",
+                        "status": dim_result.status,
+                        "source_url": dim_result.source_url,
+                        "failure_reason": dim_result.failure_reason,
                     })
         except Exception as exc:
             label = _str_val(r.get("Product Name")) or _str_val(r.get("Brand")) or _str_val(r.get("Model/SKU")) or str(idx)

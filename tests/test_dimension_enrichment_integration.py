@@ -29,7 +29,7 @@ def test_enrich_row_calls_find_dimensions_when_dims_missing():
     )
     with patch("src.product_enrichment.search_product_candidates", return_value=[]):
         with patch("src.product_enrichment._find_dimensions", return_value=mock_result):
-            updated, error = enrich_row(_row_missing_dims())
+            updated, error, _ = enrich_row(_row_missing_dims())
 
     assert error is None
     assert updated["Dimensions"] == '28"W x 30"H x 17"D'
@@ -49,7 +49,7 @@ def test_enrich_row_skips_dimension_pass_when_dims_already_complete():
             "src.product_enrichment._find_dimensions",
             side_effect=lambda r: find_dims_called.append(r) or DimensionResult(),
         ):
-            updated, error = enrich_row(row)
+            updated, error, _ = enrich_row(row)
 
     assert find_dims_called == []
 
@@ -62,7 +62,7 @@ def test_enrich_row_not_found_sets_status_not_found():
     )
     with patch("src.product_enrichment.search_product_candidates", return_value=[]):
         with patch("src.product_enrichment._find_dimensions", return_value=mock_result):
-            updated, error = enrich_row(_row_missing_dims())
+            updated, error, _ = enrich_row(_row_missing_dims())
 
     assert updated.get("Dimension Lookup Status") == "not_found"
     assert updated.get("Dimensions", "") == ""
@@ -82,7 +82,7 @@ def test_enrich_row_appliance_appends_cutout_to_notes():
 
     with patch("src.product_enrichment.search_product_candidates", return_value=[]):
         with patch("src.product_enrichment._find_dimensions", return_value=mock_result):
-            updated, error = enrich_row(row)
+            updated, error, _ = enrich_row(row)
 
     assert updated["Dimensions"] == '23.875"W x 33.375"H x 22"D'
     assert "[Cutout Dimensions:" in updated.get("Notes", "")
@@ -100,7 +100,7 @@ def test_enrich_row_does_not_overwrite_existing_complete_dims():
     )
     with patch("src.product_enrichment.search_product_candidates", return_value=[]):
         with patch("src.product_enrichment._find_dimensions", return_value=mock_result):
-            updated, error = enrich_row(row)
+            updated, error, _ = enrich_row(row)
 
     assert updated["Dimensions"] == original_dims
 
@@ -118,7 +118,7 @@ def test_enrich_row_low_confidence_does_not_write_dimensions():
     )
     with patch("src.product_enrichment.search_product_candidates", return_value=[]):
         with patch("src.product_enrichment._find_dimensions", return_value=mock_result):
-            updated, error = enrich_row(_row_missing_dims())
+            updated, error, _ = enrich_row(_row_missing_dims())
 
     assert error is None
     assert updated.get("Dimensions", "") == ""
@@ -137,7 +137,7 @@ def test_enrich_row_skips_dimension_pass_when_brand_missing():
             "src.product_enrichment._find_dimensions",
             side_effect=lambda r: find_dims_called.append(r) or DimensionResult(),
         ):
-            updated, error = enrich_row(row)
+            updated, error, _ = enrich_row(row)
 
     assert find_dims_called == []
     assert updated.get("Dimension Lookup Status", "") == ""
