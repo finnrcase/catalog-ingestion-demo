@@ -330,13 +330,14 @@ def enrich_row(row: dict) -> tuple[dict, str | None]:
                     updated["Length (in)"] = dim_result.length
                 if "Cutout:" in dim_result.evidence_text:
                     cutout_part = dim_result.evidence_text.split("Cutout:")[-1].strip()
-                    existing_notes = _str_val(updated.get("Notes"))
-                    tag = f"[Cutout Dimensions: {cutout_part}]"
-                    if tag not in existing_notes:
-                        updated["Notes"] = f"{existing_notes} {tag}".strip() if existing_notes else tag
+                    if cutout_part:
+                        existing_notes = _str_val(updated.get("Notes"))
+                        tag = f"[Cutout Dimensions: {cutout_part}]"
+                        if tag not in existing_notes:
+                            updated["Notes"] = f"{existing_notes} {tag}".strip() if existing_notes else tag
             updated["Dimension Source URL"] = dim_result.source_url
-            updated["Dimension Confidence"] = dim_result.confidence if dim_result.confidence != "none" else ""
-            updated["Dimension Source Type"] = dim_result.source_type if dim_result.source_type != "none" else ""
+            updated["Dimension Confidence"] = dim_result.confidence if dim_result.confidence not in ("", "none", None) else ""
+            updated["Dimension Source Type"] = dim_result.source_type if dim_result.source_type not in ("", "none", None) else ""
             updated["Dimension Lookup Status"] = dim_result.status
 
         return updated, None

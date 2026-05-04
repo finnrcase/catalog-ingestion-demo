@@ -125,3 +125,19 @@ def test_enrich_row_low_confidence_does_not_write_dimensions():
     assert updated["Dimension Lookup Status"] == "low_confidence_skipped"
     assert updated["Dimension Confidence"] == "low"
     assert updated["Dimension Source URL"] == "https://example.com/k-3999"
+
+
+def test_enrich_row_skips_dimension_pass_when_brand_missing():
+    row = _row_missing_dims()
+    row["Brand"] = ""
+
+    find_dims_called = []
+    with patch("src.product_enrichment.search_product_candidates", return_value=[]):
+        with patch(
+            "src.product_enrichment._find_dimensions",
+            side_effect=lambda r: find_dims_called.append(r) or DimensionResult(),
+        ):
+            updated, error = enrich_row(row)
+
+    assert find_dims_called == []
+    assert updated.get("Dimension Lookup Status", "") == ""
