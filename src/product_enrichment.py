@@ -340,11 +340,12 @@ def _apply_cache_to_row(
             updated[row_col] = cached_val
             filled.append(cache_field)
 
-    missing = [
-        f for f in _ESSENTIAL_CACHE_FIELDS
-        if not _str_val(updated.get(all_cache_fields.get(f, f)))
-        or (f == "dimensions" and not has_complete_3d_dimensions(_str_val(updated.get("Dimensions", ""))))
-    ]
+    missing = []
+    for f in _ESSENTIAL_CACHE_FIELDS:
+        row_col = all_cache_fields[f]  # KeyError if f is not mapped — fail loud, not silent
+        val = _str_val(updated.get(row_col))
+        if not val or (f == "dimensions" and not has_complete_3d_dimensions(val)):
+            missing.append(f)
     return updated, filled, missing
 
 
@@ -465,15 +466,20 @@ def enrich_row(
                     updated["Length (in)"] = dim_result.length
                 # ── Cache write-back (dimension fields) ────────────────────
                 if cache_key:
-                    _product_cache.update(cache_key, {
-                        "dimensions": dim_result.dimensions,
-                        "width_in": dim_result.width or None,
-                        "height_in": dim_result.height or None,
-                        "depth_in": dim_result.depth or None,
-                        "length_in": dim_result.length or None,
-                        "dimension_source_url": dim_result.source_url,
-                        "dimension_confidence": dim_result.confidence,
-                    })
+                    _conf_rank = {"high": 2, "medium": 1, "low": 0, "none": -1}
+                    existing_entry = _product_cache.get(cache_key) or {}
+                    existing_dim_conf = existing_entry.get("dimension_confidence", "none")
+                    new_dim_conf = dim_result.confidence or "none"
+                    if _conf_rank.get(new_dim_conf, -1) >= _conf_rank.get(existing_dim_conf, -1):
+                        _product_cache.update(cache_key, {
+                            "dimensions": dim_result.dimensions,
+                            "width_in": dim_result.width or None,
+                            "height_in": dim_result.height or None,
+                            "depth_in": dim_result.depth or None,
+                            "length_in": dim_result.length or None,
+                            "dimension_source_url": dim_result.source_url,
+                            "dimension_confidence": dim_result.confidence,
+                        })
                 if "Cutout:" in dim_result.evidence_text:
                     cutout_part = dim_result.evidence_text.split("Cutout:")[-1].strip()
                     if cutout_part:

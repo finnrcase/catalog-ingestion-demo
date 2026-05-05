@@ -737,6 +737,7 @@ def test_enrich_row_returns_early_on_full_cache_hit(monkeypatch, tmp_path):
     assert call_count["n"] == 0  # no Brave calls made
     assert updated["Dimensions"] == '30"W x 15"H x 17"D'
     assert updated["Product URL"] == "https://wolf.com/mdd30ts"
+    assert updated["Source Type"] == "PDF_Enriched"
 
 
 def test_enrich_dataframe_creates_session_cache_once(monkeypatch):
