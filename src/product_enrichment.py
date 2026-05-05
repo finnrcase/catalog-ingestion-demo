@@ -25,6 +25,7 @@ from src.brave_search import BRAVE_API_KEY, search_product_candidates
 from src.category_ai import _normalise_category
 from src.dimension_enrichment import DimensionResult as _DimensionResult, find_dimensions as _find_dimensions
 from src.dimensions import has_complete_3d_dimensions
+from src.manufacturer_domains import get_domain_for_brand, record_discovered_domain
 
 try:
     import html2text as _html2text
@@ -39,6 +40,33 @@ except ImportError:
 load_dotenv()
 
 ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
+
+from src.enrichment_cache import (
+    SessionCache as _SessionCache,
+    SearchBudget as _SearchBudget,
+    ProductEnrichmentCache as _ProductEnrichmentCache,
+    normalize_key as _normalize_key,
+    normalize_mode as _normalize_mode,
+    budget_for_mode as _budget_for_mode,
+    confidence_ok as _confidence_ok,
+)
+
+# Module-level singleton — lazy-loads on first access
+_product_cache = _ProductEnrichmentCache()
+
+# Cache field mappings: cache field name → row column name
+_CACHE_GENERAL_FIELDS: dict[str, str] = {
+    "product_url": "Product URL",
+    "finish": "Finish / Color",
+}
+_CACHE_DIM_FIELDS: dict[str, str] = {
+    "dimensions": "Dimensions",
+    "width_in": "Width (in)",
+    "height_in": "Height (in)",
+    "depth_in": "Depth (in)",
+    "length_in": "Length (in)",
+}
+_ESSENTIAL_CACHE_FIELDS: list[str] = ["dimensions", "product_url"]
 
 _ENRICHABLE_FIELDS: list = [
     "Product Name",
@@ -95,7 +123,12 @@ def _build_search_query(row: dict) -> str:
         if needs_dims
         else "specifications official"
     )
-    return " ".join(p for p in parts if p) + " " + suffix
+    query = " ".join(p for p in parts if p) + " " + suffix
+    domain_match = get_domain_for_brand(_str_val(row.get("Brand")))
+    if domain_match:
+        domain, _source = domain_match
+        return f"site:{domain} {query}"
+    return query
 
 
 def _apply_enrichment(
@@ -278,7 +311,48 @@ def _extract_with_claude(page_text: str, row: dict) -> dict:
         return {}
 
 
-def enrich_row(row: dict) -> tuple[dict, str | None, _DimensionResult | None]:
+def _apply_cache_to_row(
+    row: dict,
+    cache_entry: dict,
+    force_refresh: bool,
+) -> tuple[dict, list[str], list[str]]:
+    """
+    Fill row from cache entry where confidence is high/medium.
+    Returns (updated_row, cache_fields_filled, still_missing_essentials).
+    Null cache values are skipped unless force_refresh=True.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    updated = row.copy()
+    filled: list[str] = []
+    all_cache_fields = {**_CACHE_GENERAL_FIELDS, **_CACHE_DIM_FIELDS}
+
+    for cache_field, row_col in all_cache_fields.items():
+        cached_val = cache_entry.get(cache_field)
+        if cached_val is None:
+            if not force_refresh:
+                _log.debug("[CACHED NULL SKIPPED] field=%s", cache_field)
+            continue  # null = searched before, no result; skip unless force_refresh
+        if not _confidence_ok(cache_entry, cache_field):
+            continue
+        if not _str_val(updated.get(row_col)):
+            updated[row_col] = cached_val
+            filled.append(cache_field)
+
+    missing = [
+        f for f in _ESSENTIAL_CACHE_FIELDS
+        if not _str_val(updated.get(all_cache_fields.get(f, f)))
+        or (f == "dimensions" and not has_complete_3d_dimensions(_str_val(updated.get("Dimensions", ""))))
+    ]
+    return updated, filled, missing
+
+
+def enrich_row(
+    row: dict,
+    enrichment_mode: str = "standard",
+    session_cache: "_SessionCache | None" = None,
+) -> tuple[dict, str | None, _DimensionResult | None]:
     """
     Enrich a single row using Brave Search + httpx + Claude.
 
@@ -287,10 +361,56 @@ def enrich_row(row: dict) -> tuple[dict, str | None, _DimensionResult | None]:
     dim_result_or_none is the DimensionResult when a dimension lookup ran, else None.
     """
     try:
-        query = _build_search_query(row)
-        brand = _str_val(row.get("Brand"))
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
 
-        results = search_product_candidates(query, brand)
+        mode = _normalize_mode(enrichment_mode)
+        budget = _budget_for_mode(mode)
+        brand = _str_val(row.get("Brand"))
+        model_sku = _str_val(row.get("Model/SKU"))
+        cache_key = _normalize_key(brand, model_sku) if brand and model_sku else ""
+        force_refresh = session_cache.force_refresh if session_cache else False
+
+        # ── Cache check ────────────────────────────────────────────────────────
+        cache_fields_filled: list[str] = []
+        fields_searched: list[str] = []
+        product_cache_hit = "miss"
+
+        if cache_key:
+            cache_entry = _product_cache.get(cache_key)
+            if cache_entry is not None:
+                row, cache_fields_filled, still_missing = _apply_cache_to_row(
+                    row, cache_entry, force_refresh
+                )
+                if not still_missing:
+                    _log.info("[CACHE HIT: full] key=%s", cache_key)
+                    product_cache_hit = "full"
+                    updated = row.copy()
+                    original = _str_val(updated.get("Source Type", ""))
+                    if not original.endswith("_Enriched"):
+                        updated["Source Type"] = f"{original}_Enriched" if original else "Enriched"
+                    return updated, None, None
+                else:
+                    product_cache_hit = "partial"
+                    fields_searched.extend(still_missing)
+                    _log.info("[CACHE HIT: partial] key=%s still_missing=%s", cache_key, still_missing)
+            else:
+                fields_searched.extend(_ESSENTIAL_CACHE_FIELDS)
+                _log.info("[CACHE MISS] key=%s", cache_key)
+
+        # Fast mode: if manufacturer domain is known, skip general Brave search
+        # (dimension lookup will handle targeted search via the known domain)
+        skip_general_search = (mode == "fast")
+
+        query = _build_search_query(row)
+        domain_match = get_domain_for_brand(brand)
+        results = []
+        if not skip_general_search and budget.can_search():
+            _log.info("[LIVE SEARCH] query=%s", query[:80])
+            results = search_product_candidates(query, brand, session_cache=session_cache)
+            budget.consume_search()
+        elif not budget.can_search():
+            _log.info("[BUDGET EXHAUSTED] skipping general search for key=%s", cache_key)
 
         if not results or results[0].domain_score < MIN_USE_SCORE:
             updated = row.copy()
@@ -300,6 +420,9 @@ def enrich_row(row: dict) -> tuple[dict, str | None, _DimensionResult | None]:
                 updated["Notes"] = f"{existing} {note}".strip() if existing else note
         else:
             best = results[0]
+            parsed_domain = urllib.parse.urlparse(best.url).netloc
+            if parsed_domain and not domain_match:
+                record_discovered_domain(brand, parsed_domain)
             page_text = _fetch_page_text(best.url)
 
             if not page_text:
@@ -312,6 +435,16 @@ def enrich_row(row: dict) -> tuple[dict, str | None, _DimensionResult | None]:
             else:
                 extracted = _extract_with_claude(page_text, row)
                 updated = _apply_enrichment(row, extracted, best.url, best.domain_score)
+                # ── Cache write-back (general fields found) ────────────────────
+                if cache_key:
+                    _cache_fields: dict = {}
+                    if _str_val(updated.get("Product URL")):
+                        _cache_fields["product_url"] = _str_val(updated.get("Product URL"))
+                    if _str_val(updated.get("Finish / Color")):
+                        _cache_fields["finish"] = _str_val(updated.get("Finish / Color"))
+                    if _cache_fields:
+                        _cache_fields["general_confidence"] = "medium"
+                        _product_cache.update(cache_key, _cache_fields)
 
         # ── Dimension enrichment pass ──────────────────────────────────────────
         brand_val = _str_val(updated.get("Brand"))
@@ -319,7 +452,7 @@ def enrich_row(row: dict) -> tuple[dict, str | None, _DimensionResult | None]:
         dims_val = _str_val(updated.get("Dimensions"))
         dim_result: _DimensionResult | None = None
         if brand_val and model_val and not has_complete_3d_dimensions(dims_val):
-            dim_result = _find_dimensions(updated)
+            dim_result = _find_dimensions(updated, session_cache=session_cache, budget=budget)
             if dim_result.status == "found" and dim_result.confidence in ("high", "medium"):
                 updated["Dimensions"] = dim_result.dimensions
                 if dim_result.width:
@@ -330,6 +463,17 @@ def enrich_row(row: dict) -> tuple[dict, str | None, _DimensionResult | None]:
                     updated["Depth (in)"] = dim_result.depth
                 if dim_result.length:
                     updated["Length (in)"] = dim_result.length
+                # ── Cache write-back (dimension fields) ────────────────────
+                if cache_key:
+                    _product_cache.update(cache_key, {
+                        "dimensions": dim_result.dimensions,
+                        "width_in": dim_result.width or None,
+                        "height_in": dim_result.height or None,
+                        "depth_in": dim_result.depth or None,
+                        "length_in": dim_result.length or None,
+                        "dimension_source_url": dim_result.source_url,
+                        "dimension_confidence": dim_result.confidence,
+                    })
                 if "Cutout:" in dim_result.evidence_text:
                     cutout_part = dim_result.evidence_text.split("Cutout:")[-1].strip()
                     if cutout_part:
@@ -347,7 +491,11 @@ def enrich_row(row: dict) -> tuple[dict, str | None, _DimensionResult | None]:
         return row, str(exc), None
 
 
-def enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[dict]]:
+def enrich_dataframe(
+    df: pd.DataFrame,
+    enrichment_mode: str = "standard",
+    force_refresh: bool = False,
+) -> tuple[pd.DataFrame, list[str], list[dict]]:
     """
     Enrich all qualifying rows in df. Returns (updated_df, error_list, dimension_diagnostics).
     Exceptions in individual rows are caught and logged; the row is left unchanged.
@@ -356,13 +504,16 @@ def enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[di
     errors: list[str] = []
     dimension_diagnostics: list[dict] = []
 
+    from src.enrichment_cache import SessionCache as _SC
+    _session = _SC(force_refresh=force_refresh)
+
     for idx, row in df.iterrows():
         r = row.to_dict()
         if not _qualifies(r):
             continue
 
         try:
-            updated, error, dim_result = enrich_row(r)
+            updated, error, dim_result = enrich_row(r, enrichment_mode=enrichment_mode, session_cache=_session)
             if error:
                 errors.append(error)
             else:

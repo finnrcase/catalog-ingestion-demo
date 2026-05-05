@@ -1,6 +1,17 @@
+import pytest
 from unittest.mock import patch, MagicMock
 from src.product_enrichment import enrich_row
 from src.dimension_enrichment import DimensionResult
+
+
+@pytest.fixture(autouse=True)
+def _reset_product_cache(monkeypatch):
+    """Isolate each test from the module-level ProductEnrichmentCache singleton."""
+    from src.enrichment_cache import ProductEnrichmentCache
+    import src.product_enrichment as pe
+    fresh_cache = ProductEnrichmentCache()
+    fresh_cache._data = {}  # empty in-memory only, no disk I/O
+    monkeypatch.setattr(pe, "_product_cache", fresh_cache)
 
 
 def _row_missing_dims() -> dict:

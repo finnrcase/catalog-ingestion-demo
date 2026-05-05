@@ -9,6 +9,22 @@ from src.product_enrichment import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_manufacturer_domain_cache(monkeypatch):
+    monkeypatch.setattr("src.product_enrichment.get_domain_for_brand", lambda brand: None)
+    monkeypatch.setattr("src.product_enrichment.record_discovered_domain", lambda brand, domain: None)
+
+
+@pytest.fixture(autouse=True)
+def _reset_product_cache(monkeypatch):
+    """Isolate each test from the module-level ProductEnrichmentCache singleton."""
+    from src.enrichment_cache import ProductEnrichmentCache
+    import src.product_enrichment as pe
+    fresh_cache = ProductEnrichmentCache()
+    fresh_cache._data = {}  # empty in-memory only, no disk I/O
+    monkeypatch.setattr(pe, "_product_cache", fresh_cache)
+
+
 # ── _qualifies ─────────────────────────────────────────────────────────────────
 
 def _base_qualifying_row():
@@ -119,6 +135,16 @@ def test_build_search_query_strips_whitespace():
 def test_build_search_query_none_fields():
     row = {"Brand": "Wolf", "Model/SKU": None, "Product Name": None}
     assert _build_search_query(row) == "Wolf dimensions width height depth spec sheet official"
+
+
+def test_build_search_query_uses_manufacturer_override_domain(monkeypatch):
+    monkeypatch.setattr(
+        "src.product_enrichment.get_domain_for_brand",
+        lambda brand: ("scotsman-ice.com", "user"),
+    )
+    row = {"Brand": "Scotsman", "Model/SKU": "SCN60PA1SU", "Product Name": "Ice Machine"}
+
+    assert _build_search_query(row).startswith("site:scotsman-ice.com Scotsman SCN60PA1SU")
 
 
 # ── _apply_enrichment ──────────────────────────────────────────────────────────
@@ -406,7 +432,7 @@ def test_enrich_dataframe_isolates_exceptions():
     ]
     df = pd.DataFrame(rows)
 
-    def bad_enrich_row(row):
+    def bad_enrich_row(row, enrichment_mode="standard", session_cache=None):
         if row["Brand"] == "Wolf":
             raise RuntimeError("network error")
         return row, None, None
@@ -659,3 +685,84 @@ def test_3d_two_numbers_with_not_fails():
 def test_3d_two_number_unlabeled_fails():
     """'36 x 24' is only two dimensions — must fail."""
     assert has_complete_3d_dimensions("36 x 24") is False
+
+
+def test_enrich_row_accepts_enrichment_mode_and_session_cache():
+    """enrich_row must accept enrichment_mode and session_cache kwargs without error."""
+    from src.product_enrichment import enrich_row
+    from src.enrichment_cache import SessionCache
+    row = {
+        "Source Type": "PDF", "Brand": "Wolf", "Model/SKU": "MDD30TS",
+        "Product Name": "", "Dimensions": "", "Finish / Color": "",
+        "Product Category": "", "Product URL": "", "Notes": "",
+        "Review Required": False, "Suggested Action": "",
+    }
+    sc = SessionCache()
+    # With no API keys configured, should return row without crashing
+    updated, err, dim_result = enrich_row(row, enrichment_mode="standard", session_cache=sc)
+    assert isinstance(updated, dict)
+
+
+def test_enrich_row_returns_early_on_full_cache_hit(monkeypatch, tmp_path):
+    """When cache has all essentials, enrich_row must not call Brave."""
+    from src.product_enrichment import enrich_row
+    from src.enrichment_cache import SessionCache, ProductEnrichmentCache, normalize_key
+    import src.product_enrichment as pe
+    import src.brave_search as bs
+
+    call_count = {"n": 0}
+    def fake_search(*args, **kwargs):
+        call_count["n"] += 1
+        return []
+    monkeypatch.setattr(bs, "search_product_candidates", fake_search)
+
+    cache = ProductEnrichmentCache()
+    cache._path = str(tmp_path / "product_cache.json")
+    cache.update(normalize_key("Wolf", "MDD30TS"), {
+        "dimensions": '30"W x 15"H x 17"D',
+        "product_url": "https://wolf.com/mdd30ts",
+        "dimension_confidence": "high",
+        "general_confidence": "high",
+    })
+    monkeypatch.setattr(pe, "_product_cache", cache)
+
+    row = {
+        "Source Type": "PDF", "Brand": "Wolf", "Model/SKU": "MDD30TS",
+        "Product Name": "", "Dimensions": "", "Finish / Color": "",
+        "Product Category": "", "Product URL": "", "Notes": "",
+        "Review Required": False, "Suggested Action": "",
+    }
+    sc = SessionCache()
+    updated, err, _ = enrich_row(row, enrichment_mode="standard", session_cache=sc)
+    assert call_count["n"] == 0  # no Brave calls made
+    assert updated["Dimensions"] == '30"W x 15"H x 17"D'
+    assert updated["Product URL"] == "https://wolf.com/mdd30ts"
+
+
+def test_enrich_dataframe_creates_session_cache_once(monkeypatch):
+    """enrich_dataframe creates one SessionCache and passes it to all rows."""
+    import pandas as pd
+    from src.product_enrichment import enrich_dataframe
+    import src.product_enrichment as pe
+
+    created = []
+    original_enrich_row = pe.enrich_row
+    def tracking_enrich_row(row, enrichment_mode="standard", session_cache=None):
+        created.append(id(session_cache))
+        return original_enrich_row(row, enrichment_mode=enrichment_mode, session_cache=session_cache)
+    monkeypatch.setattr(pe, "enrich_row", tracking_enrich_row)
+
+    rows = [
+        {"Source Type": "PDF", "Brand": "Wolf", "Model/SKU": "MDD30TS",
+         "Product Name": "", "Dimensions": "", "Finish / Color": "",
+         "Product Category": "", "Product URL": "", "Notes": "",
+         "Review Required": False, "Suggested Action": ""},
+        {"Source Type": "PDF", "Brand": "Kohler", "Model/SKU": "K-596",
+         "Product Name": "", "Dimensions": "", "Finish / Color": "",
+         "Product Category": "", "Product URL": "", "Notes": "",
+         "Review Required": False, "Suggested Action": ""},
+    ]
+    df = pd.DataFrame(rows)
+    enrich_dataframe(df, enrichment_mode="standard")
+    # All rows received the same SessionCache instance
+    assert len(set(created)) == 1
