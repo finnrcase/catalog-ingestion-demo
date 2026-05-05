@@ -5,13 +5,21 @@ from src.dimension_enrichment import DimensionResult
 
 
 @pytest.fixture(autouse=True)
-def _reset_product_cache(monkeypatch):
-    """Isolate each test from the module-level ProductEnrichmentCache singleton."""
-    from src.enrichment_cache import ProductEnrichmentCache
+def _isolate_caches(monkeypatch, tmp_path):
+    """Isolate each test from all cache singletons and manufacturer_domains disk writes."""
+    from src.enrichment_cache import ProductEnrichmentCache, ManufacturerDomainCache
     import src.product_enrichment as pe
+    import src.dimension_enrichment as de
+    monkeypatch.setattr("src.product_enrichment.get_domain_for_brand", lambda brand: None)
+    monkeypatch.setattr("src.product_enrichment.record_discovered_domain", lambda brand, domain: None)
     fresh_cache = ProductEnrichmentCache()
-    fresh_cache._data = {}  # empty in-memory only, no disk I/O
+    fresh_cache._data = {}
+    fresh_cache._path = str(tmp_path / "product_enrichment_cache.json")
     monkeypatch.setattr(pe, "_product_cache", fresh_cache)
+    fresh_mfr = ManufacturerDomainCache()
+    fresh_mfr._data = {}
+    fresh_mfr._path = str(tmp_path / "manufacturer_domain_cache.json")
+    monkeypatch.setattr(de, "_mfr_cache", fresh_mfr)
 
 
 def _row_missing_dims() -> dict:

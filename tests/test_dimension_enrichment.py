@@ -120,18 +120,19 @@ def test_get_domain_unknown_brand_returns_none_without_search():
     assert result is None
 
 
-def test_get_domain_unknown_brand_discovered_via_injected_search():
+def test_get_domain_unknown_brand_discovered_via_injected_search(monkeypatch, tmp_path):
     import src.dimension_enrichment as _mod
-    # pre-clean from persistent cache
-    _mod._mfr_cache._load()
-    _mod._mfr_cache._data.pop("unknownbrandxyz2", None)
+    from src.enrichment_cache import ManufacturerDomainCache
+    isolated_mfr = ManufacturerDomainCache()
+    isolated_mfr._data = {}
+    isolated_mfr._path = str(tmp_path / "mfr.json")
+    monkeypatch.setattr(_mod, "_mfr_cache", isolated_mfr)
     def _mock_search(query):
         return ["https://unknownbrandxyz.com/products/spec"]
     result = _get_manufacturer_domain("UnknownBrandXYZ2", _search_fn=_mock_search)
     assert result == "unknownbrandxyz.com"
     assert _mod._mfr_cache.get("unknownbrandxyz2") is not None
     assert _mod._mfr_cache.get("unknownbrandxyz2")["domain"] == "unknownbrandxyz.com"
-    _mod._mfr_cache._data.pop("unknownbrandxyz2", None)  # post-clean
 
 
 def test_get_domain_discovery_failure_returns_none():
