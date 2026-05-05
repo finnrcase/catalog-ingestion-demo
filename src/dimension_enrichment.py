@@ -35,13 +35,30 @@ try:
 except ImportError:
     _brave_candidates = None
 
+from src.enrichment_cache import ManufacturerDomainCache, SessionCache, SearchBudget
 
-def _brave_search_urls(query: str, limit: int = 5, brand: str = "") -> list[str]:
-    """Call Brave Search and return up to `limit` result URLs."""
+
+def _brave_search_urls(
+    query: str,
+    limit: int = 5,
+    brand: str = "",
+    session_cache: "SessionCache | None" = None,
+    budget: "SearchBudget | None" = None,
+) -> list[str]:
+    """Call Brave Search and return up to `limit` result URLs.
+    Checks session cache first (no budget consumed). Skips call if budget exhausted."""
     if _brave_candidates is None:
         return []
+    # Session cache hit — free, no budget consumed
+    if session_cache is not None and query in session_cache.queries:
+        return [r.url for r in session_cache.queries[query][:limit]]
+    # Budget check before real API call
+    if budget is not None and not budget.can_search():
+        return []
     try:
-        results = _brave_candidates(query, brand)
+        results = _brave_candidates(query, brand, session_cache=session_cache)
+        if budget is not None:
+            budget.consume_search()
         return [r.url for r in results[:limit]]
     except Exception:
         return []
@@ -108,8 +125,8 @@ _APPLIANCE_CATEGORIES: frozenset[str] = frozenset({
     "Kitchen Appliance", "Built-in Appliances",
 })
 
-# Simple session-scoped cache — not a cross-process or persistent cache.
-_discovered_domains: dict[str, str] = {}
+# Persistent manufacturer domain cache (lazy-loads from data/manufacturer_domain_cache.json)
+_mfr_cache = ManufacturerDomainCache()
 
 _SPEC_LABEL_KEYWORDS = frozenset({
     "width", "height", "depth", "dimensions", "overall dimensions",
@@ -177,17 +194,21 @@ def _get_manufacturer_domain(
 ) -> str | None:
     """
     Return official manufacturer domain for a brand, or None.
-    Checks BRAND_DOMAIN_TABLE first, then _discovered_domains cache,
+    Checks BRAND_DOMAIN_TABLE first, then persistent ManufacturerDomainCache,
     then optionally runs a discovery search via _search_fn(query) -> list[str].
     """
     brand_stripped = brand.strip()
     key = brand_stripped.lower()
     if not key:
         return None
+    # 1. Hardcoded table (fastest, authoritative)
     if key in BRAND_DOMAIN_TABLE:
         return BRAND_DOMAIN_TABLE[key]
-    if key in _discovered_domains:
-        return _discovered_domains[key]
+    # 2. Persistent discovered cache
+    cached = _mfr_cache.get(key)
+    if cached:
+        return cached["domain"]
+    # 3. Live discovery search
     if _search_fn is None:
         return None
     try:
@@ -197,7 +218,7 @@ def _get_manufacturer_domain(
         netloc = _urlparse.urlparse(urls[0]).netloc.lower()
         domain = netloc[4:] if netloc.startswith("www.") else netloc
         if domain:
-            _discovered_domains[key] = domain
+            _mfr_cache.set(key, domain, source="discovered")
             return domain
     except Exception:
         pass
@@ -658,7 +679,11 @@ def _assign_confidence(
     return "low"
 
 
-def find_dimensions(row: dict) -> DimensionResult:
+def find_dimensions(
+    row: dict,
+    session_cache: "SessionCache | None" = None,
+    budget: "SearchBudget | None" = None,
+) -> DimensionResult:
     """
     Perform full dimension lookup for one intake row.
     Returns DimensionResult with status "found", "not_found", or "low_confidence_skipped".
@@ -680,7 +705,10 @@ def find_dimensions(row: dict) -> DimensionResult:
     if not model:
         return _make_not_found_result(failure_reason="model/sku required for dimension lookup")
 
-    domain = _get_manufacturer_domain(brand, _search_fn=_brave_search_urls)
+    domain = _get_manufacturer_domain(
+        brand,
+        _search_fn=lambda q: _brave_search_urls(q, limit=5, brand=brand, session_cache=session_cache, budget=budget),
+    )
     model_variants = _normalize_model_variants(model)
 
     queries_tried: list[str] = []
@@ -691,9 +719,13 @@ def find_dimensions(row: dict) -> DimensionResult:
         nonlocal low_confidence_result
         for query in query_list:
             queries_tried.append(query)
-            search_urls = _brave_search_urls(query, limit=5, brand=brand)
+            search_urls = _brave_search_urls(query, limit=5, brand=brand, session_cache=session_cache, budget=budget)
             for url in search_urls:
                 urls_checked.append(url)
+                if budget is not None:
+                    if not budget.can_fetch():
+                        break
+                    budget.consume_fetch()
                 product_dims, cutout_dims, src_suffix = _fetch_and_parse_url(
                     url, is_appliance=is_appliance
                 )

@@ -98,7 +98,7 @@ def test_normalize_model_whitespace_only_returns_empty_list():
     assert _normalize_model_variants("   ") == []
 
 
-from src.dimension_enrichment import _get_manufacturer_domain, _discovered_domains
+from src.dimension_enrichment import _get_manufacturer_domain
 
 
 def test_get_domain_known_brand():
@@ -122,13 +122,16 @@ def test_get_domain_unknown_brand_returns_none_without_search():
 
 def test_get_domain_unknown_brand_discovered_via_injected_search():
     import src.dimension_enrichment as _mod
-    _mod._discovered_domains.pop("unknownbrandxyz2", None)  # pre-clean
+    # pre-clean from persistent cache
+    _mod._mfr_cache._load()
+    _mod._mfr_cache._data.pop("unknownbrandxyz2", None)
     def _mock_search(query):
         return ["https://unknownbrandxyz.com/products/spec"]
     result = _get_manufacturer_domain("UnknownBrandXYZ2", _search_fn=_mock_search)
     assert result == "unknownbrandxyz.com"
-    assert _mod._discovered_domains.get("unknownbrandxyz2") == "unknownbrandxyz.com"
-    _mod._discovered_domains.pop("unknownbrandxyz2", None)  # post-clean
+    assert _mod._mfr_cache.get("unknownbrandxyz2") is not None
+    assert _mod._mfr_cache.get("unknownbrandxyz2")["domain"] == "unknownbrandxyz.com"
+    _mod._mfr_cache._data.pop("unknownbrandxyz2", None)  # post-clean
 
 
 def test_get_domain_discovery_failure_returns_none():
@@ -807,3 +810,60 @@ def test_find_dimensions_retailer_phase_not_called_when_manufacturer_succeeds():
 
     assert result.status == "found"
     assert retailer_called == []  # retailer phase must not have fired
+
+
+def test_find_dimensions_accepts_session_cache_and_budget():
+    """find_dimensions must accept session_cache and budget kwargs without error."""
+    from src.dimension_enrichment import find_dimensions
+    from src.enrichment_cache import SessionCache, SearchBudget
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "Dimensions": "", "Product Name": "", "Product Category": ""}
+    sc = SessionCache()
+    budget = SearchBudget(max_searches=0, max_urls=0)  # budget exhausted immediately
+    result = find_dimensions(row, session_cache=sc, budget=budget)
+    # With zero budget, must return not_found without crashing
+    assert result.status in ("not_found", "low_confidence_skipped")
+
+
+def test_brave_search_urls_respects_session_cache():
+    """_brave_search_urls returns session cache hit without consuming budget."""
+    from src.dimension_enrichment import _brave_search_urls
+    from src.enrichment_cache import SessionCache, SearchBudget
+    from src.brave_search import SearchResult
+    sc = SessionCache()
+    sc.queries["site:wolf.com MDD30TS dimensions"] = [
+        SearchResult(title="Wolf", url="https://wolf.com/mdd30ts", description="", domain_score=90)
+    ]
+    budget = SearchBudget(max_searches=0, max_urls=5)  # zero searches allowed
+    urls = _brave_search_urls("site:wolf.com MDD30TS dimensions", session_cache=sc, budget=budget)
+    assert "https://wolf.com/mdd30ts" in urls
+    assert budget.searches_used == 0  # session hit, no budget consumed
+
+
+def test_brave_search_urls_respects_budget_exhaustion(monkeypatch):
+    """_brave_search_urls returns [] without calling Brave when budget is exhausted."""
+    from src.dimension_enrichment import _brave_search_urls
+    from src.enrichment_cache import SessionCache, SearchBudget
+    import src.brave_search as bs
+    monkeypatch.setattr(bs, "BRAVE_API_KEY", "fake")
+    sc = SessionCache()
+    budget = SearchBudget(max_searches=0, max_urls=5)
+    urls = _brave_search_urls("wolf MDD30TS dimensions", session_cache=sc, budget=budget)
+    assert urls == []
+
+
+def test_get_manufacturer_domain_uses_persistent_cache(tmp_path, monkeypatch):
+    """_get_manufacturer_domain writes discovered domains to ManufacturerDomainCache."""
+    from src.enrichment_cache import ManufacturerDomainCache
+    import src.dimension_enrichment as de
+    # Give the module-level cache a tmp path
+    monkeypatch.setattr(de._mfr_cache, "_path", str(tmp_path / "mfr.json"))
+    monkeypatch.setattr(de._mfr_cache, "_data", None)  # force re-load
+
+    def fake_search(query):
+        return ["https://acme-brand.com/products"]
+
+    domain = de._get_manufacturer_domain("Acme Brand", _search_fn=fake_search)
+    assert domain == "acme-brand.com"
+    # Should now be in persistent cache
+    de._mfr_cache._load()
+    assert de._mfr_cache.get("acme brand") is not None
