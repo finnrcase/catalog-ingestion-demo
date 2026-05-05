@@ -82,11 +82,17 @@ def _score_domain(url: str, brand: str) -> int:
     return min(100, max(0, score))
 
 
-def search_product_candidates(query: str, brand: str = "") -> list:
+def search_product_candidates(query: str, brand: str = "", session_cache=None) -> list:
     """
     Search Brave Web Search and return results ranked by domain trustworthiness.
     Returns an empty list if BRAVE_API_KEY is not set or the request fails.
+    If session_cache is provided, checks for a cached result first and stores
+    new results after a live call (no budget is tracked here).
     """
+    # Session cache dedup — return immediately without hitting Brave
+    if session_cache is not None and query in session_cache.queries:
+        return session_cache.queries[query]
+
     if not BRAVE_API_KEY:
         return []
 
@@ -114,6 +120,12 @@ def search_product_candidates(query: str, brand: str = "") -> list:
             if r.get("url")
         ]
         results.sort(key=lambda r: r.domain_score, reverse=True)
-        return results[:5]
+        results = results[:5]
+
+        # Store in session cache after live call
+        if session_cache is not None:
+            session_cache.queries[query] = results
+
+        return results
     except Exception:
         return []

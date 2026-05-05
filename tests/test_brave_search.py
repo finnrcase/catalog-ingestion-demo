@@ -42,3 +42,43 @@ def test_search_product_candidates_exception_returns_empty(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", raise_exc)
     results = bs.search_product_candidates("Wolf MDD30TS specifications", "Wolf")
     assert results == []
+
+
+def test_search_uses_session_cache_hit_without_calling_api(monkeypatch):
+    """If query is in session_cache.queries, return cached result without hitting Brave."""
+    from src.enrichment_cache import SessionCache
+    monkeypatch.setattr(bs, "BRAVE_API_KEY", "real_key")
+
+    call_count = {"n": 0}
+    def fake_urlopen(*args, **kwargs):
+        call_count["n"] += 1
+        raise AssertionError("Should not have called Brave API")
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    sc = SessionCache()
+    fake_result = bs.SearchResult(title="Cached", url="https://cached.com", description="", domain_score=80)
+    sc.queries["Wolf MDD30TS specifications"] = [fake_result]
+
+    results = bs.search_product_candidates("Wolf MDD30TS specifications", "Wolf", session_cache=sc)
+    assert results == [fake_result]
+    assert call_count["n"] == 0
+
+
+def test_search_stores_result_in_session_cache(monkeypatch):
+    """After a real Brave call, the result is stored in session_cache.queries."""
+    from src.enrichment_cache import SessionCache
+    import urllib.request, io, json as _json
+    monkeypatch.setattr(bs, "BRAVE_API_KEY", "fake_key")
+
+    fake_response_data = {"web": {"results": [{"url": "https://wolf.com/p", "title": "Wolf", "description": ""}]}}
+    class FakeResp:
+        def read(self): return _json.dumps(fake_response_data).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **kw: FakeResp())
+
+    sc = SessionCache()
+    bs.search_product_candidates("Wolf MDD30TS specs", "Wolf", session_cache=sc)
+    assert "Wolf MDD30TS specs" in sc.queries
