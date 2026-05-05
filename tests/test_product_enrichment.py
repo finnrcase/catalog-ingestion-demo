@@ -306,6 +306,179 @@ def test_fetch_page_text_caps_at_6000_chars():
     assert len(result) <= 6000
 
 
+# ── extract_image_url / _is_valid_image_url ────────────────────────────────────
+
+from src.product_enrichment import extract_image_url, _is_valid_image_url
+
+
+def test_is_valid_image_url_accepts_https_jpg():
+    assert _is_valid_image_url("https://example.com/photo.jpg") is True
+
+
+def test_is_valid_image_url_accepts_https_jpeg():
+    assert _is_valid_image_url("https://cdn.example.com/img.jpeg") is True
+
+
+def test_is_valid_image_url_accepts_https_png():
+    assert _is_valid_image_url("https://example.com/img.png") is True
+
+
+def test_is_valid_image_url_accepts_query_string():
+    assert _is_valid_image_url("https://example.com/img.jpg?size=large") is True
+
+
+def test_is_valid_image_url_rejects_http():
+    assert _is_valid_image_url("http://example.com/img.jpg") is False
+
+
+def test_is_valid_image_url_rejects_no_extension():
+    assert _is_valid_image_url("https://example.com/product") is False
+
+
+def test_is_valid_image_url_rejects_webp():
+    assert _is_valid_image_url("https://example.com/photo.webp") is False
+
+
+def test_is_valid_image_url_rejects_relative():
+    assert _is_valid_image_url("/images/photo.jpg") is False
+
+
+def test_is_valid_image_url_rejects_empty():
+    assert _is_valid_image_url("") is False
+
+
+def test_extract_image_url_og_image():
+    html = '<meta property="og:image" content="https://example.com/hero.jpg">'
+    assert extract_image_url(html) == "https://example.com/hero.jpg"
+
+
+def test_extract_image_url_og_image_content_first():
+    html = '<meta content="https://example.com/hero.jpg" property="og:image">'
+    assert extract_image_url(html) == "https://example.com/hero.jpg"
+
+
+def test_extract_image_url_og_image_invalid_extension_skips_to_next():
+    html = (
+        '<meta property="og:image" content="https://example.com/hero.webp">'
+        '<img src="https://example.com/fallback.jpg" width="800" height="600">'
+    )
+    result = extract_image_url(html)
+    assert result == "https://example.com/fallback.jpg"
+
+
+def test_extract_image_url_jsonld_image():
+    import json
+    data = {"@type": "Product", "image": "https://example.com/product.png"}
+    html = f'<script type="application/ld+json">{json.dumps(data)}</script>'
+    assert extract_image_url(html) == "https://example.com/product.png"
+
+
+def test_extract_image_url_jsonld_image_list():
+    import json
+    data = {"@type": "Product", "image": ["https://example.com/p.png", "https://example.com/q.png"]}
+    html = f'<script type="application/ld+json">{json.dumps(data)}</script>'
+    assert extract_image_url(html) == "https://example.com/p.png"
+
+
+def test_extract_image_url_largest_img():
+    html = (
+        '<img src="https://example.com/small.jpg" width="50" height="50">'
+        '<img src="https://example.com/large.jpg" width="800" height="600">'
+        '<img src="https://example.com/medium.jpg" width="400" height="300">'
+    )
+    assert extract_image_url(html) == "https://example.com/large.jpg"
+
+
+def test_extract_image_url_no_valid_images_returns_none():
+    html = '<img src="/relative/path.jpg"><img src="https://example.com/page">'
+    assert extract_image_url(html) is None
+
+
+def test_extract_image_url_empty_html_returns_none():
+    assert extract_image_url("") is None
+
+
+def test_enrich_row_extracts_and_fills_image_url():
+    """When page HTML contains a valid image, enrich_row fills Image URL on the row."""
+    good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
+    html_with_image = '<meta property="og:image" content="https://wolfappliance.com/img/mdd30ts.jpg">'
+    extracted = {
+        "Product Name": "Wolf Drawer Microwave",
+        "Dimensions": "", "Finish / Color": "", "Product Category": "Appliance", "materials": "",
+    }
+    with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
+         patch("src.product_enrichment._fetch_page_html", return_value=html_with_image), \
+         patch("src.product_enrichment._extract_with_claude", return_value=extracted):
+        updated, error, _ = enrich_row(_qualifying_row())
+
+    assert updated.get("Image URL") == "https://wolfappliance.com/img/mdd30ts.jpg"
+
+
+def test_enrich_row_invalid_image_not_stored(monkeypatch, tmp_path):
+    """og:image pointing to .webp is rejected; Image URL stays empty."""
+    from src.enrichment_cache import ProductEnrichmentCache
+    import src.product_enrichment as pe
+    cache = ProductEnrichmentCache()
+    cache._path = str(tmp_path / "c.json")
+    cache._data = {}
+    monkeypatch.setattr(pe, "_product_cache", cache)
+
+    good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
+    html_bad_image = '<meta property="og:image" content="https://wolfappliance.com/img.webp">'
+    extracted = {"Product Name": "", "Dimensions": "", "Finish / Color": "", "Product Category": "", "materials": ""}
+    with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
+         patch("src.product_enrichment._fetch_page_html", return_value=html_bad_image), \
+         patch("src.product_enrichment._extract_with_claude", return_value=extracted):
+        updated, _, _ = enrich_row(_qualifying_row())
+
+    assert not updated.get("Image URL")
+
+
+def test_enrich_row_image_written_to_cache(monkeypatch, tmp_path):
+    """Valid image_url from page is stored in ProductEnrichmentCache."""
+    from src.enrichment_cache import ProductEnrichmentCache, normalize_key
+    import src.product_enrichment as pe
+    cache = ProductEnrichmentCache()
+    cache._path = str(tmp_path / "c.json")
+    cache._data = {}
+    monkeypatch.setattr(pe, "_product_cache", cache)
+
+    good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
+    html = '<meta property="og:image" content="https://wolfappliance.com/img/spec.jpg">'
+    extracted = {"Product Name": "", "Dimensions": "", "Finish / Color": "", "Product Category": "", "materials": ""}
+    with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
+         patch("src.product_enrichment._fetch_page_html", return_value=html), \
+         patch("src.product_enrichment._extract_with_claude", return_value=extracted):
+        enrich_row(_qualifying_row())
+
+    key = normalize_key("Wolf", "MDD30TS")
+    entry = cache.get(key)
+    assert entry is not None
+    assert entry.get("image_url") == "https://wolfappliance.com/img/spec.jpg"
+
+
+def test_enrich_row_does_not_overwrite_cached_image(monkeypatch, tmp_path):
+    """Existing valid image_url in cache is not overwritten by a new extraction."""
+    from src.enrichment_cache import ProductEnrichmentCache, normalize_key
+    import src.product_enrichment as pe
+    cache = ProductEnrichmentCache()
+    cache._path = str(tmp_path / "c.json")
+    cache._data = {}
+    key = normalize_key("Wolf", "MDD30TS")
+    cache.update(key, {"image_url": "https://wolfappliance.com/img/original.jpg", "general_confidence": "medium"})
+    monkeypatch.setattr(pe, "_product_cache", cache)
+
+    good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
+    html = '<meta property="og:image" content="https://wolfappliance.com/img/new.jpg">'
+    extracted = {"Product Name": "", "Dimensions": "", "Finish / Color": "", "Product Category": "", "materials": ""}
+    with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
+         patch("src.product_enrichment._fetch_page_html", return_value=html), \
+         patch("src.product_enrichment._extract_with_claude", return_value=extracted):
+        enrich_row(_qualifying_row())
+
+    assert cache.get(key)["image_url"] == "https://wolfappliance.com/img/original.jpg"
+
+
 # ── _extract_with_claude ───────────────────────────────────────────────────────
 
 def test_extract_with_claude_parses_json():
@@ -384,7 +557,7 @@ def test_enrich_row_low_score_result_leaves_note():
 def test_enrich_row_fetch_failure_leaves_note():
     good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
     with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
-         patch("src.product_enrichment._fetch_page_text", return_value=""):
+         patch("src.product_enrichment._fetch_page_html", return_value=""):
         updated, error, _ = enrich_row(_qualifying_row())
     assert "could not fetch" in updated["Notes"]
 
@@ -399,13 +572,27 @@ def test_enrich_row_fills_fields_on_success():
         "materials": "",
     }
     with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
-         patch("src.product_enrichment._fetch_page_text", return_value="page content"), \
+         patch("src.product_enrichment._fetch_page_html", return_value="page content"), \
          patch("src.product_enrichment._extract_with_claude", return_value=extracted):
         updated, error, _ = enrich_row(_qualifying_row())
 
     assert error is None
     assert updated["Product Name"] == "Wolf 30\" Drawer Microwave"
     assert updated["Source Type"] == "PDF_Enriched"
+
+
+def test_enrich_row_web_enrichment_disabled_skips_search_domain_and_dimension_lookup():
+    with patch("src.product_enrichment.search_product_candidates") as mock_search, \
+         patch("src.product_enrichment.get_domain_for_brand") as mock_domain, \
+         patch("src.product_enrichment._find_dimensions") as mock_dimensions:
+        updated, error, dim_result = enrich_row(_qualifying_row(), use_web_enrichment=False)
+
+    assert error is None
+    assert dim_result is None
+    assert updated == _qualifying_row()
+    mock_search.assert_not_called()
+    mock_domain.assert_not_called()
+    mock_dimensions.assert_not_called()
 
 
 # ── enrich_dataframe ───────────────────────────────────────────────────────────
@@ -448,6 +635,26 @@ def test_enrich_dataframe_isolates_exceptions():
 
     assert len(errors) == 1
     assert "Wolf" in errors[0]
+
+
+def test_enrich_dataframe_web_enrichment_disabled_skips_cache_and_search(monkeypatch):
+    import src.product_enrichment as pe
+
+    df = pd.DataFrame([_qualifying_row()])
+    monkeypatch.setattr(pe._product_cache, "get", lambda key: (_ for _ in ()).throw(AssertionError("cache read")))
+    monkeypatch.setattr(pe._product_cache, "update", lambda key, fields: (_ for _ in ()).throw(AssertionError("cache write")))
+
+    with patch("src.product_enrichment.search_product_candidates") as mock_search, \
+         patch("src.product_enrichment.get_domain_for_brand") as mock_domain, \
+         patch("src.product_enrichment._find_dimensions") as mock_dimensions:
+        updated_df, errors, diagnostics = enrich_dataframe(df, use_web_enrichment=False)
+
+    assert errors == []
+    assert diagnostics == []
+    assert updated_df.to_dict("records") == df.to_dict("records")
+    mock_search.assert_not_called()
+    mock_domain.assert_not_called()
+    mock_dimensions.assert_not_called()
 
 
 # ── has_complete_3d_dimensions ─────────────────────────────────────────────────

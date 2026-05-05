@@ -255,11 +255,19 @@ def _is_photo_only(row: dict) -> bool:
     )
 
 
+def _is_public_https_image_url(value) -> bool:
+    url = _str_val(value).lower()
+    if not url.startswith("https://"):
+        return False
+    path = url.split("?")[0].split("#")[0]
+    return path.endswith((".jpg", ".jpeg", ".png"))
+
+
 def _is_exportable(row: dict) -> bool:
     if not (_is_included(row) and _str_val(row.get("Product Name"))):
         return False
     if _is_photo_only(row):
-        return bool(_str_val(row.get("Image URL")))
+        return _is_public_https_image_url(row.get("Image URL"))
     return True
 
 
@@ -297,7 +305,7 @@ def _row_to_programa_dict(row: dict) -> dict:
         "Price": _str_val(row.get("Price")),
         "Supplier": _str_val(row.get("Supplier")),
         "Product URL": _str_val(row.get("Product URL")),
-        "Image URL": _str_val(row.get("Image URL")),
+        "Image URL": _str_val(row.get("Image URL")) if _is_public_https_image_url(row.get("Image URL")) else "",
         "Finish": finish_color,
         "Color": color,
         "Material": material,
@@ -322,6 +330,8 @@ def validate_for_export(rows) -> dict:
     missing_dimensions = 0
     missing_product_url = 0
     missing_image_url = 0
+    image_url_present = 0
+    image_url_total = 0
     export_count = 0
     section_counts: dict[str, int] = {}
     section_equals_product_name: list[dict] = []
@@ -332,10 +342,14 @@ def validate_for_export(rows) -> dict:
         if not name:
             skipped.append({"index": i, "product_name": "(no name)"})
             continue
+        image_url_total += 1
+        if _is_public_https_image_url(row.get("Image URL")):
+            image_url_present += 1
         raw_section = _str_val(row.get("Product Category") or row.get("Section"))
         section = normalize_section(raw_section)
-        if _is_photo_only(row) and not _str_val(row.get("Image URL")):
-            skipped.append({"index": i, "product_name": name})
+        if _is_photo_only(row) and not _is_public_https_image_url(row.get("Image URL")):
+            missing_image_url += 1
+            skipped.append({"index": i, "product_name": name, "reason": "missing or invalid Image URL"})
             continue
 
         export_count += 1
@@ -350,7 +364,9 @@ def validate_for_export(rows) -> dict:
             missing_dimensions += 1
         if not _str_val(row.get("Product URL")):
             missing_product_url += 1
-        if not _str_val(row.get("Image URL")):
+        if _str_val(row.get("Image URL")) and not _is_public_https_image_url(row.get("Image URL")):
+            missing_image_url += 1
+        elif not _str_val(row.get("Image URL")):
             missing_image_url += 1
 
     return {
@@ -359,6 +375,8 @@ def validate_for_export(rows) -> dict:
         "missing_dimensions": missing_dimensions,
         "missing_product_url": missing_product_url,
         "missing_image_url": missing_image_url,
+        "image_url_present": image_url_present,
+        "image_url_total": image_url_total,
         "export_count": export_count,
         "unique_sections": sorted(section_counts),
         "section_counts": dict(sorted(section_counts.items())),

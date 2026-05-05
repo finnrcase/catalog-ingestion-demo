@@ -255,6 +255,53 @@ def test_photo_only_export_skips_missing_image_url():
     assert build_programa_import_dataframe([row]).empty
 
 
+def test_photo_only_export_skips_non_https_image_url():
+    from src.programa_export import build_programa_import_dataframe, validate_for_export
+
+    row = {
+        "Include": True,
+        "Source Type": "Photo",
+        "photo_only": True,
+        "Product Name": "Handmade Bowl",
+        "Product Category": "Accessories",
+        "Image URL": "http://example.com/bowl.jpg",
+    }
+
+    assert build_programa_import_dataframe([row]).empty
+    summary = validate_for_export([row])
+    assert summary["export_count"] == 0
+    assert summary["missing_image_url"] == 1
+    assert summary["skipped"][0]["reason"] == "missing or invalid Image URL"
+
+
+def test_export_blanks_non_https_image_url_for_standard_rows():
+    from src.programa_export import build_programa_import_dataframe
+
+    rows = _make_rows([{"Image URL": "http://example.com/image.jpg"}])
+
+    df = build_programa_import_dataframe(rows)
+
+    assert df.iloc[0]["Image URL"] == ""
+
+
+def test_export_blanks_https_url_without_image_extension():
+    """https:// product page URL (no .jpg/.jpeg/.png) must be blanked — not a valid image."""
+    from src.programa_export import build_programa_import_dataframe
+
+    rows = _make_rows([{"Image URL": "https://example.com/product/detail"}])
+    df = build_programa_import_dataframe(rows)
+    assert df.iloc[0]["Image URL"] == ""
+
+
+def test_export_blanks_webp_image_url():
+    """WebP images are not accepted by Programa."""
+    from src.programa_export import build_programa_import_dataframe
+
+    rows = _make_rows([{"Image URL": "https://example.com/photo.webp"}])
+    df = build_programa_import_dataframe(rows)
+    assert df.iloc[0]["Image URL"] == ""
+
+
 def test_photo_only_bulk_export_contains_public_urls_only():
     from src.photo_inventory import create_photo_only_bulk_rows
     from src.programa_export import build_programa_import_dataframe
@@ -339,6 +386,20 @@ def test_validate_flags_missing_image_url():
     rows = _make_rows([{"Image URL": ""}, {}])
     result = validate_for_export(rows)
     assert result["missing_image_url"] == 1
+    assert result["image_url_present"] == 1
+    assert result["image_url_total"] == 2
+
+
+def test_validate_counts_image_urls_present():
+    rows = _make_rows([
+        {"Image URL": "https://cdn.example.com/one.jpg"},
+        {"Image URL": "https://cdn.example.com/two.jpg"},
+        {"Image URL": ""},
+    ])
+    result = validate_for_export(rows)
+
+    assert result["image_url_present"] == 2
+    assert result["image_url_total"] == 3
 
 
 def test_validate_accepts_dataframe_input():
@@ -351,7 +412,8 @@ def test_validate_result_keys():
     result = validate_for_export([])
     assert set(result.keys()) == {
         "skipped", "missing_section", "missing_dimensions",
-        "missing_product_url", "missing_image_url", "export_count",
+        "missing_product_url", "missing_image_url", "image_url_present",
+        "image_url_total", "export_count",
         "unique_sections", "section_counts", "section_equals_product_name",
         "section_too_long", "too_many_unique_sections", "canonical_sections",
     }
@@ -404,6 +466,10 @@ def test_build_has_exactly_programa_columns():
     rows = _make_rows([{}])
     df = build_programa_import_dataframe(rows)
     assert list(df.columns) == PROGRAMA_COLUMNS
+    assert {"Section", "Product Name", "Image URL", "Quantity", "Notes"}.issubset(df.columns)
+    assert "Local Image Path" not in df.columns
+    assert "Image Upload Status" not in df.columns
+    assert "Confidence Score" not in df.columns
 
 
 def test_build_excludes_rows_missing_product_name():

@@ -58,6 +58,7 @@ _product_cache = _ProductEnrichmentCache()
 _CACHE_GENERAL_FIELDS: dict[str, str] = {
     "product_url": "Product URL",
     "finish": "Finish / Color",
+    "image_url": "Image URL",
 }
 _CACHE_DIM_FIELDS: dict[str, str] = {
     "dimensions": "Dimensions",
@@ -206,8 +207,8 @@ def _apply_enrichment(
     return updated
 
 
-def _fetch_page_text(url: str) -> str:
-    """Fetch URL with httpx and return plain text (max 6 000 chars). Empty string on error."""
+def _fetch_page_html(url: str) -> str:
+    """Fetch URL with httpx and return raw HTML. Empty string on error."""
     try:
         resp = httpx.get(
             url,
@@ -216,19 +217,110 @@ def _fetch_page_text(url: str) -> str:
             follow_redirects=True,
         )
         resp.raise_for_status()
-
-        if _html2text is not None:
-            h = _html2text.HTML2Text()
-            h.ignore_links = True
-            h.ignore_images = True
-            text = h.handle(resp.text)
-        else:
-            text = re.sub(r"<[^>]+>", " ", resp.text)
-            text = re.sub(r"\s{2,}", " ", text)
-
-        return text[:6000].strip()
+        return resp.text
     except Exception:
         return ""
+
+
+def _html_to_text(html: str) -> str:
+    """Convert raw HTML to plain text (max 6 000 chars). Returns empty string for empty input."""
+    if not html:
+        return ""
+    if _html2text is not None:
+        h = _html2text.HTML2Text()
+        h.ignore_links = True
+        h.ignore_images = True
+        text = h.handle(html)
+    else:
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s{2,}", " ", text)
+    return text[:6000].strip()
+
+
+def _fetch_page_text(url: str) -> str:
+    """Fetch URL and return plain text (max 6 000 chars). Empty string on error."""
+    return _html_to_text(_fetch_page_html(url))
+
+
+def _is_valid_image_url(url: str) -> bool:
+    """True if url is an absolute https URL whose path ends in .jpg, .jpeg, or .png."""
+    if not url or not isinstance(url, str):
+        return False
+    url_lower = url.lower()
+    if not url_lower.startswith("https://"):
+        return False
+    path = url_lower.split("?")[0].split("#")[0]
+    return path.endswith((".jpg", ".jpeg", ".png"))
+
+
+def extract_image_url(html: str) -> str | None:
+    """
+    Extract the best image URL from raw HTML.
+
+    Priority: og:image → JSON-LD "image" → largest <img> by pixel area.
+    Returns None if no valid https .jpg/.jpeg/.png URL is found.
+    Logs [IMAGE INVALID — skipped] for candidates that fail extension validation.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    if not html:
+        return None
+
+    # Priority 1: og:image meta tag (either attribute order)
+    for pattern in (
+        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+    ):
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            if _is_valid_image_url(candidate):
+                return candidate
+            _log.info("[IMAGE INVALID — skipped] source=og:image url=%s", candidate[:120])
+            break  # found og:image but invalid — don't fall through to other og patterns
+
+    # Priority 2: JSON-LD "image" field
+    for ld_m in re.finditer(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html, re.IGNORECASE | re.DOTALL,
+    ):
+        try:
+            data = json.loads(ld_m.group(1))
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            candidate = data.get("image", "")
+            if isinstance(candidate, list):
+                candidate = candidate[0] if candidate else ""
+            if isinstance(candidate, dict):
+                candidate = candidate.get("url", "")
+            candidate = str(candidate).strip()
+            if candidate:
+                if _is_valid_image_url(candidate):
+                    return candidate
+                _log.info("[IMAGE INVALID — skipped] source=json-ld url=%s", candidate[:120])
+        except Exception:
+            pass
+
+    # Priority 3: largest <img> tag by pixel area (width * height)
+    best_url: str | None = None
+    best_area = -1
+    for img_m in re.finditer(r"<img([^>]+)>", html, re.IGNORECASE):
+        attrs = img_m.group(1)
+        src_m = re.search(r'\bsrc=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+        if not src_m:
+            continue
+        src = src_m.group(1).strip()
+        if not _is_valid_image_url(src):
+            continue
+        w_m = re.search(r'\bwidth=["\']?(\d+)', attrs, re.IGNORECASE)
+        h_m = re.search(r'\bheight=["\']?(\d+)', attrs, re.IGNORECASE)
+        area = (int(w_m.group(1)) if w_m else 1) * (int(h_m.group(1)) if h_m else 1)
+        if area > best_area:
+            best_area = area
+            best_url = src
+
+    return best_url
 
 
 def _build_extraction_prompt(page_text: str, row: dict) -> str:
@@ -353,6 +445,7 @@ def enrich_row(
     row: dict,
     enrichment_mode: str = "standard",
     session_cache: "_SessionCache | None" = None,
+    use_web_enrichment: bool = True,
 ) -> tuple[dict, str | None, _DimensionResult | None]:
     """
     Enrich a single row using Brave Search + httpx + Claude.
@@ -364,6 +457,10 @@ def enrich_row(
     try:
         import logging as _logging
         _log = _logging.getLogger(__name__)
+
+        if not use_web_enrichment:
+            _log.info("[WEB ENRICHMENT DISABLED] skipping search and cache for row")
+            return row.copy(), None, None
 
         mode = _normalize_mode(enrichment_mode)
         budget = _budget_for_mode(mode)
@@ -424,9 +521,10 @@ def enrich_row(
             parsed_domain = urllib.parse.urlparse(best.url).netloc
             if parsed_domain and not domain_match:
                 record_discovered_domain(brand, parsed_domain)
-            page_text = _fetch_page_text(best.url)
+            raw_html = _fetch_page_html(best.url)
+            page_text = _html_to_text(raw_html)
 
-            if not page_text:
+            if not raw_html:
                 updated = row.copy()
                 existing = _str_val(updated.get("Notes"))
                 domain = urllib.parse.urlparse(best.url).netloc or best.url[:50]
@@ -436,6 +534,16 @@ def enrich_row(
             else:
                 extracted = _extract_with_claude(page_text, row)
                 updated = _apply_enrichment(row, extracted, best.url, best.domain_score)
+
+                # ── Image extraction (opportunistic — no extra Brave call) ─────
+                image_url_found = extract_image_url(raw_html)
+                if image_url_found:
+                    _log.info("[IMAGE FOUND] key=%s url=%s", cache_key, image_url_found[:80])
+                    if not _str_val(updated.get("Image URL")):
+                        updated["Image URL"] = image_url_found
+                else:
+                    _log.info("[IMAGE MISSING] key=%s", cache_key)
+
                 # ── Cache write-back (general fields found) ────────────────────
                 if cache_key:
                     _cache_fields: dict = {}
@@ -446,6 +554,13 @@ def enrich_row(
                     if _cache_fields:
                         _cache_fields["general_confidence"] = "medium"
                         _product_cache.update(cache_key, _cache_fields)
+                    # Image cache write-back — never overwrite an existing valid entry
+                    existing_entry = _product_cache.get(cache_key) or {}
+                    if not existing_entry.get("image_url"):
+                        if image_url_found:
+                            _product_cache.update(cache_key, {"image_url": image_url_found, "general_confidence": "medium"})
+                        else:
+                            _product_cache.update(cache_key, {"image_url": None, "image_url__reason": "not found on page"})
 
         # ── Dimension enrichment pass ──────────────────────────────────────────
         brand_val = _str_val(updated.get("Brand"))
@@ -501,6 +616,7 @@ def enrich_dataframe(
     df: pd.DataFrame,
     enrichment_mode: str = "standard",
     force_refresh: bool = False,
+    use_web_enrichment: bool = True,
 ) -> tuple[pd.DataFrame, list[str], list[dict]]:
     """
     Enrich all qualifying rows in df. Returns (updated_df, error_list, dimension_diagnostics).
@@ -509,6 +625,9 @@ def enrich_dataframe(
     df = df.copy()
     errors: list[str] = []
     dimension_diagnostics: list[dict] = []
+
+    if not use_web_enrichment:
+        return df, errors, dimension_diagnostics
 
     from src.enrichment_cache import SessionCache as _SC
     _session = _SC(force_refresh=force_refresh)
@@ -519,7 +638,11 @@ def enrich_dataframe(
             continue
 
         try:
-            updated, error, dim_result = enrich_row(r, enrichment_mode=enrichment_mode, session_cache=_session)
+            updated, error, dim_result = enrich_row(
+                r,
+                enrichment_mode=enrichment_mode,
+                session_cache=_session,
+            )
             if error:
                 errors.append(error)
             else:
