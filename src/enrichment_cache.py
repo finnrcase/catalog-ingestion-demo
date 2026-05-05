@@ -124,7 +124,12 @@ class ManufacturerDomainCache:
         try:
             with open(self._path, "r", encoding="utf-8") as f:
                 self._data = json.load(f)
-        except Exception:
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "ManufacturerDomainCache: could not load %s (%s) — treating as empty",
+                self._path, exc,
+            )
             self._data = {}
 
     def _save(self) -> None:
@@ -173,7 +178,12 @@ class ProductEnrichmentCache:
         try:
             with open(self._path, "r", encoding="utf-8") as f:
                 self._data = json.load(f)
-        except Exception:
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "ProductEnrichmentCache: could not load %s (%s) — treating as empty",
+                self._path, exc,
+            )
             self._data = {}
 
     def _save(self) -> None:
