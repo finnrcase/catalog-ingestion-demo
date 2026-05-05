@@ -43,10 +43,15 @@ _DIMENSION_FIELDS: frozenset[str] = frozenset(
 
 
 def normalize_key(brand: str, model: str) -> str:
-    """Stable cache key: lowercase, alphanumeric only, joined by underscore."""
+    """Stable cache key: lowercase, alphanumeric only, joined by underscore.
+    Raises ValueError if both brand and model are empty after normalization."""
     def _clean(s: str) -> str:
         return re.sub(r"[^a-z0-9]+", "", s.lower().strip())
-    return f"{_clean(brand)}_{_clean(model)}"
+    brand_clean = _clean(brand)
+    model_clean = _clean(model)
+    if not brand_clean and not model_clean:
+        raise ValueError(f"normalize_key: both brand and model are empty after normalization (brand={brand!r}, model={model!r})")
+    return f"{brand_clean}_{model_clean}"
 
 
 def normalize_mode(mode: str) -> str:
@@ -141,7 +146,10 @@ class ManufacturerDomainCache:
                 json.dump(self._data, f, indent=2)
             os.replace(tmp, self._path)
         except Exception:
-            pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     def get(self, brand_key: str) -> dict | None:
         self._load()
@@ -195,14 +203,22 @@ class ProductEnrichmentCache:
                 json.dump(self._data, f, indent=2)
             os.replace(tmp, self._path)
         except Exception:
-            pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
     def get(self, key: str) -> dict | None:
         self._load()
         return self._data.get(key)
 
     def update(self, key: str, fields: dict) -> None:
-        """Merge fields into existing entry. Only stores non-empty values or explicit None."""
+        """Merge fields into existing entry. Only stores non-empty values or explicit None.
+
+        To record a specific failure reason for a null field, pass a sidecar key:
+            update(key, {"image_url": None, "image_url__reason": "HTTP 404"})
+        Keys ending in '__reason' are stored in null_fields metadata and not as top-level fields.
+        """
         self._load()
         entry = dict(self._data.get(key) or {})
         now = datetime.now().isoformat(timespec="seconds")

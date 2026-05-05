@@ -189,6 +189,14 @@ def test_product_cache_persists_across_instances(product_cache):
     assert cache2.get("wolf_mdd30ts")["dimensions"] == '30"W x 15"H x 17"D'
 
 
+def test_product_cache_null_reason_stored_in_null_fields(product_cache):
+    product_cache.update("wolf_mdd30ts", {"image_url": None, "image_url__reason": "HTTP 404"})
+    entry = product_cache.get("wolf_mdd30ts")
+    assert entry["image_url"] is None
+    assert entry["null_fields"]["image_url"]["failure_reason"] == "HTTP 404"
+    assert "image_url__reason" not in entry  # sidecar key is not stored as a top-level field
+
+
 # ── confidence_ok ──────────────────────────────────────────────────────────────
 
 def test_confidence_ok_dimension_field_uses_dimension_confidence():
