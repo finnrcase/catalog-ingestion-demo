@@ -822,6 +822,7 @@ def test_find_dimensions_accepts_session_cache_and_budget():
     result = find_dimensions(row, session_cache=sc, budget=budget)
     # With zero budget, must return not_found without crashing
     assert result.status in ("not_found", "low_confidence_skipped")
+    assert budget.urls_used == 0  # zero-budget should have fetched nothing
 
 
 def test_brave_search_urls_respects_session_cache():

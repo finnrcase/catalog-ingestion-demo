@@ -722,13 +722,13 @@ def find_dimensions(
             search_urls = _brave_search_urls(query, limit=5, brand=brand, session_cache=session_cache, budget=budget)
             for url in search_urls:
                 urls_checked.append(url)
-                if budget is not None:
-                    if not budget.can_fetch():
-                        break
-                    budget.consume_fetch()
+                if budget is not None and not budget.can_fetch():
+                    break
                 product_dims, cutout_dims, src_suffix = _fetch_and_parse_url(
                     url, is_appliance=is_appliance
                 )
+                if budget is not None:
+                    budget.consume_fetch()
                 if not product_dims or not has_complete_3d_dimensions(product_dims):
                     continue
                 matched_variant = None
