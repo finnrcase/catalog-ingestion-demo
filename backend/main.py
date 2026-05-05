@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import io
 import os
 import sys
@@ -23,6 +24,8 @@ from src.eligibility import split_eligible_rows
 from src.export import get_csv_bytes
 from src.intake import build_intake_dataframe, create_pdf_rows, create_url_rows
 from src.intake_schema import CATEGORIES, STATUSES
+from src.image_uploader import is_public_https_image_url, upload_image
+from src.manufacturer_domains import save_manufacturer_override
 from src.notes import remove_notes_row_prefix
 from src.product_enrichment import enrich_dataframe
 from src.programa_export import (
@@ -65,6 +68,8 @@ class UploadedPDF:
 
 class RowsPayload(BaseModel):
     rows: list[dict] = Field(default_factory=list)
+    enrichment_mode: str = "standard"
+    force_refresh: bool = False
 
 
 class ProgramaPayload(RowsPayload):
@@ -105,6 +110,15 @@ class IntakeResponse(BaseModel):
     eligible_count: int = 0
     blocked_count: int = 0
     dimension_diagnostics: list[dict] = Field(default_factory=list)
+
+
+class ImageUploadResponse(BaseModel):
+    secure_url: str
+
+
+class ManufacturerOverridePayload(BaseModel):
+    brand: str = ""
+    website: str = ""
 
 
 app = FastAPI(
@@ -242,6 +256,24 @@ async def generate_intake(
     return _df_response(df, errors)
 
 
+@app.post("/api/upload-image", response_model=ImageUploadResponse)
+async def upload_image_endpoint(file: UploadFile = File(...)) -> ImageUploadResponse:
+    content_type = (file.content_type or "").lower()
+    filename = (file.filename or "").lower()
+    if not (content_type.startswith("image/") or filename.endswith((".jpg", ".jpeg", ".png", ".webp"))):
+        raise HTTPException(status_code=400, detail="Only image files can be uploaded.")
+
+    secure_url = upload_image(file.file)
+    if not secure_url or not is_public_https_image_url(secure_url):
+        raise HTTPException(status_code=502, detail="Cloudinary upload failed or did not return a secure HTTPS URL.")
+    return ImageUploadResponse(secure_url=secure_url)
+
+
+@app.post("/upload-image", response_model=ImageUploadResponse)
+async def upload_image_endpoint_alias(file: UploadFile = File(...)) -> ImageUploadResponse:
+    return await upload_image_endpoint(file)
+
+
 @app.post("/intake/validate", response_model=IntakeResponse)
 def validate_intake(payload: RowsPayload) -> IntakeResponse:
     df = apply_confidence_checks(pd.DataFrame(payload.rows))
@@ -250,9 +282,22 @@ def validate_intake(payload: RowsPayload) -> IntakeResponse:
 
 @app.post("/intake/enrich", response_model=IntakeResponse)
 def enrich_intake(payload: RowsPayload) -> IntakeResponse:
-    df, errors, dimension_diagnostics = enrich_dataframe(pd.DataFrame(payload.rows))
+    df, errors, dimension_diagnostics = enrich_dataframe(
+        pd.DataFrame(payload.rows),
+        enrichment_mode=payload.enrichment_mode,
+        force_refresh=payload.force_refresh,
+    )
     df = apply_confidence_checks(df)
     return _df_response(df, errors, dimension_diagnostics)
+
+
+@app.post("/manufacturer-override")
+def manufacturer_override(payload: ManufacturerOverridePayload) -> dict:
+    try:
+        entry = save_manufacturer_override(payload.brand, payload.website)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "saved", "override": entry}
 
 
 @app.post("/programa/eligible")
@@ -467,10 +512,11 @@ def send_to_programa(payload: ProgramaPayload) -> dict:
 @app.post("/export/csv")
 def export_csv(payload: RowsPayload) -> Response:
     df = pd.DataFrame(payload.rows)
+    today = datetime.date.today().isoformat()
     return Response(
         content=get_csv_bytes(df),
         media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="sch-intake.csv"'},
+        headers={"Content-Disposition": f'attachment; filename="internal_intake_not_for_programa_{today}.csv"'},
     )
 
 
@@ -482,20 +528,22 @@ def export_programa_validate(payload: RowsPayload) -> dict:
 @app.post("/export/programa/csv")
 def export_programa_import_csv(payload: RowsPayload) -> Response:
     df = build_programa_import_dataframe(payload.rows)
+    today = datetime.date.today().isoformat()
     return Response(
         content=export_programa_csv(df),
         media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="programa-import.csv"'},
+        headers={"Content-Disposition": f'attachment; filename="programa_import_{today}.csv"'},
     )
 
 
 @app.post("/export/programa/xlsx")
 def export_programa_import_xlsx(payload: RowsPayload) -> Response:
     df = build_programa_import_dataframe(payload.rows)
+    today = datetime.date.today().isoformat()
     return Response(
         content=export_programa_xlsx(df),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": 'attachment; filename="programa-import.xlsx"'},
+        headers={"Content-Disposition": f'attachment; filename="programa_import_{today}.xlsx"'},
     )
 
 
