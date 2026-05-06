@@ -14,6 +14,7 @@ body {
   margin: 0;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(247, 247, 245, 0.98)),
+    linear-gradient(135deg, rgba(255, 243, 232, 0.46), rgba(255, 255, 255, 0) 42%),
     #fafaf8;
   color: #1f2933;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
@@ -48,4 +49,48 @@ select:focus-visible {
 
 ::selection {
   background: rgba(249, 115, 22, 0.14);
+}
+
+@layer components {
+  .glass-panel {
+    border: 1px solid rgba(229, 231, 235, 0.82);
+    background: rgba(255, 255, 255, 0.7);
+    box-shadow: none;
+    backdrop-filter: blur(10px);
+  }
+
+  .glass-tile {
+    border: 1px solid rgba(229, 231, 235, 0.82);
+    background: rgba(255, 255, 255, 0.66);
+    box-shadow: none;
+    backdrop-filter: none;
+  }
+
+  .input-surface {
+    border: 1px solid rgba(229, 231, 235, 0.95);
+    background: rgba(255, 255, 255, 0.86);
+    box-shadow: none;
+  }
+
+  .btn-primary {
+    border: 1px solid #f97316;
+    background: #f97316;
+    color: white;
+    box-shadow: none;
+    transition: background 150ms ease, border-color 150ms ease, transform 150ms ease, box-shadow 150ms ease;
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    border-color: #ea580c;
+    background: #ea580c;
+    transform: none;
+    box-shadow: none;
+  }
+
+  .btn-secondary {
+    border: 1px solid rgba(31, 41, 51, 0.12);
+    background: rgba(255, 255, 255, 0.78);
+    color: #1f2933;
+    box-shadow: none;
+  }
 }

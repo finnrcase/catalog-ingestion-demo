@@ -51,17 +51,36 @@ def test_explicitly_ignored_rows_still_do_not_send():
     assert len(blocked) == 2
 
 
-def test_photo_only_rows_are_send_eligible_without_product_data():
+def test_photo_only_rows_require_public_image_url():
     ok, blockers = evaluate_programa_eligibility(
         {
             "Include": True,
             "Source Type": "Photo",
             "Import Type": "Photo Upload",
             "photo_only": True,
-            "Product Name": "",
+            "Product Name": "Lamp",
             "Quantity": "",
-            "Product Category": "",
+            "Product Category": "Decor",
             "Dimensions": "",
+            "Image URL": "temp/lamp.jpg",
+        },
+        allow_blank_fields=True,
+    )
+
+    assert ok is False
+    assert blockers == ["Missing hosted image URL"]
+
+
+def test_photo_only_rows_are_send_eligible_with_public_image_url():
+    ok, blockers = evaluate_programa_eligibility(
+        {
+            "Include": True,
+            "Source Type": "Photo",
+            "Import Type": "Photo Upload",
+            "photo_only": True,
+            "Product Name": "Lamp",
+            "Product Category": "Decor",
+            "Image URL": "https://res.cloudinary.com/demo/image/upload/lamp.jpg",
         },
         allow_blank_fields=True,
     )
@@ -83,4 +102,4 @@ def test_photo_only_ignored_rows_still_do_not_send():
     )
 
     assert ok is False
-    assert blockers == ["Ignored or excluded"]
+    assert blockers == ["Ignored or excluded", "Missing product name", "Missing category", "Missing hosted image URL"]

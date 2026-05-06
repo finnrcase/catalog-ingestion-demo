@@ -335,8 +335,12 @@ def test_is_valid_image_url_rejects_no_extension():
     assert _is_valid_image_url("https://example.com/product") is False
 
 
-def test_is_valid_image_url_rejects_webp():
-    assert _is_valid_image_url("https://example.com/photo.webp") is False
+def test_is_valid_image_url_accepts_webp():
+    assert _is_valid_image_url("https://example.com/photo.webp") is True
+
+
+def test_is_valid_image_url_accepts_gif():
+    assert _is_valid_image_url("https://example.com/anim.gif") is True
 
 
 def test_is_valid_image_url_rejects_relative():
@@ -357,13 +361,16 @@ def test_extract_image_url_og_image_content_first():
     assert extract_image_url(html) == "https://example.com/hero.jpg"
 
 
-def test_extract_image_url_og_image_invalid_extension_skips_to_next():
-    html = (
-        '<meta property="og:image" content="https://example.com/hero.webp">'
-        '<img src="https://example.com/fallback.jpg" width="800" height="600">'
-    )
-    result = extract_image_url(html)
-    assert result == "https://example.com/fallback.jpg"
+def test_extract_image_url_og_image_webp_returned():
+    """og:image with .webp is now returned by extract_image_url — content-type validation happens in enrich_row."""
+    html = '<meta property="og:image" content="https://example.com/hero.webp">'
+    assert extract_image_url(html) == "https://example.com/hero.webp"
+
+
+def test_extract_image_url_og_image_no_extension_returned():
+    """og:image CDN URLs without file extension are returned (Scene7-style)."""
+    html = '<meta property="og:image" content="https://s7d4.scene7.com/is/image/Brand/Model">'
+    assert extract_image_url(html) == "https://s7d4.scene7.com/is/image/Brand/Model"
 
 
 def test_extract_image_url_jsonld_image():
@@ -398,6 +405,56 @@ def test_extract_image_url_empty_html_returns_none():
     assert extract_image_url("") is None
 
 
+# ── _check_image_content_type ─────────────────────────────────────────────────
+
+from src.product_enrichment import _check_image_content_type
+
+
+def test_check_image_content_type_accepts_image_jpeg():
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-type": "image/jpeg"}
+    with patch("src.product_enrichment.httpx.head", return_value=mock_resp):
+        assert _check_image_content_type("https://example.com/photo.jpg") is True
+
+
+def test_check_image_content_type_accepts_image_png():
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-type": "image/png"}
+    with patch("src.product_enrichment.httpx.head", return_value=mock_resp):
+        assert _check_image_content_type("https://cdn.example.com/asset") is True
+
+
+def test_check_image_content_type_rejects_html():
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-type": "text/html; charset=utf-8"}
+    with patch("src.product_enrichment.httpx.head", return_value=mock_resp):
+        assert _check_image_content_type("https://example.com/product") is False
+
+
+def test_check_image_content_type_rejects_non_200():
+    mock_resp = MagicMock()
+    mock_resp.status_code = 404
+    mock_resp.headers = {"content-type": "text/html"}
+    with patch("src.product_enrichment.httpx.head", return_value=mock_resp):
+        assert _check_image_content_type("https://example.com/missing.jpg") is False
+
+
+def test_check_image_content_type_rejects_on_exception():
+    with patch("src.product_enrichment.httpx.head", side_effect=Exception("timeout")):
+        assert _check_image_content_type("https://example.com/photo.jpg") is False
+
+
+def test_check_image_content_type_rejects_empty_content_type():
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {}
+    with patch("src.product_enrichment.httpx.head", return_value=mock_resp):
+        assert _check_image_content_type("https://example.com/asset") is False
+
+
 def test_enrich_row_extracts_and_fills_image_url():
     """When page HTML contains a valid image, enrich_row fills Image URL on the row."""
     good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
@@ -408,14 +465,15 @@ def test_enrich_row_extracts_and_fills_image_url():
     }
     with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
          patch("src.product_enrichment._fetch_page_html", return_value=html_with_image), \
-         patch("src.product_enrichment._extract_with_claude", return_value=extracted):
+         patch("src.product_enrichment._extract_with_claude", return_value=extracted), \
+         patch("src.product_enrichment._check_image_content_type", return_value=True):
         updated, error, _ = enrich_row(_qualifying_row())
 
     assert updated.get("Image URL") == "https://wolfappliance.com/img/mdd30ts.jpg"
 
 
 def test_enrich_row_invalid_image_not_stored(monkeypatch, tmp_path):
-    """og:image pointing to .webp is rejected; Image URL stays empty."""
+    """Image URL that fails content-type check is rejected; Image URL stays empty."""
     from src.enrichment_cache import ProductEnrichmentCache
     import src.product_enrichment as pe
     cache = ProductEnrichmentCache()
@@ -424,11 +482,12 @@ def test_enrich_row_invalid_image_not_stored(monkeypatch, tmp_path):
     monkeypatch.setattr(pe, "_product_cache", cache)
 
     good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
-    html_bad_image = '<meta property="og:image" content="https://wolfappliance.com/img.webp">'
+    html_with_image = '<meta property="og:image" content="https://wolfappliance.com/product-page">'
     extracted = {"Product Name": "", "Dimensions": "", "Finish / Color": "", "Product Category": "", "materials": ""}
     with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
-         patch("src.product_enrichment._fetch_page_html", return_value=html_bad_image), \
-         patch("src.product_enrichment._extract_with_claude", return_value=extracted):
+         patch("src.product_enrichment._fetch_page_html", return_value=html_with_image), \
+         patch("src.product_enrichment._extract_with_claude", return_value=extracted), \
+         patch("src.product_enrichment._check_image_content_type", return_value=False):
         updated, _, _ = enrich_row(_qualifying_row())
 
     assert not updated.get("Image URL")
@@ -448,7 +507,8 @@ def test_enrich_row_image_written_to_cache(monkeypatch, tmp_path):
     extracted = {"Product Name": "", "Dimensions": "", "Finish / Color": "", "Product Category": "", "materials": ""}
     with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
          patch("src.product_enrichment._fetch_page_html", return_value=html), \
-         patch("src.product_enrichment._extract_with_claude", return_value=extracted):
+         patch("src.product_enrichment._extract_with_claude", return_value=extracted), \
+         patch("src.product_enrichment._check_image_content_type", return_value=True):
         enrich_row(_qualifying_row())
 
     key = normalize_key("Wolf", "MDD30TS")
@@ -473,7 +533,8 @@ def test_enrich_row_does_not_overwrite_cached_image(monkeypatch, tmp_path):
     extracted = {"Product Name": "", "Dimensions": "", "Finish / Color": "", "Product Category": "", "materials": ""}
     with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
          patch("src.product_enrichment._fetch_page_html", return_value=html), \
-         patch("src.product_enrichment._extract_with_claude", return_value=extracted):
+         patch("src.product_enrichment._extract_with_claude", return_value=extracted), \
+         patch("src.product_enrichment._check_image_content_type", return_value=True):
         enrich_row(_qualifying_row())
 
     assert cache.get(key)["image_url"] == "https://wolfappliance.com/img/original.jpg"

@@ -9,13 +9,36 @@ import type {
   VendorCallStatus,
 } from "./types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
-const BACKEND_UNAVAILABLE = "Backend unavailable. Check NEXT_PUBLIC_API_BASE_URL.";
+const RAW_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "";
+const BACKEND_UNAVAILABLE = "Backend is offline or not configured.";
+
+function resolveApiBase(rawUrl: string) {
+  if (!rawUrl || rawUrl === "undefined" || rawUrl === "null") return "";
+  try {
+    const parsed = new URL(rawUrl);
+    if (!["http:", "https:"].includes(parsed.protocol)) return "";
+    return parsed.href.replace(/\/$/, "");
+  } catch {
+    return "";
+  }
+}
+
+const API_BASE = resolveApiBase(RAW_API_BASE);
+
+if (typeof window !== "undefined") {
+  console.info(`[API BASE URL] ${API_BASE || "not configured"}`);
+}
+
+function apiUrl(path: string) {
+  if (!API_BASE) throw new Error(BACKEND_UNAVAILABLE);
+  return `${API_BASE}${path}`;
+}
 
 async function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
   try {
     return await fetch(input, init);
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.message === BACKEND_UNAVAILABLE) throw error;
     throw new Error(BACKEND_UNAVAILABLE);
   }
 }
@@ -35,7 +58,11 @@ async function parseJson<T>(response: Response): Promise<T> {
 }
 
 export async function fetchSchema(): Promise<SchemaResponse> {
-  return parseJson<SchemaResponse>(await apiFetch(`${API_BASE}/schema`, { cache: "no-store" }));
+  return parseJson<SchemaResponse>(await apiFetch(apiUrl("/schema"), { cache: "no-store" }));
+}
+
+export async function fetchHealth(): Promise<{ status: string }> {
+  return parseJson<{ status: string }>(await apiFetch(apiUrl("/health"), { cache: "no-store" }));
 }
 
 export async function generateIntakeTable(input: {
@@ -53,18 +80,55 @@ export async function generateIntakeTable(input: {
   input.files.forEach((file) => form.append("files", file));
 
   return parseJson<IntakeResponse>(
-    await apiFetch(`${API_BASE}/intake/generate`, { method: "POST", body: form }),
+    await apiFetch(apiUrl("/intake/generate"), { method: "POST", body: form }),
   );
 }
 
 export const generateIntake = generateIntakeTable;
 
+export async function uploadImage(file: File): Promise<{ secure_url: string }> {
+  const form = new FormData();
+  form.append("file", file);
+  return parseJson<{ secure_url: string }>(
+    await apiFetch(apiUrl("/api/upload-image"), { method: "POST", body: form }),
+  );
+}
+
 export async function validateRows(rows: IntakeRow[]): Promise<IntakeResponse> {
   return parseJson<IntakeResponse>(
-    await apiFetch(`${API_BASE}/intake/validate`, {
+    await apiFetch(apiUrl("/intake/validate"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ rows }),
+    }),
+  );
+}
+
+export async function enrichRows(input: {
+  rows: IntakeRow[];
+  useWebEnrichment: boolean;
+}): Promise<IntakeResponse> {
+  return parseJson<IntakeResponse>(
+    await apiFetch(apiUrl("/intake/enrich"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        rows: input.rows,
+        use_web_enrichment: input.useWebEnrichment,
+      }),
+    }),
+  );
+}
+
+export async function saveManufacturerOverride(input: {
+  brand: string;
+  website: string;
+}): Promise<{ status: string; override: { brand: string; domain: string; source: string; last_verified: string } }> {
+  return parseJson<{ status: string; override: { brand: string; domain: string; source: string; last_verified: string } }>(
+    await apiFetch(apiUrl("/manufacturer-override"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
     }),
   );
 }
@@ -84,7 +148,7 @@ export async function sendToPrograma(input: {
     log_path?: string;
     blocked?: IntakeRow[];
   }>(
-    await apiFetch(`${API_BASE}/programa/send`, {
+    await apiFetch(apiUrl("/programa/send"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -103,7 +167,7 @@ export const sendRows = sendToPrograma;
 
 export async function openProgramaLogin() {
   return parseJson<{ status: string; message?: string }>(
-    await apiFetch(`${API_BASE}/programa/login`, { method: "POST" }),
+    await apiFetch(apiUrl("/programa/login"), { method: "POST" }),
   );
 }
 
@@ -114,7 +178,7 @@ export async function generateVendorCallScript(input: {
   customGoal: string;
 }) {
   return parseJson<VendorCallResponse>(
-    await apiFetch(`${API_BASE}/vendor-call/script`, {
+    await apiFetch(apiUrl("/vendor-call/script"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -129,7 +193,7 @@ export async function generateVendorCallScript(input: {
 
 export async function fetchVendorCallStatus() {
   return parseJson<VendorCallStatus>(
-    await apiFetch(`${API_BASE}/vendor-call/status`, { cache: "no-store" }),
+    await apiFetch(apiUrl("/vendor-call/status"), { cache: "no-store" }),
   );
 }
 
@@ -140,7 +204,7 @@ export async function startVendorCall(input: {
   customGoal: string;
 }) {
   return parseJson<VendorCallStartResponse>(
-    await apiFetch(`${API_BASE}/vendor-call/start`, {
+    await apiFetch(apiUrl("/vendor-call/start"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -158,7 +222,7 @@ export async function refreshVendorCall(input: {
   missingFields: string[];
 }) {
   return parseJson<VendorCallRefreshResponse>(
-    await apiFetch(`${API_BASE}/vendor-call/refresh`, {
+    await apiFetch(apiUrl("/vendor-call/refresh"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -170,7 +234,7 @@ export async function refreshVendorCall(input: {
 }
 
 export async function exportReviewCsv(rows: IntakeRow[]): Promise<Blob> {
-  const response = await apiFetch(`${API_BASE}/export/csv`, {
+  const response = await apiFetch(apiUrl("/export/csv"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ rows }),
@@ -183,7 +247,7 @@ export const downloadCsv = exportReviewCsv;
 
 export async function validateProgramaExport(rows: IntakeRow[]): Promise<ProgramaExportValidation> {
   return parseJson<ProgramaExportValidation>(
-    await apiFetch(`${API_BASE}/export/programa/validate`, {
+    await apiFetch(apiUrl("/export/programa/validate"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ rows }),
@@ -192,7 +256,7 @@ export async function validateProgramaExport(rows: IntakeRow[]): Promise<Program
 }
 
 async function exportProgramaFile(rows: IntakeRow[], path: string, fallbackMessage: string): Promise<Blob> {
-  const response = await apiFetch(`${API_BASE}${path}`, {
+  const response = await apiFetch(apiUrl(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ rows }),

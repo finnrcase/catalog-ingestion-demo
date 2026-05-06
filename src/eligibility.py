@@ -22,6 +22,10 @@ def _is_photo_only(row: dict) -> bool:
     )
 
 
+def _is_public_https_url(value: object) -> bool:
+    return _text(value).lower().startswith("https://")
+
+
 def evaluate_programa_eligibility(row: dict, allow_blank_fields: bool = False) -> tuple[bool, list[str]]:
     """
     Return whether a row may be sent to Programa and plain-language blockers.
@@ -33,6 +37,12 @@ def evaluate_programa_eligibility(row: dict, allow_blank_fields: bool = False) -
     if _text(row.get("Status")) in BLOCKED_STATUSES:
         blockers.append("Ignored or excluded")
     if _is_photo_only(row):
+        if not _text(row.get("Product Name")):
+            blockers.append("Missing product name")
+        if not _text(row.get("Product Category")):
+            blockers.append("Missing category")
+        if not _is_public_https_url(row.get("Image URL")):
+            blockers.append("Missing hosted image URL")
         return len(blockers) == 0, blockers
     if allow_blank_fields:
         return len(blockers) == 0, blockers

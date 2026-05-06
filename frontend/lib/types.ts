@@ -40,6 +40,8 @@ export type ProgramaExportValidation = {
   missing_dimensions: number;
   missing_product_url: number;
   missing_image_url: number;
+  image_url_present: number;
+  image_url_total: number;
   export_count: number;
   unique_sections: string[];
   section_counts: Record<string, number>;

@@ -284,22 +284,31 @@ def test_export_blanks_non_https_image_url_for_standard_rows():
     assert df.iloc[0]["Image URL"] == ""
 
 
-def test_export_blanks_https_url_without_image_extension():
-    """https:// product page URL (no .jpg/.jpeg/.png) must be blanked — not a valid image."""
+def test_export_blanks_html_extension_url():
+    """https:// URL with .html extension is a product page — must be blanked."""
     from src.programa_export import build_programa_import_dataframe
 
-    rows = _make_rows([{"Image URL": "https://example.com/product/detail"}])
+    rows = _make_rows([{"Image URL": "https://example.com/product/detail.html"}])
     df = build_programa_import_dataframe(rows)
     assert df.iloc[0]["Image URL"] == ""
 
 
-def test_export_blanks_webp_image_url():
-    """WebP images are not accepted by Programa."""
+def test_export_accepts_webp_image_url():
+    """WebP images are valid and must pass through to the export."""
     from src.programa_export import build_programa_import_dataframe
 
     rows = _make_rows([{"Image URL": "https://example.com/photo.webp"}])
     df = build_programa_import_dataframe(rows)
-    assert df.iloc[0]["Image URL"] == ""
+    assert df.iloc[0]["Image URL"] == "https://example.com/photo.webp"
+
+
+def test_export_accepts_cdn_url_without_extension():
+    """CDN image URLs without file extension (Scene7-style) must pass through."""
+    from src.programa_export import build_programa_import_dataframe
+
+    rows = _make_rows([{"Image URL": "https://s7d4.scene7.com/is/image/Brand/ModelName"}])
+    df = build_programa_import_dataframe(rows)
+    assert df.iloc[0]["Image URL"] == "https://s7d4.scene7.com/is/image/Brand/ModelName"
 
 
 def test_photo_only_bulk_export_contains_public_urls_only():

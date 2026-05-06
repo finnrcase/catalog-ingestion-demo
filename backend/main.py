@@ -70,6 +70,7 @@ class RowsPayload(BaseModel):
     rows: list[dict] = Field(default_factory=list)
     enrichment_mode: str = "standard"
     force_refresh: bool = False
+    use_web_enrichment: bool = True
 
 
 class ProgramaPayload(RowsPayload):
@@ -286,6 +287,7 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
         pd.DataFrame(payload.rows),
         enrichment_mode=payload.enrichment_mode,
         force_refresh=payload.force_refresh,
+        use_web_enrichment=payload.use_web_enrichment,
     )
     df = apply_confidence_checks(df)
     return _df_response(df, errors, dimension_diagnostics)

@@ -242,15 +242,41 @@ def _fetch_page_text(url: str) -> str:
     return _html_to_text(_fetch_page_html(url))
 
 
+_IMAGE_FILE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+
+
 def _is_valid_image_url(url: str) -> bool:
-    """True if url is an absolute https URL whose path ends in .jpg, .jpeg, or .png."""
+    """True if url is an absolute https URL whose path ends in a recognized image extension.
+    Used as a pre-filter for <img> tags to reduce noise before content-type validation."""
     if not url or not isinstance(url, str):
         return False
     url_lower = url.lower()
     if not url_lower.startswith("https://"):
         return False
     path = url_lower.split("?")[0].split("#")[0]
-    return path.endswith((".jpg", ".jpeg", ".png"))
+    return path.endswith(_IMAGE_FILE_EXTENSIONS)
+
+
+def _is_absolute_https(url: str) -> bool:
+    """True if url is an absolute https URL."""
+    return bool(url) and isinstance(url, str) and url.lower().startswith("https://")
+
+
+def _check_image_content_type(url: str) -> bool:
+    """Return True if a HEAD request confirms Content-Type starts with image/."""
+    try:
+        resp = httpx.head(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; SCH-Intake/1.0)"},
+            timeout=5,
+            follow_redirects=True,
+        )
+        if resp.status_code < 200 or resp.status_code >= 300:
+            return False
+        ct = resp.headers.get("content-type", "").lower()
+        return ct.startswith("image/")
+    except Exception:
+        return False
 
 
 def extract_image_url(html: str) -> str | None:
@@ -268,6 +294,7 @@ def extract_image_url(html: str) -> str | None:
         return None
 
     # Priority 1: og:image meta tag (either attribute order)
+    # Accept any absolute https URL — content-type validation happens in enrich_row.
     for pattern in (
         r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
         r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
@@ -275,12 +302,12 @@ def extract_image_url(html: str) -> str | None:
         m = re.search(pattern, html, re.IGNORECASE)
         if m:
             candidate = m.group(1).strip()
-            if _is_valid_image_url(candidate):
+            if _is_absolute_https(candidate):
                 return candidate
-            _log.info("[IMAGE INVALID — skipped] source=og:image url=%s", candidate[:120])
-            break  # found og:image but invalid — don't fall through to other og patterns
+            _log.info("[IMAGE INVALID — skipped] source=og:image url=%s (not absolute https)", candidate[:120])
+            break  # found og:image but not absolute https — don't fall through to other og patterns
 
-    # Priority 2: JSON-LD "image" field
+    # Priority 2: JSON-LD "image" field — same rule: any absolute https accepted.
     for ld_m in re.finditer(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html, re.IGNORECASE | re.DOTALL,
@@ -296,9 +323,9 @@ def extract_image_url(html: str) -> str | None:
                 candidate = candidate.get("url", "")
             candidate = str(candidate).strip()
             if candidate:
-                if _is_valid_image_url(candidate):
+                if _is_absolute_https(candidate):
                     return candidate
-                _log.info("[IMAGE INVALID — skipped] source=json-ld url=%s", candidate[:120])
+                _log.info("[IMAGE INVALID — skipped] source=json-ld url=%s (not absolute https)", candidate[:120])
         except Exception:
             pass
 
@@ -536,11 +563,19 @@ def enrich_row(
                 updated = _apply_enrichment(row, extracted, best.url, best.domain_score)
 
                 # ── Image extraction (opportunistic — no extra Brave call) ─────
-                image_url_found = extract_image_url(raw_html)
-                if image_url_found:
-                    _log.info("[IMAGE FOUND] key=%s url=%s", cache_key, image_url_found[:80])
-                    if not _str_val(updated.get("Image URL")):
-                        updated["Image URL"] = image_url_found
+                image_url_candidate = extract_image_url(raw_html)
+                image_url_found: str | None = None
+                if image_url_candidate:
+                    if _check_image_content_type(image_url_candidate):
+                        image_url_found = image_url_candidate
+                        _log.info("[IMAGE FOUND] key=%s url=%s", cache_key, image_url_found[:80])
+                        if not _str_val(updated.get("Image URL")):
+                            updated["Image URL"] = image_url_found
+                    else:
+                        _log.info(
+                            "[IMAGE INVALID — skipped] url=%s failed content-type check",
+                            image_url_candidate[:80],
+                        )
                 else:
                     _log.info("[IMAGE MISSING] key=%s", cache_key)
 

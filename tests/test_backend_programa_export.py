@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+import datetime
 
 from backend.main import app
 
@@ -56,11 +57,94 @@ def test_schema_exposes_canonical_sections():
     ]
 
 
+def test_health_endpoint():
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_upload_image_endpoint_returns_secure_url(monkeypatch):
+    monkeypatch.setattr(
+        "backend.main.upload_image",
+        lambda file: "https://res.cloudinary.com/demo/image/upload/handmade-doll.jpg",
+    )
+
+    response = client.post(
+        "/api/upload-image",
+        files={"file": ("doll.jpg", b"fake image", "image/jpeg")},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"secure_url": "https://res.cloudinary.com/demo/image/upload/handmade-doll.jpg"}
+
+
+def test_upload_image_endpoint_rejects_missing_secure_url(monkeypatch):
+    monkeypatch.setattr("backend.main.upload_image", lambda file: None)
+
+    response = client.post(
+        "/api/upload-image",
+        files={"file": ("doll.jpg", b"fake image", "image/jpeg")},
+    )
+
+    assert response.status_code == 502
+
+
+def test_upload_image_endpoint_rejects_non_image(monkeypatch):
+    monkeypatch.setattr(
+        "backend.main.upload_image",
+        lambda file: "https://res.cloudinary.com/demo/image/upload/not-used.jpg",
+    )
+
+    response = client.post(
+        "/api/upload-image",
+        files={"file": ("notes.txt", b"hello", "text/plain")},
+    )
+
+    assert response.status_code == 400
+
+
+def test_manufacturer_override_endpoint_saves_mapping(monkeypatch, tmp_path):
+    path = tmp_path / "manufacturer_domain_cache.json"
+    monkeypatch.setattr("src.manufacturer_domains.CACHE_PATH", path)
+
+    response = client.post(
+        "/manufacturer-override",
+        json={"brand": "Scotsman", "website": "https://scotsman-ice.com/products"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["override"]["brand"] == "scotsman"
+    assert data["override"]["domain"] == "scotsman-ice.com"
+    assert data["override"]["source"] == "user"
+
+
+def test_intake_enrich_endpoint_passes_web_enrichment_flag(monkeypatch):
+    captured = {}
+
+    def fake_enrich_dataframe(df, enrichment_mode="standard", force_refresh=False, use_web_enrichment=True):
+        captured["use_web_enrichment"] = use_web_enrichment
+        return df, [], []
+
+    monkeypatch.setattr("backend.main.enrich_dataframe", fake_enrich_dataframe)
+
+    response = client.post(
+        "/intake/enrich",
+        json={"rows": [{"Product Name": "Lamp"}], "use_web_enrichment": False},
+    )
+
+    assert response.status_code == 200
+    assert captured["use_web_enrichment"] is False
+
+
 def test_programa_export_csv_endpoint_uses_programa_columns():
     response = client.post("/export/programa/csv", json=_rows())
+    today = datetime.date.today().isoformat()
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/csv")
+    assert f'filename="programa_import_{today}.csv"' in response.headers["content-disposition"]
     text = response.content.decode("utf-8")
     assert "Section,Product Name,Brand,SKU,Model" in text
     assert "Decor,Lamp" in text
@@ -70,8 +154,10 @@ def test_programa_export_csv_endpoint_uses_programa_columns():
 
 def test_programa_export_xlsx_endpoint_returns_workbook():
     response = client.post("/export/programa/xlsx", json=_rows())
+    today = datetime.date.today().isoformat()
 
     assert response.status_code == 200
+    assert f'filename="programa_import_{today}.xlsx"' in response.headers["content-disposition"]
     assert response.headers["content-type"].startswith(
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )

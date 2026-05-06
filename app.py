@@ -20,9 +20,12 @@ from src.intake import (
 )
 from src.export import get_csv_bytes
 from src.photo_inventory import (
+    MISSING_IMAGE_STATUS,
     analyze_photo_with_ai,
+    build_photo_only_bulk_product_names,
     create_photo_only_bulk_rows,
     create_photo_inventory_row,
+    is_public_https_image_url,
     upload_image_to_cloudinary,
 )
 from src.programa_export import (
@@ -45,6 +48,7 @@ from src.category_ai import suggest_categories_batch
 from src.notes import remove_notes_row_prefix
 from src.product_enrichment import enrich_dataframe, has_complete_3d_dimensions
 from src.brave_search import BRAVE_API_KEY as _BRAVE_API_KEY
+from src.manufacturer_domains import save_manufacturer_override
 from src.enrichment_debug import debug_enrich_dataframe, save_debug_report
 from src.vendor_call_agent import (
     build_minimal_call_task,
@@ -191,6 +195,8 @@ if "pending_enrichment" not in st.session_state:
     st.session_state.pending_enrichment = False
 if "enrichment_errors" not in st.session_state:
     st.session_state.enrichment_errors = []
+if "use_web_enrichment" not in st.session_state:
+    st.session_state.use_web_enrichment = True
 if "vendor_call_panel" not in st.session_state:
     st.session_state.vendor_call_panel = None
 if "vendor_call_results" not in st.session_state:
@@ -439,7 +445,7 @@ with right_col:
                             if image_url:
                                 photo_meta["image_upload_status"] = "Uploaded"
                             elif upload_error:
-                                photo_meta["image_upload_status"] = "Needs Cloudinary"
+                                photo_meta["image_upload_status"] = MISSING_IMAGE_STATUS
                             draft_rows.append(
                                 create_photo_inventory_row(
                                     photo_meta,
@@ -496,6 +502,16 @@ with right_col:
                 options=["Filename", "Generated names"],
                 key="photo_only_bulk_naming_mode",
             )
+            bulk_default_product_name_raw = st.text_input(
+                "Default Product Name (applies to all uploaded images)",
+                key="photo_only_bulk_default_product_name",
+            )
+            bulk_default_product_name = bulk_default_product_name_raw.strip()
+            bulk_append_sequence = st.checkbox(
+                "Append sequence number to name (e.g., Lamp 001, Lamp 002)",
+                value=True,
+                key="photo_only_bulk_append_sequence",
+            )
             bulk_use_ai = st.checkbox(
                 "Use AI to describe photos",
                 value=False,
@@ -519,6 +535,15 @@ with right_col:
                             st.caption(f"• {f.name}")
                 if len(bulk_only_files) > len(preview_files):
                     st.caption(f"+ {len(bulk_only_files) - len(preview_files)} more")
+                preview_photos = [{"image_filename": str(getattr(f, "name", "") or "")} for f in bulk_only_files]
+                preview_names = build_photo_only_bulk_product_names(
+                    preview_photos,
+                    naming_mode=bulk_naming_mode,
+                    default_product_name=bulk_default_product_name,
+                    append_sequence=bulk_append_sequence,
+                )
+                if preview_names:
+                    st.caption("Product name preview: " + ", ".join(preview_names[:5]))
 
             create_bulk_only_rows = st.button(
                 "Upload and Create Rows",
@@ -543,7 +568,7 @@ with right_col:
                             image_url, upload_error = upload_image_to_cloudinary(photo_meta["local_image_path"])
                             saved_photos.append(photo_meta)
                             image_urls.append(image_url)
-                            upload_statuses.append("Uploaded" if image_url else "Needs Cloudinary")
+                            upload_statuses.append("Uploaded" if image_url else MISSING_IMAGE_STATUS)
                             if upload_error:
                                 st.warning(upload_error, icon="⚠️")
                         except Exception as exc:
@@ -563,11 +588,13 @@ with right_col:
                             naming_mode=bulk_naming_mode,
                             image_urls=image_urls,
                             upload_statuses=upload_statuses,
+                            default_product_name=bulk_default_product_name,
+                            append_sequence=bulk_append_sequence,
                         )
                         if bulk_use_ai:
-                            for row in photo_rows:
-                                local_path = str(row.get("Local Image Path", "") or "")
-                                filename = str(row.get("Image Filename", "") or "")
+                            for row, photo_meta in zip(photo_rows, saved_photos):
+                                local_path = str(photo_meta.get("local_image_path", "") or "")
+                                filename = str(photo_meta.get("image_filename", "") or "")
                                 ai_fields, ai_error = analyze_photo_with_ai(local_path, filename)
                                 description = str(ai_fields.get("description", "") or "").strip()
                                 if description:
@@ -593,6 +620,53 @@ with right_col:
                         )
 
 st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
+
+with st.container(border=True):
+    st.checkbox(
+        "Use web search to find missing product details (recommended)",
+        key="use_web_enrichment",
+        help=(
+            "When enabled, the system searches manufacturer websites to fill missing data. "
+            "Turn off to only use uploaded documents and manual input."
+        ),
+    )
+    st.caption(
+        "When enabled, the system searches manufacturer websites to fill missing data. "
+        "Turn off to only use uploaded documents and manual input."
+    )
+    st.divider()
+    section_label("Manufacturer Override")
+    st.caption(
+        "Persist a brand-to-domain mapping for enrichment. User-defined domains are used before built-in tables, "
+        "discovered cache, and Brave search."
+    )
+    override_col1, override_col2, override_col3 = st.columns([2, 3, 2])
+    with override_col1:
+        override_brand = st.text_input("Brand", key="manufacturer_override_brand", placeholder="Scotsman")
+    with override_col2:
+        override_website = st.text_input(
+            "Manufacturer Website",
+            key="manufacturer_override_website",
+            placeholder="scotsman-ice.com",
+        )
+    with override_col3:
+        st.markdown("<div style='height:1.75rem'></div>", unsafe_allow_html=True)
+        save_override = st.button(
+            "Save for Future Use",
+            type="secondary",
+            use_container_width=True,
+            disabled=not bool(override_brand.strip()) or not bool(override_website.strip()),
+        )
+    st.caption("Saved overrides persist across runs and are used immediately by enrichment for matching brands.")
+    if save_override:
+        try:
+            saved_override = save_manufacturer_override(override_brand, override_website)
+            st.success(
+                f"Saved {saved_override['brand']} → {saved_override['domain']}. "
+                "Future enrichment will search this manufacturer website first."
+            )
+        except ValueError as exc:
+            st.warning(str(exc), icon="⚠️")
 
 # ── Intake action buttons (PDF + URL path) ─────────────────────────────────────
 gen_col, _ = st.columns([3, 7])
@@ -707,7 +781,7 @@ if st.session_state.intake_df is not None:
                 missing.append("Product Name")
             if not str(row.get("Product Category", "") or "").strip():
                 missing.append("Product Category")
-            if not str(row.get("Image URL", "") or "").strip():
+            if not is_public_https_image_url(str(row.get("Image URL", "") or "")):
                 missing.append("Image URL")
             return missing
         missing = []
@@ -820,9 +894,12 @@ if st.session_state.intake_df is not None:
 
     # ── Automatic enrichment pass ──────────────────────────────────────────────
     if st.session_state.pending_enrichment:
-        if _BRAVE_API_KEY:
+        if st.session_state.get("use_web_enrichment", True) and _BRAVE_API_KEY:
             with st.spinner("Searching manufacturer sources to fill missing product details…"):
-                _enriched_df, _enrich_errors = enrich_dataframe(df)
+                _enriched_df, _enrich_errors, _ = enrich_dataframe(
+                    df,
+                    use_web_enrichment=st.session_state.get("use_web_enrichment", True),
+                )
                 st.session_state.intake_df = apply_confidence_checks(_enriched_df)
                 st.session_state.enrichment_errors = _enrich_errors
                 st.session_state.pending_enrichment = False
@@ -916,7 +993,7 @@ if st.session_state.intake_df is not None:
             return (
                 bool(str(row.get("Product Name", "") or "").strip())
                 and bool(str(row.get("Product Category", "") or "").strip())
-                and bool(str(row.get("Image URL", "") or "").strip())
+                and is_public_https_image_url(str(row.get("Image URL", "") or ""))
             )
         if not str(row.get("Product Name", "") or "").strip():
             return False
@@ -942,7 +1019,7 @@ if st.session_state.intake_df is not None:
                 reasons.append("No product name")
             if not str(row.get("Product Category", "") or "").strip():
                 reasons.append("No category")
-            if not str(row.get("Image URL", "") or "").strip():
+            if not is_public_https_image_url(str(row.get("Image URL", "") or "")):
                 reasons.append("No hosted image URL")
             return "; ".join(reasons) if reasons else "Unknown"
         if not str(row.get("Product Name", "") or "").strip():
@@ -1490,12 +1567,13 @@ if st.session_state.intake_df is not None:
         )
         safe_name = selected_project.strip().replace(" ", "_") or "intake"
         st.download_button(
-            label="Export Review CSV",
+            label="Download Internal Intake CSV (not for Programa)",
             data=get_csv_bytes(included),
-            file_name=f"{safe_name}_intake.csv",
+            file_name=f"{safe_name}_internal_intake_not_for_programa.csv",
             mime="text/csv",
             use_container_width=True,
         )
+        st.warning("Do not upload this file to Programa. Use Export for Programa Import below.", icon="⚠️")
 
     # ── Export for Programa Import ─────────────────────────────────────────────
     st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
@@ -1512,13 +1590,20 @@ if st.session_state.intake_df is not None:
     _missing_dims = _export_summary["missing_dimensions"]
     _missing_url = _export_summary["missing_product_url"]
     _missing_img = _export_summary["missing_image_url"]
+    _image_url_present = _export_summary["image_url_present"]
+    _image_url_total = _export_summary["image_url_total"]
 
     if _export_count > 0:
-        st.success(f"✓  {_export_count} row{'s' if _export_count != 1 else ''} ready for export", icon=None)
+        st.success(
+            f"✓  {_export_count} row{'s' if _export_count != 1 else ''} ready for export. "
+            "Use this file for Programa Import Products.",
+            icon=None,
+        )
     else:
         st.info("No rows ready for export.", icon=None)
 
     if _missing_section:
+        st.warning(f"Rows missing Section: {len(_missing_section)}", icon=None)
         with st.expander(f"⚠  {len(_missing_section)} row{'s' if len(_missing_section) != 1 else ''} missing Section — using \"General\""):
             for item in _missing_section:
                 st.markdown(f"- {item['product_name']}")
@@ -1528,15 +1613,17 @@ if st.session_state.intake_df is not None:
         st.warning(f"⚠  {_missing_url} row{'s' if _missing_url != 1 else ''} missing Product URL", icon=None)
     if _missing_img > 0:
         st.warning(f"⚠  {_missing_img} row{'s' if _missing_img != 1 else ''} missing Image URL", icon=None)
+    st.info(f"Image URLs present: {_image_url_present} / {_image_url_total}", icon=None)
     if _skipped:
-        with st.expander(f"✕  {len(_skipped)} row{'s' if len(_skipped) != 1 else ''} skipped (no Product Name)"):
+        with st.expander(f"✕  {len(_skipped)} row{'s' if len(_skipped) != 1 else ''} skipped"):
             for item in _skipped:
-                st.markdown(f"- Row {item['index']}")
+                reason = item.get("reason") or "missing Product Name"
+                st.markdown(f"- Row {item['index']}: {reason}")
 
     _dl_col1, _dl_col2, _dl_spacer = st.columns([1, 1, 4])
     with _dl_col1:
         st.download_button(
-            label="Download CSV",
+            label="Download Programa CSV",
             data=export_programa_csv(_programa_df),
             file_name=f"programa_import_{_today}.csv",
             mime="text/csv",
@@ -1545,7 +1632,7 @@ if st.session_state.intake_df is not None:
         )
     with _dl_col2:
         st.download_button(
-            label="Download XLSX",
+            label="Download Programa XLSX",
             data=export_programa_xlsx(_programa_df),
             file_name=f"programa_import_{_today}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2143,16 +2230,18 @@ if st.session_state.intake_df is not None:
         st.markdown("**Enrichment**")
         if not _BRAVE_API_KEY:
             st.caption("Product enrichment requires BRAVE_API_KEY — add it to .env and restart.")
+        if not st.session_state.get("use_web_enrichment", True):
+            st.caption("Web search enrichment is turned off. Uploaded documents and manual input are still available.")
         enrich_col, _ = st.columns([3, 7])
         with enrich_col:
             enrich_rerun_clicked = st.button(
                 "Re-run Enrichment",
                 type="secondary",
                 use_container_width=True,
-                disabled=not _BRAVE_API_KEY,
+                disabled=not _BRAVE_API_KEY or not st.session_state.get("use_web_enrichment", True),
                 help="Re-search manufacturer sources for rows still missing product details.",
             )
-        if enrich_rerun_clicked and _BRAVE_API_KEY:
+        if enrich_rerun_clicked and _BRAVE_API_KEY and st.session_state.get("use_web_enrichment", True):
             st.session_state.pending_enrichment = True
             st.rerun()
 

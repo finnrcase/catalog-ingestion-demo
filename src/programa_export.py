@@ -255,12 +255,23 @@ def _is_photo_only(row: dict) -> bool:
     )
 
 
+_EXPORT_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+_EXPORT_NON_IMAGE_EXTENSIONS = (".html", ".htm", ".php", ".asp", ".aspx", ".cfm", ".pdf", ".txt", ".xml")
+
+
 def _is_public_https_image_url(value) -> bool:
     url = _str_val(value).lower()
     if not url.startswith("https://"):
         return False
     path = url.split("?")[0].split("#")[0]
-    return path.endswith((".jpg", ".jpeg", ".png"))
+    if path.endswith(_EXPORT_IMAGE_EXTENSIONS):
+        return True
+    if path.endswith(_EXPORT_NON_IMAGE_EXTENSIONS):
+        return False
+    # CDN heuristic: no file extension in the last path segment → accept.
+    # Enrichment already validated these URLs via HEAD content-type check.
+    last_segment = path.rstrip("/").rsplit("/", 1)[-1]
+    return "." not in last_segment
 
 
 def _is_exportable(row: dict) -> bool:

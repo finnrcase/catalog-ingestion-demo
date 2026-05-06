@@ -74,6 +74,10 @@ def _is_valid_url(value) -> bool:
     return bool(value and _URL_RE.match(_str(value)))
 
 
+def _is_public_https_url(value) -> bool:
+    return _str(value).lower().startswith("https://")
+
+
 def _is_ignored_row(row: dict) -> bool:
     """True if the row looks like a non-product line or is completely blank."""
     source = _str(row.get("Source Type"))
@@ -126,7 +130,7 @@ def identify_missing_fields(row: dict) -> list[str]:
             missing.append("Product Name")
         if not _str(row.get("Product Category")):
             missing.append("Product Category")
-        if not _str(row.get("Image URL")):
+        if not _is_public_https_url(row.get("Image URL")):
             missing.append("Image URL")
         return missing
 
@@ -156,7 +160,7 @@ def calculate_row_confidence(row: dict) -> int:
             score -= 35
         if not _str(row.get("Product Category")):
             score -= 25
-        if not _str(row.get("Image URL")):
+        if not _is_public_https_url(row.get("Image URL")):
             score -= 25
         return max(0, score)
 

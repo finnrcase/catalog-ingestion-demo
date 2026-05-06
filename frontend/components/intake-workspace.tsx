@@ -1,11 +1,8 @@
 "use client";
 
 import {
-  AlertTriangle,
-  ArrowUpRight,
   CheckCircle2,
   Download,
-  FileCheck2,
   FileText,
   ImageIcon,
   Loader2,
@@ -18,14 +15,16 @@ import type { ReactNode } from "react";
 
 import {
   exportProgramaCsv,
-  exportProgramaDebugCsv,
   exportProgramaXlsx,
+  fetchHealth,
   fetchSchema,
   fetchVendorCallStatus,
+  enrichRows,
   generateIntakeTable,
   generateVendorCallScript,
   refreshVendorCall,
   startVendorCall,
+  uploadImage,
   validateProgramaExport,
   validateRows,
 } from "@/lib/api";
@@ -48,6 +47,8 @@ const reviewColumns = [
   "Product Category",
   "Model/SKU",
   "Product URL",
+  "Image URL",
+  "Image Upload Status",
   "Notes",
   "Status",
 ];
@@ -64,6 +65,7 @@ const missingFieldKeys: Record<string, string> = {
   Brand: "Brand",
   Dimensions: "Dimensions",
   Quantity: "Quantity",
+  "Image URL": "Image URL",
   Supplier: "Supplier",
   Location: "Room",
   Category: "Product Category",
@@ -74,6 +76,7 @@ const missingFieldPlaceholders: Record<string, string> = {
   Brand: "Enter manufacturer / brand",
   Dimensions: "Enter full W x H x D dimensions",
   Quantity: "Enter quantity",
+  "Image URL": "Paste hosted image URL",
   Supplier: "Enter supplier",
   Location: "Enter location",
   Category: "Enter category",
@@ -94,6 +97,32 @@ const fallbackSections = [
 
 function rowText(row: IntakeRow, key: string) {
   return String(row[key] ?? "");
+}
+
+function isPhotoOnlyRow(row: IntakeRow) {
+  const photoOnly = rowText(row, "photo_only").trim().toLowerCase();
+  const sourceType = rowText(row, "Source Type").trim();
+  const importType = rowText(row, "Import Type").trim().toLowerCase();
+  return photoOnly === "true" || photoOnly === "1" || sourceType === "Photo" || importType === "photo-only bulk import";
+}
+
+function isPublicHttpsImageUrl(value: string) {
+  return value.trim().toLowerCase().startsWith("https://");
+}
+
+function filenameStem(filename: string) {
+  const withoutExtension = filename.replace(/\.[^/.]+$/, "").trim();
+  return withoutExtension || "photo_item";
+}
+
+function buildPhotoOnlyName(filename: string, index: number, defaultName: string, appendSequence: boolean) {
+  const baseName = defaultName.trim();
+  if (!baseName) return filenameStem(filename);
+  return appendSequence ? `${baseName} ${String(index + 1).padStart(3, "0")}` : baseName;
+}
+
+function bulkImageKey(file: File, index: number) {
+  return `${index}:${file.name}:${file.size}:${file.lastModified}`;
 }
 
 function buildDefaultCallGoal(row: IntakeRow, missingFields: string[]) {
@@ -121,6 +150,14 @@ function isEligible(row: IntakeRow) {
   if (row.Include === false) return false;
   if (row["Review Required"] === true) return false;
   if (["Ignored", "Excluded", "Error"].includes(rowText(row, "Status"))) return false;
+  if (isPhotoOnlyRow(row)) {
+    return (
+      Boolean(rowText(row, "Product Name").trim()) &&
+      Boolean(rowText(row, "Product Category").trim()) &&
+      Number(row.Quantity ?? 0) >= 1 &&
+      isPublicHttpsImageUrl(rowText(row, "Image URL"))
+    );
+  }
   if (!rowText(row, "Product Name").trim()) return false;
   if (!rowText(row, "Brand").trim()) return false;
   if (!rowText(row, "Product Category").trim()) return false;
@@ -133,6 +170,14 @@ function isEligible(row: IntakeRow) {
 
 function missingFieldsForRow(row: IntakeRow) {
   const missing: string[] = [];
+  if (isPhotoOnlyRow(row)) {
+    if (!rowText(row, "Product Name").trim()) missing.push("Product Name");
+    if (!rowText(row, "Product Category").trim()) missing.push("Category");
+    const qty = Number(row.Quantity ?? 0);
+    if (!Number.isFinite(qty) || qty < 1) missing.push("Quantity");
+    if (!isPublicHttpsImageUrl(rowText(row, "Image URL"))) missing.push("Image URL");
+    return missing;
+  }
   if (!rowText(row, "Product Name").trim()) missing.push("Product Name");
   if (!rowText(row, "Brand").trim()) missing.push("Brand");
   if (!hasComplete3dDimensions(row.Dimensions)) missing.push("Dimensions");
@@ -177,21 +222,34 @@ export function IntakeWorkspace() {
   const [bulkImages, setBulkImages] = useState<File[]>([]);
   const [bulkImageError, setBulkImageError] = useState("");
   const [isImageDragActive, setIsImageDragActive] = useState(false);
+  const [photoBulkSection, setPhotoBulkSection] = useState("Decor");
+  const [photoBulkCustomSection, setPhotoBulkCustomSection] = useState("");
+  const [photoBulkProductName, setPhotoBulkProductName] = useState("");
+  const [photoBulkAppendSequence, setPhotoBulkAppendSequence] = useState(true);
+  const [photoBulkResults, setPhotoBulkResults] = useState<Record<string, {
+    status: "queued" | "uploaded" | "failed";
+    url?: string;
+    error?: string;
+    rowIndex?: number;
+  }>>({});
+  const [photoBulkSummary, setPhotoBulkSummary] = useState({ success: 0, failed: 0 });
   const [uploadError, setUploadError] = useState("");
   const [useAiPdf, setUseAiPdf] = useState(true);
-  const [debugMode, setDebugMode] = useState(false);
   const [rows, setRows] = useState<IntakeRow[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
   const [sections, setSections] = useState<string[]>(fallbackSections);
-  const [bulkSection, setBulkSection] = useState("General");
   const [message, setMessage] = useState("");
-  const [busy, setBusy] = useState<"generate" | "validate" | "vendorCall" | "export" | "">("");
+  const [useWebEnrichment, setUseWebEnrichment] = useState(true);
+  const [productImageUploads, setProductImageUploads] = useState<Record<number, string>>({});
+  const [busy, setBusy] = useState<"generate" | "validate" | "vendorCall" | "export" | "photoBulk" | "">("");
   const [exportSummary, setExportSummary] = useState({
     skipped: [] as { index: number; product_name: string }[],
     missing_section: [] as { index: number; product_name: string }[],
     missing_dimensions: 0,
     missing_product_url: 0,
     missing_image_url: 0,
+    image_url_present: 0,
+    image_url_total: 0,
     export_count: 0,
     unique_sections: [] as string[],
     section_counts: {} as Record<string, number>,
@@ -212,15 +270,20 @@ export function IntakeWorkspace() {
   const bulkImageInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    fetchHealth().catch(() => {
+      setMessage("Backend is offline or not configured.");
+    });
     fetchSchema()
       .then((schema) => {
         setCategories(schema.categories);
         setSections(schema.sections?.length ? schema.sections : fallbackSections);
-        setBulkSection(schema.sections?.[0] || "General");
+        setPhotoBulkSection(schema.sections?.includes("Decor") ? "Decor" : schema.sections?.[0] || "General");
       })
       .catch(() => {
         setCategories([]);
         setSections(fallbackSections);
+        setPhotoBulkSection("Decor");
+        setMessage("Backend is offline or not configured.");
       });
   }, []);
 
@@ -259,6 +322,8 @@ export function IntakeWorkspace() {
         missing_dimensions: 0,
         missing_product_url: 0,
         missing_image_url: 0,
+        image_url_present: 0,
+        image_url_total: 0,
         export_count: 0,
         unique_sections: [],
         section_counts: {},
@@ -293,15 +358,6 @@ export function IntakeWorkspace() {
 
   function updateRow(index: number, key: string, value: unknown) {
     setRows((current) => current.map((row, i) => (i === index ? { ...row, [key]: value } : row)));
-  }
-
-  function applyBulkSection() {
-    setRows((current) =>
-      current.map((row) =>
-        row.Include === false ? row : { ...row, "Product Category": bulkSection },
-      ),
-    );
-    setMessage(`Applied ${bulkSection} to included rows.`);
   }
 
   function handleFileSelection(selectedFiles: FileList | null) {
@@ -347,12 +403,169 @@ export function IntakeWorkspace() {
       return;
     }
     setBulkImages(nextFiles);
+    setPhotoBulkResults({});
+    setPhotoBulkSummary({ success: 0, failed: 0 });
   }
 
   function clearBulkImages() {
     setBulkImages([]);
     setBulkImageError("");
+    setPhotoBulkResults({});
+    setPhotoBulkSummary({ success: 0, failed: 0 });
     if (bulkImageInputRef.current) bulkImageInputRef.current.value = "";
+  }
+
+  function createPhotoOnlyRow(file: File, index: number, secureUrl: string, status: "Needs Review" | "Missing Image") {
+    const hasImage = isPublicHttpsImageUrl(secureUrl);
+    const selectedSection = photoBulkSection === "__custom__" ? photoBulkCustomSection.trim() : photoBulkSection;
+    return {
+      Include: true,
+      Project: project,
+      Room: room,
+      "Product Name": buildPhotoOnlyName(file.name, index, photoBulkProductName, photoBulkAppendSequence),
+      Brand: "",
+      Dimensions: "",
+      Quantity: 1,
+      Supplier: "",
+      "Finish / Color": "",
+      "Product Category": selectedSection,
+      "Model/SKU": "",
+      "Product URL": "",
+      "Image URL": hasImage ? secureUrl : "",
+      "Image Upload Status": hasImage ? "Uploaded" : "Missing Image",
+      Notes: "Photo-only inventory item.",
+      "Source Type": "Photo",
+      "Import Type": "Photo-only Bulk Import",
+      photo_only: true,
+      Status: status,
+    } satisfies IntakeRow;
+  }
+
+  async function handlePhotoBulkCreate() {
+    if (!bulkImages.length) {
+      setBulkImageError("Choose at least one image first.");
+      return;
+    }
+    const selectedSection = photoBulkSection === "__custom__" ? photoBulkCustomSection.trim() : photoBulkSection;
+    if (!selectedSection.trim()) {
+      setBulkImageError("Choose a section before creating rows.");
+      return;
+    }
+    setBusy("photoBulk");
+    setBulkImageError("");
+    setMessage("");
+    const nextResults: typeof photoBulkResults = {};
+    let success = 0;
+    let failed = 0;
+    const createdRows: IntakeRow[] = [];
+    const startIndex = rows.length;
+
+    for (const [index, file] of bulkImages.entries()) {
+      const key = bulkImageKey(file, index);
+      nextResults[key] = { status: "queued" };
+      setPhotoBulkResults({ ...nextResults });
+      try {
+        const response = await uploadImage(file);
+        const secureUrl = response.secure_url || "";
+        if (!isPublicHttpsImageUrl(secureUrl)) throw new Error("Cloudinary did not return a public HTTPS URL.");
+        const row = createPhotoOnlyRow(file, index, secureUrl, "Needs Review");
+        createdRows.push(row);
+        nextResults[key] = { status: "uploaded", url: secureUrl, rowIndex: startIndex + createdRows.length - 1 };
+        success += 1;
+      } catch (error) {
+        const row = createPhotoOnlyRow(file, index, "", "Missing Image");
+        createdRows.push(row);
+        nextResults[key] = {
+          status: "failed",
+          error: error instanceof Error ? error.message : "Upload failed.",
+          rowIndex: startIndex + createdRows.length - 1,
+        };
+        failed += 1;
+      }
+      setPhotoBulkResults({ ...nextResults });
+      setPhotoBulkSummary({ success, failed });
+    }
+
+    try {
+      const response = await validateRows([...rows, ...createdRows]);
+      setRows(response.rows);
+      setErrors(response.errors);
+      setMessage(`Photo-only bulk import created ${success} row${success === 1 ? "" : "s"} with images; ${failed} failed.`);
+    } catch {
+      setRows((current) => [...current, ...createdRows]);
+      setMessage(`Photo-only bulk import created ${success} row${success === 1 ? "" : "s"} with images; ${failed} failed.`);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function retryPhotoUpload(file: File, index: number) {
+    const key = bulkImageKey(file, index);
+    const result = photoBulkResults[key];
+    if (!result || result.rowIndex === undefined) return;
+    setPhotoBulkResults((current) => ({ ...current, [key]: { ...result, status: "queued", error: "" } }));
+    try {
+      const response = await uploadImage(file);
+      const secureUrl = response.secure_url || "";
+      if (!isPublicHttpsImageUrl(secureUrl)) throw new Error("Cloudinary did not return a public HTTPS URL.");
+      const nextRows = rows.map((row, rowIndex) =>
+        rowIndex === result.rowIndex
+          ? {
+              ...row,
+              "Image URL": secureUrl,
+              "Image Upload Status": "Uploaded",
+              Status: "Needs Review",
+            }
+          : row,
+      );
+      const validated = await validateRows(nextRows);
+      setRows(validated.rows);
+      setErrors(validated.errors);
+      setPhotoBulkResults((current) => ({
+        ...current,
+        [key]: { status: "uploaded", url: secureUrl, rowIndex: result.rowIndex },
+      }));
+      setPhotoBulkSummary((current) => ({
+        success: current.success + 1,
+        failed: Math.max(0, current.failed - 1),
+      }));
+    } catch (error) {
+      setPhotoBulkResults((current) => ({
+        ...current,
+        [key]: {
+          status: "failed",
+          error: error instanceof Error ? error.message : "Upload failed.",
+          rowIndex: result.rowIndex,
+        },
+      }));
+    }
+  }
+
+  async function handleProductImageUpload(rowIndex: number, file: File | undefined) {
+    if (!file) return;
+    setProductImageUploads((current) => ({ ...current, [rowIndex]: "Uploading..." }));
+    try {
+      const response = await uploadImage(file);
+      const secureUrl = response.secure_url || "";
+      if (!isPublicHttpsImageUrl(secureUrl)) throw new Error("Upload did not return a public image URL.");
+      setRows((current) =>
+        current.map((row, index) =>
+          index === rowIndex
+            ? {
+                ...row,
+                "Image URL": secureUrl,
+                "Image Upload Status": "Uploaded",
+              }
+            : row,
+        ),
+      );
+      setProductImageUploads((current) => ({ ...current, [rowIndex]: "" }));
+    } catch (error) {
+      setProductImageUploads((current) => ({
+        ...current,
+        [rowIndex]: error instanceof Error ? error.message : "Upload failed.",
+      }));
+    }
   }
 
   async function handleGenerate() {
@@ -374,10 +587,10 @@ export function IntakeWorkspace() {
   async function handleValidate() {
     setBusy("validate");
     try {
-      const response = await validateRows(rows);
+      const response = await enrichRows({ rows, useWebEnrichment });
       setRows(response.rows);
       setErrors(response.errors);
-      setMessage("Input updates saved.");
+      setMessage(useWebEnrichment ? "Missing info search complete." : "Input updates saved without web search.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not save input updates.");
     } finally {
@@ -394,20 +607,18 @@ export function IntakeWorkspace() {
     URL.revokeObjectURL(url);
   }
 
-  async function handleProgramaExport(format: "csv" | "xlsx" | "debug-csv") {
+  async function handleProgramaExport(format: "csv" | "xlsx") {
     setBusy("export");
     try {
-      const safeProject = project.trim().replaceAll(" ", "_") || "sch";
       const blob =
         format === "xlsx"
           ? await exportProgramaXlsx(includedRows)
-          : format === "debug-csv"
-            ? await exportProgramaDebugCsv(includedRows)
-            : await exportProgramaCsv(includedRows);
+          : await exportProgramaCsv(includedRows);
       const suffix = format === "xlsx" ? "xlsx" : "csv";
-      const label = format === "debug-csv" ? "programa_debug" : "programa_import";
-      downloadBlob(blob, `${safeProject}_${label}.${suffix}`);
-      setMessage("Programa import file downloaded.");
+      const today = new Date().toISOString().slice(0, 10);
+      const filename = `programa_import_${today}.${suffix}`;
+      downloadBlob(blob, filename);
+      setMessage("Use this file for Programa Import Products.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not export Programa import file.");
     } finally {
@@ -444,427 +655,244 @@ export function IntakeWorkspace() {
   }
 
   return (
-    <main className="min-h-screen px-5 py-6 sm:px-8 lg:px-10">
-      <div className="mx-auto flex max-w-[1500px] flex-col gap-5">
-        <header className="flex flex-col gap-5 rounded-lg border border-linen bg-paper px-6 py-5 shadow-panel backdrop-blur md:flex-row md:items-center md:justify-between">
-          <div className="flex items-center gap-5">
+    <main className="min-h-screen px-4 py-6 sm:px-7 lg:px-10">
+      <div className="mx-auto flex max-w-[1180px] flex-col gap-7">
+        <header className="flex flex-col gap-4 border-b border-linen pb-5 md:flex-row md:items-center md:justify-between">
+          <div className="flex flex-wrap items-center gap-3">
             <LogoMark />
             <span className="rounded-full border border-orangeBorder bg-orangeSoft px-3 py-1 text-xs font-medium text-bronze">
               Internal
             </span>
           </div>
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-            <div className="grid grid-cols-3 gap-2 text-center">
-              <Metric label="Export Rows" value={readyRows} tone="ready" />
-              <Metric label="Needs Review" value={needsReview} tone="warn" />
-              <Metric label="Ignored" value={ignored} tone="muted" />
-            </div>
-            <div className="flex flex-col items-stretch gap-2">
-              <button
-                className="inline-flex h-11 items-center justify-center gap-2 rounded-lg border border-bronze bg-bronze px-5 text-sm font-semibold text-white shadow-sm transition hover:border-orangeHover hover:bg-orangeHover disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze disabled:shadow-none"
-                disabled={busy === "export" || exportSummary.export_count === 0}
-                onClick={() => handleProgramaExport("csv")}
-              >
-                {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                Download Programa CSV
-              </button>
-              <p className="text-center text-xs font-medium text-taupe">
-                Use Programa&apos;s native Import Products tool for most imports.
-              </p>
-            </div>
+          <div className="flex flex-wrap gap-2">
+            <StatusBadge value={`${readyRows} Ready`} />
+            <StatusBadge value={`${needsReview} Needs Review`} />
           </div>
         </header>
 
-        <section className="grid gap-5">
-          <Panel title="Project Setup" subtitle="Set default metadata for parsed rows. No Programa URL is required.">
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="Default Room / Location">
+        <Panel step="1" title="Upload" subtitle="Upload PDFs, links, or photos to create product entries.">
+          <div className="grid gap-4">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Room / Location">
                 <input
-                  className="h-11 w-full rounded-lg border border-linen bg-white px-3 text-sm text-charcoal shadow-sm"
+                  className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
                   value={room}
                   onChange={(event) => setRoom(event.target.value)}
                   placeholder="Kitchen"
                 />
               </Field>
-              <Field label="Display Name (optional)">
+              <Field label="Project Name">
                 <input
-                  className="h-11 w-full rounded-lg border border-linen bg-white px-3 text-sm text-charcoal shadow-sm"
+                  className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
                   value={project}
                   onChange={(event) => setProject(event.target.value)}
-                  placeholder="For file names and review context"
+                  placeholder="Optional"
                 />
               </Field>
             </div>
-          </Panel>
 
-          <Panel title="Product Intake" subtitle="Paste product links, upload product images, or add PDFs when needed.">
-            <div className="grid gap-5">
-              <Field label="Product URLs">
-                <textarea
-                  className="min-h-[150px] w-full resize-none rounded-lg border border-linen bg-white p-3 text-sm text-charcoal shadow-sm"
-                  value={urls}
-                  onChange={(event) => setUrls(event.target.value)}
-                  placeholder={"Paste one URL per line\nhttps://www.vendor.com/product"}
+            <textarea
+              className="input-surface min-h-28 w-full resize-none rounded-xl p-3 text-sm leading-6 text-charcoal"
+              value={urls}
+              onChange={(event) => setUrls(event.target.value)}
+              placeholder={"Paste product links, one per line"}
+            />
+
+            <div className="grid gap-3 md:grid-cols-2">
+              <label className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed border-linen bg-white/70 px-4 py-4 transition hover:border-orangeBorder hover:bg-orangeSoft/40">
+                <span className="flex items-center gap-3">
+                  <Upload className="h-5 w-5 text-bronze" />
+                  <span>
+                    <span className="block text-sm font-semibold text-charcoal">PDFs</span>
+                    <span className="text-xs text-taupe">{files.length ? `${files.length} selected` : "Choose files"}</span>
+                  </span>
+                </span>
+                <input
+                  ref={fileInputRef}
+                  className="hidden"
+                  type="file"
+                  accept="application/pdf"
+                  multiple
+                  onChange={(event) => handleFileSelection(event.target.files)}
                 />
-              </Field>
+              </label>
 
-              <section>
-                <div className="mb-2 flex items-center justify-between gap-3">
-                  <div>
-                    <h3 className="text-sm font-semibold text-charcoal">Bulk Image Upload</h3>
-                    <p className="mt-1 text-xs text-taupe">
-                      Upload many product photos now. They will stay in frontend state for the future backend handoff.
-                    </p>
-                  </div>
-                  {bulkImages.length > 0 ? (
-                    <button
-                      type="button"
-                      className="rounded-lg border border-linen bg-white px-3 py-2 text-xs font-semibold text-taupe shadow-sm transition hover:bg-ivory hover:text-charcoal"
-                      onClick={clearBulkImages}
+              <label
+                className={`flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed px-4 py-4 transition ${
+                  isImageDragActive ? "border-orangeBorder bg-orangeSoft" : "border-linen bg-white/70 hover:border-orangeBorder hover:bg-orangeSoft/40"
+                }`}
+                onDragEnter={(event) => {
+                  event.preventDefault();
+                  setIsImageDragActive(true);
+                }}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  setIsImageDragActive(true);
+                }}
+                onDragLeave={(event) => {
+                  event.preventDefault();
+                  setIsImageDragActive(false);
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  setIsImageDragActive(false);
+                  handleBulkImageSelection(event.dataTransfer.files);
+                }}
+              >
+                <span className="flex items-center gap-3">
+                  <ImageIcon className="h-5 w-5 text-bronze" />
+                  <span>
+                    <span className="block text-sm font-semibold text-charcoal">Photos</span>
+                    <span className="text-xs text-taupe">{bulkImages.length ? `${bulkImages.length} selected` : "Choose images"}</span>
+                  </span>
+                </span>
+                <input
+                  ref={bulkImageInputRef}
+                  className="hidden"
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                  multiple
+                  onChange={(event) => handleBulkImageSelection(event.target.files)}
+                />
+              </label>
+            </div>
+
+            {uploadError || bulkImageError ? (
+              <div className="rounded-xl border border-clay/20 bg-clay/10 px-3 py-2 text-sm text-clay">
+                {uploadError || bulkImageError}
+              </div>
+            ) : null}
+
+            {files.length > 0 ? (
+              <div className="flex flex-wrap gap-2 text-xs text-taupe">
+                {files.map((file, index) => (
+                  <button
+                    key={`${file.name}-${file.size}-${file.lastModified}`}
+                    type="button"
+                    className="rounded-full border border-linen bg-white px-3 py-1 hover:border-orangeBorder"
+                    onClick={() => removeFile(index)}
+                    title={`Remove ${file.name}`}
+                  >
+                    {file.name}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+
+            {bulkImages.length > 0 ? (
+              <div className="grid gap-3 border-t border-linen pt-4">
+                <div className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end">
+                  <Field label="Section">
+                    <select
+                      className="input-surface h-11 rounded-xl px-3 text-sm text-charcoal"
+                      value={photoBulkSection}
+                      onChange={(event) => setPhotoBulkSection(event.target.value)}
                     >
-                      Clear all images
+                      {sections.map((section) => (
+                        <option key={section} value={section}>
+                          {section}
+                        </option>
+                      ))}
+                      <option value="__custom__">Custom</option>
+                    </select>
+                  </Field>
+                  <Field label="Product Name">
+                    <input
+                      className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
+                      value={photoBulkProductName}
+                      onChange={(event) => setPhotoBulkProductName(event.target.value)}
+                      placeholder="Optional"
+                    />
+                  </Field>
+                  <label className="flex h-11 items-center gap-2 text-sm text-taupe">
+                    <input
+                      type="checkbox"
+                      checked={photoBulkAppendSequence}
+                      onChange={(event) => setPhotoBulkAppendSequence(event.target.checked)}
+                      className="h-4 w-4 accent-bronze"
+                    />
+                    Number names
+                  </label>
+                </div>
+                {photoBulkSection === "__custom__" ? (
+                  <input
+                    className="input-surface h-11 rounded-xl px-3 text-sm text-charcoal"
+                    value={photoBulkCustomSection}
+                    onChange={(event) => setPhotoBulkCustomSection(event.target.value)}
+                    placeholder="Custom section"
+                  />
+                ) : null}
+                <div className="flex flex-wrap gap-2">
+                  <StatusBadge value={`${photoBulkSummary.success} uploaded`} />
+                  <StatusBadge value={`${photoBulkSummary.failed} failed`} />
+                  {bulkImages.length > 0 ? (
+                    <button type="button" className="text-xs font-semibold text-taupe underline-offset-2 hover:underline" onClick={clearBulkImages}>
+                      Clear photos
                     </button>
                   ) : null}
                 </div>
-                <label
-                  className={`flex cursor-pointer flex-col items-center justify-center gap-3 rounded-lg border border-dashed p-6 text-center shadow-sm transition ${
-                    isImageDragActive
-                      ? "border-orangeBorder bg-orangeSoft"
-                      : "border-linen bg-white hover:border-orangeBorder hover:bg-orangeSoft/50"
-                  }`}
-                  onDragEnter={(event) => {
-                    event.preventDefault();
-                    setIsImageDragActive(true);
-                  }}
-                  onDragOver={(event) => {
-                    event.preventDefault();
-                    setIsImageDragActive(true);
-                  }}
-                  onDragLeave={(event) => {
-                    event.preventDefault();
-                    setIsImageDragActive(false);
-                  }}
-                  onDrop={(event) => {
-                    event.preventDefault();
-                    setIsImageDragActive(false);
-                    handleBulkImageSelection(event.dataTransfer.files);
-                  }}
+                <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
+                  {bulkImagePreviews.slice(0, 6).map(({ file, url }, index) => (
+                    <img key={`${file.name}-${file.size}-${file.lastModified}`} src={url} alt={file.name} className="h-20 w-full rounded-xl object-cover" />
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold disabled:cursor-not-allowed disabled:text-taupe/60"
+                  disabled={busy === "photoBulk" || !bulkImages.length}
+                  onClick={handlePhotoBulkCreate}
                 >
-                  <div className="grid h-11 w-11 place-items-center rounded-full bg-orangeSoft text-bronze">
-                    <ImageIcon className="h-5 w-5" />
-                  </div>
-                  <div>
-                    <div className="text-sm font-semibold text-charcoal">Drop product images here</div>
-                    <div className="mt-1 text-xs text-taupe">or click to choose JPG, PNG, or WebP files</div>
-                  </div>
-                  <input
-                    ref={bulkImageInputRef}
-                    className="hidden"
-                    type="file"
-                    accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
-                    multiple
-                    onChange={(event) => handleBulkImageSelection(event.target.files)}
-                  />
-                </label>
-                {bulkImageError ? (
-                  <div className="mt-3 rounded-lg border border-clay/20 bg-clay/10 px-3 py-2 text-sm text-clay">
-                    {bulkImageError}
-                  </div>
-                ) : null}
-                {bulkImages.length > 0 ? (
-                  <div className="mt-4">
-                    <div className="mb-3 flex flex-wrap items-center gap-2 text-xs font-medium text-taupe">
-                      <span className="rounded-full border border-orangeBorder bg-orangeSoft px-3 py-1 text-bronze">
-                        {bulkImages.length} image{bulkImages.length === 1 ? "" : "s"} uploaded
-                      </span>
-                      {bulkImages.length > 100 ? (
-                        <span className="rounded-full border border-orangeBorder bg-white px-3 py-1 text-bronze">
-                          Large upload: previews are limited for performance
-                        </span>
-                      ) : null}
-                    </div>
-                    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-                      {bulkImagePreviews.slice(0, 12).map(({ file, url }) => (
-                        <figure
-                          key={`${file.name}-${file.size}-${file.lastModified}`}
-                          className="overflow-hidden rounded-lg border border-linen bg-white shadow-sm"
-                        >
-                          <img src={url} alt={file.name} className="h-24 w-full object-cover" />
-                          <figcaption className="truncate px-2 py-2 text-[11px] text-taupe">{file.name}</figcaption>
-                        </figure>
-                      ))}
-                    </div>
-                    {bulkImages.length > 12 ? (
-                      <p className="mt-2 text-xs text-taupe">+ {bulkImages.length - 12} more image previews hidden</p>
-                    ) : null}
-                  </div>
-                ) : null}
-              </section>
-
-              <div className="rounded-lg border border-dashed border-linen bg-ivory p-4">
-                <label className="flex cursor-pointer flex-col items-center justify-center gap-3 rounded-lg border border-transparent py-2 text-center transition hover:border-orangeBorder hover:bg-orangeSoft">
-                  <Upload className="h-6 w-6 text-bronze" />
-                  <span className="text-sm font-medium text-charcoal">PDF Upload</span>
-                  <span className="text-xs text-taupe">{files.length ? "Choose more files or replace selection" : "Choose PDF files"}</span>
-                  <input
-                    ref={fileInputRef}
-                    className="hidden"
-                    type="file"
-                    accept="application/pdf"
-                    multiple
-                    onChange={(event) => handleFileSelection(event.target.files)}
-                  />
-                </label>
-                {uploadError ? (
-                  <div className="mt-3 rounded-lg border border-clay/20 bg-clay/10 px-3 py-2 text-sm text-clay">
-                    {uploadError}
-                  </div>
-                ) : null}
-                {files.length > 0 ? (
-                  <div className="mt-4 space-y-2">
-                    {files.map((file, index) => (
-                      <div
-                        key={`${file.name}-${file.size}-${file.lastModified}`}
-                        className="flex items-center justify-between gap-3 rounded-lg border border-orangeBorder/70 bg-white px-3 py-2 shadow-sm"
-                      >
-                        <div className="flex min-w-0 items-center gap-3">
-                          <FileCheck2 className="h-4 w-4 shrink-0 text-bronze" />
-                          <div className="min-w-0">
-                            <div className="truncate text-sm font-medium text-charcoal">{file.name}</div>
-                            <div className="text-xs text-taupe">{formatFileSize(file.size)}</div>
-                          </div>
-                        </div>
-                        <div className="flex shrink-0 items-center gap-2">
-                          <span className="rounded-full bg-orangeSoft px-2.5 py-1 text-xs font-semibold text-bronze">
-                            Uploaded
-                          </span>
-                          <button
-                            type="button"
-                            className="grid h-8 w-8 place-items-center rounded-lg border border-linen bg-white text-taupe transition hover:border-orangeBorder hover:bg-orangeSoft hover:text-charcoal"
-                            aria-label={`Remove ${file.name}`}
-                            onClick={() => removeFile(index)}
-                          >
-                            <X className="h-4 w-4" />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-                <label className="mt-4 flex items-center gap-2 text-sm text-taupe">
-                  <input
-                    type="checkbox"
-                    checked={useAiPdf}
-                    onChange={(event) => setUseAiPdf(event.target.checked)}
-                    className="h-4 w-4 accent-bronze"
-                  />
-                  Use AI to interpret uploaded PDFs
-                </label>
+                  {busy === "photoBulk" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageIcon className="h-4 w-4" />}
+                  Upload Photos
+                </button>
               </div>
-            </div>
-            <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            ) : null}
+
+            <label className="flex items-center gap-2 text-sm text-taupe">
+              <input
+                type="checkbox"
+                checked={useAiPdf}
+                onChange={(event) => setUseAiPdf(event.target.checked)}
+                className="h-4 w-4 accent-bronze"
+              />
+              Use AI for PDFs
+            </label>
+
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
               <button
-                className="inline-flex h-11 items-center justify-center gap-2 rounded-lg border border-bronze bg-bronze px-5 text-sm font-semibold text-white shadow-sm transition hover:border-orangeHover hover:bg-orangeHover disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze disabled:shadow-none"
+                className="btn-primary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-6 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze disabled:shadow-none"
                 disabled={busy === "generate"}
                 onClick={handleGenerate}
               >
                 {busy === "generate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-                Generate Intake Table
+                Upload
               </button>
               {message ? <p className="text-sm text-charcoal/65">{message}</p> : null}
             </div>
-          </Panel>
-        </section>
+          </div>
+        </Panel>
 
         {errors.length ? (
-          <div className="rounded-lg border border-clay/20 bg-clay/10 px-4 py-3 text-sm text-clay">
+          <div className="rounded-xl border border-clay/20 bg-clay/10 px-4 py-3 text-sm text-clay">
             {errors.map((error) => (
               <div key={error}>{error}</div>
             ))}
           </div>
         ) : null}
 
-        {rows.length > 0 ? (
-          <>
-            <Panel
-              title="Missing Inputs"
-              subtitle="Fill any details you have now, or use the phone button to prepare a vendor call."
-            >
-              {missingInputRows.length ? (
-                <div className="space-y-3">
-                  {rows.map((row, index) => {
-                    const missingFields = row.Include !== false ? missingFieldsForRow(row) : [];
-                    return missingFields.length > 0 ? (
-                      <div key={index} className="grid gap-3 rounded-lg border border-linen bg-ivory/55 p-3 md:grid-cols-[1.1fr_1.2fr] md:items-start">
-                        <div>
-                          <div className="text-sm font-semibold text-charcoal">{rowText(row, "Product Name") || "Unnamed Item"}</div>
-                          <div className="text-xs text-charcoal/55">
-                            {[rowText(row, "Brand"), rowText(row, "Model/SKU")].filter(Boolean).join(" / ") || "Product details pending"}
-                          </div>
-                        </div>
-                        <div className="grid gap-2">
-                          {missingFields.map((field) => {
-                            const key = missingFieldKeys[field];
-                            return (
-                              <MissingInputField
-                                key={field}
-                                field={field}
-                                value={rowText(row, key)}
-                                onChange={(value) => updateRow(index, key, key === "Quantity" && value ? Number(value) : value)}
-                                onVendorCall={() => openVendorCall(row, [field])}
-                              />
-                            );
-                          })}
-                        </div>
-                      </div>
-                    ) : null;
-                  })}
-                  <button
-                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-bronze/25 bg-bronze/10 px-4 text-sm font-semibold text-bronze hover:bg-bronze/15"
-                    disabled={busy === "validate"}
-                    onClick={handleValidate}
-                  >
-                    {busy === "validate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-                    Save Input Updates
-                  </button>
-                </div>
-              ) : (
-                <div className="flex items-center gap-2 text-sm text-sage">
-                  <CheckCircle2 className="h-4 w-4" />
-                  All included rows have the key inputs filled.
-                </div>
-              )}
-            </Panel>
-
-            <Panel
-              title="Export for Programa Import"
-              subtitle="Download a Programa-compatible CSV or XLSX file, then upload it through Programa's Import Products tool."
-            >
-              <div className="grid gap-4 lg:grid-cols-[1.1fr_0.9fr]">
-                <div className="rounded-lg border border-linen bg-ivory p-4">
-                  <h3 className="text-sm font-semibold text-charcoal">Validation Summary</h3>
-                  <div className="mt-3 grid gap-2 text-sm text-charcoal/75 sm:grid-cols-2">
-                    <SummaryLine label="Rows ready for export" value={exportSummary.export_count} tone="ready" />
-                    <SummaryLine label="Skipped: missing Product Name" value={exportSummary.skipped.length} tone="warn" />
-                    <SummaryLine label="Missing Section" value={exportSummary.missing_section.length} tone="warn" />
-                    <SummaryLine label="Missing Dimensions" value={exportSummary.missing_dimensions} tone="warn" />
-                    <SummaryLine label="Missing Product URL" value={exportSummary.missing_product_url} tone="warn" />
-                    <SummaryLine label="Missing Image URL" value={exportSummary.missing_image_url} tone="warn" />
-                  </div>
-                  {exportSummary.skipped.length > 0 ? (
-                    <p className="mt-3 text-xs font-medium text-bronze">
-                      Rows without Product Name are excluded from the Programa import file.
-                    </p>
-                  ) : null}
-                  <div className="mt-4 border-t border-linen pt-4">
-                    <h4 className="text-xs font-semibold uppercase text-charcoal/55">Section Distribution</h4>
-                    {Object.keys(exportSummary.section_counts).length ? (
-                      <div className="mt-2 grid gap-2">
-                        {Object.entries(exportSummary.section_counts).map(([section, count]) => (
-                          <div key={section} className="flex items-center justify-between rounded-lg bg-white px-3 py-2 text-sm">
-                            <span className="font-medium text-charcoal">{section}</span>
-                            <span className="text-charcoal/60">{count} item{count === 1 ? "" : "s"}</span>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <p className="mt-2 text-sm text-taupe">No exportable rows yet.</p>
-                    )}
-                    {exportSummary.section_equals_product_name.length ||
-                    exportSummary.section_too_long.length ||
-                    exportSummary.too_many_unique_sections ? (
-                      <div className="mt-3 rounded-lg border border-orangeBorder bg-orangeSoft px-3 py-2 text-xs font-medium text-bronze">
-                        {exportSummary.section_equals_product_name.length ? (
-                          <div>{exportSummary.section_equals_product_name.length} row(s) have a raw section matching the product name.</div>
-                        ) : null}
-                        {exportSummary.section_too_long.length ? (
-                          <div>{exportSummary.section_too_long.length} row(s) have a raw section longer than 30 characters.</div>
-                        ) : null}
-                        {exportSummary.too_many_unique_sections ? <div>Too many unique sections.</div> : null}
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
-                <div className="rounded-lg border border-linen bg-white p-4">
-                  <h3 className="text-sm font-semibold text-charcoal">Download Files</h3>
-                  <p className="mt-1 text-sm leading-6 text-taupe">
-                    Legacy direct-upload workflow is deprecated. Use CSV/XLSX export for most imports.
-                  </p>
-                  <div className="mt-4 grid gap-2">
-                    <button
-                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-bronze bg-bronze px-4 text-sm font-semibold text-white shadow-sm hover:bg-orangeHover disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
-                      disabled={busy === "export" || exportSummary.export_count === 0}
-                      onClick={() => handleProgramaExport("csv")}
-                    >
-                      {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                      Download Programa CSV
-                    </button>
-                    <button
-                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-charcoal/15 bg-white px-4 text-sm font-semibold text-charcoal shadow-sm hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
-                      disabled={busy === "export" || exportSummary.export_count === 0}
-                      onClick={() => handleProgramaExport("xlsx")}
-                    >
-                      <Download className="h-4 w-4" />
-                      Download Programa XLSX
-                    </button>
-                    <label className="mt-1 flex items-center gap-2 text-xs font-medium text-taupe">
-                      <input
-                        type="checkbox"
-                        checked={debugMode}
-                        onChange={(event) => setDebugMode(event.target.checked)}
-                        className="h-4 w-4 accent-bronze"
-                      />
-                      Enable debug export
-                    </label>
-                    {debugMode ? (
-                      <button
-                        className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-linen bg-ivory px-4 text-sm font-semibold text-taupe shadow-sm hover:bg-white disabled:cursor-not-allowed disabled:text-taupe/60"
-                        disabled={busy === "export" || exportSummary.export_count === 0}
-                        onClick={() => handleProgramaExport("debug-csv")}
-                      >
-                        <Download className="h-4 w-4" />
-                        Download Debug CSV
-                      </button>
-                    ) : null}
-                  </div>
-                  <div className="mt-5 border-t border-linen pt-4">
-                    <h3 className="text-sm font-semibold text-charcoal">Bulk Section Override</h3>
-                    <p className="mt-1 text-xs leading-5 text-taupe">
-                      Sections are controlled. Exports always map to the canonical Programa list.
-                    </p>
-                    <div className="mt-3 flex flex-col gap-2 sm:flex-row">
-                      <select
-                        className="h-10 rounded-lg border border-linen bg-white px-3 text-sm text-charcoal"
-                        value={bulkSection}
-                        onChange={(event) => setBulkSection(event.target.value)}
-                      >
-                        {sections.map((section) => (
-                          <option key={section} value={section}>
-                            {section}
-                          </option>
-                        ))}
-                      </select>
-                      <button
-                        className="inline-flex h-10 items-center justify-center rounded-lg border border-charcoal/15 bg-white px-4 text-sm font-semibold text-charcoal shadow-sm hover:bg-ivory disabled:cursor-not-allowed disabled:text-taupe/60"
-                        disabled={includedRows.length === 0}
-                        onClick={applyBulkSection}
-                        type="button"
-                      >
-                        Apply to Included Rows
-                      </button>
-                    </div>
-                  </div>
-                </div>
+        <Panel step="2" title="Review" subtitle="Check and edit product entries.">
+          {rows.length > 0 ? (
+            <>
+              <div className="mb-3 flex flex-wrap gap-2">
+                <StatusBadge value={`${readyRows} Ready`} />
+                <StatusBadge value={`${missingInputRows.length} Needs Review`} />
               </div>
-            </Panel>
-
-            <Panel title="Review Table" subtitle="Review each row before exporting. Missing inputs stay flagged.">
-              <div className="overflow-x-auto">
+              <div className="overflow-x-auto rounded-xl border border-linen bg-white">
                 <table className="min-w-[1180px] w-full border-separate border-spacing-0 text-left text-sm">
                   <thead>
                     <tr>
                       {reviewColumns.map((column) => (
-                        <th key={column} className="border-b border-linen bg-ivory/70 px-3 py-3 text-xs font-semibold text-charcoal/60">
+                        <th key={column} className="sticky top-0 border-b border-linen bg-ivory px-3 py-3 text-xs font-semibold text-charcoal/60">
                           {column === "Room"
                             ? "Location"
                             : column === "Quantity"
@@ -888,9 +916,9 @@ export function IntakeWorkspace() {
                   </thead>
                   <tbody>
                     {rows.map((row, index) => (
-                      <tr key={index} className="align-top">
+                      <tr key={index} className="align-top transition-colors hover:bg-orangeSoft/30">
                         {reviewColumns.map((column) => (
-                          <td key={column} className="border-b border-linen/70 px-3 py-2">
+                          <td key={column} className="border-b border-linen/70 px-3 py-3">
                             <Cell
                               row={row}
                               column={column}
@@ -906,20 +934,179 @@ export function IntakeWorkspace() {
                   </tbody>
                 </table>
               </div>
-              <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <div className="flex items-center gap-2 text-sm text-charcoal/60">
-                  <AlertTriangle className="h-4 w-4 text-bronze" />
-                  {readyRows} ready for export. {missingInputRows.length} have missing inputs.
-                </div>
+            </>
+          ) : (
+            <div className="rounded-xl border border-dashed border-linen bg-white/60 px-5 py-10 text-center">
+              <p className="text-sm text-taupe">Uploaded products will appear here.</p>
+            </div>
+          )}
+        </Panel>
+
+        <Panel step="3" title="Enrich" subtitle="Fill missing product details automatically.">
+          <div className="grid gap-4">
+            <label className="flex items-start gap-3 text-sm text-taupe">
+              <input
+                type="checkbox"
+                checked={useWebEnrichment}
+                onChange={(event) => setUseWebEnrichment(event.target.checked)}
+                className="mt-1 h-4 w-4 accent-bronze"
+              />
+              Use web search
+            </label>
+
+            {rows.length > 0 && missingInputRows.length ? (
+              <div className="divide-y divide-linen rounded-xl border border-linen bg-white">
+                {rows.map((row, index) => {
+                  const missingFields = row.Include !== false ? missingFieldsForRow(row) : [];
+                  return missingFields.length > 0 ? (
+                    <div key={index} className="grid gap-3 p-4 lg:grid-cols-[0.8fr_1.2fr] lg:items-start">
+                      <div>
+                        <div className="text-sm font-semibold text-charcoal">{rowText(row, "Product Name") || "Unnamed Item"}</div>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {missingFields.map((field) => (
+                            <StatusBadge
+                              key={field}
+                              value={field === "Dimensions" ? "Missing Dimensions" : field === "Image URL" ? "Missing Image" : `Missing ${field}`}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                      <div className="grid gap-2">
+                        {missingFields.map((field) => {
+                          const key = missingFieldKeys[field];
+                          return (
+                            <MissingInputField
+                              key={field}
+                              field={field}
+                              value={rowText(row, key)}
+                              onChange={(value) => updateRow(index, key, key === "Quantity" && value ? Number(value) : value)}
+                              onVendorCall={() => openVendorCall(row, [field])}
+                            />
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : null;
+                })}
               </div>
-            </Panel>
-          </>
-        ) : (
-          <div className="rounded-lg border border-linen bg-paper/80 px-5 py-12 text-center shadow-panel">
-            <ArrowUpRight className="mx-auto mb-3 h-5 w-5 text-bronze" />
-            <p className="text-sm text-charcoal/60">Add PDFs or product URLs to begin.</p>
+            ) : rows.length > 0 ? (
+              <div className="flex items-center gap-2 rounded-xl border border-sage/20 bg-sage/10 p-4 text-sm text-sage">
+                <CheckCircle2 className="h-4 w-4" />
+                No missing details.
+              </div>
+            ) : (
+              <p className="text-sm text-taupe">Create product entries first.</p>
+            )}
+            <button
+              className="btn-primary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
+              disabled={busy === "validate" || rows.length === 0}
+              onClick={handleValidate}
+            >
+              {busy === "validate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+              Run Enrichment
+            </button>
           </div>
-        )}
+        </Panel>
+
+        <Panel step="4" title="Export" subtitle="Download a file ready for Programa.">
+          <div className="grid gap-4">
+            <div className="flex flex-wrap gap-2">
+              <StatusBadge value={`${exportSummary.export_count} Export Ready`} />
+              <StatusBadge value={`Images ${exportSummary.image_url_present}/${exportSummary.image_url_total}`} />
+              <StatusBadge value={`${exportSummary.missing_section.length} Missing Section`} />
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <button
+                className="btn-primary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
+                disabled={busy === "export" || exportSummary.export_count === 0}
+                onClick={() => handleProgramaExport("csv")}
+              >
+                {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                Download CSV
+              </button>
+              <button
+                className="btn-secondary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                disabled={busy === "export" || exportSummary.export_count === 0}
+                onClick={() => handleProgramaExport("xlsx")}
+              >
+                <Download className="h-4 w-4" />
+                Download XLSX
+              </button>
+            </div>
+            <div className="border-t border-linen pt-4">
+              <h3 className="text-base font-semibold text-charcoal">Review &amp; Complete Product Data</h3>
+              {includedRows.length ? (
+                <div className="mt-3 divide-y divide-linen rounded-xl border border-linen bg-white">
+                  {rows.map((row, index) => {
+                    if (row.Include === false) return null;
+                    const productName = rowText(row, "Product Name");
+                    const brand = rowText(row, "Brand");
+                    const dimensions = rowText(row, "Dimensions");
+                    const productUrl = rowText(row, "Product URL");
+                    const imageUrl = rowText(row, "Image URL");
+                    const uploadStatus = productImageUploads[index] || "";
+                    return (
+                      <div key={index} className="grid gap-3 p-4 md:grid-cols-[1fr_1.2fr_auto] md:items-center">
+                        <div className="min-w-0">
+                          <div className={productName ? "truncate text-sm font-semibold text-charcoal" : "text-sm font-semibold text-clay"}>
+                            {productName || "Missing"}
+                          </div>
+                          <div className="mt-1 text-xs text-taupe">Brand: <ReviewValue value={brand} /></div>
+                        </div>
+                        <div className="grid gap-1 text-xs text-taupe sm:grid-cols-2">
+                          <div>Dimensions: <ReviewValue value={dimensions} /></div>
+                          <div>Product URL: <ReviewValue value={productUrl} /></div>
+                          <div className="sm:col-span-2">
+                            Image:{" "}
+                            {imageUrl ? (
+                              <span className="inline-flex max-w-full items-center gap-2 align-middle">
+                                <img src={imageUrl} alt={productName || "Product image"} className="h-8 w-8 rounded-lg object-cover" />
+                                <span className="truncate text-charcoal">{imageUrl}</span>
+                              </span>
+                            ) : (
+                              <span className="font-semibold text-clay">Missing</span>
+                            )}
+                          </div>
+                          {uploadStatus ? (
+                            <div className={`sm:col-span-2 ${uploadStatus === "Uploading..." ? "text-bronze" : "text-clay"}`}>
+                              {uploadStatus}
+                            </div>
+                          ) : null}
+                        </div>
+                        {!imageUrl ? (
+                          <label className="btn-secondary inline-flex h-10 cursor-pointer items-center justify-center rounded-xl px-4 text-sm font-semibold">
+                            Upload Image
+                            <input
+                              className="hidden"
+                              type="file"
+                              accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                              onChange={(event) => {
+                                void handleProductImageUpload(index, event.target.files?.[0]);
+                                event.currentTarget.value = "";
+                              }}
+                            />
+                          </label>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p className="mt-2 text-sm text-taupe">Create product entries first.</p>
+              )}
+              {includedRows.length ? (
+                <button
+                  className="btn-primary mt-4 inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
+                  disabled={busy === "export" || exportSummary.export_count === 0}
+                  onClick={() => handleProgramaExport("csv")}
+                >
+                  {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                  Download Updated CSV
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </Panel>
         {vendorCall ? (
           <VendorCallDialog
             state={vendorCall}
@@ -934,36 +1121,54 @@ export function IntakeWorkspace() {
   );
 }
 
-function Metric({ label, value, tone }: { label: string; value: number; tone: "ready" | "warn" | "muted" }) {
-  const colors = {
-    ready: "text-sage bg-sage/10 border-sage/15",
-    warn: "text-bronze bg-bronze/10 border-bronze/15",
-    muted: "text-charcoal/55 bg-charcoal/5 border-charcoal/10",
-  };
+function StatusBadge({ value }: { value: string }) {
+  const normal = value.toLowerCase();
+  const tone =
+    normal.startsWith("0 failed")
+      ? "border-linen bg-white/70 text-taupe"
+      : normal.includes("ready") || normal.includes("uploaded")
+      ? "border-sage/20 bg-sage/10 text-sage"
+      : normal.includes("missing") || normal.includes("failed")
+        ? "border-clay/20 bg-clay/10 text-clay"
+        : normal.includes("review")
+          ? "border-orangeBorder bg-orangeSoft text-bronze"
+          : "border-linen bg-white/70 text-taupe";
   return (
-    <div className={`min-w-24 rounded-lg border px-3 py-2 ${colors[tone]}`}>
-      <div className="text-lg font-semibold leading-none">{value}</div>
-      <div className="mt-1 text-[11px] font-medium">{label}</div>
-    </div>
+    <span className={`inline-flex min-h-6 items-center rounded-full border px-2.5 py-1 text-xs font-semibold ${tone}`}>
+      {value}
+    </span>
   );
 }
 
-function SummaryLine({ label, value, tone }: { label: string; value: number; tone: "ready" | "warn" }) {
-  const valueClass = tone === "ready" ? "text-sage" : value > 0 ? "text-bronze" : "text-charcoal/50";
-  return (
-    <div className="flex items-center justify-between gap-3 rounded-lg border border-linen bg-white px-3 py-2">
-      <span>{label}</span>
-      <span className={`font-semibold ${valueClass}`}>{value}</span>
-    </div>
-  );
+function ReviewValue({ value }: { value: string }) {
+  return value ? <span className="text-charcoal">{value}</span> : <span className="font-semibold text-clay">Missing</span>;
 }
 
-function Panel({ title, subtitle, children }: { title: string; subtitle: string; children: ReactNode }) {
+function Panel({
+  step,
+  title,
+  subtitle,
+  children,
+}: {
+  step?: string;
+  title: string;
+  subtitle: string;
+  children: ReactNode;
+}) {
   return (
-    <section className="rounded-lg border border-linen/90 bg-paper/90 p-5 shadow-panel backdrop-blur">
-      <div className="mb-4">
-        <h2 className="text-base font-semibold text-charcoal">{title}</h2>
-        <p className="mt-1 text-sm text-charcoal/55">{subtitle}</p>
+    <section className="rounded-2xl border border-linen bg-white/72 p-5 sm:p-6">
+      <div className="mb-5">
+        <div>
+          <div className="flex items-center gap-3">
+            {step ? (
+              <span className="grid h-8 w-8 place-items-center rounded-full border border-orangeBorder bg-orangeSoft text-sm font-semibold text-bronze">
+                {step}
+              </span>
+            ) : null}
+            <h2 className="text-xl font-semibold tracking-normal text-charcoal">{title}</h2>
+          </div>
+          <p className="mt-2 text-sm leading-6 text-charcoal/60">{subtitle}</p>
+        </div>
       </div>
       {children}
     </section>
@@ -1087,7 +1292,7 @@ function VendorCallDialog({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-charcoal/25 px-4 py-6">
-      <div className="w-full max-w-xl rounded-lg border border-linen bg-white p-5 shadow-panel">
+      <div className="glass-panel w-full max-w-xl rounded-lg p-5">
         <div className="flex items-start justify-between gap-4">
           <div>
             <h2 className="text-base font-semibold text-charcoal">Call Vendor</h2>
@@ -1096,14 +1301,14 @@ function VendorCallDialog({
           <button
             type="button"
             onClick={onClose}
-            className="grid h-8 w-8 place-items-center rounded-lg border border-linen bg-white text-taupe hover:bg-ivory"
+            className="btn-secondary grid h-8 w-8 place-items-center rounded-xl text-taupe hover:bg-ivory"
             aria-label="Close vendor call dialog"
           >
             <X className="h-4 w-4" />
           </button>
         </div>
 
-        <div className="mt-5 grid gap-3 rounded-lg border border-linen bg-ivory p-3 text-sm">
+        <div className="glass-tile mt-5 grid gap-3 rounded-lg p-3 text-sm">
           <Detail label="Product Name" value={rowText(state.row, "Product Name") || "Missing"} />
           <Detail label="Brand" value={rowText(state.row, "Brand") || "Missing"} />
           <Detail label="Model/SKU" value={rowText(state.row, "Model/SKU") || "Not provided"} />
@@ -1125,7 +1330,7 @@ function VendorCallDialog({
         <div className="mt-4 grid gap-4">
           <Field label="Phone Number">
             <input
-              className="h-10 w-full rounded-lg border border-linen bg-white px-3 text-sm shadow-sm"
+              className="input-surface h-10 w-full rounded-xl px-3 text-sm"
               value={state.phoneNumber}
               onChange={(event) => onChange({ ...state, phoneNumber: event.target.value })}
               placeholder="Vendor phone number"
@@ -1133,7 +1338,7 @@ function VendorCallDialog({
           </Field>
           <Field label="Call Goal">
             <textarea
-              className="min-h-20 w-full resize-none rounded-lg border border-linen bg-white px-3 py-2 text-sm shadow-sm"
+              className="input-surface min-h-20 w-full resize-none rounded-xl px-3 py-2 text-sm"
               value={state.customGoal}
               onChange={(event) => onChange({ ...state, customGoal: event.target.value })}
               placeholder="Get the missing dimensions for this product."
@@ -1153,7 +1358,7 @@ function VendorCallDialog({
             type="button"
             onClick={onGenerateScript}
             disabled={!state.phoneNumber.trim() || busy}
-            className="inline-flex h-10 items-center justify-center rounded-lg border border-bronze bg-bronze px-4 text-sm font-semibold text-white shadow-sm hover:bg-orangeHover disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze disabled:shadow-none"
+            className="btn-primary inline-flex h-10 items-center justify-center rounded-xl px-4 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze disabled:shadow-none"
           >
             {busy ? "Generating..." : "Generate Call Script"}
           </button>
@@ -1162,7 +1367,7 @@ function VendorCallDialog({
               type="button"
               disabled={!providerEnabled || !state.phoneNumber.trim() || !state.script || startingCall}
               onClick={handleStartCall}
-              className="inline-flex h-10 items-center justify-center rounded-lg border border-linen bg-ivory px-4 text-sm font-semibold text-taupe hover:bg-white disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/65"
+              className="btn-secondary inline-flex h-10 items-center justify-center rounded-xl px-4 text-sm font-semibold text-taupe hover:bg-white disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/65"
               title={
                 providerEnabled
                   ? state.script
@@ -1250,13 +1455,12 @@ function MissingInputField({
       <span className="text-xs font-semibold uppercase text-charcoal/50">{label}</span>
       <div className="flex items-center gap-2">
         <input
-          className="h-10 min-w-0 flex-1 rounded-lg border border-linen bg-white px-3 text-sm shadow-sm"
+          className="input-surface h-10 min-w-0 flex-1 rounded-xl px-3 text-sm"
           value={value}
           onChange={(event) => onChange(event.target.value)}
           placeholder={missingFieldPlaceholders[field]}
           type={field === "Quantity" ? "number" : "text"}
         />
-        <VendorCallButton onClick={onVendorCall} />
       </div>
     </label>
   );
@@ -1269,7 +1473,7 @@ function VendorCallButton({ onClick }: { onClick: () => void }) {
       aria-label="Call Vendor"
       title="Call Vendor"
       onClick={onClick}
-      className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-linen bg-white text-taupe shadow-sm transition hover:bg-ivory hover:text-bronze"
+      className="btn-secondary inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl text-taupe transition hover:bg-ivory hover:text-bronze"
     >
       <Phone className="h-3.5 w-3.5" />
     </button>
@@ -1291,12 +1495,6 @@ function Cell({
   onChange: (value: unknown) => void;
   onVendorCall: (missingFields: string[]) => void;
 }) {
-  const showVendorCall = isColumnMissing(row, column);
-  const callField = callFieldLabels[column] || column;
-  const vendorCallButton = showVendorCall ? (
-    <VendorCallButton onClick={() => onVendorCall([callField])} />
-  ) : null;
-
   if (column === "Include" || column === "Review Required") {
     return (
       <input
@@ -1313,50 +1511,59 @@ function Cell({
     return <span className="font-medium text-charcoal/70">{score}%</span>;
   }
 
+  if (column === "Image Upload Status") {
+    return <StatusBadge value={rowText(row, column) || "Missing Image"} />;
+  }
+
+  if (column === "Status") {
+    const value = rowText(row, column) || "Needs Review";
+    return (
+      <div className="grid gap-1.5">
+        <StatusBadge value={value} />
+        <input
+          className="input-surface h-9 w-40 rounded-xl px-2 text-sm"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      </div>
+    );
+  }
+
   if (column === "Product Category") {
     return (
-      <div className="flex items-start gap-2">
-        <select
-          className="h-9 w-36 rounded-lg border border-linen bg-white px-2 text-sm"
-          value={rowText(row, column)}
-          onChange={(event) => onChange(event.target.value)}
-        >
-          {sections.map((category) => (
-            <option key={category} value={category}>
-              {category}
-            </option>
-          ))}
-        </select>
-        {vendorCallButton}
-      </div>
+      <select
+        className="input-surface h-9 w-36 rounded-xl px-2 text-sm"
+        value={rowText(row, column)}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        {sections.map((category) => (
+          <option key={category} value={category}>
+            {category}
+          </option>
+        ))}
+      </select>
     );
   }
 
   if (column === "Suggested Action" || column === "Notes") {
     const value = column === "Notes" ? cleanNotes(rowText(row, column)) : rowText(row, column);
     return (
-      <div className="flex items-start gap-2">
-        <textarea
-          className="min-h-9 w-56 resize-none rounded-lg border border-linen bg-white px-2 py-2 text-sm"
-          value={value}
-          onChange={(event) => onChange(column === "Notes" ? cleanNotes(event.target.value) : event.target.value)}
-        />
-        {vendorCallButton}
-      </div>
+      <textarea
+        className="input-surface min-h-9 w-56 resize-none rounded-xl px-2 py-2 text-sm"
+        value={value}
+        onChange={(event) => onChange(column === "Notes" ? cleanNotes(event.target.value) : event.target.value)}
+      />
     );
   }
 
   const disabled = column === "Project";
   const width = column === "Product Name" ? "w-56" : "w-40";
   return (
-    <div className="flex items-start gap-2">
-      <input
-        className={`${width} h-9 rounded-lg border border-linen bg-white px-2 text-sm disabled:bg-ivory disabled:text-charcoal/50`}
-        value={rowText(row, column)}
-        disabled={disabled}
-        onChange={(event) => onChange(column === "Quantity" ? Number(event.target.value) : event.target.value)}
-      />
-      {vendorCallButton}
-    </div>
+    <input
+      className={`input-surface ${width} h-9 rounded-xl px-2 text-sm disabled:bg-ivory disabled:text-charcoal/50`}
+      value={rowText(row, column)}
+      disabled={disabled}
+      onChange={(event) => onChange(column === "Quantity" ? Number(event.target.value) : event.target.value)}
+    />
   );
 }

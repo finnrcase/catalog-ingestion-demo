@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import mimetypes
 import os
-import time
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
 
 from src.ai_extraction import ALLOWED_CATEGORIES, extract_json_array_from_text
+from src.image_uploader import (
+    is_public_https_image_url,
+    public_https_url_is_accessible,
+    upload_image,
+)
 from src.intake_schema import SOURCE_PHOTO, make_base_row
 
 load_dotenv()
 
 PHOTO_ONLY_NOTE = "Photo-only item; details generated from uploaded image."
 PHOTO_ONLY_BULK_NOTE = "Photo-only inventory item."
+MISSING_IMAGE_STATUS = "Missing Image"
 
 _SUPPORTED_AI_MEDIA_TYPES = {
     "image/jpeg",
@@ -41,6 +44,30 @@ def filename_stem_as_product_name(filename: str) -> str:
 
 def generated_photo_item_name(index: int) -> str:
     return f"Photo Item {max(1, int(index)):03d}"
+
+
+def build_photo_only_bulk_product_names(
+    photos: list[dict],
+    naming_mode: str,
+    default_product_name: str = "",
+    append_sequence: bool = True,
+) -> list[str]:
+    """Derive fast photo-only product names, preserving input order."""
+    default_name = str(default_product_name or "").strip()
+    if default_name:
+        return [
+            f"{default_name} {idx:03d}" if append_sequence else default_name
+            for idx, _photo in enumerate(photos, start=1)
+        ]
+
+    names: list[str] = []
+    for idx, photo in enumerate(photos, start=1):
+        filename = str(photo.get("image_filename", "") or "")
+        if naming_mode == "Generated names":
+            names.append(generated_photo_item_name(idx))
+        else:
+            names.append(filename_stem_as_product_name(filename))
+    return names
 
 
 def _photo_prompt(filename: str) -> str:
@@ -128,54 +155,24 @@ def analyze_photo_with_ai(image_path: str, filename: str) -> tuple[dict, str | N
         return fallback, f"AI photo analysis failed for '{filename}': {exc}"
 
 
-def _cloudinary_config() -> tuple[str, str, str] | None:
-    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip()
-    api_key = os.getenv("CLOUDINARY_API_KEY", "").strip()
-    api_secret = os.getenv("CLOUDINARY_API_SECRET", "").strip()
-    cloudinary_url = os.getenv("CLOUDINARY_URL", "").strip()
-
-    if cloudinary_url and not (cloud_name and api_key and api_secret):
-        from urllib.parse import urlparse
-
-        parsed = urlparse(cloudinary_url)
-        if parsed.scheme == "cloudinary" and parsed.hostname and parsed.username and parsed.password:
-            cloud_name = parsed.hostname
-            api_key = parsed.username
-            api_secret = parsed.password
-
-    if cloud_name and api_key and api_secret:
-        return cloud_name, api_key, api_secret
-    return None
-
-
 def upload_image_to_cloudinary(image_path: str) -> tuple[str, str | None]:
-    """Upload an image to Cloudinary with a signed upload and return its public URL."""
-    config = _cloudinary_config()
-    if not config:
+    """Upload an image to Cloudinary and return its public secure_url."""
+    if not (
+        os.getenv("CLOUDINARY_CLOUD_NAME")
+        and os.getenv("CLOUDINARY_API_KEY")
+        and os.getenv("CLOUDINARY_API_SECRET")
+    ):
         return "", "Cloudinary upload requires CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET."
-
-    cloud_name, api_key, api_secret = config
-    timestamp = str(int(time.time()))
-    public_id = f"programa-photo-inventory/{Path(image_path).stem}"
-    signature_base = f"public_id={public_id}&timestamp={timestamp}{api_secret}"
-    signature = hashlib.sha1(signature_base.encode("utf-8")).hexdigest()
-
     try:
         with open(image_path, "rb") as fh:
-            response = requests.post(
-                f"https://api.cloudinary.com/v1_1/{cloud_name}/image/upload",
-                data={
-                    "api_key": api_key,
-                    "timestamp": timestamp,
-                    "public_id": public_id,
-                    "signature": signature,
-                },
-                files={"file": fh},
-                timeout=45,
-            )
-        response.raise_for_status()
-        payload = response.json()
-        return str(payload.get("secure_url") or payload.get("url") or ""), None
+            secure_url = upload_image(fh)
+        if not secure_url:
+            return "", f"Cloudinary upload failed or did not return secure_url for '{Path(image_path).name}'."
+        if not is_public_https_image_url(secure_url):
+            return "", f"Cloudinary returned a non-HTTPS image URL for '{Path(image_path).name}'."
+        if not public_https_url_is_accessible(secure_url):
+            return "", f"Cloudinary image URL is not publicly accessible for '{Path(image_path).name}'."
+        return secure_url, None
     except Exception as exc:
         return "", f"Cloudinary upload failed for '{Path(image_path).name}': {exc}"
 
@@ -227,9 +224,9 @@ def create_photo_inventory_row(
             "photo_only": True,
             "Status": "Needs Review",
             "Image URL": image_url,
-            "Local Image Path": str(photo.get("local_image_path", "") or ""),
+            "Local Image Path": "",
             "Image Filename": filename,
-            "Image Upload Status": "Uploaded" if image_url else str(photo.get("image_upload_status", "") or "Needs Upload"),
+            "Image Upload Status": "Uploaded" if image_url else str(photo.get("image_upload_status", "") or MISSING_IMAGE_STATUS),
         }
     )
     return row
@@ -266,9 +263,9 @@ def create_photo_only_bulk_row(
             "photo_only": True,
             "Status": "Needs Review",
             "Image URL": image_url.strip(),
-            "Local Image Path": str(photo.get("local_image_path", "") or ""),
+            "Local Image Path": "",
             "Image Filename": str(photo.get("image_filename", "") or ""),
-            "Image Upload Status": image_upload_status or ("Uploaded" if image_url else "Needs Cloudinary"),
+            "Image Upload Status": image_upload_status or ("Uploaded" if image_url else MISSING_IMAGE_STATUS),
         }
     )
     return row
@@ -282,16 +279,20 @@ def create_photo_only_bulk_rows(
     naming_mode: str,
     image_urls: list[str],
     upload_statuses: list[str] | None = None,
+    default_product_name: str = "",
+    append_sequence: bool = True,
 ) -> list[dict]:
     """Create one fast photo-only row per photo, preserving input order."""
     rows: list[dict] = []
     statuses = upload_statuses or []
+    product_names = build_photo_only_bulk_product_names(
+        photos,
+        naming_mode=naming_mode,
+        default_product_name=default_product_name,
+        append_sequence=append_sequence,
+    )
     for idx, photo in enumerate(photos, start=1):
-        filename = str(photo.get("image_filename", "") or "")
-        if naming_mode == "Generated names":
-            product_name = generated_photo_item_name(idx)
-        else:
-            product_name = filename_stem_as_product_name(filename)
+        product_name = product_names[idx - 1] if idx - 1 < len(product_names) else ""
         image_url = image_urls[idx - 1] if idx - 1 < len(image_urls) else ""
         status = statuses[idx - 1] if idx - 1 < len(statuses) else ""
         rows.append(
