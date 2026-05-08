@@ -263,29 +263,49 @@ def _is_absolute_https(url: str) -> bool:
 
 
 def _check_image_content_type(url: str) -> bool:
-    """Return True if a HEAD request confirms Content-Type starts with image/."""
+    """Confirm url points to an image via HEAD, falling back to a GET byte-range request.
+
+    Many manufacturer CDNs (Scene7, Imgix, Akamai) block HEAD with 405/403.
+    If HEAD fails with a non-2xx status we retry with a small GET range request,
+    which is universally supported and still confirms the content-type without
+    downloading the whole image.
+    """
+    _ua = {"User-Agent": "Mozilla/5.0 (compatible; SCH-Intake/1.0)"}
     try:
-        resp = httpx.head(
+        resp = httpx.head(url, headers=_ua, timeout=5, follow_redirects=True)
+        if 200 <= resp.status_code < 300:
+            ct = resp.headers.get("content-type", "").lower()
+            return ct.startswith("image/")
+        # HEAD blocked (405, 403, etc.) — try a minimal GET
+        resp2 = httpx.get(
             url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; SCH-Intake/1.0)"},
-            timeout=5,
+            headers={**_ua, "Range": "bytes=0-1023"},
+            timeout=8,
             follow_redirects=True,
         )
-        if resp.status_code < 200 or resp.status_code >= 300:
-            return False
-        ct = resp.headers.get("content-type", "").lower()
-        return ct.startswith("image/")
+        if 200 <= resp2.status_code < 300 or resp2.status_code == 206:
+            ct = resp2.headers.get("content-type", "").lower()
+            return ct.startswith("image/")
+        return False
     except Exception:
         return False
 
 
 def extract_image_url(html: str) -> str | None:
     """
-    Extract the best image URL from raw HTML.
+    Extract the best image URL from raw HTML using a multi-source fallback pipeline.
 
-    Priority: og:image → JSON-LD "image" → largest <img> by pixel area.
-    Returns None if no valid https .jpg/.jpeg/.png URL is found.
-    Logs [IMAGE INVALID — skipped] for candidates that fail extension validation.
+    Priority order:
+      1. og:image meta tag (structured, authoritative)
+      2. twitter:image meta tag (structured)
+      3. JSON-LD Product "image" field (structured schema.org)
+      4. Largest <img> by pixel area — checks src, srcset, data-src, data-original
+
+    For structured sources (og/twitter/JSON-LD): accepts any absolute https URL;
+    content-type validation happens later in enrich_row via _check_image_content_type.
+
+    For <img> tags: applies extension pre-filter (_is_valid_image_url) and rejects
+    tiny images (both dimensions < 100px) to skip icons and tracking pixels.
     """
     import logging as _logging
     _log = _logging.getLogger(__name__)
@@ -293,8 +313,7 @@ def extract_image_url(html: str) -> str | None:
     if not html:
         return None
 
-    # Priority 1: og:image meta tag (either attribute order)
-    # Accept any absolute https URL — content-type validation happens in enrich_row.
+    # Priority 1: og:image (either attribute order)
     for pattern in (
         r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
         r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
@@ -305,9 +324,22 @@ def extract_image_url(html: str) -> str | None:
             if _is_absolute_https(candidate):
                 return candidate
             _log.info("[IMAGE INVALID — skipped] source=og:image url=%s (not absolute https)", candidate[:120])
-            break  # found og:image but not absolute https — don't fall through to other og patterns
+            break
 
-    # Priority 2: JSON-LD "image" field — same rule: any absolute https accepted.
+    # Priority 2: twitter:image (either attribute order)
+    for pattern in (
+        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+    ):
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            candidate = m.group(1).strip()
+            if _is_absolute_https(candidate):
+                return candidate
+            _log.info("[IMAGE INVALID — skipped] source=twitter:image url=%s (not absolute https)", candidate[:120])
+            break
+
+    # Priority 3: JSON-LD Product "image" field
     for ld_m in re.finditer(
         r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
         html, re.IGNORECASE | re.DOTALL,
@@ -329,25 +361,78 @@ def extract_image_url(html: str) -> str | None:
         except Exception:
             pass
 
-    # Priority 3: largest <img> tag by pixel area (width * height)
+    # Priority 4: largest <img> by pixel area.
+    # Checks src, then srcset (last/largest descriptor), then data-src / data-original.
     best_url: str | None = None
     best_area = -1
-    for img_m in re.finditer(r"<img([^>]+)>", html, re.IGNORECASE):
+    for img_m in re.finditer(r"<img([^>]+?)>", html, re.IGNORECASE):
         attrs = img_m.group(1)
-        src_m = re.search(r'\bsrc=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
-        if not src_m:
+
+        # Determine the candidate URL.
+        # srcset wins when present (contains multiple resolutions; we take the highest).
+        # Fall back to standard src, then lazy-load attributes.
+        src: str | None = None
+        srcset_m = re.search(r'\bsrcset=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+        if srcset_m:
+            # "url1 320w, url2 768w, url3 1200w" — last entry is highest-res
+            parts = [p.strip().split() for p in srcset_m.group(1).split(",") if p.strip()]
+            if parts and parts[-1]:
+                src = parts[-1][0]
+        if not src:
+            for attr in ("src", "data-src", "data-original", "data-image"):
+                src_m = re.search(rf'\b{attr}=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+                if src_m:
+                    src = src_m.group(1).strip()
+                    break
+
+        if not src or not _is_valid_image_url(src):
             continue
-        src = src_m.group(1).strip()
-        if not _is_valid_image_url(src):
-            continue
+
+        # Reject tiny images: icons, tracking pixels, sprites (< 100px on longest side)
         w_m = re.search(r'\bwidth=["\']?(\d+)', attrs, re.IGNORECASE)
         h_m = re.search(r'\bheight=["\']?(\d+)', attrs, re.IGNORECASE)
-        area = (int(w_m.group(1)) if w_m else 1) * (int(h_m.group(1)) if h_m else 1)
+        w = int(w_m.group(1)) if w_m else None
+        h = int(h_m.group(1)) if h_m else None
+        if w is not None and h is not None and max(w, h) < 100:
+            continue
+
+        area = (w or 1) * (h or 1)
         if area > best_area:
             best_area = area
             best_url = src
 
     return best_url
+
+
+def _try_image_from_url(product_url: str, cache_key: str = "") -> str | None:
+    """Fetch product_url, extract the best image candidate, and validate via content-type.
+
+    On success, updates the persistent cache so future cache hits carry the image.
+    Returns the validated image URL, or None.
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    raw_html = _fetch_page_html(product_url)
+    if not raw_html:
+        _log.info("[IMAGE PIPELINE] fetch failed url=%s", product_url[:80])
+        return None
+
+    candidate = extract_image_url(raw_html)
+    if not candidate:
+        _log.info("[IMAGE PIPELINE] no candidate found url=%s", product_url[:80])
+        return None
+
+    if not _check_image_content_type(candidate):
+        _log.info("[IMAGE PIPELINE] content-type rejected candidate=%s", candidate[:80])
+        if cache_key:
+            _product_cache.update(cache_key, {"image_url": None})
+        return None
+
+    _log.info("[IMAGE PIPELINE] found url=%s img=%s", product_url[:60], candidate[:80])
+    if cache_key:
+        _product_cache.update(cache_key, {"image_url": candidate, "general_confidence": "medium"})
+    return candidate
 
 
 def _build_extraction_prompt(page_text: str, row: dict) -> str:
@@ -514,6 +599,15 @@ def enrich_row(
                     original = _str_val(updated.get("Source Type", ""))
                     if not original.endswith("_Enriched"):
                         updated["Source Type"] = f"{original}_Enriched" if original else "Enriched"
+                    # Image is not an essential cache field; try recovering it when
+                    # the cache explicitly has null (tried before, but now extraction
+                    # logic is improved / CDN URLs were previously rejected by extension filter).
+                    if not _str_val(updated.get("Image URL")) and "image_url" in cache_entry and cache_entry["image_url"] is None:
+                        product_url = _str_val(updated.get("Product URL"))
+                        if product_url:
+                            img = _try_image_from_url(product_url, cache_key)
+                            if img:
+                                updated["Image URL"] = img
                     return updated, None, None
                 else:
                     product_cache_hit = "partial"
@@ -714,3 +808,66 @@ def enrich_dataframe(
         time.sleep(0.5)
 
     return df, errors, dimension_diagnostics
+
+
+def recover_images_for_dataframe(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Targeted image recovery pass — runs only on rows that are missing Image URL.
+
+    For each row without an image, attempts in order:
+      1. Fetch the Product URL and extract an image via the standard pipeline.
+      2. (Future) Brand/SKU-targeted image search as fallback.
+
+    Returns (updated_df, diagnostics) where diagnostics is a list of per-row dicts:
+      {row_index, product_name, status ("found"|"not_found"), source, image_url}
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+
+    df = df.copy()
+    if "Image URL" not in df.columns:
+        df["Image URL"] = ""
+    diagnostics: list[dict] = []
+
+    for idx, row in df.iterrows():
+        if _str_val(row.get("Image URL")):
+            continue  # already has image — skip
+
+        r = row.to_dict()
+        product_name = _str_val(r.get("Product Name"))
+        brand = _str_val(r.get("Brand"))
+        model_sku = _str_val(r.get("Model/SKU"))
+        cache_key = _normalize_key(brand, model_sku) if brand and model_sku else ""
+
+        image_url: str | None = None
+        source = "none"
+
+        # Step 1: fetch the cached/available Product URL
+        product_url = _str_val(r.get("Product URL"))
+        if product_url:
+            _log.info("[RECOVER] row=%s trying product_url=%s", idx, product_url[:80])
+            image_url = _try_image_from_url(product_url, cache_key)
+            if image_url:
+                source = "product_url"
+
+        diagnostics.append({
+            "row_index": int(idx),
+            "product_name": product_name,
+            "brand": brand,
+            "model_sku": model_sku,
+            "product_url": product_url,
+            "status": "found" if image_url else "not_found",
+            "source": source,
+            "image_url": image_url or "",
+        })
+
+        if image_url and "Image URL" in df.columns:
+            df.at[idx, "Image URL"] = image_url
+
+        time.sleep(0.3)
+
+    found = sum(1 for d in diagnostics if d["status"] == "found")
+    _log.info("[RECOVER] complete — recovered %d / %d missing images", found, len(diagnostics))
+    return df, diagnostics

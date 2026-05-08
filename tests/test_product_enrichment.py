@@ -455,6 +455,211 @@ def test_check_image_content_type_rejects_empty_content_type():
         assert _check_image_content_type("https://example.com/asset") is False
 
 
+def test_check_image_content_type_get_fallback_when_head_fails():
+    """If HEAD returns 405/403, retry with GET range request."""
+    head_resp = MagicMock()
+    head_resp.status_code = 405
+    head_resp.headers = {}
+
+    get_resp = MagicMock()
+    get_resp.status_code = 206
+    get_resp.headers = {"content-type": "image/jpeg"}
+
+    with patch("src.product_enrichment.httpx.head", return_value=head_resp), \
+         patch("src.product_enrichment.httpx.get", return_value=get_resp):
+        assert _check_image_content_type("https://cdn.example.com/image") is True
+
+
+def test_check_image_content_type_rejects_when_both_head_and_get_fail():
+    """HEAD 405, GET 404 → False."""
+    head_resp = MagicMock()
+    head_resp.status_code = 405
+    head_resp.headers = {}
+
+    get_resp = MagicMock()
+    get_resp.status_code = 404
+    get_resp.headers = {"content-type": "text/html"}
+
+    with patch("src.product_enrichment.httpx.head", return_value=head_resp), \
+         patch("src.product_enrichment.httpx.get", return_value=get_resp):
+        assert _check_image_content_type("https://cdn.example.com/missing") is False
+
+
+# ── extract_image_url — extended sources ──────────────────────────────────────
+
+def test_extract_image_url_twitter_image():
+    html = '<meta name="twitter:image" content="https://example.com/card.jpg">'
+    assert extract_image_url(html) == "https://example.com/card.jpg"
+
+
+def test_extract_image_url_twitter_image_content_first():
+    html = '<meta content="https://example.com/card.jpg" name="twitter:image">'
+    assert extract_image_url(html) == "https://example.com/card.jpg"
+
+
+def test_extract_image_url_data_src():
+    html = '<img data-src="https://example.com/lazy.jpg" width="800" height="600">'
+    assert extract_image_url(html) == "https://example.com/lazy.jpg"
+
+
+def test_extract_image_url_data_original():
+    html = '<img data-original="https://example.com/orig.jpg" width="600" height="400">'
+    assert extract_image_url(html) == "https://example.com/orig.jpg"
+
+
+def test_extract_image_url_srcset_returns_last_largest():
+    html = (
+        '<img srcset="https://example.com/sm.jpg 320w, '
+        'https://example.com/lg.jpg 1200w" '
+        'src="https://example.com/fallback.jpg">'
+    )
+    result = extract_image_url(html)
+    assert result == "https://example.com/lg.jpg"
+
+
+def test_extract_image_url_rejects_tiny_image():
+    """Images with both width and height < 100 are skipped (icons, tracking pixels)."""
+    html = (
+        '<img src="https://example.com/icon.png" width="32" height="32">'
+        '<img src="https://example.com/product.jpg" width="800" height="600">'
+    )
+    assert extract_image_url(html) == "https://example.com/product.jpg"
+
+
+def test_extract_image_url_og_takes_priority_over_twitter():
+    html = (
+        '<meta property="og:image" content="https://example.com/og.jpg">'
+        '<meta name="twitter:image" content="https://example.com/tw.jpg">'
+    )
+    assert extract_image_url(html) == "https://example.com/og.jpg"
+
+
+def test_extract_image_url_twitter_before_jsonld():
+    import json
+    data = {"image": "https://example.com/ld.jpg"}
+    html = (
+        f'<meta name="twitter:image" content="https://example.com/tw.jpg">'
+        f'<script type="application/ld+json">{json.dumps(data)}</script>'
+    )
+    assert extract_image_url(html) == "https://example.com/tw.jpg"
+
+
+# ── enrich_row image recovery on full cache hit ───────────────────────────────
+
+def test_enrich_row_image_from_product_url_on_full_cache_hit(monkeypatch, tmp_path):
+    """On full cache hit where image_url is null, enrich_row fetches the product URL to get image."""
+    from src.enrichment_cache import ProductEnrichmentCache, normalize_key
+    import src.product_enrichment as pe
+
+    cache = ProductEnrichmentCache()
+    cache._path = str(tmp_path / "c.json")
+    cache._data = {}
+    key = normalize_key("Wolf", "MDD30TS")
+    cache.update(key, {
+        "product_url": "https://wolfappliance.com/mdd30ts",
+        "dimensions": '30"W x 15"H x 17"D',
+        "image_url": None,
+        "general_confidence": "high",
+        "dimension_confidence": "high",
+    })
+    monkeypatch.setattr(pe, "_product_cache", cache)
+
+    html_with_image = '<meta property="og:image" content="https://wolfappliance.com/img/mdd30ts.jpg">'
+
+    with patch("src.product_enrichment._fetch_page_html", return_value=html_with_image), \
+         patch("src.product_enrichment._check_image_content_type", return_value=True):
+        updated, error, _ = enrich_row(_qualifying_row())
+
+    assert error is None
+    assert updated.get("Image URL") == "https://wolfappliance.com/img/mdd30ts.jpg"
+
+
+def test_enrich_row_full_cache_hit_no_extra_search_when_image_already_cached(monkeypatch, tmp_path):
+    """Full cache hit with valid cached image_url should NOT trigger a page fetch."""
+    from src.enrichment_cache import ProductEnrichmentCache, normalize_key
+    import src.product_enrichment as pe
+
+    cache = ProductEnrichmentCache()
+    cache._path = str(tmp_path / "c.json")
+    cache._data = {}
+    key = normalize_key("Wolf", "MDD30TS")
+    cache.update(key, {
+        "product_url": "https://wolfappliance.com/mdd30ts",
+        "dimensions": '30"W x 15"H x 17"D',
+        "image_url": "https://wolfappliance.com/img/cached.jpg",
+        "general_confidence": "high",
+        "dimension_confidence": "high",
+    })
+    monkeypatch.setattr(pe, "_product_cache", cache)
+
+    with patch("src.product_enrichment._fetch_page_html") as mock_fetch:
+        updated, error, _ = enrich_row(_qualifying_row())
+
+    mock_fetch.assert_not_called()
+    assert updated.get("Image URL") == "https://wolfappliance.com/img/cached.jpg"
+
+
+# ── recover_images_for_dataframe ──────────────────────────────────────────────
+
+from src.product_enrichment import recover_images_for_dataframe
+
+
+def test_recover_images_skips_rows_with_existing_image():
+    rows = [{
+        **_qualifying_row(),
+        "Image URL": "https://example.com/existing.jpg",
+        "Product URL": "https://wolfappliance.com/product",
+    }]
+    df = pd.DataFrame(rows)
+    with patch("src.product_enrichment._fetch_page_html") as mock_fetch:
+        updated_df, diagnostics = recover_images_for_dataframe(df)
+    mock_fetch.assert_not_called()
+    assert updated_df.iloc[0]["Image URL"] == "https://example.com/existing.jpg"
+
+
+def test_recover_images_finds_image_from_product_url():
+    rows = [{**_qualifying_row(), "Product URL": "https://wolfappliance.com/mdd30ts"}]
+    df = pd.DataFrame(rows)
+    html = '<meta property="og:image" content="https://wolfappliance.com/img.jpg">'
+
+    with patch("src.product_enrichment._fetch_page_html", return_value=html), \
+         patch("src.product_enrichment._check_image_content_type", return_value=True), \
+         patch("src.product_enrichment.time.sleep"):
+        updated_df, diagnostics = recover_images_for_dataframe(df)
+
+    assert updated_df.iloc[0]["Image URL"] == "https://wolfappliance.com/img.jpg"
+    assert diagnostics[0]["status"] == "found"
+    assert diagnostics[0]["source"] == "product_url"
+
+
+def test_recover_images_returns_not_found_diagnostic_when_no_image():
+    rows = [{**_qualifying_row(), "Product URL": "https://wolfappliance.com/mdd30ts"}]
+    df = pd.DataFrame(rows)
+
+    with patch("src.product_enrichment._fetch_page_html", return_value="<html><body>No image here</body></html>"), \
+         patch("src.product_enrichment.time.sleep"):
+        updated_df, diagnostics = recover_images_for_dataframe(df)
+
+    assert not updated_df.iloc[0].get("Image URL")
+    assert diagnostics[0]["status"] == "not_found"
+
+
+def test_recover_images_reports_recovered_count():
+    rows = [
+        {**_qualifying_row(), "Brand": "Wolf", "Model/SKU": "MDD30TS", "Product URL": "https://wolfappliance.com/p1"},
+        {**_qualifying_row(), "Brand": "Miele", "Model/SKU": "CVA7440", "Product URL": "https://miele.com/p2"},
+    ]
+    df = pd.DataFrame(rows)
+    html = '<meta property="og:image" content="https://example.com/img.jpg">'
+
+    with patch("src.product_enrichment._fetch_page_html", return_value=html), \
+         patch("src.product_enrichment._check_image_content_type", return_value=True), \
+         patch("src.product_enrichment.time.sleep"):
+        updated_df, diagnostics = recover_images_for_dataframe(df)
+
+    assert sum(1 for d in diagnostics if d["status"] == "found") == 2
+
+
 def test_enrich_row_extracts_and_fills_image_url():
     """When page HTML contains a valid image, enrich_row fills Image URL on the row."""
     good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
