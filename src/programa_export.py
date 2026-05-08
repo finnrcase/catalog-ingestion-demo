@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import io
 import re
+import zipfile
 
 import pandas as pd
 
@@ -80,6 +81,7 @@ _DEBUG_EXTRA_COLUMNS: list[str] = [
     "AI Category Confidence",
     "Category Source",
     "Local Image Path",
+    "Image Filename",
     "Dimension Source URL",
     "Dimension Confidence",
     "Dimension Source Type",
@@ -437,4 +439,119 @@ def export_programa_xlsx(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Programa Import")
+    return buf.getvalue()
+
+
+_MANIFEST_COLUMNS: list[str] = [
+    "Product Name",
+    "Brand",
+    "SKU/Model",
+    "Product URL",
+    "Original Image URL",
+    "Local Image Filename",
+    "Image Status",
+    "Error",
+]
+
+
+def export_programa_zip(
+    rows,
+    include_images: bool = True,
+    manual_images: dict | None = None,
+) -> bytes:
+    """
+    Build a ZIP archive for the Programa export.
+
+    Contents
+    --------
+    programa_import.csv  — the standard 21-column Programa import file
+    images/              — one .jpg per successfully downloaded/uploaded product image
+    manifest.csv         — per-row image status: URL, filename, status, errors
+
+    Parameters
+    ----------
+    rows : list[dict] | pd.DataFrame
+        Intake rows (same format accepted by build_programa_import_dataframe).
+    include_images : bool
+        If False, skip all image processing (manifest records "missing_image_url").
+    manual_images : dict[int, bytes] | None
+        Manually uploaded JPEG bytes keyed by 0-based index in `rows`.
+        Manual images take priority over remote URL download.
+        Status in manifest will be "manually_uploaded".
+    """
+    from src.image_assets import download_and_convert_image as _download_convert, build_image_filename
+
+    manual_images = manual_images or {}
+    row_list = _to_row_list(rows)
+
+    df = build_programa_import_dataframe(rows)
+    csv_bytes = export_programa_csv(df)
+
+    # Track seen filenames for deduplication: "wolf_mdd30ts.jpg" -> count
+    seen_filenames: dict[str, int] = {}
+
+    def _unique_filename(filename: str) -> str:
+        if filename not in seen_filenames:
+            seen_filenames[filename] = 1
+            return filename
+        seen_filenames[filename] += 1
+        if "." in filename:
+            stem, ext = filename.rsplit(".", 1)
+            return f"{stem}_{seen_filenames[filename]}.{ext}"
+        return f"{filename}_{seen_filenames[filename]}"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("programa_import.csv", csv_bytes.decode("utf-8"))
+
+        manifest_rows: list[dict] = []
+        for i, r in enumerate(row_list):
+            if not _is_exportable(r):
+                continue
+
+            image_url = _str_val(r.get("Image URL"))
+            brand = _str_val(r.get("Brand"))
+            sku = _str_val(r.get("Model/SKU"))
+            product_name = _str_val(r.get("Product Name"))
+
+            manifest_row: dict = {
+                "Product Name": product_name,
+                "Brand": brand,
+                "SKU/Model": sku,
+                "Product URL": _str_val(r.get("Product URL")),
+                "Original Image URL": image_url,
+                "Local Image Filename": "",
+                "Image Status": "missing_image_url",
+                "Error": "",
+            }
+
+            if include_images:
+                manual_bytes = manual_images.get(i)
+                if manual_bytes:
+                    filename = _unique_filename(build_image_filename(brand, sku, product_name))
+                    manifest_row["Local Image Filename"] = filename
+                    manifest_row["Image Status"] = "manually_uploaded"
+                    zf.writestr(f"images/{filename}", manual_bytes)
+                elif _is_public_https_image_url(image_url):
+                    result = _download_convert(
+                        image_url,
+                        brand=brand,
+                        model_sku=sku,
+                        product_name=product_name,
+                    )
+                    manifest_row["Image Status"] = result["image_status"]
+                    manifest_row["Error"] = result.get("error", "")
+                    if result["image_status"] == "downloaded" and result.get("jpeg_bytes"):
+                        filename = _unique_filename(result["local_image_filename"])
+                        manifest_row["Local Image Filename"] = filename
+                        zf.writestr(f"images/{filename}", result["jpeg_bytes"])
+
+            manifest_rows.append(manifest_row)
+
+        if manifest_rows:
+            manifest_df = pd.DataFrame(manifest_rows, columns=_MANIFEST_COLUMNS)
+            mbuf = io.StringIO()
+            manifest_df.to_csv(mbuf, index=False)
+            zf.writestr("manifest.csv", mbuf.getvalue())
+
     return buf.getvalue()
