@@ -33,6 +33,7 @@ from src.programa_export import (
     build_programa_import_dataframe,
     export_programa_csv,
     export_programa_xlsx,
+    export_programa_zip,
     validate_for_export,
 )
 from src.programa_automation import (
@@ -46,7 +47,7 @@ from src.ai_extraction import extract_products_from_pdf_with_ai
 from src.document_parser import parse_pdf_rows
 from src.category_ai import suggest_categories_batch
 from src.notes import remove_notes_row_prefix
-from src.product_enrichment import enrich_dataframe, has_complete_3d_dimensions
+from src.product_enrichment import enrich_dataframe, recover_images_for_dataframe, has_complete_3d_dimensions
 from src.brave_search import BRAVE_API_KEY as _BRAVE_API_KEY
 from src.manufacturer_domains import save_manufacturer_override
 from src.enrichment_debug import debug_enrich_dataframe, save_debug_report
@@ -197,6 +198,8 @@ if "enrichment_errors" not in st.session_state:
     st.session_state.enrichment_errors = []
 if "use_web_enrichment" not in st.session_state:
     st.session_state.use_web_enrichment = True
+if "manual_image_uploads" not in st.session_state:
+    st.session_state.manual_image_uploads = {}  # {row_idx: jpeg_bytes}
 if "vendor_call_panel" not in st.session_state:
     st.session_state.vendor_call_panel = None
 if "vendor_call_results" not in st.session_state:
@@ -622,18 +625,32 @@ with right_col:
 st.markdown("<div style='height:1.25rem'></div>", unsafe_allow_html=True)
 
 with st.container(border=True):
-    st.checkbox(
-        "Use web search to find missing product details (recommended)",
-        key="use_web_enrichment",
-        help=(
-            "When enabled, the system searches manufacturer websites to fill missing data. "
-            "Turn off to only use uploaded documents and manual input."
-        ),
-    )
-    st.caption(
-        "When enabled, the system searches manufacturer websites to fill missing data. "
-        "Turn off to only use uploaded documents and manual input."
-    )
+    _enrich_col, _refresh_col = st.columns(2)
+    with _enrich_col:
+        st.checkbox(
+            "Use web search to find missing product details (recommended)",
+            key="use_web_enrichment",
+            help=(
+                "When enabled, the system searches manufacturer websites to fill missing data. "
+                "Turn off to only use uploaded documents and manual input."
+            ),
+        )
+        st.caption(
+            "When enabled, searches manufacturer sites to fill missing data."
+        )
+    with _refresh_col:
+        st.checkbox(
+            "Force refresh cached product data",
+            key="force_refresh_enrichment",
+            value=False,
+            help=(
+                "Ignore previously cached enrichment results and re-fetch all fields. "
+                "Use after improving extraction logic or to recover missing images."
+            ),
+        )
+        st.caption(
+            "Re-fetches all fields even if previously cached. Slower but recovers missed data."
+        )
     st.divider()
     section_label("Manufacturer Override")
     st.caption(
@@ -899,6 +916,7 @@ if st.session_state.intake_df is not None:
                 _enriched_df, _enrich_errors, _ = enrich_dataframe(
                     df,
                     use_web_enrichment=st.session_state.get("use_web_enrichment", True),
+                    force_refresh=st.session_state.get("force_refresh_enrichment", False),
                 )
                 st.session_state.intake_df = apply_confidence_checks(_enriched_df)
                 st.session_state.enrichment_errors = _enrich_errors
@@ -913,6 +931,95 @@ if st.session_state.intake_df is not None:
             "details added to Notes for those rows.",
             icon="⚠️",
         )
+
+    # ── Image status summary ───────────────────────────────────────────────────
+    def _has_valid_image(v) -> bool:
+        s = str(v or "").strip()
+        return bool(s) and s.lower() not in {"nan", "none", ""}
+
+    if "Image URL" in df.columns:
+        _total_n = len(df[df.get("Include", pd.Series([True] * len(df))) != False])
+        _with_image = int(df["Image URL"].apply(_has_valid_image).sum())
+        _missing_image_count = _total_n - _with_image
+    else:
+        _total_n = len(df)
+        _with_image = 0
+        _missing_image_count = _total_n
+
+    with st.container(border=True):
+        _img_title_col, _img_action_col = st.columns([5, 3])
+        with _img_title_col:
+            section_label("Image Status")
+        with _img_action_col:
+            if _missing_image_count > 0 and _BRAVE_API_KEY:
+                if st.button(
+                    "Recover Missing Images",
+                    type="secondary",
+                    use_container_width=True,
+                    help="Fetches product pages for rows without Image URL and extracts images.",
+                ):
+                    with st.spinner(f"Recovering images for {_missing_image_count} row(s)…"):
+                        _recovered_df, _img_diagnostics = recover_images_for_dataframe(df)
+                        st.session_state.intake_df = apply_confidence_checks(_recovered_df)
+                        st.session_state.manual_image_uploads = {}
+                    _found = sum(1 for d in _img_diagnostics if d["status"] == "found")
+                    if _found:
+                        st.success(f"Recovered {_found} of {len(_img_diagnostics)} missing images.")
+                    else:
+                        st.warning(
+                            "No images recovered automatically. "
+                            "Check that Product URL is populated, or upload images manually below."
+                        )
+                    st.rerun()
+
+        _s1, _s2, _s3, _s4 = st.columns(4)
+        _s1.metric("Total products", _total_n)
+        _s2.metric("Images found", _with_image)
+        _s3.metric("Missing images", _missing_image_count, delta=None if _missing_image_count == 0 else f"-{_missing_image_count}", delta_color="inverse")
+        # Count manually uploaded this session
+        _manually_uploaded = len(st.session_state.get("manual_image_uploads", {}))
+        _s4.metric("Manual uploads this session", _manually_uploaded)
+
+        # Per-product upload fallback
+        if _missing_image_count > 0:
+            st.caption("Upload images manually for products that could not be recovered automatically.")
+            _missing_rows = df[df["Image URL"].apply(lambda v: not _has_valid_image(v))] if "Image URL" in df.columns else df
+
+            with st.expander(f"Upload Images for {len(_missing_rows)} Product(s)", expanded=False):
+                from src.image_assets import _convert_to_jpeg
+
+                for _row_idx in _missing_rows.index:
+                    _row = df.loc[_row_idx]
+                    _pname = str(_row.get("Product Name", "")).strip() or f"Row {_row_idx}"
+                    _brand = str(_row.get("Brand", "")).strip()
+                    _sku = str(_row.get("Model/SKU", "")).strip()
+
+                    _thumb_col, _info_col = st.columns([1, 4])
+                    with _info_col:
+                        st.markdown(f"**{_pname}**" + (f" — {_brand} {_sku}" if _brand or _sku else ""))
+                        _uploaded = st.file_uploader(
+                            "Choose image file",
+                            type=["jpg", "jpeg", "png", "webp"],
+                            key=f"img_upload_{_row_idx}",
+                            label_visibility="collapsed",
+                        )
+                        if _uploaded is not None:
+                            try:
+                                _jpeg_bytes = _convert_to_jpeg(_uploaded.read())
+                                _cloud_url, _cloud_err = upload_image_to_cloudinary(
+                                    type("_F", (), {"read": lambda self: _jpeg_bytes, "seek": lambda self, *a: None})()
+                                ) if _BRAVE_API_KEY else (None, "Cloudinary not configured")
+                                if _cloud_url:
+                                    df.at[_row_idx, "Image URL"] = _cloud_url
+                                    st.session_state.intake_df = apply_confidence_checks(df)
+                                    st.success(f"Uploaded: {_cloud_url}")
+                                else:
+                                    # Store JPEG locally for ZIP export
+                                    st.session_state.manual_image_uploads[int(_row_idx)] = _jpeg_bytes
+                                    st.info("Image attached for ZIP export (Cloudinary not configured).")
+                            except Exception as _e:
+                                st.error(f"Upload failed: {_e}")
+                    st.divider()
 
     st.divider()
 
@@ -1620,7 +1727,7 @@ if st.session_state.intake_df is not None:
                 reason = item.get("reason") or "missing Product Name"
                 st.markdown(f"- Row {item['index']}: {reason}")
 
-    _dl_col1, _dl_col2, _dl_spacer = st.columns([1, 1, 4])
+    _dl_col1, _dl_col2, _dl_col3 = st.columns(3)
     with _dl_col1:
         st.download_button(
             label="Download Programa CSV",
@@ -1638,6 +1745,24 @@ if st.session_state.intake_df is not None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
             disabled=_programa_df.empty,
+        )
+    with _dl_col3:
+        _manual_uploads = st.session_state.get("manual_image_uploads", {})
+        _covered_by_manual = len(_manual_uploads)
+        _net_missing = max(0, _missing_img - _covered_by_manual)
+        if _net_missing > 0:
+            st.caption(
+                f"ZIP will export without images for {_net_missing} product{'s' if _net_missing != 1 else ''}. "
+                "Upload images above or add Image URLs before exporting."
+            )
+        st.download_button(
+            label="Download ZIP (CSV + images)",
+            data=export_programa_zip(included, manual_images=_manual_uploads),
+            file_name=f"programa_export_{_today}.zip",
+            mime="application/zip",
+            use_container_width=True,
+            disabled=not included,
+            help="ZIP archive containing the Programa CSV, downloaded product images (JPG), and a per-product image manifest.",
         )
 
     _include_debug = st.checkbox("Include debug columns", key="programa_debug_export")

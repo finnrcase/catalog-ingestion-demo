@@ -27,13 +27,14 @@ from src.intake_schema import CATEGORIES, STATUSES
 from src.image_uploader import is_public_https_image_url, upload_image
 from src.manufacturer_domains import save_manufacturer_override
 from src.notes import remove_notes_row_prefix
-from src.product_enrichment import enrich_dataframe
+from src.product_enrichment import enrich_dataframe, recover_images_for_dataframe
 from src.programa_export import (
     CANONICAL_SECTIONS,
     build_programa_debug_dataframe,
     build_programa_import_dataframe,
     export_programa_csv,
     export_programa_xlsx,
+    export_programa_zip,
     validate_for_export,
 )
 from src.programa_automation import open_programa_login_window, run_programa_automation
@@ -293,6 +294,19 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
     return _df_response(df, errors, dimension_diagnostics)
 
 
+@app.post("/intake/recover-images", response_model=IntakeResponse)
+def recover_images(payload: RowsPayload) -> IntakeResponse:
+    """Run a targeted image recovery pass on rows that are missing Image URL.
+
+    Only rows without an Image URL are processed; all others are returned unchanged.
+    Diagnostics (per-row status, source, recovered URL) are returned in the
+    dimension_diagnostics field for now — the contract may be extended later.
+    """
+    df, diagnostics = recover_images_for_dataframe(pd.DataFrame(payload.rows))
+    df = apply_confidence_checks(df)
+    return _df_response(df, dimension_diagnostics=diagnostics)
+
+
 @app.post("/manufacturer-override")
 def manufacturer_override(payload: ManufacturerOverridePayload) -> dict:
     try:
@@ -546,6 +560,18 @@ def export_programa_import_xlsx(payload: RowsPayload) -> Response:
         content=export_programa_xlsx(df),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="programa_import_{today}.xlsx"'},
+    )
+
+
+@app.post("/export/programa/zip")
+def export_programa_import_zip(payload: RowsPayload) -> Response:
+    """ZIP archive: programa_import.csv + images/ folder + manifest.csv."""
+    today = datetime.date.today().isoformat()
+    zip_bytes = export_programa_zip(payload.rows)
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="programa_export_{today}.zip"'},
     )
 
 
