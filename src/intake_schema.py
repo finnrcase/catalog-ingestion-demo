@@ -127,8 +127,14 @@ def make_base_row(
     """
     Return a blank row dict with every column at its default value.
     Callers fill in the source-specific fields after calling this.
+
+    Internal `_source_*` fields (added Phase 1 image recovery, 2026-05-08)
+    record which uploaded PDF and page a row was parsed from. They are
+    intentionally NOT in ALL_COLUMNS so the standard Programa CSV/XLSX
+    export stays clean. They surface only in the debug export and in the
+    manifest CSV inside the Programa ZIP.
     """
-    return {
+    base = {
         "Include":          True,
         "Project":          project,
         "Room":             room,
@@ -160,3 +166,7 @@ def make_base_row(
         "Dimension Source Type":  "",
         "Dimension Lookup Status": "",
     }
+    base["_source_pdf_id"] = ""
+    base["_source_page_number"] = None
+    base["_source_filename"] = ""
+    return base
