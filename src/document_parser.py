@@ -226,31 +226,32 @@ def parse_pdf_rows(
 ) -> list[dict]:
     """
     Extract structured product rows from a PDF using heuristic text/table parsing.
-    No AI call is made. Unknown fields are left blank — never invented.
 
-    Parameters
-    ----------
-    pdf_file : Streamlit UploadedFile or any object with .read() and .seek().
-    project, room, supplier, notes : metadata applied to every row.
-
-    Returns
-    -------
-    list[dict] of partial row dicts aligned to make_base_row() field names.
-    Empty list if the PDF has no parseable text.
+    Phase 1 image recovery (2026-05-08) annotates each row with internal
+    `_source_pdf_id` (SHA1[:12] of the PDF bytes), `_source_page_number`
+    (1-indexed page the row came from), and `_source_filename` (when the
+    upload object exposes a `name` attribute).
     """
     try:
         import fitz
     except ImportError:
         raise ImportError("PyMuPDF is required. Run: pip install pymupdf")
 
+    import hashlib
+
     raw = pdf_file.read()
     pdf_file.seek(0)
+
+    pdf_id = hashlib.sha1(raw).hexdigest()[:12]
+    filename = getattr(pdf_file, "name", "") or ""
 
     doc = fitz.open(stream=raw, filetype="pdf")
     all_rows: list[dict] = []
     seen_keys: set[tuple[str, str]] = set()
 
-    for page in doc:
+    for page_index, page in enumerate(doc):
+        page_number = page_index + 1
+
         # 1. Try table extraction first
         table_rows = _parse_table_rows(page, project, room, supplier, notes)
         if table_rows:
@@ -261,6 +262,9 @@ def parse_pdf_rows(
                 )
                 if key not in seen_keys:
                     seen_keys.add(key)
+                    r["_source_pdf_id"] = pdf_id
+                    r["_source_page_number"] = page_number
+                    r["_source_filename"] = filename
                     all_rows.append(r)
             continue
 
@@ -279,6 +283,9 @@ def parse_pdf_rows(
             )
             if key not in seen_keys:
                 seen_keys.add(key)
+                row["_source_pdf_id"] = pdf_id
+                row["_source_page_number"] = page_number
+                row["_source_filename"] = filename
                 all_rows.append(row)
 
     doc.close()

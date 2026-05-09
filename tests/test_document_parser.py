@@ -90,3 +90,47 @@ def test_extract_price_decimal():
 
 def test_extract_price_none():
     assert _extract_price("Chair no price here") == ""
+
+
+# ── Source annotation ──────────────────────────────────────────────────────────
+
+def test_parsed_rows_carry_source_pdf_id_and_page(tmp_path):
+    import io as _io
+    import fitz
+    from src.document_parser import parse_pdf_rows
+
+    doc = fitz.open()
+    p1 = doc.new_page(width=595, height=842)
+    p1.insert_text((50, 50), "Wolf MDD30TS Warming Drawer 1 ea $999")
+    p2 = doc.new_page(width=595, height=842)
+    p2.insert_text((50, 50), "Sub-Zero ID36R Refrigerator 1 ea $5000")
+    pdf_path = tmp_path / "spec.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+
+    class _Up:
+        def __init__(self, raw, name):
+            self._raw = raw
+            self._pos = 0
+            self.name = name
+        def read(self):
+            return self._raw
+        def seek(self, p):
+            self._pos = p
+
+    raw = pdf_path.read_bytes()
+    up = _Up(raw, "spec.pdf")
+    rows = parse_pdf_rows(up)
+    assert rows, "expected at least one row from synthetic PDF"
+
+    # All rows share the same _source_pdf_id (it's the SHA1 of the bytes).
+    pdf_ids = {r.get("_source_pdf_id") for r in rows}
+    assert len(pdf_ids) == 1
+    assert next(iter(pdf_ids))
+
+    # Page numbers are 1-indexed.
+    pages = {r.get("_source_page_number") for r in rows}
+    assert pages.issubset({1, 2})
+
+    # Filename preserved.
+    assert all(r.get("_source_filename") == "spec.pdf" for r in rows)
