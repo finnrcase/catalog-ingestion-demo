@@ -811,63 +811,22 @@ def enrich_dataframe(
 
 
 def recover_images_for_dataframe(
-    df: pd.DataFrame,
-) -> tuple[pd.DataFrame, list[dict]]:
+    df,
+    pdf_lookup: dict[str, str] | None = None,
+    session_id: str | None = None,
+    enable_screenshot: bool = True,
+):
     """
-    Targeted image recovery pass — runs only on rows that are missing Image URL.
+    Backward-compatible alias for src.image_recovery.recover_images_for_dataframe.
 
-    For each row without an image, attempts in order:
-      1. Fetch the Product URL and extract an image via the standard pipeline.
-      2. (Future) Brand/SKU-targeted image search as fallback.
-
-    Returns (updated_df, diagnostics) where diagnostics is a list of per-row dicts:
-      {row_index, product_name, status ("found"|"not_found"), source, image_url}
+    Existing callers that pass only `df` continue to work — PDF crop is
+    skipped (no pdf_lookup) and screenshot defaults to True. Real production
+    callers in app.py and backend/main.py pass pdf_lookup + session_id.
     """
-    import logging as _logging
-    _log = _logging.getLogger(__name__)
-
-    df = df.copy()
-    if "Image URL" not in df.columns:
-        df["Image URL"] = ""
-    diagnostics: list[dict] = []
-
-    for idx, row in df.iterrows():
-        if _str_val(row.get("Image URL")):
-            continue  # already has image — skip
-
-        r = row.to_dict()
-        product_name = _str_val(r.get("Product Name"))
-        brand = _str_val(r.get("Brand"))
-        model_sku = _str_val(r.get("Model/SKU"))
-        cache_key = _normalize_key(brand, model_sku) if brand and model_sku else ""
-
-        image_url: str | None = None
-        source = "none"
-
-        # Step 1: fetch the cached/available Product URL
-        product_url = _str_val(r.get("Product URL"))
-        if product_url:
-            _log.info("[RECOVER] row=%s trying product_url=%s", idx, product_url[:80])
-            image_url = _try_image_from_url(product_url, cache_key)
-            if image_url:
-                source = "product_url"
-
-        diagnostics.append({
-            "row_index": int(idx),
-            "product_name": product_name,
-            "brand": brand,
-            "model_sku": model_sku,
-            "product_url": product_url,
-            "status": "found" if image_url else "not_found",
-            "source": source,
-            "image_url": image_url or "",
-        })
-
-        if image_url and "Image URL" in df.columns:
-            df.at[idx, "Image URL"] = image_url
-
-        time.sleep(0.3)
-
-    found = sum(1 for d in diagnostics if d["status"] == "found")
-    _log.info("[RECOVER] complete — recovered %d / %d missing images", found, len(diagnostics))
-    return df, diagnostics
+    from src.image_recovery import recover_images_for_dataframe as _impl
+    return _impl(
+        df,
+        pdf_lookup=pdf_lookup,
+        session_id=session_id,
+        enable_screenshot=enable_screenshot,
+    )

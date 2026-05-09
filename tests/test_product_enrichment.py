@@ -600,64 +600,59 @@ def test_enrich_row_full_cache_hit_no_extra_search_when_image_already_cached(mon
 
 
 # ── recover_images_for_dataframe ──────────────────────────────────────────────
+# These tests verify the legacy entry point in product_enrichment delegates to
+# src.image_recovery.recover_images_for_dataframe. The detailed row-iteration
+# mechanics (skip-existing, find-from-url, not-found, multi-row counts) are
+# fully covered by tests/test_image_recovery.py (Task 7).
 
 from src.product_enrichment import recover_images_for_dataframe
 
 
-def test_recover_images_skips_rows_with_existing_image():
-    rows = [{
-        **_qualifying_row(),
-        "Image URL": "https://example.com/existing.jpg",
-        "Product URL": "https://wolfappliance.com/product",
-    }]
+def test_recover_images_legacy_entry_point_delegates():
+    """Legacy entry point forwards to image_recovery and returns its result unchanged."""
+    rows = [{**_qualifying_row(), "Image URL": "", "Product URL": "https://wolfappliance.com/p"}]
     df = pd.DataFrame(rows)
-    with patch("src.product_enrichment._fetch_page_html") as mock_fetch:
-        updated_df, diagnostics = recover_images_for_dataframe(df)
-    mock_fetch.assert_not_called()
-    assert updated_df.iloc[0]["Image URL"] == "https://example.com/existing.jpg"
+    expected_df = df.copy()
+    expected_df.at[0, "Image URL"] = "https://wolfappliance.com/img.jpg"
+    expected_diagnostics = [{"row_index": 0, "status": "found"}]
 
-
-def test_recover_images_finds_image_from_product_url():
-    rows = [{**_qualifying_row(), "Product URL": "https://wolfappliance.com/mdd30ts"}]
-    df = pd.DataFrame(rows)
-    html = '<meta property="og:image" content="https://wolfappliance.com/img.jpg">'
-
-    with patch("src.product_enrichment._fetch_page_html", return_value=html), \
-         patch("src.product_enrichment._check_image_content_type", return_value=True), \
-         patch("src.product_enrichment.time.sleep"):
+    with patch("src.image_recovery.recover_images_for_dataframe", return_value=(expected_df, expected_diagnostics)) as m:
         updated_df, diagnostics = recover_images_for_dataframe(df)
 
+    assert m.called
     assert updated_df.iloc[0]["Image URL"] == "https://wolfappliance.com/img.jpg"
-    assert diagnostics[0]["status"] == "found"
-    assert diagnostics[0]["source"] == "product_url"
+    assert diagnostics == expected_diagnostics
 
 
-def test_recover_images_returns_not_found_diagnostic_when_no_image():
-    rows = [{**_qualifying_row(), "Product URL": "https://wolfappliance.com/mdd30ts"}]
-    df = pd.DataFrame(rows)
+def test_recover_images_passes_kwargs_to_impl():
+    """Legacy entry point forwards pdf_lookup, session_id, enable_screenshot kwargs."""
+    df = pd.DataFrame([{"Product Name": "X", "Image URL": "", "Product URL": ""}])
 
-    with patch("src.product_enrichment._fetch_page_html", return_value="<html><body>No image here</body></html>"), \
-         patch("src.product_enrichment.time.sleep"):
-        updated_df, diagnostics = recover_images_for_dataframe(df)
+    with patch("src.image_recovery.recover_images_for_dataframe", return_value=(df, [])) as m:
+        recover_images_for_dataframe(
+            df,
+            pdf_lookup={"a": "/tmp/x.pdf"},
+            session_id="sess1",
+            enable_screenshot=False,
+        )
 
-    assert not updated_df.iloc[0].get("Image URL")
-    assert diagnostics[0]["status"] == "not_found"
+    kwargs = m.call_args.kwargs
+    assert kwargs["pdf_lookup"] == {"a": "/tmp/x.pdf"}
+    assert kwargs["session_id"] == "sess1"
+    assert kwargs["enable_screenshot"] is False
 
 
-def test_recover_images_reports_recovered_count():
-    rows = [
-        {**_qualifying_row(), "Brand": "Wolf", "Model/SKU": "MDD30TS", "Product URL": "https://wolfappliance.com/p1"},
-        {**_qualifying_row(), "Brand": "Miele", "Model/SKU": "CVA7440", "Product URL": "https://miele.com/p2"},
-    ]
-    df = pd.DataFrame(rows)
-    html = '<meta property="og:image" content="https://example.com/img.jpg">'
+def test_recover_images_defaults_enable_screenshot_true():
+    """enable_screenshot defaults to True when not explicitly provided."""
+    df = pd.DataFrame([{"Product Name": "X", "Image URL": "", "Product URL": ""}])
 
-    with patch("src.product_enrichment._fetch_page_html", return_value=html), \
-         patch("src.product_enrichment._check_image_content_type", return_value=True), \
-         patch("src.product_enrichment.time.sleep"):
-        updated_df, diagnostics = recover_images_for_dataframe(df)
+    with patch("src.image_recovery.recover_images_for_dataframe", return_value=(df, [])) as m:
+        recover_images_for_dataframe(df)
 
-    assert sum(1 for d in diagnostics if d["status"] == "found") == 2
+    kwargs = m.call_args.kwargs
+    assert kwargs["enable_screenshot"] is True
+    assert kwargs["pdf_lookup"] is None
+    assert kwargs["session_id"] is None
 
 
 def test_enrich_row_extracts_and_fills_image_url():
@@ -1245,3 +1240,23 @@ def test_enrich_dataframe_creates_session_cache_once(monkeypatch):
     enrich_dataframe(df, enrichment_mode="standard")
     # All rows received the same SessionCache instance
     assert len(set(created)) == 1
+
+
+# ── delegation: product_enrichment → image_recovery ───────────────────────────
+
+def test_product_enrichment_delegates_to_image_recovery():
+    """The legacy entry point now forwards to src.image_recovery.recover_images_for_dataframe."""
+    from unittest.mock import patch
+    import pandas as pd
+
+    df = pd.DataFrame([{"Product Name": "X", "Image URL": "", "Product URL": ""}])
+
+    with patch("src.image_recovery.recover_images_for_dataframe") as m:
+        m.return_value = (df, [])
+        from src.product_enrichment import recover_images_for_dataframe as _legacy
+        _legacy(df, pdf_lookup={"a": "/tmp/x.pdf"}, session_id="s", enable_screenshot=True)
+        assert m.called
+        kwargs = m.call_args.kwargs
+        assert kwargs["pdf_lookup"] == {"a": "/tmp/x.pdf"}
+        assert kwargs["session_id"] == "s"
+        assert kwargs["enable_screenshot"] is True
