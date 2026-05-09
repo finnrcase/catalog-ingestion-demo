@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 from unittest.mock import MagicMock, patch
 
+import pytest
 from PIL import Image
 
 from src.image_recovery import (
@@ -269,3 +270,152 @@ def test_pdf_crop_none_when_pdf_body_is_corrupt(tmp_path):
     result = recover_from_pdf_crop(row, str(pdf_path))
     assert result.confidence == "NONE"
     assert result.error.startswith("pdf_unreadable")
+
+
+# ── recover_from_screenshot ───────────────────────────────────────────────────
+
+from src.image_recovery import recover_from_screenshot
+
+
+@pytest.fixture
+def mock_playwright():
+    """Mock Playwright sync_api context manager. Tests configure .page behavior."""
+    with patch("src.image_recovery.sync_playwright") as mock_sp:
+        cm = MagicMock()
+        pw = MagicMock()
+        browser = MagicMock()
+        context = MagicMock()
+        page = MagicMock()
+        cm.__enter__.return_value = pw
+        cm.__exit__.return_value = False
+        mock_sp.return_value = cm
+        pw.chromium.launch.return_value = browser
+        browser.new_context.return_value = context
+        context.new_page.return_value = page
+        # Default: page renders empty content
+        page.content.return_value = "<html><body></body></html>"
+        yield page
+
+
+def test_screenshot_high_when_element_selector_hits_with_sku(mock_playwright):
+    page = mock_playwright
+    page.content.return_value = "<html><body>Wolf MDD30TS warming drawer</body></html>"
+    locator = MagicMock()
+    locator.count.return_value = 1
+    locator.first.bounding_box.return_value = {"x": 0, "y": 0, "width": 600, "height": 600}
+    locator.first.is_visible.return_value = True
+    locator.first.screenshot.return_value = _jpeg_bytes()
+    page.locator.return_value = locator
+
+    row = {
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product Name": "Warming Drawer",
+    }
+    result = recover_from_screenshot(row, "https://www.subzero-wolf.com/wolf/warming-drawer")
+    assert result.image_source == "page_screenshot"
+    assert result.confidence == "HIGH"
+    assert "sku_on_page" in result.evidence
+    assert len(result.jpeg_bytes) > 0
+
+
+def test_screenshot_medium_when_official_domain_no_sku(mock_playwright):
+    page = mock_playwright
+    page.content.return_value = "<html><body>Some unrelated text</body></html>"
+    locator = MagicMock()
+    locator.count.return_value = 1
+    locator.first.bounding_box.return_value = {"x": 0, "y": 0, "width": 600, "height": 600}
+    locator.first.is_visible.return_value = True
+    locator.first.screenshot.return_value = _jpeg_bytes()
+    page.locator.return_value = locator
+
+    row = {"Brand": "Wolf", "Model/SKU": "ZZZ999", "Product Name": "Some Product"}
+    result = recover_from_screenshot(row, "https://www.subzero-wolf.com/some-page")
+    assert result.confidence == "MEDIUM"
+    assert "official_domain" in result.evidence
+
+
+def test_screenshot_low_when_unknown_domain_no_sku(mock_playwright):
+    page = mock_playwright
+    page.content.return_value = "<html><body>random page</body></html>"
+    locator = MagicMock()
+    locator.count.return_value = 1
+    locator.first.bounding_box.return_value = {"x": 0, "y": 0, "width": 600, "height": 600}
+    locator.first.is_visible.return_value = True
+    locator.first.screenshot.return_value = _jpeg_bytes()
+    page.locator.return_value = locator
+
+    row = {"Brand": "Wolf", "Model/SKU": "ZZZ999", "Product Name": "Some Product"}
+    result = recover_from_screenshot(row, "https://random-site.com/x")
+    assert result.confidence == "LOW"
+
+
+def test_screenshot_falls_back_to_bbox_crop_when_no_selector_matches(mock_playwright):
+    page = mock_playwright
+    page.content.return_value = "<html><body>Wolf MDD30TS</body></html>"
+    no_match_locator = MagicMock()
+    no_match_locator.count.return_value = 0
+    page.locator.return_value = no_match_locator
+
+    # Full-page screenshot returns valid PNG bytes (a 1200×1200 plain image).
+    img = Image.new("RGB", (1200, 1200), "red")
+    full_buf = io.BytesIO()
+    img.save(full_buf, format="PNG")
+    page.screenshot.return_value = full_buf.getvalue()
+
+    # eval_on_selector_all returns one good <img> bbox candidate.
+    page.eval_on_selector_all.return_value = [
+        {
+            "src": "https://example.com/hero.jpg",
+            "x": 100, "y": 100, "width": 600, "height": 600,
+        }
+    ]
+    page.viewport_size = {"width": 1280, "height": 800}
+
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "Product Name": "Warming Drawer"}
+    result = recover_from_screenshot(row, "https://www.subzero-wolf.com/x")
+    assert result.image_source == "page_screenshot"
+    assert result.confidence == "HIGH"
+    assert "bbox_crop" in result.evidence
+    assert len(result.jpeg_bytes) > 0
+
+
+def test_screenshot_filters_logo_url(mock_playwright):
+    page = mock_playwright
+    page.content.return_value = "<html><body>Wolf MDD30TS</body></html>"
+    no_match_locator = MagicMock()
+    no_match_locator.count.return_value = 0
+    page.locator.return_value = no_match_locator
+    img = Image.new("RGB", (1200, 1200), "red")
+    full_buf = io.BytesIO()
+    img.save(full_buf, format="PNG")
+    page.screenshot.return_value = full_buf.getvalue()
+    page.eval_on_selector_all.return_value = [
+        # logo URL → filtered
+        {"src": "https://example.com/header-logo.png", "x": 0, "y": 0, "width": 800, "height": 200},
+        # tiny image → filtered
+        {"src": "https://example.com/icon.png", "x": 50, "y": 50, "width": 80, "height": 80},
+    ]
+    page.viewport_size = {"width": 1280, "height": 800}
+
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS"}
+    result = recover_from_screenshot(row, "https://www.subzero-wolf.com/x")
+    # All candidates filtered; no usable image found.
+    assert result.confidence == "NONE"
+    assert result.error == "no_usable_image_element"
+
+
+def test_screenshot_returns_none_on_browser_unavailable():
+    with patch("src.image_recovery.sync_playwright", side_effect=Exception("browser fail")):
+        result = recover_from_screenshot({"Brand": "Wolf"}, "https://example.com")
+    assert result.confidence == "NONE"
+    assert result.error == "browser_unavailable"
+
+
+def test_screenshot_returns_none_on_page_load_timeout(mock_playwright):
+    page = mock_playwright
+    page.goto.side_effect = Exception("Timeout 15000ms exceeded")
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS"}
+    result = recover_from_screenshot(row, "https://www.subzero-wolf.com/x")
+    assert result.confidence == "NONE"
+    assert result.error == "page_load_timeout"

@@ -351,3 +351,226 @@ def recover_from_pdf_crop(row: dict, pdf_path: str | Path) -> ImageRecoveryResul
             )
     finally:
         doc.close()
+
+
+# ── recover_from_screenshot ───────────────────────────────────────────────────
+
+try:
+    from playwright.sync_api import sync_playwright  # type: ignore
+except Exception:  # pragma: no cover - playwright optional at import
+    sync_playwright = None  # type: ignore
+
+
+_SCREENSHOT_SELECTORS = [
+    "img[class*=product-image]",
+    "[class*=product] img",
+    "[class*=gallery] img",
+    "[class*=hero] img",
+    "[class*=media] img",
+    'img[id*="product"]',
+]
+_SCREENSHOT_MIN_DIMENSION = 200            # px each side
+_SCREENSHOT_PAGE_LOAD_TIMEOUT_MS = 15_000
+_SCREENSHOT_LOGO_HINTS = ("logo", "icon", "sprite", "favicon")
+_SCREENSHOT_ASPECT_RATIO_MIN = 0.25
+_SCREENSHOT_ASPECT_RATIO_MAX = 4.0
+
+
+def _is_logo_url(src: str) -> bool:
+    s = (src or "").lower()
+    return any(hint in s for hint in _SCREENSHOT_LOGO_HINTS)
+
+
+def _bbox_passes_filters(bbox: dict) -> bool:
+    w, h = bbox.get("width", 0), bbox.get("height", 0)
+    if w < _SCREENSHOT_MIN_DIMENSION or h < _SCREENSHOT_MIN_DIMENSION:
+        return False
+    ratio = w / h if h else 0
+    if ratio < _SCREENSHOT_ASPECT_RATIO_MIN or ratio > _SCREENSHOT_ASPECT_RATIO_MAX:
+        return False
+    return True
+
+
+def _crop_jpeg_bytes_from_full_page(full_page_png: bytes, bbox: dict) -> bytes:
+    """Crop bbox out of a full-page screenshot, return JPEG bytes."""
+    with Image.open(io.BytesIO(full_page_png)) as img:
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        x, y = int(bbox["x"]), int(bbox["y"])
+        w, h = int(bbox["width"]), int(bbox["height"])
+        cropped = img.crop((x, y, x + w, y + h))
+        buf = io.BytesIO()
+        cropped.save(buf, format="JPEG", quality=85, optimize=True)
+        return buf.getvalue()
+
+
+def _score_screenshot_confidence(
+    *,
+    page_text: str,
+    sku: str,
+    product_name: str,
+    brand: str,
+    product_url: str,
+) -> tuple[str, list[str]]:
+    """Apply the screenshot confidence rules from the spec."""
+    evidence: list[str] = []
+    if sku and sku_appears_in_text(sku, page_text):
+        evidence.append("sku_on_page")
+        return "HIGH", evidence
+    if product_name and product_name_appears_in_text(product_name, page_text):
+        evidence.append("product_name_on_page")
+        return "HIGH", evidence
+    if is_official_domain(product_url, brand):
+        evidence.append("official_domain")
+        return "MEDIUM", evidence
+    return "LOW", evidence
+
+
+def recover_from_screenshot(row: dict, product_url: str) -> ImageRecoveryResult:
+    """Open product_url in headless Chromium, capture and score a product image."""
+    if sync_playwright is None:
+        return ImageRecoveryResult(image_source="page_screenshot", error="browser_unavailable")
+    if not product_url:
+        return ImageRecoveryResult(image_source="page_screenshot", error="no_product_url")
+
+    sku = _str_val(row.get("Model/SKU"))
+    brand = _str_val(row.get("Brand"))
+    product_name = _str_val(row.get("Product Name"))
+
+    try:
+        sp_ctx = sync_playwright()
+    except Exception:
+        return ImageRecoveryResult(
+            image_source="page_screenshot",
+            error="browser_unavailable",
+        )
+
+    try:
+        with sp_ctx as pw:
+            browser = pw.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(user_agent=_USER_AGENT)
+                page = context.new_page()
+
+                try:
+                    page.goto(
+                        product_url,
+                        wait_until="networkidle",
+                        timeout=_SCREENSHOT_PAGE_LOAD_TIMEOUT_MS,
+                    )
+                except Exception:
+                    return ImageRecoveryResult(
+                        image_source="page_screenshot",
+                        error="page_load_timeout",
+                    )
+
+                page_text = page.content() or ""
+
+                # 1) Element-selector pass
+                for selector in _SCREENSHOT_SELECTORS:
+                    try:
+                        loc = page.locator(selector)
+                        if loc.count() == 0:
+                            continue
+                        first = loc.first
+                        if not first.is_visible():
+                            continue
+                        bbox = first.bounding_box()
+                        if not bbox or not _bbox_passes_filters(bbox):
+                            continue
+                        jpeg = first.screenshot(type="jpeg", quality=85)
+                        if not jpeg:
+                            continue
+                        confidence, evidence = _score_screenshot_confidence(
+                            page_text=page_text,
+                            sku=sku,
+                            product_name=product_name,
+                            brand=brand,
+                            product_url=product_url,
+                        )
+                        evidence.append(f"selector:{selector}")
+                        return ImageRecoveryResult(
+                            image_source="page_screenshot",
+                            confidence=confidence,
+                            evidence=evidence,
+                            jpeg_bytes=jpeg,
+                        )
+                    except Exception:
+                        continue
+
+                # 2) Bounding-box fallback over all <img>
+                try:
+                    candidates = page.eval_on_selector_all(
+                        "img",
+                        """
+                        (els) => els.map(el => {
+                            const r = el.getBoundingClientRect();
+                            return {
+                                src: el.currentSrc || el.src || "",
+                                x: r.left, y: r.top,
+                                width: r.width, height: r.height,
+                            };
+                        })
+                        """,
+                    ) or []
+                except Exception:
+                    candidates = []
+
+                viewport = page.viewport_size or {"width": 1280, "height": 800}
+                fold = viewport.get("height", 800)
+
+                filtered = [
+                    c for c in candidates
+                    if not _is_logo_url(c.get("src", ""))
+                    and _bbox_passes_filters(c)
+                    and c.get("y", 0) < fold
+                ]
+                if not filtered:
+                    return ImageRecoveryResult(
+                        image_source="page_screenshot",
+                        error="no_usable_image_element",
+                    )
+
+                filtered.sort(key=lambda c: c["width"] * c["height"], reverse=True)
+                best = filtered[0]
+
+                try:
+                    full_png = page.screenshot(full_page=True, type="png")
+                except Exception:
+                    return ImageRecoveryResult(
+                        image_source="page_screenshot",
+                        error="screenshot_failed",
+                    )
+
+                try:
+                    jpeg = _crop_jpeg_bytes_from_full_page(full_png, best)
+                except Exception as exc:
+                    return ImageRecoveryResult(
+                        image_source="page_screenshot",
+                        error=f"crop_failed: {exc}",
+                    )
+
+                confidence, evidence = _score_screenshot_confidence(
+                    page_text=page_text,
+                    sku=sku,
+                    product_name=product_name,
+                    brand=brand,
+                    product_url=product_url,
+                )
+                evidence.append("bbox_crop")
+                return ImageRecoveryResult(
+                    image_source="page_screenshot",
+                    confidence=confidence,
+                    evidence=evidence,
+                    jpeg_bytes=jpeg,
+                )
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+    except Exception:
+        return ImageRecoveryResult(
+            image_source="page_screenshot",
+            error="browser_unavailable",
+        )
