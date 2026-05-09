@@ -127,6 +127,13 @@ def _save_bulk_photo_upload(uploaded_file) -> dict:
         "image_upload_status": "Ready",
     }
 
+# Phase 1 image recovery: prune session dirs older than 24h on app boot.
+try:
+    from src.image_recovery import cleanup_old_sessions as _cleanup_old_sessions
+    _cleanup_old_sessions(max_age_hours=24)
+except Exception:
+    pass
+
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="SCH DesignOps Intake",
@@ -210,6 +217,51 @@ if "vendor_call_extractions" not in st.session_state:
     st.session_state.vendor_call_extractions = {}
 if "custom_retell_test_result" not in st.session_state:
     st.session_state.custom_retell_test_result = None
+
+# ── Phase 1 image recovery: session helpers ────────────────────────────────────
+import hashlib as _hashlib
+import uuid as _uuid
+from pathlib import Path as _Path
+
+
+def _ensure_session_id() -> str:
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = _uuid.uuid4().hex[:12]
+    return st.session_state.session_id
+
+
+def _save_uploaded_pdf(raw_bytes: bytes, filename: str) -> tuple[str, str]:
+    """Save uploaded PDF to .tmp/uploads/{session_id}/pdfs/{pdf_id}.pdf.
+    Returns (pdf_id, pdf_path)."""
+    sid = _ensure_session_id()
+    pdf_id = _hashlib.sha1(raw_bytes).hexdigest()[:12]
+    pdfs_dir = _Path(".tmp") / "uploads" / sid / "pdfs"
+    pdfs_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = pdfs_dir / f"{pdf_id}.pdf"
+    if not pdf_path.exists():
+        pdf_path.write_bytes(raw_bytes)
+    if "uploaded_pdfs" not in st.session_state:
+        st.session_state.uploaded_pdfs = {}
+    st.session_state.uploaded_pdfs[pdf_id] = raw_bytes
+    return pdf_id, str(pdf_path)
+
+
+def _build_pdf_lookup() -> dict[str, str]:
+    sid = _ensure_session_id()
+    pdfs_dir = _Path(".tmp") / "uploads" / sid / "pdfs"
+    lookup: dict[str, str] = {}
+    if pdfs_dir.exists():
+        for f in pdfs_dir.glob("*.pdf"):
+            lookup[f.stem] = str(f)
+    # Fallback: write any session-state bytes back out if disk file missing.
+    for pdf_id, raw in (st.session_state.get("uploaded_pdfs") or {}).items():
+        if pdf_id not in lookup:
+            pdfs_dir.mkdir(parents=True, exist_ok=True)
+            target = pdfs_dir / f"{pdf_id}.pdf"
+            target.write_bytes(raw)
+            lookup[pdf_id] = str(target)
+    return lookup
+
 
 # ── Programa Destination ───────────────────────────────────────────────────────
 with st.container(border=True):
@@ -737,6 +789,10 @@ if generate:
         parsed_pdf_rows = []
         for pdf_file in (uploaded_files or []):
             try:
+                # Phase 1 image recovery: persist PDF bytes for later crop access.
+                _pdf_raw = pdf_file.read()
+                pdf_file.seek(0)
+                _save_uploaded_pdf(_pdf_raw, getattr(pdf_file, "name", "upload.pdf"))
                 rows = parse_pdf_rows(pdf_file, selected_project, room, "", "")
                 if rows:
                     parsed_pdf_rows.extend(rows)
@@ -959,10 +1015,17 @@ if st.session_state.intake_df is not None:
                     help="Fetches product pages for rows without Image URL and extracts images.",
                 ):
                     with st.spinner(f"Recovering images for {_missing_image_count} row(s)…"):
-                        _recovered_df, _img_diagnostics = recover_images_for_dataframe(df)
+                        sid = _ensure_session_id()
+                        pdf_lookup = _build_pdf_lookup()
+                        _recovered_df, _img_diagnostics = recover_images_for_dataframe(
+                            df,
+                            pdf_lookup=pdf_lookup,
+                            session_id=sid,
+                            enable_screenshot=True,
+                        )
                         st.session_state.intake_df = apply_confidence_checks(_recovered_df)
                         st.session_state.manual_image_uploads = {}
-                    _found = sum(1 for d in _img_diagnostics if d["status"] == "found")
+                    _found = sum(1 for d in _img_diagnostics if d.get("confidence") in ("HIGH", "MEDIUM"))
                     if _found:
                         st.success(f"Recovered {_found} of {len(_img_diagnostics)} missing images.")
                     else:
@@ -1757,7 +1820,7 @@ if st.session_state.intake_df is not None:
             )
         st.download_button(
             label="Download ZIP (CSV + images)",
-            data=export_programa_zip(included, manual_images=_manual_uploads),
+            data=export_programa_zip(included, manual_images=_manual_uploads, session_id=_ensure_session_id()),
             file_name=f"programa_export_{_today}.zip",
             mime="application/zip",
             use_container_width=True,
