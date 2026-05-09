@@ -563,3 +563,146 @@ def test_orchestrator_url_medium_wins_tie_against_pdf_medium():
         out = recover_image_for_row(row, pdf_lookup={"abc": "/tmp/x.pdf"}, session_id="s1")
     assert out.confidence == "MEDIUM"
     assert out.image_source == "url"
+
+
+# ── recover_images_for_dataframe + cleanup_old_sessions ───────────────────────
+
+import os
+import time
+
+import pandas as pd
+
+from src.image_recovery import recover_images_for_dataframe, cleanup_old_sessions
+
+
+def test_dataframe_recovery_skips_high_confidence_rows(tmp_path):
+    df = pd.DataFrame([
+        {
+            "Product Name": "Existing Good", "Brand": "Wolf", "Model/SKU": "AAA",
+            "Image URL": "https://x.com/y.jpg", "Product URL": "",
+            "confidence": "HIGH", "_source_pdf_id": "",
+        },
+        {
+            "Product Name": "Needs Recovery", "Brand": "Wolf", "Model/SKU": "BBB",
+            "Image URL": "", "Product URL": "https://x.com/p",
+            "_source_pdf_id": "",
+        },
+    ])
+    with patch("src.image_recovery.recover_image_for_row") as m:
+        m.return_value = _result(confidence="HIGH", source="page_screenshot", jpeg=_jpeg_bytes())
+        out_df, diags = recover_images_for_dataframe(
+            df, pdf_lookup=None, session_id="testsess",
+            enable_screenshot=True,
+        )
+    # Called only for the second row.
+    assert m.call_count == 1
+
+
+def test_dataframe_recovery_writes_files_to_session_images_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    df = pd.DataFrame([
+        {
+            "Product Name": "Wolf Drawer", "Brand": "Wolf", "Model/SKU": "MDD30TS",
+            "Image URL": "", "Product URL": "https://x.com/p",
+            "_source_pdf_id": "",
+        },
+    ])
+    with patch("src.image_recovery.recover_image_for_row") as m:
+        m.return_value = _result(confidence="HIGH", source="page_screenshot", jpeg=_jpeg_bytes())
+        out_df, diags = recover_images_for_dataframe(
+            df, pdf_lookup=None, session_id="sess123",
+            enable_screenshot=True,
+        )
+    expected_dir = tmp_path / ".tmp" / "uploads" / "sess123" / "images"
+    files = list(expected_dir.glob("*.jpg"))
+    assert len(files) == 1
+    row = out_df.iloc[0]
+    assert row["confidence"] == "HIGH"
+    assert row["image_source"] == "page_screenshot"
+    assert row["local_image_filename"].endswith(".jpg")
+    assert row["local_image_path"] == str(files[0])
+
+
+def test_dataframe_recovery_does_not_write_files_for_low_confidence(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    df = pd.DataFrame([
+        {"Product Name": "X", "Brand": "Y", "Model/SKU": "Z",
+         "Image URL": "", "Product URL": "https://x.com/p", "_source_pdf_id": ""},
+    ])
+    with patch("src.image_recovery.recover_image_for_row") as m:
+        m.return_value = _result(confidence="LOW", source="page_screenshot", jpeg=_jpeg_bytes())
+        out_df, diags = recover_images_for_dataframe(
+            df, pdf_lookup=None, session_id="sess123",
+            enable_screenshot=True,
+        )
+    images_dir = tmp_path / ".tmp" / "uploads" / "sess123" / "images"
+    assert not images_dir.exists() or not list(images_dir.glob("*.jpg"))
+    row = out_df.iloc[0]
+    assert row["confidence"] == "LOW"
+    assert row["image_source"] == "page_screenshot"
+    assert row["local_image_filename"] == ""
+    assert row["local_image_path"] == ""
+
+
+def test_dataframe_recovery_diagnostics_have_no_jpeg_bytes(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    df = pd.DataFrame([
+        {"Product Name": "X", "Brand": "Y", "Model/SKU": "Z",
+         "Image URL": "", "Product URL": "https://x.com/p", "_source_pdf_id": ""},
+    ])
+    with patch("src.image_recovery.recover_image_for_row") as m:
+        m.return_value = _result(confidence="HIGH", source="page_screenshot", jpeg=_jpeg_bytes())
+        out_df, diags = recover_images_for_dataframe(
+            df, pdf_lookup=None, session_id="sess123",
+        )
+    assert len(diags) == 1
+    assert "jpeg_bytes" not in diags[0]
+    # Required keys
+    for k in ("row_index", "product_name", "brand", "model_sku", "image_source", "confidence", "evidence"):
+        assert k in diags[0]
+
+
+def test_dataframe_recovery_preserves_internal_source_columns(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    df = pd.DataFrame([
+        {"Product Name": "X", "Brand": "Y", "Model/SKU": "Z",
+         "Image URL": "", "Product URL": "https://x.com/p",
+         "_source_pdf_id": "abc", "_source_page_number": 3, "_source_filename": "spec.pdf"},
+    ])
+    with patch("src.image_recovery.recover_image_for_row", return_value=_result(confidence="NONE", source="none", jpeg=b"")):
+        out_df, _ = recover_images_for_dataframe(df, pdf_lookup=None, session_id="s")
+    row = out_df.iloc[0]
+    assert row["_source_pdf_id"] == "abc"
+    assert row["_source_page_number"] == 3
+    assert row["_source_filename"] == "spec.pdf"
+
+
+# ── cleanup_old_sessions ──────────────────────────────────────────────────────
+
+def test_cleanup_removes_old_session_dirs(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    base = tmp_path / ".tmp" / "uploads"
+    base.mkdir(parents=True)
+
+    fresh = base / "fresh-sess"
+    fresh.mkdir()
+    (fresh / "marker").write_text("x")
+
+    stale = base / "stale-sess"
+    stale.mkdir()
+    (stale / "marker").write_text("x")
+
+    # Backdate stale's mtime by 48 hours.
+    old = time.time() - 48 * 3600
+    os.utime(stale, (old, old))
+
+    deleted = cleanup_old_sessions(max_age_hours=24)
+    assert deleted == 1
+    assert fresh.exists()
+    assert not stale.exists()
+
+
+def test_cleanup_handles_missing_root_quietly(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    deleted = cleanup_old_sessions(max_age_hours=24)
+    assert deleted == 0

@@ -23,6 +23,15 @@ recover_image_for_row(row, pdf_lookup=None, session_id=None, enable_screenshot=T
     Orchestrates all three sources in priority order (URL → PDF → screenshot),
     short-circuiting on HIGH and returning the best held result on lower tiers.
 
+recover_images_for_dataframe(df, pdf_lookup=None, session_id=None, enable_screenshot=True)
+    Runs the recovery pipeline on every row lacking a HIGH-confidence image,
+    writes recovered files to .tmp/uploads/{session_id}/images/, and returns
+    an annotated DataFrame plus a diagnostics list (jpeg_bytes never leaks).
+
+cleanup_old_sessions(max_age_hours=24)
+    Removes .tmp/uploads/<id> session directories older than max_age_hours
+    and returns the count of directories deleted.
+
 Sources for Phase 2 (image search) drop in alongside the existing three.
 """
 from __future__ import annotations
@@ -653,3 +662,145 @@ def recover_image_for_row(
                 held = _better(held, shot_result)
 
     return held if held is not None else ImageRecoveryResult()
+
+
+# ── recover_images_for_dataframe ──────────────────────────────────────────────
+
+import os
+import time
+
+import pandas as pd
+
+from src.image_assets import build_image_filename
+
+
+_TMP_ROOT = ".tmp/uploads"
+
+
+def _session_image_dir(session_id: str) -> Path:
+    return Path(_TMP_ROOT) / session_id / "images"
+
+
+_RECOVERY_COLUMNS = [
+    "image_source", "confidence", "evidence", "needs_image_review",
+    "local_image_filename", "local_image_path",
+]
+
+
+def _ensure_recovery_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for col in _RECOVERY_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    if "Image URL" not in df.columns:
+        df["Image URL"] = ""
+    return df
+
+
+def _row_already_high(row: pd.Series) -> bool:
+    return _str_val(row.get("confidence")).upper() == "HIGH"
+
+
+def recover_images_for_dataframe(
+    df: pd.DataFrame,
+    pdf_lookup: dict[str, str] | None = None,
+    session_id: str | None = None,
+    enable_screenshot: bool = True,
+) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Run the recovery pipeline on rows that don't already carry a HIGH-confidence
+    image. Writes recovered files to .tmp/uploads/{session_id}/images/ and
+    annotates rows with image_source / confidence / evidence / needs_image_review
+    / local_image_filename / local_image_path.
+
+    Returns (updated_df, diagnostics_list). Diagnostics never include jpeg_bytes.
+    """
+    df = df.copy()
+    df = _ensure_recovery_columns(df)
+    diagnostics: list[dict] = []
+
+    if not session_id:
+        session_id = "default"
+    images_dir = _session_image_dir(session_id)
+
+    for idx, row in df.iterrows():
+        if _row_already_high(row):
+            continue
+
+        row_dict = row.to_dict()
+        result = recover_image_for_row(
+            row_dict,
+            pdf_lookup=pdf_lookup,
+            session_id=session_id,
+            enable_screenshot=enable_screenshot,
+        )
+
+        # Persist evidence on the row regardless of confidence.
+        df.at[idx, "image_source"] = result.image_source
+        df.at[idx, "confidence"] = result.confidence
+        df.at[idx, "evidence"] = ";".join(result.evidence)
+        df.at[idx, "needs_image_review"] = str(result.needs_image_review)
+
+        if result.image_source == "url" and result.image_url:
+            df.at[idx, "Image URL"] = result.image_url
+
+        # Only write files for HIGH/MEDIUM. LOW results are diagnostic only.
+        if result.confidence in ("HIGH", "MEDIUM") and result.jpeg_bytes:
+            try:
+                images_dir.mkdir(parents=True, exist_ok=True)
+                filename = build_image_filename(
+                    brand=_str_val(row_dict.get("Brand")),
+                    model_sku=_str_val(row_dict.get("Model/SKU")),
+                    product_name=_str_val(row_dict.get("Product Name")),
+                )
+                # Deduplicate against files already in this session dir.
+                base_name = filename
+                counter = 2
+                target = images_dir / filename
+                while target.exists():
+                    stem, ext = base_name.rsplit(".", 1) if "." in base_name else (base_name, "jpg")
+                    filename = f"{stem}_{counter}.{ext}"
+                    target = images_dir / filename
+                    counter += 1
+
+                target.write_bytes(result.jpeg_bytes)
+                df.at[idx, "local_image_filename"] = filename
+                df.at[idx, "local_image_path"] = str(target.resolve())
+            except Exception as exc:
+                _log.warning("[IMAGE RECOVERY] disk write failed idx=%s err=%s", idx, exc)
+
+        diagnostics.append({
+            "row_index": int(idx),
+            "product_name": _str_val(row_dict.get("Product Name")),
+            "brand": _str_val(row_dict.get("Brand")),
+            "model_sku": _str_val(row_dict.get("Model/SKU")),
+            "image_source": result.image_source,
+            "confidence": result.confidence,
+            "evidence": list(result.evidence),
+            "error": result.error,
+        })
+
+    return df, diagnostics
+
+
+# ── cleanup_old_sessions ──────────────────────────────────────────────────────
+
+def cleanup_old_sessions(max_age_hours: int = 24) -> int:
+    """Delete .tmp/uploads/<id> dirs older than max_age_hours. Returns count deleted."""
+    import shutil
+
+    root = Path(_TMP_ROOT)
+    if not root.exists():
+        return 0
+    threshold = time.time() - max_age_hours * 3600
+    deleted = 0
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            if child.stat().st_mtime < threshold:
+                shutil.rmtree(child, ignore_errors=True)
+                if not child.exists():
+                    deleted += 1
+        except Exception as exc:
+            _log.warning("[IMAGE RECOVERY] cleanup failed dir=%s err=%s", child, exc)
+    return deleted
