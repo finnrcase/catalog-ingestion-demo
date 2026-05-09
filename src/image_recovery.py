@@ -8,7 +8,16 @@ ImageRecoveryResult : dataclass
 
 recover_from_url(row)
     Validates an existing Image URL on the row, downloads bytes, scores
-    confidence based on SKU presence in URL path and on official domain.
+    confidence based on SKU presence in URL and on official domain.
+
+recover_from_pdf_crop(row, pdf_path)
+    Renders the row's source PDF page with PyMuPDF, crops the largest
+    non-icon image, scores confidence from page text.
+
+recover_from_screenshot(row, product_url)
+    Opens product_url in headless Chromium, captures a product image via
+    element-selector priority list with full-page+bbox-crop fallback,
+    scores confidence from rendered page text.
 
 Sources for Phase 2 (image search) drop in alongside the existing three.
 """
@@ -394,6 +403,7 @@ def _bbox_passes_filters(bbox: dict) -> bool:
 def _crop_jpeg_bytes_from_full_page(full_page_png: bytes, bbox: dict) -> bytes:
     """Crop bbox out of a full-page screenshot, return JPEG bytes."""
     with Image.open(io.BytesIO(full_page_png)) as img:
+        img = ImageOps.exif_transpose(img)
         if img.mode != "RGB":
             img = img.convert("RGB")
         x, y = int(bbox["x"]), int(bbox["y"])

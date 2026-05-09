@@ -419,3 +419,30 @@ def test_screenshot_returns_none_on_page_load_timeout(mock_playwright):
     result = recover_from_screenshot(row, "https://www.subzero-wolf.com/x")
     assert result.confidence == "NONE"
     assert result.error == "page_load_timeout"
+
+
+def test_screenshot_uses_first_matching_selector_in_priority_order(mock_playwright):
+    """When earlier selectors miss, the first matching selector wins and is recorded."""
+    page = mock_playwright
+    page.content.return_value = "<html><body>Wolf MDD30TS</body></html>"
+
+    no_match = MagicMock()
+    no_match.count.return_value = 0
+    hit = MagicMock()
+    hit.count.return_value = 1
+    hit.first.bounding_box.return_value = {"x": 0, "y": 0, "width": 600, "height": 600}
+    hit.first.is_visible.return_value = True
+    hit.first.screenshot.return_value = _jpeg_bytes()
+
+    # First selector misses (img[class*=product-image]),
+    # second selector hits ([class*=product] img).
+    page.locator.side_effect = [no_match, hit]
+
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "Product Name": "Warming Drawer"}
+    result = recover_from_screenshot(row, "https://www.subzero-wolf.com/x")
+    assert result.confidence == "HIGH"
+    # Evidence should record which selector matched.
+    selector_evidence = [e for e in result.evidence if e.startswith("selector:")]
+    assert len(selector_evidence) == 1
+    # The second selector in the list, "[class*=product] img", was the winner.
+    assert selector_evidence[0] == "selector:[class*=product] img"
