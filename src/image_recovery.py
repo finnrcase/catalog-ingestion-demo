@@ -192,10 +192,7 @@ _PDF_RENDER_DPI = 200
 
 def _crop_largest_image_on_pdf_page(page) -> bytes | None:
     """Return JPEG bytes of the largest non-icon image rect on `page`, or None."""
-    try:
-        import fitz  # PyMuPDF
-    except ImportError:
-        return None
+    import fitz  # PyMuPDF — caller already guards the import at function entry
 
     images = page.get_images(full=True)
     if not images:
@@ -232,6 +229,10 @@ def _crop_largest_image_on_pdf_page(page) -> bytes | None:
     zoom = _PDF_RENDER_DPI / 72.0
     matrix = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=matrix, clip=best_rect, alpha=False)
+    # Belt-and-suspenders guard: with a 595×842 A4 page and 1%-area pre-filter,
+    # any survivor renders to ~38 700 px² at 200 DPI, comfortably above this
+    # 10 000 px² threshold. The check still defends against unusual page sizes
+    # where 1% of the page area might be small in absolute pixels.
     if pix.width * pix.height < _PDF_MIN_PIXEL_AREA:
         return None
     img_bytes = pix.tobytes("png")
@@ -264,7 +265,10 @@ def recover_from_pdf_crop(row: dict, pdf_path: str | Path) -> ImageRecoveryResul
 
     pdf_path = str(pdf_path)
     if not Path(pdf_path).exists():
-        return ImageRecoveryResult(image_source="pdf_crop", error="pdf_unreadable")
+        return ImageRecoveryResult(
+            image_source="pdf_crop",
+            error=f"pdf_unreadable: file not found at {pdf_path}",
+        )
 
     try:
         doc = fitz.open(pdf_path)
@@ -280,62 +284,70 @@ def recover_from_pdf_crop(row: dict, pdf_path: str | Path) -> ImageRecoveryResul
     product_name = _str_val(row.get("Product Name"))
 
     try:
-        # 1. Try the recorded page first.
-        target_idx = page_number - 1
-        if target_idx >= doc.page_count or target_idx < 0:
-            target_idx = 0
+        try:
+            # 1. Try the recorded page first.
+            target_idx = page_number - 1
+            if target_idx >= doc.page_count or target_idx < 0:
+                target_idx = 0
 
-        target_page = doc[target_idx]
-        target_text = target_page.get_text("text") or ""
+            target_page = doc[target_idx]
 
-        jpeg = _crop_largest_image_on_pdf_page(target_page)
-        is_adjacent = False
+            jpeg = _crop_largest_image_on_pdf_page(target_page)
+            is_adjacent = False
 
-        if not jpeg:
-            # 2. Fall back to ±1 adjacent pages.
-            for offset in (-1, 1):
-                idx = target_idx + offset
-                if 0 <= idx < doc.page_count:
-                    page = doc[idx]
-                    j = _crop_largest_image_on_pdf_page(page)
-                    if j:
-                        jpeg = j
-                        is_adjacent = True
-                        break
+            if not jpeg:
+                # 2. Fall back to ±1 adjacent pages.
+                for offset in (-1, 1):
+                    idx = target_idx + offset
+                    if 0 <= idx < doc.page_count:
+                        page = doc[idx]
+                        j = _crop_largest_image_on_pdf_page(page)
+                        if j:
+                            jpeg = j
+                            is_adjacent = True
+                            break
 
-        if not jpeg:
-            return ImageRecoveryResult(image_source="pdf_crop", error="no_usable_images_in_pdf")
+            if not jpeg:
+                return ImageRecoveryResult(image_source="pdf_crop", error="no_usable_images_in_pdf")
 
-        # 3. Score confidence.
-        evidence: list[str] = []
+            # 3. Score confidence.
+            evidence: list[str] = []
 
-        if is_adjacent:
-            evidence.append("adjacent_page_crop")
-            confidence = "MEDIUM"
-        else:
-            # Same-page crop: the row's _source_pdf_id + _source_page_number
-            # metadata is itself MEDIUM evidence. SKU/name on page promotes
-            # to HIGH; brand-only just adds an evidence string but stays at MEDIUM.
-            confidence = "MEDIUM"
-            sku_hit = bool(sku and sku_appears_in_text(sku, target_text))
-            name_hit = bool(product_name and product_name_appears_in_text(product_name, target_text))
-            brand_hit = bool(brand and brand.lower() in target_text.lower())
+            if is_adjacent:
+                evidence.append("adjacent_page_crop")
+                confidence = "MEDIUM"
+            else:
+                # Same-page crop: read text only now that we know we'll use it.
+                target_text = target_page.get_text("text") or ""
+                # The row's _source_pdf_id + _source_page_number metadata is
+                # itself MEDIUM evidence. SKU/name on page promotes to HIGH;
+                # brand-only just adds an evidence string but stays at MEDIUM.
+                confidence = "MEDIUM"
+                sku_hit = bool(sku and sku_appears_in_text(sku, target_text))
+                name_hit = bool(product_name and product_name_appears_in_text(product_name, target_text))
+                brand_hit = bool(brand and brand.lower() in target_text.lower())
 
-            if sku_hit:
-                evidence.append("sku_on_pdf_page")
-                confidence = "HIGH"
-            elif name_hit:
-                evidence.append("product_name_on_pdf_page")
-                confidence = "HIGH"
-            elif brand_hit:
-                evidence.append("brand_on_pdf_page")
-                # confidence stays MEDIUM
+                if sku_hit:
+                    evidence.append("sku_on_pdf_page")
+                    confidence = "HIGH"
+                elif name_hit:
+                    evidence.append("product_name_on_pdf_page")
+                    confidence = "HIGH"
+                elif brand_hit:
+                    evidence.append("brand_on_pdf_page")
+                    # confidence stays MEDIUM
 
-        return ImageRecoveryResult(
-            image_source="pdf_crop",
-            confidence=confidence,
-            evidence=evidence,
-            jpeg_bytes=jpeg,
-        )
+            return ImageRecoveryResult(
+                image_source="pdf_crop",
+                confidence=confidence,
+                evidence=evidence,
+                jpeg_bytes=jpeg,
+            )
+        except Exception as exc:
+            _log.warning("[IMAGE RECOVERY] pdf_crop failed path=%s err=%s", pdf_path, exc)
+            return ImageRecoveryResult(
+                image_source="pdf_crop",
+                error=f"pdf_render_error: {exc}",
+            )
     finally:
         doc.close()

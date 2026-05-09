@@ -134,10 +134,8 @@ def _make_pdf_with_image(
     tmp_path,
     text: str,
     image_size: tuple[int, int] = (400, 400),
-    pages_text: list[str] | None = None,
 ) -> str:
-    """Build a synthetic PDF: page 1 has `text` and an embedded image of `image_size`.
-    Optional pages_text adds extra pages with given text only (no images)."""
+    """Build a synthetic PDF: page 1 has `text` and an embedded image of `image_size`."""
     pdf_path = tmp_path / "test.pdf"
     doc = fitz.open()
     page = doc.new_page(width=595, height=842)  # A4
@@ -148,10 +146,6 @@ def _make_pdf_with_image(
     img.save(buf, format="JPEG")
     rect = fitz.Rect(100, 100, 100 + image_size[0] / 2, 100 + image_size[1] / 2)
     page.insert_image(rect, stream=buf.getvalue())
-
-    for extra in pages_text or []:
-        p = doc.new_page(width=595, height=842)
-        p.insert_text((50, 50), extra)
 
     doc.save(str(pdf_path))
     doc.close()
@@ -228,7 +222,7 @@ def test_pdf_crop_none_when_pdf_unreadable(tmp_path):
     row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "_source_page_number": 1}
     result = recover_from_pdf_crop(row, str(pdf_path))
     assert result.confidence == "NONE"
-    assert result.error == "pdf_unreadable"
+    assert result.error.startswith("pdf_unreadable")
 
 
 def test_pdf_crop_filters_tiny_icons(tmp_path):
@@ -246,3 +240,32 @@ def test_pdf_crop_filters_tiny_icons(tmp_path):
     row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "_source_page_number": 1}
     result = recover_from_pdf_crop(row, str(pdf_path))
     assert result.confidence == "NONE"
+
+
+def test_pdf_crop_filters_extreme_aspect_ratio(tmp_path):
+    """Aspect ratios outside [1:4, 4:1] are rejected as banners/dividers."""
+    pdf_path = tmp_path / "test.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((50, 50), "Wolf MDD30TS")
+    # 800x50 banner = 16:1 aspect, well outside the [1:4, 4:1] bounds.
+    img = Image.new("RGB", (800, 50), "red")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    page.insert_image(fitz.Rect(50, 100, 550, 130), stream=buf.getvalue())  # ~17:1
+    doc.save(str(pdf_path))
+    doc.close()
+
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "_source_page_number": 1}
+    result = recover_from_pdf_crop(row, str(pdf_path))
+    assert result.confidence == "NONE"
+
+
+def test_pdf_crop_none_when_pdf_body_is_corrupt(tmp_path):
+    """A file that exists but isn't a valid PDF should hit the fitz.open exception path."""
+    pdf_path = tmp_path / "corrupt.pdf"
+    pdf_path.write_bytes(b"not a real pdf")
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "_source_page_number": 1}
+    result = recover_from_pdf_crop(row, str(pdf_path))
+    assert result.confidence == "NONE"
+    assert result.error.startswith("pdf_unreadable")
