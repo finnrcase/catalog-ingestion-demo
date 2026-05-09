@@ -281,3 +281,108 @@ def test_zip_deduplicated_second_filename_has_numeric_suffix():
         image_files = sorted(n for n in zf.namelist() if n.startswith("images/"))
     assert image_files[0] == "images/wolf_wwd30.jpg"
     assert image_files[1] == "images/wolf_wwd30_2.jpg"
+
+
+# ── manifest 4 new columns + path validation + LOW skip ───────────────────────
+
+def test_manifest_includes_image_source_confidence_evidence_needs_review(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    row = _make_exportable_row()
+    row["image_source"] = "page_screenshot"
+    row["confidence"] = "MEDIUM"
+    row["evidence"] = "official_domain;bbox_crop"
+    row["needs_image_review"] = "True"
+    row["Image URL"] = ""
+    zip_bytes = export_programa_zip([row])
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        manifest_text = zf.read("manifest.csv").decode("utf-8")
+    for col in ("Image Source", "Confidence", "Evidence", "Needs Image Review"):
+        assert col in manifest_text
+
+
+def test_zip_reads_local_image_path_first_no_remote_download(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    images_dir = tmp_path / ".tmp" / "uploads" / "sess1" / "images"
+    images_dir.mkdir(parents=True)
+    local = images_dir / "wolf_wwd30.jpg"
+    local.write_bytes(_make_image_bytes())
+
+    row = _make_exportable_row()
+    # local_image_path stored absolute (matches Task 7 behavior)
+    row["local_image_path"] = str(local.resolve())
+    row["local_image_filename"] = "wolf_wwd30.jpg"
+    row["confidence"] = "HIGH"
+    row["image_source"] = "pdf_crop"
+    row["evidence"] = "sku_on_pdf_page"
+    row["Image URL"] = "https://wolfappliance.com/img/wwd30.jpg"
+
+    with patch("src.image_assets.httpx.get") as mock_get:
+        zip_bytes = export_programa_zip([row], session_id="sess1")
+    mock_get.assert_not_called()
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = zf.namelist()
+    assert "images/wolf_wwd30.jpg" in names
+
+
+def test_zip_skips_path_outside_session_images_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    # Write a file OUTSIDE .tmp/uploads/sess1/images
+    bad = tmp_path / "outside.jpg"
+    bad.write_bytes(_make_image_bytes())
+
+    row = _make_exportable_row()
+    row["local_image_path"] = str(bad.resolve())
+    row["local_image_filename"] = "outside.jpg"
+    row["confidence"] = "HIGH"
+    row["image_source"] = "pdf_crop"
+    row["evidence"] = ""
+    row["Image URL"] = ""
+
+    zip_bytes = export_programa_zip([row], session_id="sess1")
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = zf.namelist()
+        manifest_text = zf.read("manifest.csv").decode("utf-8")
+    assert not any(n.startswith("images/") for n in names)
+    assert "invalid_local_path" in manifest_text
+
+
+def test_zip_skips_missing_local_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    missing = tmp_path / ".tmp" / "uploads" / "sess1" / "images" / "missing.jpg"
+    row = _make_exportable_row()
+    row["local_image_path"] = str(missing)
+    row["local_image_filename"] = "missing.jpg"
+    row["confidence"] = "HIGH"
+    row["image_source"] = "pdf_crop"
+    row["evidence"] = ""
+    row["Image URL"] = ""
+
+    zip_bytes = export_programa_zip([row], session_id="sess1")
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = zf.namelist()
+        manifest_text = zf.read("manifest.csv").decode("utf-8")
+    assert not any(n.startswith("images/") for n in names)
+    assert "invalid_local_path" in manifest_text
+
+
+def test_zip_skips_low_confidence_row(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    images_dir = tmp_path / ".tmp" / "uploads" / "sess1" / "images"
+    images_dir.mkdir(parents=True)
+    local = images_dir / "wolf_wwd30.jpg"
+    local.write_bytes(_make_image_bytes())
+
+    row = _make_exportable_row()
+    row["local_image_path"] = str(local.resolve())  # file exists in valid place
+    row["local_image_filename"] = "wolf_wwd30.jpg"
+    row["confidence"] = "LOW"
+    row["image_source"] = "page_screenshot"
+    row["evidence"] = ""
+    row["Image URL"] = ""
+
+    zip_bytes = export_programa_zip([row], session_id="sess1")
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = zf.namelist()
+        manifest_text = zf.read("manifest.csv").decode("utf-8")
+    assert not any(n.startswith("images/") for n in names)
+    assert "low_confidence_skipped" in manifest_text

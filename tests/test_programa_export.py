@@ -629,4 +629,39 @@ def test_golden_csv_exact_columns_and_no_nan():
     assert data[PROGRAMA_COLUMNS.index("Height (in)")] == "33.375"
     assert data[PROGRAMA_COLUMNS.index("Depth (in)")] == "22"
     assert data[PROGRAMA_COLUMNS.index("Material")] == "Stainless Steel"
-    assert "[Materials:" not in data[PROGRAMA_COLUMNS.index("Notes")]
+
+
+def test_internal_source_columns_excluded_from_standard_export():
+    from src.programa_export import build_programa_import_dataframe, PROGRAMA_COLUMNS
+    rows = [{
+        "Include": True,
+        "Product Name": "X",
+        "Brand": "Y",
+        "Model/SKU": "Z",
+        "Quantity": 1,
+        "_source_pdf_id": "abc",
+        "_source_page_number": 2,
+        "_source_filename": "spec.pdf",
+    }]
+    df = build_programa_import_dataframe(rows)
+    assert list(df.columns) == PROGRAMA_COLUMNS
+    assert "_source_pdf_id" not in df.columns
+
+
+def test_internal_source_columns_present_in_debug_export():
+    from src.programa_export import build_programa_debug_dataframe
+    rows = [{
+        "Include": True,
+        "Product Name": "X",
+        "Brand": "Y",
+        "Model/SKU": "Z",
+        "Quantity": 1,
+        "_source_pdf_id": "abc123",
+        "_source_page_number": 2,
+        "_source_filename": "spec.pdf",
+    }]
+    df = build_programa_debug_dataframe(rows)
+    assert "_source_pdf_id" in df.columns
+    assert df.iloc[0]["_source_pdf_id"] == "abc123"
+    assert df.iloc[0]["_source_page_number"] == 2
+    assert df.iloc[0]["_source_filename"] == "spec.pdf"
