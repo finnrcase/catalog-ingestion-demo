@@ -4,7 +4,11 @@ import os
 import re
 import hashlib
 import time
+import uuid
 from pathlib import Path
+
+_SESSION_TMP_ROOT = Path(__file__).resolve().parent / ".tmp" / "uploads"
+
 import streamlit as st
 import pandas as pd
 
@@ -128,11 +132,22 @@ def _save_bulk_photo_upload(uploaded_file) -> dict:
     }
 
 # Phase 1 image recovery: prune session dirs older than 24h on app boot.
-try:
-    from src.image_recovery import cleanup_old_sessions as _cleanup_old_sessions
-    _cleanup_old_sessions(max_age_hours=24)
-except Exception:
-    pass
+@st.cache_resource
+def _run_phase1_startup_cleanup() -> None:
+    try:
+        from src.image_recovery import cleanup_old_sessions as _c
+    except ImportError:
+        return  # image_recovery not available; skip silently
+    try:
+        _c(max_age_hours=24)
+    except Exception as exc:  # pragma: no cover
+        # Cleanup failures are non-fatal but should be visible in logs.
+        import logging
+        logging.getLogger(__name__).warning(
+            "[IMAGE RECOVERY] startup cleanup failed: %s", exc
+        )
+
+_run_phase1_startup_cleanup()
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -219,14 +234,11 @@ if "custom_retell_test_result" not in st.session_state:
     st.session_state.custom_retell_test_result = None
 
 # ── Phase 1 image recovery: session helpers ────────────────────────────────────
-import hashlib as _hashlib
-import uuid as _uuid
-from pathlib import Path as _Path
 
 
 def _ensure_session_id() -> str:
     if "session_id" not in st.session_state:
-        st.session_state.session_id = _uuid.uuid4().hex[:12]
+        st.session_state.session_id = uuid.uuid4().hex[:12]
     return st.session_state.session_id
 
 
@@ -234,8 +246,8 @@ def _save_uploaded_pdf(raw_bytes: bytes, filename: str) -> tuple[str, str]:
     """Save uploaded PDF to .tmp/uploads/{session_id}/pdfs/{pdf_id}.pdf.
     Returns (pdf_id, pdf_path)."""
     sid = _ensure_session_id()
-    pdf_id = _hashlib.sha1(raw_bytes).hexdigest()[:12]
-    pdfs_dir = _Path(".tmp") / "uploads" / sid / "pdfs"
+    pdf_id = hashlib.sha1(raw_bytes).hexdigest()[:12]
+    pdfs_dir = _SESSION_TMP_ROOT / sid / "pdfs"
     pdfs_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = pdfs_dir / f"{pdf_id}.pdf"
     if not pdf_path.exists():
@@ -248,7 +260,7 @@ def _save_uploaded_pdf(raw_bytes: bytes, filename: str) -> tuple[str, str]:
 
 def _build_pdf_lookup() -> dict[str, str]:
     sid = _ensure_session_id()
-    pdfs_dir = _Path(".tmp") / "uploads" / sid / "pdfs"
+    pdfs_dir = _SESSION_TMP_ROOT / sid / "pdfs"
     lookup: dict[str, str] = {}
     if pdfs_dir.exists():
         for f in pdfs_dir.glob("*.pdf"):
@@ -747,6 +759,19 @@ if generate:
     url_rows = create_url_rows(raw_urls, selected_project, room, "", "")
     st.session_state.ai_errors = []
 
+    # Phase 1 image recovery: persist PDF bytes for both AI and standard-parser
+    # uploads so bytes survive regardless of which parse path is taken.
+    # Bytes are persisted for both AI and standard-parser uploads. AI-extracted
+    # rows do not carry _source_pdf_id (Phase 2 work), so PDF crop will not
+    # fire for them; but the bytes survive for future recovery passes.
+    for pdf_file in (uploaded_files or []):
+        try:
+            _pdf_raw = pdf_file.read()
+            pdf_file.seek(0)
+            _save_uploaded_pdf(_pdf_raw, getattr(pdf_file, "name", "upload.pdf"))
+        except Exception:
+            pass  # non-fatal; parse path will handle missing bytes gracefully
+
     if use_ai_pdf and uploaded_files:
         # ── AI extraction path ─────────────────────────────────────────────────
         with st.spinner(
@@ -789,10 +814,6 @@ if generate:
         parsed_pdf_rows = []
         for pdf_file in (uploaded_files or []):
             try:
-                # Phase 1 image recovery: persist PDF bytes for later crop access.
-                _pdf_raw = pdf_file.read()
-                pdf_file.seek(0)
-                _save_uploaded_pdf(_pdf_raw, getattr(pdf_file, "name", "upload.pdf"))
                 rows = parse_pdf_rows(pdf_file, selected_project, room, "", "")
                 if rows:
                     parsed_pdf_rows.extend(rows)
