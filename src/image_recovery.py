@@ -17,8 +17,6 @@ from __future__ import annotations
 import io
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
-from urllib.parse import urlparse
 
 import httpx
 from PIL import Image, ImageOps
@@ -52,6 +50,13 @@ class ImageRecoveryResult:
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
+
+# These helpers (_check_image_content_type, _download_jpeg_bytes) intentionally
+# duplicate logic that also exists in src/product_enrichment.py and src/image_assets.py.
+# The duplication is removed in Task 8 of the Phase 1 plan, when
+# product_enrichment.recover_images_for_dataframe becomes a thin delegator to
+# this module. Until then, fixes to the HEAD+GET-Range probe pattern need to
+# be applied to all three locations.
 
 def _str_val(v) -> str:
     if v is None:
@@ -152,16 +157,12 @@ def recover_from_url(row: dict) -> ImageRecoveryResult:
     evidence: list[str] = []
     confidence = "LOW"
 
-    # SKU in URL path is the strongest URL-side signal we have without a page fetch.
-    parsed_path = urlparse(url).path
-    if sku and sku_appears_in_text(sku, parsed_path):
-        evidence.append("sku_in_image_url")
-        confidence = "HIGH"
-    elif sku and sku_appears_in_text(sku, url):
+    # SKU in URL is the strongest URL-side signal we have without a page fetch.
+    if sku and sku_appears_in_text(sku, url):
         evidence.append("sku_in_image_url")
         confidence = "HIGH"
 
-    if confidence != "HIGH" and product_name and product_name_appears_in_text(product_name, parsed_path):
+    if confidence != "HIGH" and product_name and product_name_appears_in_text(product_name, url):
         evidence.append("product_name_in_image_url")
         confidence = "HIGH"
 

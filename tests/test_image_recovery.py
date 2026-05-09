@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import io
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-import pytest
 from PIL import Image
 
 from src.image_recovery import (
@@ -21,7 +20,6 @@ def _jpeg_bytes(size: tuple[int, int] = (200, 200), color: str = "red") -> bytes
 
 
 def _mock_get(content: bytes, content_type: str = "image/jpeg"):
-    from unittest.mock import MagicMock
     resp = MagicMock()
     resp.content = content
     resp.headers = {"content-type": content_type}
@@ -52,6 +50,11 @@ def test_result_high_confidence_does_not_need_review():
 
 def test_result_medium_needs_review():
     r = ImageRecoveryResult(confidence="MEDIUM")
+    assert r.needs_image_review is True
+
+
+def test_result_low_needs_review():
+    r = ImageRecoveryResult(confidence="LOW")
     assert r.needs_image_review is True
 
 
