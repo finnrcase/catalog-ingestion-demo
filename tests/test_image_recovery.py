@@ -446,3 +446,96 @@ def test_screenshot_uses_first_matching_selector_in_priority_order(mock_playwrig
     assert len(selector_evidence) == 1
     # The second selector in the list, "[class*=product] img", was the winner.
     assert selector_evidence[0] == "selector:[class*=product] img"
+
+
+# ── recover_image_for_row orchestrator ────────────────────────────────────────
+
+from src.image_recovery import recover_image_for_row
+
+
+def _result(confidence="HIGH", source="url", evidence=None, jpeg=b"x"):
+    from src.image_recovery import ImageRecoveryResult
+    return ImageRecoveryResult(
+        image_source=source,
+        confidence=confidence,
+        evidence=evidence or [],
+        jpeg_bytes=jpeg,
+    )
+
+
+def test_orchestrator_returns_url_high_immediately():
+    row = {"Image URL": "https://x.com/y.jpg", "_source_pdf_id": "abc"}
+    with patch("src.image_recovery.recover_from_url", return_value=_result(confidence="HIGH")) as m_url, \
+         patch("src.image_recovery.recover_from_pdf_crop") as m_pdf, \
+         patch("src.image_recovery.recover_from_screenshot") as m_shot:
+        out = recover_image_for_row(row, pdf_lookup={"abc": "/tmp/x.pdf"}, session_id="s1")
+    assert out.image_source == "url"
+    assert out.confidence == "HIGH"
+    m_pdf.assert_not_called()
+    m_shot.assert_not_called()
+
+
+def test_orchestrator_pdf_high_returns_immediately():
+    row = {"Image URL": "", "_source_pdf_id": "abc", "Product URL": "https://x.com/p"}
+    with patch("src.image_recovery.recover_from_url", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_pdf_crop", return_value=_result(confidence="HIGH", source="pdf_crop")) as m_pdf, \
+         patch("src.image_recovery.recover_from_screenshot") as m_shot:
+        out = recover_image_for_row(row, pdf_lookup={"abc": "/tmp/x.pdf"}, session_id="s1")
+    assert out.image_source == "pdf_crop"
+    assert out.confidence == "HIGH"
+    m_shot.assert_not_called()
+
+
+def test_orchestrator_screenshot_high_beats_pdf_medium():
+    row = {"Image URL": "", "_source_pdf_id": "abc", "Product URL": "https://x.com/p"}
+    with patch("src.image_recovery.recover_from_url", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_pdf_crop", return_value=_result(confidence="MEDIUM", source="pdf_crop")), \
+         patch("src.image_recovery.recover_from_screenshot", return_value=_result(confidence="HIGH", source="page_screenshot")):
+        out = recover_image_for_row(row, pdf_lookup={"abc": "/tmp/x.pdf"}, session_id="s1")
+    assert out.image_source == "page_screenshot"
+    assert out.confidence == "HIGH"
+
+
+def test_orchestrator_pdf_medium_wins_tie_against_screenshot_medium():
+    row = {"Image URL": "", "_source_pdf_id": "abc", "Product URL": "https://x.com/p"}
+    with patch("src.image_recovery.recover_from_url", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_pdf_crop", return_value=_result(confidence="MEDIUM", source="pdf_crop")), \
+         patch("src.image_recovery.recover_from_screenshot", return_value=_result(confidence="MEDIUM", source="page_screenshot")):
+        out = recover_image_for_row(row, pdf_lookup={"abc": "/tmp/x.pdf"}, session_id="s1")
+    assert out.image_source == "pdf_crop"
+
+
+def test_orchestrator_low_low_returns_first_low_no_file_attached():
+    row = {"Image URL": "", "_source_pdf_id": "abc", "Product URL": "https://x.com/p"}
+    with patch("src.image_recovery.recover_from_url", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_pdf_crop", return_value=_result(confidence="LOW", source="pdf_crop")), \
+         patch("src.image_recovery.recover_from_screenshot", return_value=_result(confidence="LOW", source="page_screenshot")):
+        out = recover_image_for_row(row, pdf_lookup={"abc": "/tmp/x.pdf"}, session_id="s1")
+    assert out.confidence == "LOW"
+    assert out.image_source == "pdf_crop"  # first LOW returned
+
+
+def test_orchestrator_all_none_returns_none_result():
+    row = {"Image URL": "", "Product URL": ""}
+    with patch("src.image_recovery.recover_from_url", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_pdf_crop") as m_pdf, \
+         patch("src.image_recovery.recover_from_screenshot") as m_shot:
+        out = recover_image_for_row(row, pdf_lookup=None, session_id=None)
+    assert out.confidence == "NONE"
+    m_pdf.assert_not_called()
+    m_shot.assert_not_called()
+
+
+def test_orchestrator_skips_screenshot_when_disabled():
+    row = {"Image URL": "", "_source_pdf_id": "abc", "Product URL": "https://x.com/p"}
+    with patch("src.image_recovery.recover_from_url", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_pdf_crop", return_value=_result(confidence="MEDIUM", source="pdf_crop")), \
+         patch("src.image_recovery.recover_from_screenshot") as m_shot:
+        out = recover_image_for_row(
+            row,
+            pdf_lookup={"abc": "/tmp/x.pdf"},
+            session_id="s1",
+            enable_screenshot=False,
+        )
+    assert out.image_source == "pdf_crop"
+    m_shot.assert_not_called()

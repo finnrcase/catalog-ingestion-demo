@@ -19,6 +19,10 @@ recover_from_screenshot(row, product_url)
     element-selector priority list with full-page+bbox-crop fallback,
     scores confidence from rendered page text.
 
+recover_image_for_row(row, pdf_lookup=None, session_id=None, enable_screenshot=True)
+    Orchestrates all three sources in priority order (URL → PDF → screenshot),
+    short-circuiting on HIGH and returning the best held result on lower tiers.
+
 Sources for Phase 2 (image search) drop in alongside the existing three.
 """
 from __future__ import annotations
@@ -584,3 +588,65 @@ def recover_from_screenshot(row: dict, product_url: str) -> ImageRecoveryResult:
             image_source="page_screenshot",
             error="browser_unavailable",
         )
+
+
+# ── recover_image_for_row orchestrator ────────────────────────────────────────
+
+_CONFIDENCE_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
+
+
+def _better(a: ImageRecoveryResult | None, b: ImageRecoveryResult) -> ImageRecoveryResult:
+    """Return whichever result has higher confidence; on tie keep `a` (first wins)."""
+    if a is None:
+        return b
+    if _CONFIDENCE_RANK[b.confidence] > _CONFIDENCE_RANK[a.confidence]:
+        return b
+    return a
+
+
+def recover_image_for_row(
+    row: dict,
+    pdf_lookup: dict[str, str] | None = None,
+    session_id: str | None = None,
+    enable_screenshot: bool = True,
+) -> ImageRecoveryResult:
+    """
+    Try sources in priority order:
+      1) existing Image URL (HIGH short-circuits)
+      2) PDF crop          (HIGH short-circuits; MEDIUM/LOW held)
+      3) Screenshot        (HIGH short-circuits; MEDIUM/LOW compared)
+
+    On tie between PDF MEDIUM and Screenshot MEDIUM, PDF wins (held first).
+    """
+    held: ImageRecoveryResult | None = None
+
+    # 1) URL on row
+    url_val = _str_val(row.get("Image URL"))
+    if url_val:
+        url_result = recover_from_url(row)
+        if url_result.confidence == "HIGH":
+            return url_result
+        if url_result.confidence in ("MEDIUM", "LOW"):
+            held = url_result
+
+    # 2) PDF crop
+    pdf_id = _str_val(row.get("_source_pdf_id"))
+    pdf_path = (pdf_lookup or {}).get(pdf_id) if pdf_id else None
+    if pdf_id and pdf_path:
+        pdf_result = recover_from_pdf_crop(row, pdf_path)
+        if pdf_result.confidence == "HIGH":
+            return pdf_result
+        if pdf_result.confidence in ("MEDIUM", "LOW"):
+            held = _better(held, pdf_result)
+
+    # 3) Screenshot
+    if enable_screenshot:
+        product_url = _str_val(row.get("Product URL"))
+        if product_url:
+            shot_result = recover_from_screenshot(row, product_url)
+            if shot_result.confidence == "HIGH":
+                return shot_result
+            if shot_result.confidence in ("MEDIUM", "LOW"):
+                held = _better(held, shot_result)
+
+    return held if held is not None else ImageRecoveryResult()
