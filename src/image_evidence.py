@@ -23,10 +23,11 @@ from src.manufacturer_domains import get_domain_for_brand
 
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 # Stop-words excluded from product-name token matching — they're too generic
-# to count as evidence on their own.
+# to count as evidence on their own. Tokens are post-normalization (lowercase,
+# punctuation stripped), so entries here must be alphanumeric only.
 _STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "for", "with",
-    "in", "on", "to", "by", "inch", "inches", "in.", "cm", "mm",
+    "in", "on", "to", "by", "inch", "inches", "cm", "mm",
 }
 
 
@@ -97,7 +98,7 @@ def is_official_domain(url: str, brand: str) -> bool:
     if not result:
         return False
     # get_domain_for_brand returns (domain, source) — domain is at index [0]
-    canonical_domain = result[0].lower().strip() if isinstance(result, tuple) else str(result).lower().strip()
+    canonical_domain = result[0].lower().strip()
     if not canonical_domain:
         return False
     parsed = urlparse(url)
