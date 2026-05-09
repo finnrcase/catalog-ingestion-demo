@@ -11,6 +11,7 @@ parse_pdf_rows(pdf_file, project, room, supplier, notes) -> list[dict]
     Unknown fields are left at their default — never invented.
 """
 
+import hashlib
 import re
 
 from src.intake_schema import IMPORTANT_FIELDS, SOURCE_PDF, make_base_row
@@ -226,6 +227,17 @@ def parse_pdf_rows(
 ) -> list[dict]:
     """
     Extract structured product rows from a PDF using heuristic text/table parsing.
+    No AI call is made. Unknown fields are left blank — never invented.
+
+    Parameters
+    ----------
+    pdf_file : Streamlit UploadedFile or any object with .read() and .seek().
+    project, room, supplier, notes : metadata applied to every row.
+
+    Returns
+    -------
+    list[dict] of partial row dicts aligned to make_base_row() field names.
+    Empty list if the PDF has no parseable text.
 
     Phase 1 image recovery (2026-05-08) annotates each row with internal
     `_source_pdf_id` (SHA1[:12] of the PDF bytes), `_source_page_number`
@@ -236,8 +248,6 @@ def parse_pdf_rows(
         import fitz
     except ImportError:
         raise ImportError("PyMuPDF is required. Run: pip install pymupdf")
-
-    import hashlib
 
     raw = pdf_file.read()
     pdf_file.seek(0)
