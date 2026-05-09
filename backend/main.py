@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import io
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -16,6 +18,8 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+_TMP_UPLOADS = ROOT / ".tmp" / "uploads"
 
 from src.ai_extraction import extract_products_from_pdf_with_ai
 from src.confidence import apply_confidence_checks
@@ -27,6 +31,7 @@ from src.intake_schema import CATEGORIES, STATUSES
 from src.image_uploader import is_public_https_image_url, upload_image
 from src.manufacturer_domains import save_manufacturer_override
 from src.notes import remove_notes_row_prefix
+from src.image_recovery import cleanup_old_sessions
 from src.product_enrichment import enrich_dataframe, recover_images_for_dataframe
 from src.programa_export import (
     CANONICAL_SECTIONS,
@@ -72,6 +77,7 @@ class RowsPayload(BaseModel):
     enrichment_mode: str = "standard"
     force_refresh: bool = False
     use_web_enrichment: bool = True
+    session_id: str | None = None
 
 
 class ProgramaPayload(RowsPayload):
@@ -142,6 +148,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+def _startup_cleanup():
+    try:
+        cleanup_old_sessions(max_age_hours=24)
+    except Exception:
+        pass
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -294,6 +308,42 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
     return _df_response(df, errors, dimension_diagnostics)
 
 
+@app.post("/intake/upload-pdf")
+async def upload_pdf(
+    file: UploadFile = File(...),
+    x_session_id: str | None = Header(default=None),
+):
+    """
+    Persist an uploaded PDF to .tmp/uploads/{session_id}/pdfs/{pdf_id}.pdf
+    and return parsed rows.
+
+    The session_id is generated server-side if absent in the X-Session-Id
+    header. pdf_id is SHA1[:12] of the bytes (so re-uploads dedupe).
+    """
+    raw = await file.read()
+    session_id = x_session_id or uuid.uuid4().hex[:12]
+    pdf_id = hashlib.sha1(raw).hexdigest()[:12]
+
+    pdfs_dir = _TMP_UPLOADS / session_id / "pdfs"
+    pdfs_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = pdfs_dir / f"{pdf_id}.pdf"
+    if not pdf_path.exists():
+        pdf_path.write_bytes(raw)
+
+    # Parse rows from the same bytes via a minimal file-like wrapper.
+    class _Wrap:
+        def __init__(self, raw: bytes, name: str):
+            self._raw = raw
+            self.name = name
+        def read(self) -> bytes:
+            return self._raw
+        def seek(self, _p: int) -> None:
+            pass
+
+    rows = parse_pdf_rows(_Wrap(raw, file.filename or "upload.pdf"))
+    return {"session_id": session_id, "pdf_id": pdf_id, "rows": rows}
+
+
 @app.post("/intake/recover-images", response_model=IntakeResponse)
 def recover_images(payload: RowsPayload) -> IntakeResponse:
     """Run a targeted image recovery pass on rows that are missing Image URL.
@@ -302,7 +352,15 @@ def recover_images(payload: RowsPayload) -> IntakeResponse:
     Diagnostics (per-row status, source, recovered URL) are returned in the
     dimension_diagnostics field for now — the contract may be extended later.
     """
-    df, diagnostics = recover_images_for_dataframe(pd.DataFrame(payload.rows))
+    session_id = payload.session_id or "default"
+    pdfs_dir = _TMP_UPLOADS / session_id / "pdfs"
+    pdf_lookup = {f.stem: str(f) for f in pdfs_dir.glob("*.pdf")} if pdfs_dir.exists() else {}
+    df, diagnostics = recover_images_for_dataframe(
+        pd.DataFrame(payload.rows),
+        pdf_lookup=pdf_lookup,
+        session_id=session_id,
+        enable_screenshot=True,
+    )
     df = apply_confidence_checks(df)
     return _df_response(df, dimension_diagnostics=diagnostics)
 
