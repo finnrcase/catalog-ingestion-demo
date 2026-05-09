@@ -599,7 +599,8 @@ def _better(a: ImageRecoveryResult | None, b: ImageRecoveryResult) -> ImageRecov
     """Return whichever result has higher confidence; on tie keep `a` (first wins)."""
     if a is None:
         return b
-    if _CONFIDENCE_RANK[b.confidence] > _CONFIDENCE_RANK[a.confidence]:
+    # Strict >: ties keep a (the held-first result wins).
+    if _CONFIDENCE_RANK.get(b.confidence, -1) > _CONFIDENCE_RANK.get(a.confidence, -1):
         return b
     return a
 
@@ -607,16 +608,18 @@ def _better(a: ImageRecoveryResult | None, b: ImageRecoveryResult) -> ImageRecov
 def recover_image_for_row(
     row: dict,
     pdf_lookup: dict[str, str] | None = None,
-    session_id: str | None = None,
+    session_id: str | None = None,  # forward-plumbing for recover_images_for_dataframe (Task 7) — not used here
     enable_screenshot: bool = True,
 ) -> ImageRecoveryResult:
     """
     Try sources in priority order:
-      1) existing Image URL (HIGH short-circuits)
-      2) PDF crop          (HIGH short-circuits; MEDIUM/LOW held)
-      3) Screenshot        (HIGH short-circuits; MEDIUM/LOW compared)
+      1) existing Image URL (HIGH short-circuits; MEDIUM/LOW held as best-so-far)
+      2) PDF crop          (HIGH short-circuits; MEDIUM/LOW compared against held)
+      3) Screenshot        (HIGH short-circuits; MEDIUM/LOW compared against held)
 
-    On tie between PDF MEDIUM and Screenshot MEDIUM, PDF wins (held first).
+    On a confidence tie between two non-HIGH results, the source held first wins
+    (URL > PDF > Screenshot). This means PDF MEDIUM beats Screenshot MEDIUM, and
+    URL MEDIUM beats PDF MEDIUM, etc.
     """
     held: ImageRecoveryResult | None = None
 

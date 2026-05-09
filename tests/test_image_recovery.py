@@ -453,7 +453,7 @@ def test_screenshot_uses_first_matching_selector_in_priority_order(mock_playwrig
 from src.image_recovery import recover_image_for_row
 
 
-def _result(confidence="HIGH", source="url", evidence=None, jpeg=b"x"):
+def _result(confidence="NONE", source="url", evidence=None, jpeg=b"x"):
     from src.image_recovery import ImageRecoveryResult
     return ImageRecoveryResult(
         image_source=source,
@@ -539,3 +539,27 @@ def test_orchestrator_skips_screenshot_when_disabled():
         )
     assert out.image_source == "pdf_crop"
     m_shot.assert_not_called()
+
+
+def test_orchestrator_url_medium_held_when_no_pdf_or_screenshot():
+    """URL MEDIUM is held and returned when no PDF metadata and no Product URL."""
+    row = {"Image URL": "https://x.com/y.jpg"}  # no _source_pdf_id, no Product URL
+    with patch("src.image_recovery.recover_from_url", return_value=_result(confidence="MEDIUM", source="url")), \
+         patch("src.image_recovery.recover_from_pdf_crop") as m_pdf, \
+         patch("src.image_recovery.recover_from_screenshot") as m_shot:
+        out = recover_image_for_row(row, pdf_lookup=None, session_id=None)
+    assert out.confidence == "MEDIUM"
+    assert out.image_source == "url"
+    m_pdf.assert_not_called()
+    m_shot.assert_not_called()
+
+
+def test_orchestrator_url_medium_wins_tie_against_pdf_medium():
+    """URL MEDIUM is held first, so a tied PDF MEDIUM does not displace it."""
+    row = {"Image URL": "https://x.com/y.jpg", "_source_pdf_id": "abc", "Product URL": "https://x.com/p"}
+    with patch("src.image_recovery.recover_from_url", return_value=_result(confidence="MEDIUM", source="url")), \
+         patch("src.image_recovery.recover_from_pdf_crop", return_value=_result(confidence="MEDIUM", source="pdf_crop")), \
+         patch("src.image_recovery.recover_from_screenshot", return_value=_result(confidence="MEDIUM", source="page_screenshot")):
+        out = recover_image_for_row(row, pdf_lookup={"abc": "/tmp/x.pdf"}, session_id="s1")
+    assert out.confidence == "MEDIUM"
+    assert out.image_source == "url"
