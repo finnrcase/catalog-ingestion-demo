@@ -38,12 +38,16 @@ from __future__ import annotations
 
 import io
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
+import pandas as pd
 from PIL import Image, ImageOps
 
+from src.image_assets import build_image_filename
 from src.image_evidence import (
     is_official_domain,
     product_name_appears_in_text,
@@ -666,14 +670,10 @@ def recover_image_for_row(
 
 # ── recover_images_for_dataframe ──────────────────────────────────────────────
 
-import os
-import time
-
-import pandas as pd
-
-from src.image_assets import build_image_filename
-
-
+# Relative to process cwd. Both uvicorn (FastAPI) and streamlit run from
+# the repo root, so this resolves to <repo>/.tmp/uploads at runtime.
+# `local_image_path` values stored in the dataframe are absolute (via
+# Path.resolve()), so consumers don't need to know cwd to find files.
 _TMP_ROOT = ".tmp/uploads"
 
 
@@ -738,6 +738,12 @@ def recover_images_for_dataframe(
         df.at[idx, "image_source"] = result.image_source
         df.at[idx, "confidence"] = result.confidence
         df.at[idx, "evidence"] = ";".join(result.evidence)
+        # CONTRACT: needs_image_review is stored as the string "True" or "False",
+        # not the Python boolean. Pandas Arrow-backed StringDtype rejects bool
+        # assignment to a string-typed column (and _ensure_recovery_columns
+        # initializes this column with ""). Downstream readers must compare against
+        # the string ("True" / "False"), not bool() — bool("False") evaluates to
+        # True because non-empty strings are truthy.
         df.at[idx, "needs_image_review"] = str(result.needs_image_review)
 
         if result.image_source == "url" and result.image_url:
@@ -753,11 +759,11 @@ def recover_images_for_dataframe(
                     product_name=_str_val(row_dict.get("Product Name")),
                 )
                 # Deduplicate against files already in this session dir.
-                base_name = filename
-                counter = 2
                 target = images_dir / filename
+                counter = 2
+                stem = Path(filename).stem
+                ext = Path(filename).suffix.lstrip(".") or "jpg"
                 while target.exists():
-                    stem, ext = base_name.rsplit(".", 1) if "." in base_name else (base_name, "jpg")
                     filename = f"{stem}_{counter}.{ext}"
                     target = images_dir / filename
                     counter += 1

@@ -2578,7 +2578,11 @@ def export_programa_zip(
                 "Image Source": _str_val(r.get("image_source")),
                 "Confidence": confidence,
                 "Evidence": _str_val(r.get("evidence")),
-                "Needs Image Review": str(bool(r.get("needs_image_review"))).lower(),
+                # needs_image_review is stored as string "True"/"False" by image_recovery
+                # (Task 7 contract — pandas string dtype constraint). Compare against the
+                # string explicitly; do not call bool() on it (bool("False") is True).
+                _nir_raw = str(r.get("needs_image_review", "")).strip().lower()
+                "Needs Image Review": "false" if _nir_raw == "false" else "true",
                 "Error": "",
             }
 

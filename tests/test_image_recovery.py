@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import io
+import os
+import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -567,9 +570,6 @@ def test_orchestrator_url_medium_wins_tie_against_pdf_medium():
 
 # ── recover_images_for_dataframe + cleanup_old_sessions ───────────────────────
 
-import os
-import time
-
 import pandas as pd
 
 from src.image_recovery import recover_images_for_dataframe, cleanup_old_sessions
@@ -620,7 +620,7 @@ def test_dataframe_recovery_writes_files_to_session_images_dir(tmp_path, monkeyp
     assert row["confidence"] == "HIGH"
     assert row["image_source"] == "page_screenshot"
     assert row["local_image_filename"].endswith(".jpg")
-    assert row["local_image_path"] == str(files[0])
+    assert Path(row["local_image_path"]).resolve() == files[0].resolve()
 
 
 def test_dataframe_recovery_does_not_write_files_for_low_confidence(tmp_path, monkeypatch):
