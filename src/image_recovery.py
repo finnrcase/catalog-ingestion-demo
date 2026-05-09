@@ -216,11 +216,17 @@ _PDF_ASPECT_RATIO_MAX = 4.0            # 4:1
 _PDF_RENDER_DPI = 200
 
 
-def _crop_largest_image_on_pdf_page(page) -> bytes | None:
-    """Return JPEG bytes of the largest non-icon image rect on `page`, or None."""
+def _crop_largest_image_on_pdf_page(page, debug: dict | None = None) -> bytes | None:
+    """Return JPEG bytes of the largest non-icon image rect on `page`, or None.
+
+    When `debug` is provided, populate it with diagnostic counters so callers
+    can see why candidates were rejected.
+    """
     import fitz  # PyMuPDF — caller already guards the import at function entry
 
     images = page.get_images(full=True)
+    if debug is not None:
+        debug["pdf_image_objects_count"] = len(images)
     if not images:
         return None
 
@@ -228,22 +234,45 @@ def _crop_largest_image_on_pdf_page(page) -> bytes | None:
     page_area = page_rect.width * page_rect.height
 
     candidates: list[tuple[float, fitz.Rect]] = []
+    rejection_reasons: list[str] = [] if debug is not None else []
     for img_info in images:
         xref = img_info[0]
         try:
             rects = page.get_image_rects(xref)
-        except Exception:
+        except Exception as exc:
+            if debug is not None:
+                rejection_reasons.append(f"xref={xref}: get_image_rects raised {exc}")
+            continue
+        if not rects:
+            if debug is not None:
+                rejection_reasons.append(f"xref={xref}: no rects returned")
             continue
         for rect in rects:
             w, h = rect.width, rect.height
             if w <= 0 or h <= 0:
+                if debug is not None:
+                    rejection_reasons.append(f"xref={xref}: zero-area rect ({w}x{h})")
                 continue
             if (w * h) < (page_area * _PDF_MIN_PAGE_AREA_FRACTION):
+                if debug is not None:
+                    pct = (w * h) / page_area * 100 if page_area else 0
+                    rejection_reasons.append(
+                        f"xref={xref}: too small ({w:.0f}x{h:.0f}={pct:.2f}% of page)"
+                    )
                 continue
             ratio = w / h
             if ratio < _PDF_ASPECT_RATIO_MIN or ratio > _PDF_ASPECT_RATIO_MAX:
+                if debug is not None:
+                    rejection_reasons.append(
+                        f"xref={xref}: extreme aspect ratio {ratio:.2f}"
+                    )
                 continue
             candidates.append((w * h, rect))
+
+    if debug is not None:
+        debug["pdf_candidates_after_filter"] = len(candidates)
+        if rejection_reasons:
+            debug.setdefault("pdf_rejection_reasons", []).extend(rejection_reasons)
 
     if not candidates:
         return None
@@ -260,6 +289,11 @@ def _crop_largest_image_on_pdf_page(page) -> bytes | None:
     # 10 000 px² threshold. The check still defends against unusual page sizes
     # where 1% of the page area might be small in absolute pixels.
     if pix.width * pix.height < _PDF_MIN_PIXEL_AREA:
+        if debug is not None:
+            debug.setdefault("pdf_rejection_reasons", []).append(
+                f"best candidate rendered to {pix.width}x{pix.height}px, below "
+                f"{_PDF_MIN_PIXEL_AREA}px² minimum"
+            )
         return None
     img_bytes = pix.tobytes("png")
     with Image.open(io.BytesIO(img_bytes)) as img:
@@ -270,35 +304,131 @@ def _crop_largest_image_on_pdf_page(page) -> bytes | None:
         return buf.getvalue()
 
 
-def recover_from_pdf_crop(row: dict, pdf_path: str | Path) -> ImageRecoveryResult:
+def _render_pdf_page_to_jpeg(page, dpi: int = _PDF_RENDER_DPI) -> bytes | None:
+    """Render an entire PDF page at `dpi` and return JPEG bytes, or None on failure.
+
+    Used as a last-resort fallback when no embedded images can be extracted —
+    many vendor spec sheets flatten product photos into page graphics that
+    page.get_images() doesn't expose. Rendering the page itself always works
+    when the page is otherwise readable.
+    """
+    try:
+        import fitz  # caller has already guarded the import
+        zoom = dpi / 72.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        png_bytes = pix.tobytes("png")
+    except Exception:
+        return None
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as img:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85, optimize=True)
+            return buf.getvalue()
+    except Exception:
+        return None
+
+
+_PAGE_RENDER_CONTENT_THRESHOLD = 240  # gray pixels < this are "content"
+_PAGE_RENDER_MIN_BBOX_FRACTION = 0.05  # bbox must cover ≥5% of page
+_PAGE_RENDER_MAX_BBOX_FRACTION = 0.95  # > this means we found nothing distinct
+
+
+def _crop_largest_non_white_region(jpeg_bytes: bytes) -> bytes | None:
+    """Crop the bounding box of all non-near-white pixels from a rendered page.
+
+    Returns JPEG bytes of the cropped region, or None if the rendered page is
+    nearly empty (bbox covers <5% of the page) or essentially all-content
+    (bbox covers >95%, which means we couldn't isolate the photo from
+    surrounding text). In the latter case the caller should fall through to
+    the full-page render rather than this content-crop result.
+    """
+    try:
+        with Image.open(io.BytesIO(jpeg_bytes)) as img:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            gray = img.convert("L")
+            # Binary mask: white pixels become 0, content pixels become 255.
+            mask = gray.point(lambda px: 255 if px < _PAGE_RENDER_CONTENT_THRESHOLD else 0)
+            bbox = mask.getbbox()
+            if not bbox:
+                return None
+            left, top, right, bottom = bbox
+            bbox_area = max(0, (right - left) * (bottom - top))
+            page_area = img.width * img.height
+            if page_area == 0:
+                return None
+            frac = bbox_area / page_area
+            if frac < _PAGE_RENDER_MIN_BBOX_FRACTION:
+                return None
+            if frac > _PAGE_RENDER_MAX_BBOX_FRACTION:
+                return None
+            cropped = img.crop(bbox)
+            buf = io.BytesIO()
+            cropped.save(buf, format="JPEG", quality=85, optimize=True)
+            return buf.getvalue()
+    except Exception:
+        return None
+
+
+def recover_from_pdf_crop(
+    row: dict,
+    pdf_path: str | Path,
+    debug: dict | None = None,
+) -> ImageRecoveryResult:
     """
     Render the row's PDF page and crop the largest non-icon image region.
 
     Confidence rules:
       HIGH   — SKU OR product name appears as text on the same page as the crop
-      MEDIUM — same-page crop with no SKU/name match (the row's _source_pdf_id
-               + _source_page_number metadata is itself evidence that this PDF
-               is the user-provided source for this row), OR crop comes from
-               an adjacent ±1 page (capped at MEDIUM regardless of text)
-      NONE   — PDF unreadable, or no usable images on this or adjacent pages
+               (only via the embedded-image extraction path)
+      MEDIUM — same-page embedded-image crop with no SKU/name match, OR
+               crop comes from an adjacent ±1 page, OR
+               page-render content crop, OR
+               full-page render fallback
+      NONE   — PDF unreadable
 
-    LOW is not reachable from PDF crop in Phase 1.
+    Fallback chain when the embedded-image path fails (page.get_images()
+    returns 0 candidates or all are filtered out):
+      1. Try ±1 adjacent pages with the embedded-image path.
+      2. Render the target page at 200 DPI and crop the largest non-near-white
+         region (page_render_content_crop).
+      3. Otherwise return the full-page render itself (page_render_full).
+
+    Steps 2-3 always cap confidence at MEDIUM and add `needs_review` semantics.
+    Many vendor spec sheets flatten product photos into page graphics that
+    page.get_images() doesn't expose; the page-render fallback ensures the
+    user always gets a usable image candidate when the PDF is readable.
     """
     try:
         import fitz  # PyMuPDF
     except ImportError:
+        if debug is not None:
+            debug["error"] = "pymupdf_unavailable"
         return ImageRecoveryResult(error="pymupdf_unavailable")
 
     pdf_path = str(pdf_path)
+    if debug is not None:
+        debug["pdf_path"] = pdf_path
     if not Path(pdf_path).exists():
+        if debug is not None:
+            debug["pdf_path_exists"] = False
         return ImageRecoveryResult(
             image_source="pdf_crop",
             error=f"pdf_unreadable: file not found at {pdf_path}",
         )
+    if debug is not None:
+        debug["pdf_path_exists"] = True
 
     try:
         doc = fitz.open(pdf_path)
+        if debug is not None:
+            debug["pdf_opened"] = True
     except Exception as exc:
+        if debug is not None:
+            debug["pdf_opened"] = False
+            debug["error"] = f"pdf_unreadable: {exc}"
         return ImageRecoveryResult(image_source="pdf_crop", error=f"pdf_unreadable: {exc}")
 
     page_number = row.get("_source_page_number")
@@ -318,15 +448,21 @@ def recover_from_pdf_crop(row: dict, pdf_path: str | Path) -> ImageRecoveryResul
 
             target_page = doc[target_idx]
 
-            jpeg = _crop_largest_image_on_pdf_page(target_page)
+            jpeg = _crop_largest_image_on_pdf_page(target_page, debug=debug)
             is_adjacent = False
+            adjacent_pages_scanned = False
+            page_render_used = False
+            page_render_full = False
 
             if not jpeg:
                 # 2. Fall back to ±1 adjacent pages.
+                adjacent_pages_scanned = True
                 for offset in (-1, 1):
                     idx = target_idx + offset
                     if 0 <= idx < doc.page_count:
                         page = doc[idx]
+                        # Don't pollute primary-page debug counters with adjacent
+                        # ones; capture as a side-channel list instead.
                         j = _crop_largest_image_on_pdf_page(page)
                         if j:
                             jpeg = j
@@ -334,16 +470,44 @@ def recover_from_pdf_crop(row: dict, pdf_path: str | Path) -> ImageRecoveryResul
                             break
 
             if not jpeg:
-                return ImageRecoveryResult(image_source="pdf_crop", error="no_usable_images_in_pdf")
+                # 3. Render the target page itself and try a content-region crop.
+                rendered = _render_pdf_page_to_jpeg(target_page)
+                if rendered:
+                    cropped = _crop_largest_non_white_region(rendered)
+                    if cropped:
+                        jpeg = cropped
+                        page_render_used = True
+                    else:
+                        # 4. Last resort: hand back the full page render.
+                        jpeg = rendered
+                        page_render_used = True
+                        page_render_full = True
 
-            # 3. Score confidence.
+            if debug is not None:
+                debug["pdf_adjacent_pages_scanned"] = adjacent_pages_scanned
+                debug["pdf_page_render_fallback_used"] = page_render_used
+                debug["pdf_page_render_full"] = page_render_full
+
+            if not jpeg:
+                # Even page rendering failed (corrupt page, encrypted, etc.)
+                return ImageRecoveryResult(
+                    image_source="pdf_crop",
+                    error="no_usable_images_in_pdf",
+                )
+
+            # 5. Score confidence.
             evidence: list[str] = []
 
-            if is_adjacent:
+            if page_render_used:
+                # Page-render fallbacks are MEDIUM at best — we have less
+                # certainty about what the cropped region actually contains.
+                evidence.append("page_render_full" if page_render_full else "page_render_content_crop")
+                confidence = "MEDIUM"
+            elif is_adjacent:
                 evidence.append("adjacent_page_crop")
                 confidence = "MEDIUM"
             else:
-                # Same-page crop: read text only now that we know we'll use it.
+                # Same-page embedded image: read text now that we know we'll use it.
                 target_text = target_page.get_text("text") or ""
                 # The row's _source_pdf_id + _source_page_number metadata is
                 # itself MEDIUM evidence. SKU/name on page promotes to HIGH;
@@ -371,6 +535,8 @@ def recover_from_pdf_crop(row: dict, pdf_path: str | Path) -> ImageRecoveryResul
             )
         except Exception as exc:
             _log.warning("[IMAGE RECOVERY] pdf_crop failed path=%s err=%s", pdf_path, exc)
+            if debug is not None:
+                debug["error"] = f"pdf_render_error: {exc}"
             return ImageRecoveryResult(
                 image_source="pdf_crop",
                 error=f"pdf_render_error: {exc}",
@@ -453,8 +619,16 @@ def _score_screenshot_confidence(
     return "LOW", evidence
 
 
-def recover_from_screenshot(row: dict, product_url: str) -> ImageRecoveryResult:
-    """Open product_url in headless Chromium, capture and score a product image."""
+def recover_from_screenshot(
+    row: dict,
+    product_url: str,
+    debug: dict | None = None,
+) -> ImageRecoveryResult:
+    """Open product_url in headless Chromium, capture and score a product image.
+
+    When `debug` is provided, populate it with screenshot diagnostics
+    (`screenshot_selector_matched`, `screenshot_candidates_found`).
+    """
     if sync_playwright is None:
         return ImageRecoveryResult(image_source="page_screenshot", error="browser_unavailable")
     if not product_url:
@@ -516,6 +690,8 @@ def recover_from_screenshot(row: dict, product_url: str) -> ImageRecoveryResult:
                             product_url=product_url,
                         )
                         evidence.append(f"selector:{selector}")
+                        if debug is not None:
+                            debug["screenshot_selector_matched"] = selector
                         return ImageRecoveryResult(
                             image_source="page_screenshot",
                             confidence=confidence,
@@ -552,6 +728,8 @@ def recover_from_screenshot(row: dict, product_url: str) -> ImageRecoveryResult:
                     and _bbox_passes_filters(c)
                     and c.get("y", 0) < fold
                 ]
+                if debug is not None:
+                    debug["screenshot_candidates_found"] = len(filtered)
                 if not filtered:
                     return ImageRecoveryResult(
                         image_source="page_screenshot",
@@ -623,6 +801,7 @@ def recover_image_for_row(
     pdf_lookup: dict[str, str] | None = None,
     session_id: str | None = None,  # forward-plumbing for recover_images_for_dataframe (Task 7) — not used here
     enable_screenshot: bool = True,
+    debug: dict | None = None,
 ) -> ImageRecoveryResult:
     """
     Try sources in priority order:
@@ -633,14 +812,33 @@ def recover_image_for_row(
     On a confidence tie between two non-HIGH results, the source held first wins
     (URL > PDF > Screenshot). This means PDF MEDIUM beats Screenshot MEDIUM, and
     URL MEDIUM beats PDF MEDIUM, etc.
+
+    When `debug` is provided, populate it with per-source diagnostics so the
+    caller can produce an Image Recovery Debug Report.
     """
     held: ImageRecoveryResult | None = None
+
+    if debug is not None:
+        debug.setdefault("pdf_path_exists", None)
+        debug.setdefault("pdf_opened", None)
+        debug.setdefault("pdf_image_objects_count", 0)
+        debug.setdefault("pdf_candidates_after_filter", 0)
+        debug.setdefault("pdf_rejection_reasons", [])
+        debug.setdefault("pdf_adjacent_pages_scanned", False)
+        debug.setdefault("pdf_page_render_fallback_used", False)
+        debug.setdefault("pdf_page_render_full", False)
+        debug.setdefault("screenshot_ran", False)
+        debug.setdefault("screenshot_url_attempted", "")
+        debug.setdefault("screenshot_selector_matched", "")
+        debug.setdefault("screenshot_candidates_found", 0)
 
     # 1) URL on row
     url_val = _str_val(row.get("Image URL"))
     if url_val:
         url_result = recover_from_url(row)
         if url_result.confidence == "HIGH":
+            if debug is not None:
+                _record_final_debug(debug, url_result)
             return url_result
         if url_result.confidence in ("MEDIUM", "LOW"):
             held = url_result
@@ -649,8 +847,10 @@ def recover_image_for_row(
     pdf_id = _str_val(row.get("_source_pdf_id"))
     pdf_path = (pdf_lookup or {}).get(pdf_id) if pdf_id else None
     if pdf_id and pdf_path:
-        pdf_result = recover_from_pdf_crop(row, pdf_path)
+        pdf_result = recover_from_pdf_crop(row, pdf_path, debug=debug)
         if pdf_result.confidence == "HIGH":
+            if debug is not None:
+                _record_final_debug(debug, pdf_result)
             return pdf_result
         if pdf_result.confidence in ("MEDIUM", "LOW"):
             held = _better(held, pdf_result)
@@ -659,13 +859,28 @@ def recover_image_for_row(
     if enable_screenshot:
         product_url = _str_val(row.get("Product URL"))
         if product_url:
-            shot_result = recover_from_screenshot(row, product_url)
+            if debug is not None:
+                debug["screenshot_ran"] = True
+                debug["screenshot_url_attempted"] = product_url
+            shot_result = recover_from_screenshot(row, product_url, debug=debug)
             if shot_result.confidence == "HIGH":
+                if debug is not None:
+                    _record_final_debug(debug, shot_result)
                 return shot_result
             if shot_result.confidence in ("MEDIUM", "LOW"):
                 held = _better(held, shot_result)
 
-    return held if held is not None else ImageRecoveryResult()
+    final = held if held is not None else ImageRecoveryResult()
+    if debug is not None:
+        _record_final_debug(debug, final)
+    return final
+
+
+def _record_final_debug(debug: dict, result: "ImageRecoveryResult") -> None:
+    debug["final_image_source"] = result.image_source
+    debug["final_confidence"] = result.confidence
+    debug["final_evidence"] = list(result.evidence)
+    debug["final_error"] = result.error
 
 
 # ── recover_images_for_dataframe ──────────────────────────────────────────────
@@ -731,11 +946,13 @@ def recover_images_for_dataframe(
             continue
 
         row_dict = row.to_dict()
+        debug: dict = {}
         result = recover_image_for_row(
             row_dict,
             pdf_lookup=pdf_lookup,
             session_id=session_id,
             enable_screenshot=enable_screenshot,
+            debug=debug,
         )
 
         # Persist evidence on the row regardless of confidence.
@@ -783,13 +1000,83 @@ def recover_images_for_dataframe(
             "product_name": _str_val(row_dict.get("Product Name")),
             "brand": _str_val(row_dict.get("Brand")),
             "model_sku": _str_val(row_dict.get("Model/SKU")),
+            "product_url": _str_val(row_dict.get("Product URL")),
+            "_source_pdf_id": _str_val(row_dict.get("_source_pdf_id")),
+            "_source_page_number": row_dict.get("_source_page_number"),
+            "_source_filename": _str_val(row_dict.get("_source_filename")),
             "image_source": result.image_source,
             "confidence": result.confidence,
             "evidence": list(result.evidence),
             "error": result.error,
+            # Per-source diagnostics for the Image Recovery Debug Report.
+            "pdf_path": debug.get("pdf_path", ""),
+            "pdf_path_exists": debug.get("pdf_path_exists"),
+            "pdf_opened": debug.get("pdf_opened"),
+            "pdf_image_objects_count": debug.get("pdf_image_objects_count", 0),
+            "pdf_candidates_after_filter": debug.get("pdf_candidates_after_filter", 0),
+            "pdf_rejection_reasons": list(debug.get("pdf_rejection_reasons", [])),
+            "pdf_adjacent_pages_scanned": bool(debug.get("pdf_adjacent_pages_scanned", False)),
+            "pdf_page_render_fallback_used": bool(debug.get("pdf_page_render_fallback_used", False)),
+            "pdf_page_render_full": bool(debug.get("pdf_page_render_full", False)),
+            "screenshot_ran": bool(debug.get("screenshot_ran", False)),
+            "screenshot_url_attempted": debug.get("screenshot_url_attempted", ""),
+            "screenshot_selector_matched": debug.get("screenshot_selector_matched", ""),
+            "screenshot_candidates_found": debug.get("screenshot_candidates_found", 0),
         })
 
     return df, diagnostics
+
+
+# ── Debug report builder ──────────────────────────────────────────────────────
+
+_DEBUG_REPORT_COLUMNS = [
+    "row_index",
+    "product_name",
+    "brand",
+    "model_sku",
+    "product_url",
+    "_source_pdf_id",
+    "_source_page_number",
+    "_source_filename",
+    "pdf_path",
+    "pdf_path_exists",
+    "pdf_opened",
+    "pdf_image_objects_count",
+    "pdf_candidates_after_filter",
+    "pdf_rejection_reasons",
+    "pdf_adjacent_pages_scanned",
+    "pdf_page_render_fallback_used",
+    "pdf_page_render_full",
+    "screenshot_ran",
+    "screenshot_url_attempted",
+    "screenshot_selector_matched",
+    "screenshot_candidates_found",
+    "image_source",
+    "confidence",
+    "evidence",
+    "error",
+]
+
+
+def build_image_recovery_debug_dataframe(diagnostics: list[dict]) -> pd.DataFrame:
+    """Convert the diagnostics list from recover_images_for_dataframe into a
+    fixed-column DataFrame suitable for CSV download. Joins list-valued fields
+    (`evidence`, `pdf_rejection_reasons`) with semicolons so each cell stays
+    flat. Missing fields default to empty/0/False.
+    """
+    if not diagnostics:
+        return pd.DataFrame(columns=_DEBUG_REPORT_COLUMNS)
+
+    rows: list[dict] = []
+    for d in diagnostics:
+        row = {col: d.get(col, "") for col in _DEBUG_REPORT_COLUMNS}
+        # Flatten list-valued fields for CSV friendliness.
+        if isinstance(row.get("evidence"), list):
+            row["evidence"] = ";".join(row["evidence"])
+        if isinstance(row.get("pdf_rejection_reasons"), list):
+            row["pdf_rejection_reasons"] = " | ".join(row["pdf_rejection_reasons"])
+        rows.append(row)
+    return pd.DataFrame(rows, columns=_DEBUG_REPORT_COLUMNS)
 
 
 # ── cleanup_old_sessions ──────────────────────────────────────────────────────

@@ -210,7 +210,10 @@ def test_pdf_crop_falls_back_to_adjacent_page_capped_at_medium(tmp_path):
     assert "adjacent_page_crop" in result.evidence
 
 
-def test_pdf_crop_none_when_no_images_anywhere(tmp_path):
+def test_pdf_crop_falls_back_to_page_render_when_no_embedded_images(tmp_path):
+    """When the PDF page has no embedded images, fall back to rendering the
+    page itself and either crop the largest non-white region or hand back the
+    full-page render at MEDIUM confidence with page_render_* evidence."""
     pdf_path = tmp_path / "test.pdf"
     doc = fitz.open()
     doc.new_page().insert_text((50, 50), "Wolf MDD30TS no images here")
@@ -218,7 +221,9 @@ def test_pdf_crop_none_when_no_images_anywhere(tmp_path):
     doc.close()
     row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "_source_page_number": 1}
     result = recover_from_pdf_crop(row, str(pdf_path))
-    assert result.confidence == "NONE"
+    assert result.confidence == "MEDIUM"
+    assert any(e.startswith("page_render_") for e in result.evidence)
+    assert len(result.jpeg_bytes) > 0
 
 
 def test_pdf_crop_none_when_pdf_unreadable(tmp_path):
@@ -230,6 +235,9 @@ def test_pdf_crop_none_when_pdf_unreadable(tmp_path):
 
 
 def test_pdf_crop_filters_tiny_icons(tmp_path):
+    """Tiny icon-sized embedded images must be filtered. Without other usable
+    embedded images, recovery falls through to the page-render fallback at
+    MEDIUM rather than returning NONE."""
     pdf_path = tmp_path / "test.pdf"
     doc = fitz.open()
     page = doc.new_page(width=595, height=842)
@@ -242,12 +250,19 @@ def test_pdf_crop_filters_tiny_icons(tmp_path):
     doc.save(str(pdf_path))
     doc.close()
     row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "_source_page_number": 1}
-    result = recover_from_pdf_crop(row, str(pdf_path))
-    assert result.confidence == "NONE"
+    debug: dict = {}
+    result = recover_from_pdf_crop(row, str(pdf_path), debug=debug)
+    # The icon was filtered (visible in the debug counters), but page-render
+    # fallback produced a usable image at MEDIUM confidence.
+    assert debug["pdf_image_objects_count"] == 1
+    assert debug["pdf_candidates_after_filter"] == 0
+    assert result.confidence == "MEDIUM"
+    assert any(e.startswith("page_render_") for e in result.evidence)
 
 
 def test_pdf_crop_filters_extreme_aspect_ratio(tmp_path):
-    """Aspect ratios outside [1:4, 4:1] are rejected as banners/dividers."""
+    """Aspect ratios outside [1:4, 4:1] are rejected as banners/dividers.
+    With no other embedded images, recovery falls through to page-render."""
     pdf_path = tmp_path / "test.pdf"
     doc = fitz.open()
     page = doc.new_page(width=595, height=842)
@@ -261,8 +276,12 @@ def test_pdf_crop_filters_extreme_aspect_ratio(tmp_path):
     doc.close()
 
     row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "_source_page_number": 1}
-    result = recover_from_pdf_crop(row, str(pdf_path))
-    assert result.confidence == "NONE"
+    debug: dict = {}
+    result = recover_from_pdf_crop(row, str(pdf_path), debug=debug)
+    # Banner was filtered; page-render fallback ran.
+    assert debug["pdf_candidates_after_filter"] == 0
+    assert result.confidence == "MEDIUM"
+    assert any(e.startswith("page_render_") for e in result.evidence)
 
 
 def test_pdf_crop_none_when_pdf_body_is_corrupt(tmp_path):
@@ -273,6 +292,64 @@ def test_pdf_crop_none_when_pdf_body_is_corrupt(tmp_path):
     result = recover_from_pdf_crop(row, str(pdf_path))
     assert result.confidence == "NONE"
     assert result.error.startswith("pdf_unreadable")
+
+
+def test_pdf_crop_page_render_content_crop_used_when_page_has_distinct_region(tmp_path):
+    """A page with distinct dark content surrounded by white margins should
+    produce a content-crop fallback (page_render_content_crop), not the
+    full-page render (page_render_full)."""
+    pdf_path = tmp_path / "test.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    # Insert a single dark rectangle in the middle of the page — this becomes
+    # the "content region" the non-white bbox crop will isolate.
+    page.draw_rect(fitz.Rect(150, 200, 450, 600), color=(0, 0, 0), fill=(0, 0, 0))
+    doc.save(str(pdf_path))
+    doc.close()
+
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "_source_page_number": 1}
+    result = recover_from_pdf_crop(row, str(pdf_path))
+    assert result.confidence == "MEDIUM"
+    assert "page_render_content_crop" in result.evidence
+    assert "page_render_full" not in result.evidence
+
+
+def test_pdf_crop_debug_records_image_object_count(tmp_path):
+    """The debug dict captures pdf_image_objects_count for diagnostic reports."""
+    pdf_path = tmp_path / "test.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_text((50, 50), "Wolf MDD30TS no images")
+    doc.save(str(pdf_path))
+    doc.close()
+
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "_source_page_number": 1}
+    debug: dict = {}
+    recover_from_pdf_crop(row, str(pdf_path), debug=debug)
+    assert debug.get("pdf_path_exists") is True
+    assert debug.get("pdf_opened") is True
+    assert debug.get("pdf_image_objects_count") == 0
+    assert debug.get("pdf_page_render_fallback_used") is True
+
+
+def test_pdf_crop_debug_records_rejection_reasons(tmp_path):
+    """When candidates are filtered out, debug records WHY each was rejected."""
+    pdf_path = tmp_path / "test.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+    # 800×50 banner image — will be rejected for aspect ratio.
+    img = Image.new("RGB", (800, 50), "red")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    page.insert_image(fitz.Rect(50, 100, 550, 130), stream=buf.getvalue())
+    doc.save(str(pdf_path))
+    doc.close()
+
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "_source_page_number": 1}
+    debug: dict = {}
+    recover_from_pdf_crop(row, str(pdf_path), debug=debug)
+    reasons = debug.get("pdf_rejection_reasons", [])
+    assert any("aspect ratio" in r for r in reasons)
 
 
 # ── recover_from_screenshot ───────────────────────────────────────────────────
@@ -676,6 +753,87 @@ def test_dataframe_recovery_preserves_internal_source_columns(tmp_path, monkeypa
     assert row["_source_pdf_id"] == "abc"
     assert row["_source_page_number"] == 3
     assert row["_source_filename"] == "spec.pdf"
+
+
+def test_dataframe_diagnostics_carry_debug_fields(tmp_path, monkeypatch):
+    """Diagnostics list now includes per-source debug fields (Image Recovery
+    Debug Report data). Static row info, PDF counters, and screenshot
+    counters all flow through to the consumer."""
+    monkeypatch.chdir(tmp_path)
+    df = pd.DataFrame([
+        {"Product Name": "Wolf Drawer", "Brand": "Wolf", "Model/SKU": "MDD30TS",
+         "Image URL": "", "Product URL": "https://x.com/p",
+         "_source_pdf_id": "abc", "_source_page_number": 2, "_source_filename": "spec.pdf"},
+    ])
+    with patch("src.image_recovery.recover_image_for_row", return_value=_result(confidence="NONE", source="none", jpeg=b"")):
+        _, diags = recover_images_for_dataframe(df, pdf_lookup=None, session_id="s")
+    d = diags[0]
+    # Static row info echoed back into diagnostics for reporting.
+    assert d["product_name"] == "Wolf Drawer"
+    assert d["brand"] == "Wolf"
+    assert d["model_sku"] == "MDD30TS"
+    assert d["product_url"] == "https://x.com/p"
+    assert d["_source_pdf_id"] == "abc"
+    assert d["_source_page_number"] == 2
+    assert d["_source_filename"] == "spec.pdf"
+    # Debug fields with sensible defaults when no source produced data.
+    for k in (
+        "pdf_image_objects_count", "pdf_candidates_after_filter",
+        "pdf_rejection_reasons", "pdf_adjacent_pages_scanned",
+        "pdf_page_render_fallback_used", "pdf_page_render_full",
+        "screenshot_ran", "screenshot_url_attempted",
+        "screenshot_selector_matched", "screenshot_candidates_found",
+    ):
+        assert k in d
+
+
+def test_build_image_recovery_debug_dataframe_returns_fixed_columns(tmp_path):
+    """The debug-CSV builder produces a fixed column order regardless of which
+    diagnostic fields were populated. List fields are flattened (semicolons or
+    pipes) so each cell stays a single string for spreadsheet readers."""
+    from src.image_recovery import (
+        build_image_recovery_debug_dataframe,
+        _DEBUG_REPORT_COLUMNS,
+    )
+    diags = [
+        {
+            "row_index": 0,
+            "product_name": "Wolf Warming Drawer",
+            "brand": "Wolf",
+            "model_sku": "MDD30TS",
+            "evidence": ["sku_on_pdf_page", "page_render_content_crop"],
+            "pdf_rejection_reasons": ["xref=12: too small (0.30%)", "xref=14: aspect 16.0"],
+            "image_source": "pdf_crop",
+            "confidence": "MEDIUM",
+        },
+        {
+            "row_index": 1,
+            "product_name": "Sub-Zero Fridge",
+            "brand": "Sub-Zero",
+            "model_sku": "ID36R",
+        },
+    ]
+    out = build_image_recovery_debug_dataframe(diags)
+    assert list(out.columns) == _DEBUG_REPORT_COLUMNS
+    assert len(out) == 2
+    # Evidence list flattened with semicolons.
+    assert out.iloc[0]["evidence"] == "sku_on_pdf_page;page_render_content_crop"
+    # Rejection reasons flattened with " | ".
+    assert "aspect 16.0" in out.iloc[0]["pdf_rejection_reasons"]
+    assert " | " in out.iloc[0]["pdf_rejection_reasons"]
+    # Empty / missing fields stay as empty strings (CSV-friendly).
+    assert out.iloc[1]["evidence"] == ""
+    assert out.iloc[1]["pdf_rejection_reasons"] == ""
+
+
+def test_build_image_recovery_debug_dataframe_empty_input():
+    from src.image_recovery import (
+        build_image_recovery_debug_dataframe,
+        _DEBUG_REPORT_COLUMNS,
+    )
+    out = build_image_recovery_debug_dataframe([])
+    assert list(out.columns) == _DEBUG_REPORT_COLUMNS
+    assert len(out) == 0
 
 
 # ── cleanup_old_sessions ──────────────────────────────────────────────────────

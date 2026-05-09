@@ -1046,6 +1046,8 @@ if st.session_state.intake_df is not None:
                         )
                         st.session_state.intake_df = apply_confidence_checks(_recovered_df)
                         st.session_state.manual_image_uploads = {}
+                        # Persist diagnostics so the debug report renders after rerun.
+                        st.session_state.image_recovery_diagnostics = _img_diagnostics
                     _found = sum(1 for d in _img_diagnostics if d.get("confidence") in ("HIGH", "MEDIUM"))
                     if _found:
                         st.success(f"Recovered {_found} of {len(_img_diagnostics)} missing images.")
@@ -1063,6 +1065,47 @@ if st.session_state.intake_df is not None:
         # Count manually uploaded this session
         _manually_uploaded = len(st.session_state.get("manual_image_uploads", {}))
         _s4.metric("Manual uploads this session", _manually_uploaded)
+
+        # ── Image Recovery Debug Report ──────────────────────────────────────
+        # Developer-only panel that surfaces per-row diagnostics from the most
+        # recent recovery pass: PDF page-object counts, candidate filtering
+        # rejections, screenshot selectors, and the final confidence/evidence.
+        # Useful when zero images come back and the user needs to know WHY.
+        _diag = st.session_state.get("image_recovery_diagnostics") or []
+        if _diag:
+            from src.image_recovery import (
+                build_image_recovery_debug_dataframe as _build_debug_df,
+            )
+            with st.expander(
+                f"🔍 Image Recovery Debug Report ({len(_diag)} row{'s' if len(_diag) != 1 else ''})",
+                expanded=False,
+            ):
+                st.caption(
+                    "Developer-only diagnostic from the most recent Recover Missing "
+                    "Images pass. Shows each fallback step the pipeline tried, why "
+                    "candidates were rejected, and the final confidence/evidence."
+                )
+                _debug_df = _build_debug_df(_diag)
+                # Group rows by their final outcome to surface what the pipeline did.
+                _by_conf = _debug_df["confidence"].value_counts(dropna=False).to_dict()
+                _conf_summary = ", ".join(
+                    f"{c or '(empty)'}: {n}" for c, n in sorted(_by_conf.items())
+                )
+                st.text(f"Outcomes — {_conf_summary}")
+                # Render the full per-row debug table.
+                st.dataframe(_debug_df, use_container_width=True, hide_index=True)
+                _debug_today = datetime.date.today().isoformat()
+                st.download_button(
+                    label="Download image_recovery_debug.csv",
+                    data=_debug_df.to_csv(index=False).encode("utf-8"),
+                    file_name=f"image_recovery_debug_{_debug_today}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    help=(
+                        "Per-row diagnostic CSV. Include this file when reporting "
+                        "image-recovery bugs so the development team can reproduce."
+                    ),
+                )
 
         # Per-product upload fallback
         if _missing_image_count > 0:
