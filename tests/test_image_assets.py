@@ -316,7 +316,8 @@ def test_zip_reads_local_image_path_first_no_remote_download(tmp_path, monkeypat
     row["evidence"] = "sku_on_pdf_page"
     row["Image URL"] = "https://wolfappliance.com/img/wwd30.jpg"
 
-    with patch("src.image_assets.httpx.get") as mock_get:
+    with patch("src.image_assets.httpx.get") as mock_get, \
+         patch("src.programa_export._REPO_ROOT", tmp_path):
         zip_bytes = export_programa_zip([row], session_id="sess1")
     mock_get.assert_not_called()
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
@@ -338,7 +339,8 @@ def test_zip_skips_path_outside_session_images_dir(tmp_path, monkeypatch):
     row["evidence"] = ""
     row["Image URL"] = ""
 
-    zip_bytes = export_programa_zip([row], session_id="sess1")
+    with patch("src.programa_export._REPO_ROOT", tmp_path):
+        zip_bytes = export_programa_zip([row], session_id="sess1")
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         names = zf.namelist()
         manifest_text = zf.read("manifest.csv").decode("utf-8")
@@ -357,7 +359,8 @@ def test_zip_skips_missing_local_path(tmp_path, monkeypatch):
     row["evidence"] = ""
     row["Image URL"] = ""
 
-    zip_bytes = export_programa_zip([row], session_id="sess1")
+    with patch("src.programa_export._REPO_ROOT", tmp_path):
+        zip_bytes = export_programa_zip([row], session_id="sess1")
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         names = zf.namelist()
         manifest_text = zf.read("manifest.csv").decode("utf-8")
@@ -380,9 +383,48 @@ def test_zip_skips_low_confidence_row(tmp_path, monkeypatch):
     row["evidence"] = ""
     row["Image URL"] = ""
 
-    zip_bytes = export_programa_zip([row], session_id="sess1")
+    with patch("src.programa_export._REPO_ROOT", tmp_path):
+        zip_bytes = export_programa_zip([row], session_id="sess1")
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         names = zf.namelist()
         manifest_text = zf.read("manifest.csv").decode("utf-8")
     assert not any(n.startswith("images/") for n in names)
     assert "low_confidence_skipped" in manifest_text
+
+
+def test_zip_local_image_path_wins_over_manual_image(tmp_path, monkeypatch):
+    """When both local_image_path and manual_images bytes exist, local_path wins."""
+    monkeypatch.chdir(tmp_path)
+    # Need to also set the path anchor so _REPO_ROOT-based resolution finds the dir
+    # The validation uses _REPO_ROOT (Path(__file__).parent.parent of programa_export.py),
+    # not cwd, so we patch _REPO_ROOT to point at tmp_path for this test.
+    images_dir = tmp_path / ".tmp" / "uploads" / "sess1" / "images"
+    images_dir.mkdir(parents=True)
+    local = images_dir / "wolf_wwd30.jpg"
+    local.write_bytes(_make_image_bytes(color="blue"))
+
+    manual_jpeg = _make_image_bytes(color="red")
+
+    row = _make_exportable_row()
+    row["local_image_path"] = str(local.resolve())
+    row["local_image_filename"] = "wolf_wwd30.jpg"
+    row["confidence"] = "HIGH"
+    row["image_source"] = "pdf_crop"
+    row["evidence"] = ""
+    row["Image URL"] = ""
+
+    with patch("src.programa_export._REPO_ROOT", tmp_path):
+        zip_bytes = export_programa_zip(
+            [row],
+            manual_images={0: manual_jpeg},
+            session_id="sess1",
+        )
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = zf.namelist()
+        # The image should be the local file (blue), not the manual upload (red).
+        # We just verify exactly one image was written and its name comes from the
+        # local_image_filename, not a fresh build_image_filename.
+        image_files = [n for n in names if n.startswith("images/")]
+    assert len(image_files) == 1
+    assert image_files[0] == "images/wolf_wwd30.jpg"

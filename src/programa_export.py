@@ -30,6 +30,7 @@ from __future__ import annotations
 import io
 import re
 import zipfile
+from pathlib import Path
 
 import pandas as pd
 
@@ -100,6 +101,10 @@ _DEBUG_EXTRA_COLUMNS: list[str] = [
 _MATERIAL_TAG_RE = re.compile(r"\[Materials:\s*([^\]]+)\]", re.IGNORECASE)
 _SYSTEM_TAG_RE = re.compile(r"\[[^\]]*\]")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+# Anchor to the repo root regardless of process cwd.
+# src/programa_export.py → src/ → repo root (two levels up).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _SECTION_ALIASES: dict[str, str] = {
     "": "General",
@@ -283,6 +288,32 @@ def _is_public_https_image_url(value) -> bool:
     # Enrichment already validated these URLs via HEAD content-type check.
     last_segment = path.rstrip("/").rsplit("/", 1)[-1]
     return "." not in last_segment
+
+
+def _validate_local_path(path_str: str, session_id: str | None) -> tuple[bool, str]:
+    """
+    Verify that `path_str` is a real .jpg/.jpeg under
+    .tmp/uploads/{session_id}/images/ at the repo root.
+    Returns (ok, reason). reason is the empty string when ok.
+    """
+    if not session_id:
+        return False, "no_session_id"
+    try:
+        p = Path(path_str).resolve()
+    except Exception:
+        return False, "invalid_path"
+    if not p.exists():
+        return False, "file_not_found"
+    if p.suffix.lower() not in (".jpg", ".jpeg"):
+        return False, "wrong_extension"
+    if p.stat().st_size <= 0:
+        return False, "empty_file"
+    allowed_root = _REPO_ROOT / ".tmp" / "uploads" / session_id / "images"
+    try:
+        p.relative_to(allowed_root)
+    except ValueError:
+        return False, "path_outside_session_dir"
+    return True, ""
 
 
 def _is_exportable(row: dict) -> bool:
@@ -514,31 +545,6 @@ def export_programa_zip(
             return f"{stem}_{seen_filenames[filename]}.{ext}"
         return f"{filename}_{seen_filenames[filename]}"
 
-    def _validate_local_path(path_str: str) -> tuple[bool, str]:
-        """Return (ok, reason). Reason is empty when ok."""
-        if not session_id:
-            return False, "no_session_id"
-        try:
-            from pathlib import Path as _P
-            p = _P(path_str).resolve()
-        except Exception:
-            return False, "invalid_path"
-        if not p.exists():
-            return False, "file_not_found"
-        if p.suffix.lower() not in (".jpg", ".jpeg"):
-            return False, "wrong_extension"
-        if p.stat().st_size <= 0:
-            return False, "empty_file"
-        try:
-            allowed_root = (_P(".tmp") / "uploads" / session_id / "images").resolve()
-        except Exception:
-            return False, "invalid_session_dir"
-        try:
-            p.relative_to(allowed_root)
-        except ValueError:
-            return False, "path_outside_session_dir"
-        return True, ""
-
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("programa_import.csv", csv_bytes.decode("utf-8"))
@@ -590,13 +596,12 @@ def export_programa_zip(
 
             # 1) local_image_path
             if local_path:
-                ok, reason = _validate_local_path(local_path)
+                ok, reason = _validate_local_path(local_path, session_id)
                 if ok:
                     filename = _unique_filename(local_filename or build_image_filename(brand, sku, product_name))
-                    from pathlib import Path as _P
                     manifest_row["Local Image Filename"] = filename
                     manifest_row["Image Status"] = "downloaded"
-                    zf.writestr(f"images/{filename}", _P(local_path).read_bytes())
+                    zf.writestr(f"images/{filename}", Path(local_path).read_bytes())
                     wrote_image = True
                 else:
                     manifest_row["Image Status"] = "invalid_local_path"

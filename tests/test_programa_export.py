@@ -629,6 +629,10 @@ def test_golden_csv_exact_columns_and_no_nan():
     assert data[PROGRAMA_COLUMNS.index("Height (in)")] == "33.375"
     assert data[PROGRAMA_COLUMNS.index("Depth (in)")] == "22"
     assert data[PROGRAMA_COLUMNS.index("Material")] == "Stainless Steel"
+    # [Materials:] tag stripping in Notes is verified by:
+    # - test_clean_notes_strips_materials_tag (line ~73)
+    # - test_scotsman_notes_cleaned (line ~162)
+    # - test_build_scotsman_acceptance_case (line ~504)
 
 
 def test_internal_source_columns_excluded_from_standard_export():
