@@ -120,6 +120,12 @@ class IntakeResponse(BaseModel):
     dimension_diagnostics: list[dict] = Field(default_factory=list)
 
 
+class UploadPdfResponse(BaseModel):
+    session_id: str
+    pdf_id: str
+    rows: list[dict] = Field(default_factory=list)
+
+
 class ImageUploadResponse(BaseModel):
     secure_url: str
 
@@ -154,8 +160,11 @@ app.add_middleware(
 def _startup_cleanup():
     try:
         cleanup_old_sessions(max_age_hours=24)
-    except Exception:
-        pass
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "[IMAGE RECOVERY] startup cleanup failed: %s", exc
+        )
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -308,7 +317,7 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
     return _df_response(df, errors, dimension_diagnostics)
 
 
-@app.post("/intake/upload-pdf")
+@app.post("/intake/upload-pdf", response_model=UploadPdfResponse)
 async def upload_pdf(
     file: UploadFile = File(...),
     x_session_id: str | None = Header(default=None),
@@ -330,17 +339,7 @@ async def upload_pdf(
     if not pdf_path.exists():
         pdf_path.write_bytes(raw)
 
-    # Parse rows from the same bytes via a minimal file-like wrapper.
-    class _Wrap:
-        def __init__(self, raw: bytes, name: str):
-            self._raw = raw
-            self.name = name
-        def read(self) -> bytes:
-            return self._raw
-        def seek(self, _p: int) -> None:
-            pass
-
-    rows = parse_pdf_rows(_Wrap(raw, file.filename or "upload.pdf"))
+    rows = parse_pdf_rows(UploadedPDF(file.filename or "upload.pdf", raw))
     return {"session_id": session_id, "pdf_id": pdf_id, "rows": rows}
 
 

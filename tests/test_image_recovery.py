@@ -607,7 +607,8 @@ def test_dataframe_recovery_writes_files_to_session_images_dir(tmp_path, monkeyp
             "_source_pdf_id": "",
         },
     ])
-    with patch("src.image_recovery.recover_image_for_row") as m:
+    with patch("src.image_recovery._TMP_ROOT", tmp_path / ".tmp" / "uploads"), \
+         patch("src.image_recovery.recover_image_for_row") as m:
         m.return_value = _result(confidence="HIGH", source="page_screenshot", jpeg=_jpeg_bytes())
         out_df, diags = recover_images_for_dataframe(
             df, pdf_lookup=None, session_id="sess123",
@@ -696,7 +697,8 @@ def test_cleanup_removes_old_session_dirs(tmp_path, monkeypatch):
     old = time.time() - 48 * 3600
     os.utime(stale, (old, old))
 
-    deleted = cleanup_old_sessions(max_age_hours=24)
+    with patch("src.image_recovery._TMP_ROOT", base):
+        deleted = cleanup_old_sessions(max_age_hours=24)
     assert deleted == 1
     assert fresh.exists()
     assert not stale.exists()
@@ -704,5 +706,6 @@ def test_cleanup_removes_old_session_dirs(tmp_path, monkeypatch):
 
 def test_cleanup_handles_missing_root_quietly(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    deleted = cleanup_old_sessions(max_age_hours=24)
+    with patch("src.image_recovery._TMP_ROOT", tmp_path / ".tmp" / "uploads"):
+        deleted = cleanup_old_sessions(max_age_hours=24)
     assert deleted == 0

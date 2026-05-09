@@ -101,3 +101,41 @@ JSON body:
 ```
 
 Returns `text/csv`.
+
+## `POST /intake/upload-pdf`
+
+Multipart form data:
+
+| Field | Type | Notes |
+|---|---|---|
+| `file` | PDF | The PDF file to upload |
+
+Optional request header:
+
+| Header | Type | Notes |
+|---|---|---|
+| `X-Session-Id` | string | Reuse an existing session; generated server-side if absent |
+
+Persists the PDF to `.tmp/uploads/{session_id}/pdfs/{pdf_id}.pdf` (deduped by SHA1[:12] of the file bytes) and returns parsed product rows.
+
+Returns:
+
+```json
+{
+  "session_id": "abc123",
+  "pdf_id": "def456",
+  "rows": []
+}
+```
+
+## `POST /intake/recover-images`
+
+JSON body:
+
+```json
+{ "rows": [], "session_id": "abc123" }
+```
+
+`session_id` is optional. When provided, the backend looks up PDFs stored under `.tmp/uploads/{session_id}/pdfs/` and uses them as the source for PDF crop recovery. Rows that already have an `Image URL` are skipped.
+
+Returns `IntakeResponse` with recovery diagnostics in `dimension_diagnostics`.

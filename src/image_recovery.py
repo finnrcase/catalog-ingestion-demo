@@ -674,11 +674,15 @@ def recover_image_for_row(
 # the repo root, so this resolves to <repo>/.tmp/uploads at runtime.
 # `local_image_path` values stored in the dataframe are absolute (via
 # Path.resolve()), so consumers don't need to know cwd to find files.
-_TMP_ROOT = ".tmp/uploads"
+# Anchor to repo root via __file__ (always absolute) so cwd drift in
+# deployment doesn't divert recovered images away from the PDFs the
+# backend stored under the same .tmp/uploads/{sid}/ tree.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_TMP_ROOT = _REPO_ROOT / ".tmp" / "uploads"
 
 
 def _session_image_dir(session_id: str) -> Path:
-    return Path(_TMP_ROOT) / session_id / "images"
+    return _TMP_ROOT / session_id / "images"
 
 
 _RECOVERY_COLUMNS = [
@@ -794,7 +798,7 @@ def cleanup_old_sessions(max_age_hours: int = 24) -> int:
     """Delete .tmp/uploads/<id> dirs older than max_age_hours. Returns count deleted."""
     import shutil
 
-    root = Path(_TMP_ROOT)
+    root = _TMP_ROOT
     if not root.exists():
         return 0
     threshold = time.time() - max_age_hours * 3600
