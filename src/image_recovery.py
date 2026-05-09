@@ -123,9 +123,9 @@ def recover_from_url(row: dict) -> ImageRecoveryResult:
     Validate the row's existing Image URL and download bytes.
 
     Confidence rules:
-      HIGH   — SKU appears in image URL path OR in fetched page text
-               (page text not yet fetched in Phase 1; we rely on URL path
-                + product name match against the URL)
+      HIGH   — SKU appears in image URL OR in fetched page text
+               (page text not yet fetched in Phase 1; we rely on token-based
+                SKU/product-name matching against the full URL string)
       MEDIUM — image URL is on the brand's official domain, no SKU evidence
       LOW    — URL valid but unrelated/unknown domain, no SKU evidence
     """
