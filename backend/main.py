@@ -77,6 +77,7 @@ class RowsPayload(BaseModel):
     enrichment_mode: str = "standard"
     force_refresh: bool = False
     use_web_enrichment: bool = True
+    include_low_confidence_images: bool = False
     session_id: str | None = None
 
 
@@ -624,7 +625,11 @@ def export_programa_import_xlsx(payload: RowsPayload) -> Response:
 def export_programa_import_zip(payload: RowsPayload) -> Response:
     """ZIP archive: programa_import.csv + images/ folder + manifest.csv."""
     today = datetime.date.today().isoformat()
-    zip_bytes = export_programa_zip(payload.rows)
+    zip_bytes = export_programa_zip(
+        payload.rows,
+        include_low_confidence_images=payload.include_low_confidence_images,
+        session_id=payload.session_id,
+    )
     return Response(
         content=zip_bytes,
         media_type="application/zip",

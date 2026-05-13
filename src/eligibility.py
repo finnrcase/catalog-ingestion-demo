@@ -5,6 +5,7 @@ Programa send eligibility rules shared by the legacy app and API backend.
 from __future__ import annotations
 
 from src.dimensions import has_complete_3d_dimensions
+from src.image_presence import row_has_image
 
 BLOCKED_STATUSES = {"Ignored", "Excluded", "Error"}
 
@@ -41,8 +42,8 @@ def evaluate_programa_eligibility(row: dict, allow_blank_fields: bool = False) -
             blockers.append("Missing product name")
         if not _text(row.get("Product Category")):
             blockers.append("Missing category")
-        if not _is_public_https_url(row.get("Image URL")):
-            blockers.append("Missing hosted image URL")
+        if not row_has_image(row):
+            blockers.append("Missing image")
         return len(blockers) == 0, blockers
     if allow_blank_fields:
         return len(blockers) == 0, blockers

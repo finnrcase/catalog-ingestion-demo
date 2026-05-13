@@ -41,6 +41,10 @@ def test_build_filename_all_empty_defaults_to_product():
     assert build_image_filename() == "product.jpg"
 
 
+def test_build_filename_punctuation_only_defaults_to_product():
+    assert build_image_filename(product_name="_________________") == "product.jpg"
+
+
 # ── download_and_convert_image ────────────────────────────────────────────────
 
 from src.image_assets import download_and_convert_image
@@ -173,6 +177,21 @@ def test_zip_contains_manifest():
     assert "wolf_wwd30.jpg" in manifest_text
 
 
+def test_zip_contains_manual_image_upload_guide_and_readme():
+    rows = [_make_exportable_row()]
+    with patch("src.image_assets.httpx.get", return_value=_mock_get(_make_image_bytes())):
+        zip_bytes = export_programa_zip(rows)
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = zf.namelist()
+        guide_text = zf.read("manual_image_upload_guide.csv").decode("utf-8")
+        readme_text = zf.read("README_manual_image_upload.txt").decode("utf-8")
+    assert "manual_image_upload_guide.csv" in names
+    assert "README_manual_image_upload.txt" in names
+    assert "Image Folder Path" in guide_text
+    assert "images/wolf_wwd30.jpg" in guide_text
+    assert "may not automatically create product photos" in readme_text
+
+
 def test_zip_contains_downloaded_image():
     rows = [_make_exportable_row()]
     with patch("src.image_assets.httpx.get", return_value=_mock_get(_make_image_bytes())):
@@ -280,7 +299,29 @@ def test_zip_deduplicated_second_filename_has_numeric_suffix():
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         image_files = sorted(n for n in zf.namelist() if n.startswith("images/"))
     assert image_files[0] == "images/wolf_wwd30.jpg"
-    assert image_files[1] == "images/wolf_wwd30_2.jpg"
+    assert image_files[1].startswith("images/wolf_wwd30_")
+    assert image_files[1].endswith(".jpg")
+    assert image_files[1] != "images/wolf_wwd30_2.jpg"
+
+
+def test_zip_contains_programa_xlsx():
+    rows = [_make_exportable_row()]
+    with patch("src.image_assets.httpx.get", return_value=_mock_get(_make_image_bytes())):
+        zip_bytes = export_programa_zip(rows)
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        assert "programa_import.xlsx" in zf.namelist()
+
+
+def test_zip_csv_image_filename_matches_zip_member():
+    rows = [_make_exportable_row()]
+    with patch("src.image_assets.httpx.get", return_value=_mock_get(_make_image_bytes())):
+        zip_bytes = export_programa_zip(rows)
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        csv_text = zf.read("programa_import.csv").decode("utf-8")
+        names = zf.namelist()
+    assert "Image Filename" in csv_text.splitlines()[0]
+    assert "wolf_wwd30.jpg" in csv_text
+    assert "images/wolf_wwd30.jpg" in names
 
 
 # ── manifest 4 new columns + path validation + LOW skip ───────────────────────
@@ -390,6 +431,31 @@ def test_zip_skips_low_confidence_row(tmp_path, monkeypatch):
         manifest_text = zf.read("manifest.csv").decode("utf-8")
     assert not any(n.startswith("images/") for n in names)
     assert "low_confidence_skipped" in manifest_text
+
+
+def test_zip_includes_low_confidence_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    images_dir = tmp_path / ".tmp" / "uploads" / "sess1" / "images"
+    images_dir.mkdir(parents=True)
+    local = images_dir / "wolf_wwd30.jpg"
+    local.write_bytes(_make_image_bytes())
+
+    row = _make_exportable_row()
+    row["local_image_path"] = str(local.resolve())
+    row["local_image_filename"] = "wolf_wwd30.jpg"
+    row["confidence"] = "LOW"
+    row["image_source"] = "official_site_html_image"
+    row["Image URL"] = ""
+
+    with patch("src.programa_export._REPO_ROOT", tmp_path):
+        zip_bytes = export_programa_zip(
+            [row],
+            session_id="sess1",
+            include_low_confidence_images=True,
+        )
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = zf.namelist()
+    assert "images/wolf_wwd30.jpg" in names
 
 
 def test_zip_local_image_path_wins_over_manual_image(tmp_path, monkeypatch):

@@ -53,6 +53,9 @@ from src.image_evidence import (
     product_name_appears_in_text,
     sku_appears_in_text,
 )
+from src.image_presence import row_has_image, row_image_status
+from src.product_page_images import extract_image_from_url
+from src.web_product_lookup import lookup_official_product_image
 
 
 _log = logging.getLogger(__name__)
@@ -62,7 +65,7 @@ _USER_AGENT = "Mozilla/5.0 (compatible; SCH-Intake/1.0)"
 
 @dataclass
 class ImageRecoveryResult:
-    image_source: str = "none"   # "url" | "pdf_crop" | "page_screenshot" | "manual_upload" | "none"
+    image_source: str = "none"
     confidence: str = "NONE"     # "HIGH" | "MEDIUM" | "LOW" | "NONE"
     evidence: list[str] = field(default_factory=list)
     image_url: str = ""
@@ -162,7 +165,7 @@ def recover_from_url(row: dict) -> ImageRecoveryResult:
 
     if not _check_image_content_type(url):
         return ImageRecoveryResult(
-            image_source="url",
+            image_source="product_url_html_image",
             confidence="NONE",
             error="invalid_content_type",
             image_url=url,
@@ -171,7 +174,7 @@ def recover_from_url(row: dict) -> ImageRecoveryResult:
     jpeg = _download_jpeg_bytes(url)
     if not jpeg:
         return ImageRecoveryResult(
-            image_source="url",
+            image_source="product_url_html_image",
             confidence="NONE",
             error="download_failed",
             image_url=url,
@@ -198,12 +201,57 @@ def recover_from_url(row: dict) -> ImageRecoveryResult:
         confidence = "MEDIUM"
 
     return ImageRecoveryResult(
-        image_source="url",
+        image_source="product_url_html_image",
         confidence=confidence,
         evidence=evidence,
         image_url=url,
         jpeg_bytes=jpeg,
     )
+
+
+def _result_from_page_result(page_result) -> ImageRecoveryResult:
+    if not page_result.image_found:
+        return ImageRecoveryResult(
+            image_source=page_result.image_source or "none",
+            confidence="NONE",
+            image_url=page_result.image_url or "",
+            error=page_result.error or "no_usable_product_images",
+        )
+    jpeg = _download_jpeg_bytes(page_result.image_url)
+    if not jpeg:
+        return ImageRecoveryResult(
+            image_source=page_result.image_source,
+            confidence="NONE",
+            evidence=list(page_result.evidence),
+            image_url=page_result.image_url,
+            error="image_download_failed",
+        )
+    return ImageRecoveryResult(
+        image_source=page_result.image_source,
+        confidence=page_result.confidence,
+        evidence=list(page_result.evidence),
+        image_url=page_result.image_url,
+        jpeg_bytes=jpeg,
+    )
+
+
+def recover_from_product_page(row: dict, page_url: str, debug: dict | None = None) -> ImageRecoveryResult:
+    page_result = extract_image_from_url(page_url, row, source_prefix="product_url")
+    pdebug = page_result.debug or {}
+    if debug is not None:
+        debug["product_url_fetch_ran"] = True
+        debug["product_url_fetch_status"] = pdebug.get("fetch_status")
+        debug["product_url_images_found"] = pdebug.get("images_found", 0)
+        debug["product_url_selected_image"] = pdebug.get("selected_image", "")
+        debug["product_url_rejection_reasons"] = list(pdebug.get("rejection_reasons", []))
+    return _result_from_page_result(page_result)
+
+
+def recover_from_official_lookup(row: dict, debug: dict | None = None) -> ImageRecoveryResult:
+    web = lookup_official_product_image(row)
+    if debug is not None:
+        debug.update(web.debug)
+    return _result_from_page_result(web.image_result)
 
 
 # ── recover_from_pdf_crop ─────────────────────────────────────────────────────
@@ -415,7 +463,7 @@ def recover_from_pdf_crop(
         if debug is not None:
             debug["pdf_path_exists"] = False
         return ImageRecoveryResult(
-            image_source="pdf_crop",
+            image_source="none",
             error=f"pdf_unreadable: file not found at {pdf_path}",
         )
     if debug is not None:
@@ -429,7 +477,7 @@ def recover_from_pdf_crop(
         if debug is not None:
             debug["pdf_opened"] = False
             debug["error"] = f"pdf_unreadable: {exc}"
-        return ImageRecoveryResult(image_source="pdf_crop", error=f"pdf_unreadable: {exc}")
+        return ImageRecoveryResult(image_source="none", error=f"pdf_unreadable: {exc}")
 
     page_number = row.get("_source_page_number")
     if not isinstance(page_number, int) or page_number < 1:
@@ -491,7 +539,7 @@ def recover_from_pdf_crop(
             if not jpeg:
                 # Even page rendering failed (corrupt page, encrypted, etc.)
                 return ImageRecoveryResult(
-                    image_source="pdf_crop",
+                    image_source="none",
                     error="no_usable_images_in_pdf",
                 )
 
@@ -502,11 +550,14 @@ def recover_from_pdf_crop(
                 # Page-render fallbacks are MEDIUM at best — we have less
                 # certainty about what the cropped region actually contains.
                 evidence.append("page_render_full" if page_render_full else "page_render_content_crop")
+                source = "pdf_page_render_full" if page_render_full else "pdf_page_render_content_crop"
                 confidence = "MEDIUM"
             elif is_adjacent:
                 evidence.append("adjacent_page_crop")
+                source = "pdf_adjacent_page_image"
                 confidence = "MEDIUM"
             else:
+                source = "pdf_embedded_image"
                 # Same-page embedded image: read text now that we know we'll use it.
                 target_text = target_page.get_text("text") or ""
                 # The row's _source_pdf_id + _source_page_number metadata is
@@ -528,7 +579,7 @@ def recover_from_pdf_crop(
                     # confidence stays MEDIUM
 
             return ImageRecoveryResult(
-                image_source="pdf_crop",
+                image_source=source,
                 confidence=confidence,
                 evidence=evidence,
                 jpeg_bytes=jpeg,
@@ -538,7 +589,7 @@ def recover_from_pdf_crop(
             if debug is not None:
                 debug["error"] = f"pdf_render_error: {exc}"
             return ImageRecoveryResult(
-                image_source="pdf_crop",
+                image_source="none",
                 error=f"pdf_render_error: {exc}",
             )
     finally:
@@ -805,9 +856,10 @@ def recover_image_for_row(
 ) -> ImageRecoveryResult:
     """
     Try sources in priority order:
-      1) existing Image URL (HIGH short-circuits; MEDIUM/LOW held as best-so-far)
-      2) PDF crop          (HIGH short-circuits; MEDIUM/LOW compared against held)
-      3) Screenshot        (HIGH short-circuits; MEDIUM/LOW compared against held)
+      1) Product/Supplier/Source URL page extraction
+      2) Official manufacturer/supplier web lookup
+      3) Existing Image URL validation
+      4) PDF native image extraction and page-render fallback
 
     On a confidence tie between two non-HIGH results, the source held first wins
     (URL > PDF > Screenshot). This means PDF MEDIUM beats Screenshot MEDIUM, and
@@ -827,12 +879,55 @@ def recover_image_for_row(
         debug.setdefault("pdf_adjacent_pages_scanned", False)
         debug.setdefault("pdf_page_render_fallback_used", False)
         debug.setdefault("pdf_page_render_full", False)
-        debug.setdefault("screenshot_ran", False)
-        debug.setdefault("screenshot_url_attempted", "")
-        debug.setdefault("screenshot_selector_matched", "")
-        debug.setdefault("screenshot_candidates_found", 0)
+        debug.setdefault("product_url_fetch_ran", False)
+        debug.setdefault("product_url_fetch_status", "")
+        debug.setdefault("product_url_images_found", 0)
+        debug.setdefault("product_url_selected_image", "")
+        debug.setdefault("product_url_rejection_reasons", [])
+        debug.setdefault("web_lookup_ran", False)
+        debug.setdefault("web_queries_used", [])
+        debug.setdefault("web_results_found", 0)
+        debug.setdefault("official_candidate_pages", [])
+        debug.setdefault("selected_product_page_url", "")
+        debug.setdefault("selected_product_page_domain", "")
+        debug.setdefault("selected_web_image_url", "")
+        debug.setdefault("web_confidence_reason", "")
+        debug.setdefault("web_rejection_reasons", [])
+        debug.setdefault("brand_registry_match", False)
+        debug.setdefault("brand_registry_domains_checked", [])
+        debug.setdefault("brand_search_queries_used", [])
+        debug.setdefault("candidate_pages_found", 0)
+        debug.setdefault("candidate_page_scores", [])
+        debug.setdefault("selected_product_page_score", 0)
+        debug.setdefault("selected_product_page_reason", "")
+        debug.setdefault("image_candidates_found", 0)
+        debug.setdefault("selected_image_url", "")
+        debug.setdefault("selected_image_reason", "")
 
-    # 1) URL on row
+    # 1) Product/Supplier/Source URL page extraction.
+    for page_key in ("Product URL", "Supplier URL", "Source URL"):
+        page_url = _str_val(row.get(page_key))
+        if not page_url:
+            continue
+        page_result = recover_from_product_page(row, page_url, debug=debug)
+        if page_result.confidence == "HIGH":
+            if debug is not None:
+                _record_final_debug(debug, page_result)
+            return page_result
+        if page_result.confidence in ("MEDIUM", "LOW"):
+            held = page_result
+        break
+
+    # 2) Official manufacturer/supplier web lookup.
+    web_result = recover_from_official_lookup(row, debug=debug)
+    if web_result.confidence == "HIGH":
+        if debug is not None:
+            _record_final_debug(debug, web_result)
+        return web_result
+    if web_result.confidence in ("MEDIUM", "LOW"):
+        held = _better(held, web_result)
+
+    # 3) Existing image URL on row.
     url_val = _str_val(row.get("Image URL"))
     if url_val:
         url_result = recover_from_url(row)
@@ -843,7 +938,7 @@ def recover_image_for_row(
         if url_result.confidence in ("MEDIUM", "LOW"):
             held = url_result
 
-    # 2) PDF crop
+    # 4) PDF crop/render fallback.
     pdf_id = _str_val(row.get("_source_pdf_id"))
     pdf_path = (pdf_lookup or {}).get(pdf_id) if pdf_id else None
     if pdf_id and pdf_path:
@@ -854,21 +949,6 @@ def recover_image_for_row(
             return pdf_result
         if pdf_result.confidence in ("MEDIUM", "LOW"):
             held = _better(held, pdf_result)
-
-    # 3) Screenshot
-    if enable_screenshot:
-        product_url = _str_val(row.get("Product URL"))
-        if product_url:
-            if debug is not None:
-                debug["screenshot_ran"] = True
-                debug["screenshot_url_attempted"] = product_url
-            shot_result = recover_from_screenshot(row, product_url, debug=debug)
-            if shot_result.confidence == "HIGH":
-                if debug is not None:
-                    _record_final_debug(debug, shot_result)
-                return shot_result
-            if shot_result.confidence in ("MEDIUM", "LOW"):
-                held = _better(held, shot_result)
 
     final = held if held is not None else ImageRecoveryResult()
     if debug is not None:
@@ -916,7 +996,10 @@ def _ensure_recovery_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _row_already_high(row: pd.Series) -> bool:
-    return _str_val(row.get("confidence")).upper() == "HIGH"
+    row_dict = row.to_dict()
+    if _str_val(row.get("image_source")).lower() == "manual_upload" and row_has_image(row_dict):
+        return True
+    return _str_val(row.get("confidence")).upper() == "HIGH" and row_has_image(row_dict)
 
 
 def recover_images_for_dataframe(
@@ -967,7 +1050,7 @@ def recover_images_for_dataframe(
         # True because non-empty strings are truthy.
         df.at[idx, "needs_image_review"] = str(result.needs_image_review)
 
-        if result.image_source == "url" and result.image_url:
+        if result.image_url:
             df.at[idx, "Image URL"] = result.image_url
 
         # Only write files for HIGH/MEDIUM. LOW results are diagnostic only.
@@ -991,33 +1074,95 @@ def recover_images_for_dataframe(
 
                 target.write_bytes(result.jpeg_bytes)
                 df.at[idx, "local_image_filename"] = filename
+                df.at[idx, "Image Filename"] = filename
                 df.at[idx, "local_image_path"] = str(target.resolve())
+                df.at[idx, "recovered_image_path"] = str(target.resolve())
             except Exception as exc:
                 _log.warning("[IMAGE RECOVERY] disk write failed idx=%s err=%s", idx, exc)
 
+        row_after = df.loc[idx].to_dict()
+        local_path_after = _str_val(row_after.get("local_image_path") or row_after.get("recovered_image_path"))
+        source_pdf_id = _str_val(row_dict.get("_source_pdf_id"))
+        source_pdf_path = (pdf_lookup or {}).get(source_pdf_id, "") if source_pdf_id else ""
+        image_url_after = _str_val(row_after.get("Image URL"))
+        confidence_after = result.confidence
+        local_path_exists = bool(local_path_after and Path(local_path_after).exists())
+        exported_to_zip = bool(
+            confidence_after in {"HIGH", "MEDIUM"}
+            and (local_path_exists or image_url_after.lower().startswith("https://"))
+        )
+        if exported_to_zip:
+            export_skip_reason = ""
+        elif confidence_after == "LOW":
+            export_skip_reason = "low_confidence_skipped_by_default"
+        elif not row_has_image(row_after):
+            export_skip_reason = "missing_image"
+        elif local_path_after and not local_path_exists:
+            export_skip_reason = "local_image_path_missing"
+        else:
+            export_skip_reason = "not_export_ready"
+
         diagnostics.append({
             "row_index": int(idx),
+            "row_id": _str_val(row_dict.get("row_id") or row_dict.get("Row ID") or idx),
             "product_name": _str_val(row_dict.get("Product Name")),
             "brand": _str_val(row_dict.get("Brand")),
             "model_sku": _str_val(row_dict.get("Model/SKU")),
+            "supplier": _str_val(row_dict.get("Supplier")),
             "product_url": _str_val(row_dict.get("Product URL")),
+            "product_url_present": bool(_str_val(row_dict.get("Product URL"))),
             "_source_pdf_id": _str_val(row_dict.get("_source_pdf_id")),
             "_source_page_number": row_dict.get("_source_page_number"),
+            "page_number": row_dict.get("_source_page_number"),
             "_source_filename": _str_val(row_dict.get("_source_filename")),
+            "source_pdf_path": source_pdf_path,
+            "source_pdf_path_exists": bool(source_pdf_path and Path(source_pdf_path).exists()),
             "image_source": result.image_source,
             "confidence": result.confidence,
             "evidence": list(result.evidence),
             "error": result.error,
+            "local_image_path": local_path_after,
+            "image_filename": _str_val(row_after.get("Image Filename") or row_after.get("local_image_filename")),
+            "image_url": image_url_after,
+            "row_has_image": row_has_image(row_after),
+            "exported_to_zip": exported_to_zip,
+            "export_skip_reason": export_skip_reason,
+            "final_ui_status": row_image_status(row_after),
             # Per-source diagnostics for the Image Recovery Debug Report.
             "pdf_path": debug.get("pdf_path", ""),
             "pdf_path_exists": debug.get("pdf_path_exists"),
             "pdf_opened": debug.get("pdf_opened"),
             "pdf_image_objects_count": debug.get("pdf_image_objects_count", 0),
+            "pdf_images_found": debug.get("pdf_image_objects_count", 0),
             "pdf_candidates_after_filter": debug.get("pdf_candidates_after_filter", 0),
             "pdf_rejection_reasons": list(debug.get("pdf_rejection_reasons", [])),
             "pdf_adjacent_pages_scanned": bool(debug.get("pdf_adjacent_pages_scanned", False)),
             "pdf_page_render_fallback_used": bool(debug.get("pdf_page_render_fallback_used", False)),
             "pdf_page_render_full": bool(debug.get("pdf_page_render_full", False)),
+            "product_url_fetch_ran": bool(debug.get("product_url_fetch_ran", False)),
+            "product_url_fetch_status": debug.get("product_url_fetch_status", ""),
+            "product_url_images_found": debug.get("product_url_images_found", 0),
+            "product_url_selected_image": debug.get("product_url_selected_image", ""),
+            "product_url_rejection_reasons": list(debug.get("product_url_rejection_reasons", [])),
+            "web_lookup_ran": bool(debug.get("web_lookup_ran", False)),
+            "web_queries_used": list(debug.get("web_queries_used", [])),
+            "web_results_found": debug.get("web_results_found", 0),
+            "official_candidate_pages": list(debug.get("official_candidate_pages", [])),
+            "selected_product_page_url": debug.get("selected_product_page_url", ""),
+            "selected_product_page_domain": debug.get("selected_product_page_domain", ""),
+            "selected_web_image_url": debug.get("selected_web_image_url", ""),
+            "web_confidence_reason": debug.get("web_confidence_reason", ""),
+            "web_rejection_reasons": list(debug.get("web_rejection_reasons", [])),
+            "brand_registry_match": debug.get("brand_registry_match", False),
+            "brand_registry_domains_checked": list(debug.get("brand_registry_domains_checked", [])),
+            "brand_search_queries_used": list(debug.get("brand_search_queries_used", [])),
+            "candidate_pages_found": debug.get("candidate_pages_found", 0),
+            "candidate_page_scores": list(debug.get("candidate_page_scores", [])),
+            "selected_product_page_score": debug.get("selected_product_page_score", 0),
+            "selected_product_page_reason": debug.get("selected_product_page_reason", ""),
+            "image_candidates_found": debug.get("image_candidates_found", 0),
+            "selected_image_url": debug.get("selected_image_url", ""),
+            "selected_image_reason": debug.get("selected_image_reason", ""),
             "screenshot_ran": bool(debug.get("screenshot_ran", False)),
             "screenshot_url_attempted": debug.get("screenshot_url_attempted", ""),
             "screenshot_selector_matched": debug.get("screenshot_selector_matched", ""),
@@ -1031,22 +1176,53 @@ def recover_images_for_dataframe(
 
 _DEBUG_REPORT_COLUMNS = [
     "row_index",
+    "row_id",
     "product_name",
     "brand",
     "model_sku",
+    "supplier",
     "product_url",
+    "product_url_present",
     "_source_pdf_id",
     "_source_page_number",
+    "page_number",
     "_source_filename",
+    "source_pdf_path",
+    "source_pdf_path_exists",
     "pdf_path",
     "pdf_path_exists",
     "pdf_opened",
     "pdf_image_objects_count",
+    "pdf_images_found",
     "pdf_candidates_after_filter",
     "pdf_rejection_reasons",
     "pdf_adjacent_pages_scanned",
     "pdf_page_render_fallback_used",
     "pdf_page_render_full",
+    "product_url_fetch_ran",
+    "product_url_fetch_status",
+    "product_url_images_found",
+    "product_url_selected_image",
+    "product_url_rejection_reasons",
+    "web_lookup_ran",
+    "web_queries_used",
+    "web_results_found",
+    "official_candidate_pages",
+    "selected_product_page_url",
+    "selected_product_page_domain",
+    "selected_web_image_url",
+    "web_confidence_reason",
+    "web_rejection_reasons",
+    "brand_registry_match",
+    "brand_registry_domains_checked",
+    "brand_search_queries_used",
+    "candidate_pages_found",
+    "candidate_page_scores",
+    "selected_product_page_score",
+    "selected_product_page_reason",
+    "image_candidates_found",
+    "selected_image_url",
+    "selected_image_reason",
     "screenshot_ran",
     "screenshot_url_attempted",
     "screenshot_selector_matched",
@@ -1055,6 +1231,13 @@ _DEBUG_REPORT_COLUMNS = [
     "confidence",
     "evidence",
     "error",
+    "local_image_path",
+    "image_filename",
+    "image_url",
+    "row_has_image",
+    "exported_to_zip",
+    "export_skip_reason",
+    "final_ui_status",
 ]
 
 
@@ -1075,6 +1258,14 @@ def build_image_recovery_debug_dataframe(diagnostics: list[dict]) -> pd.DataFram
             row["evidence"] = ";".join(row["evidence"])
         if isinstance(row.get("pdf_rejection_reasons"), list):
             row["pdf_rejection_reasons"] = " | ".join(row["pdf_rejection_reasons"])
+        for key in (
+            "product_url_rejection_reasons",
+            "web_queries_used",
+            "official_candidate_pages",
+            "web_rejection_reasons",
+        ):
+            if isinstance(row.get(key), list):
+                row[key] = " | ".join(str(v) for v in row[key])
         rows.append(row)
     return pd.DataFrame(rows, columns=_DEBUG_REPORT_COLUMNS)
 

@@ -41,6 +41,8 @@ def build_image_filename(
     if not raw:
         raw = "product"
     slug = _NON_ALNUM_RE.sub("_", raw.lower()).strip("_")
+    if not slug:
+        slug = "product"
     return f"{slug}.jpg"
 
 

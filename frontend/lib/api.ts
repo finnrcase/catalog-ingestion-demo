@@ -120,6 +120,16 @@ export async function enrichRows(input: {
   );
 }
 
+export async function recoverImages(rows: IntakeRow[]): Promise<IntakeResponse> {
+  return parseJson<IntakeResponse>(
+    await apiFetch(apiUrl("/intake/recover-images"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rows }),
+    }),
+  );
+}
+
 export async function saveManufacturerOverride(input: {
   brand: string;
   website: string;
@@ -271,6 +281,19 @@ export async function exportProgramaCsv(rows: IntakeRow[]): Promise<Blob> {
 
 export async function exportProgramaXlsx(rows: IntakeRow[]): Promise<Blob> {
   return exportProgramaFile(rows, "/export/programa/xlsx", "Could not export Programa XLSX.");
+}
+
+export async function exportProgramaZip(rows: IntakeRow[], includeLowConfidenceImages = false): Promise<Blob> {
+  const response = await apiFetch(apiUrl("/export/programa/zip"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      rows,
+      include_low_confidence_images: includeLowConfidenceImages,
+    }),
+  });
+  if (!response.ok) throw new Error("Could not export Programa ZIP.");
+  return response.blob();
 }
 
 export async function exportProgramaDebugCsv(rows: IntakeRow[]): Promise<Blob> {

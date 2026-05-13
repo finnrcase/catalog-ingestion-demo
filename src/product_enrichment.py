@@ -25,7 +25,13 @@ from src.brave_search import BRAVE_API_KEY, search_product_candidates
 from src.category_ai import _normalise_category
 from src.dimension_enrichment import DimensionResult as _DimensionResult, find_dimensions as _find_dimensions
 from src.dimensions import has_complete_3d_dimensions
+from src.image_presence import row_has_image
+from src.measurement_parser import normalize_dimension_fields
 from src.manufacturer_domains import get_domain_for_brand, record_discovered_domain
+from src.official_product_lookup import lookup_official_product_page
+from src.product_lookup_cache import ProductLookupCache as _ProductLookupCache, make_lookup_cache_key
+from src.product_page_images import extract_product_page_image
+from src.product_page_specs import extract_product_page_specs
 
 try:
     import html2text as _html2text
@@ -53,6 +59,7 @@ from src.enrichment_cache import (
 
 # Module-level singleton — lazy-loads on first access
 _product_cache = _ProductEnrichmentCache()
+_lookup_cache = _ProductLookupCache()
 
 # Cache field mappings: cache field name → row column name
 _CACHE_GENERAL_FIELDS: dict[str, str] = {
@@ -130,6 +137,39 @@ def _build_search_query(row: dict) -> str:
         domain, _source = domain_match
         return f"site:{domain} {query}"
     return query
+
+
+def build_search_queries(row: dict) -> list[str]:
+    """Build precise product enrichment queries in priority order."""
+    brand = _str_val(row.get("Brand"))
+    model = _str_val(row.get("Model/SKU"))
+    product_name = _str_val(row.get("Product Name"))
+    supplier = _str_val(row.get("Supplier"))
+    category = _str_val(row.get("Product Category") or row.get("Category"))
+    queries: list[str] = []
+
+    def add(query: str) -> None:
+        cleaned = " ".join(query.split()).strip()
+        if cleaned and cleaned not in queries:
+            queries.append(cleaned)
+
+    if brand and model:
+        add(f'"{brand}" "{model}"')
+    if brand and product_name:
+        add(f'"{brand}" "{product_name}"')
+        add(f'"{brand}" "{product_name}" dimensions')
+    if supplier and model:
+        add(f'"{supplier}" "{model}"')
+    if brand and product_name and category:
+        add(f'"{brand}" "{product_name}" "{category}"')
+    return queries
+
+
+def has_enough_search_identity(row: dict) -> bool:
+    return bool(
+        (_str_val(row.get("Brand")) and (_str_val(row.get("Model/SKU")) or _str_val(row.get("Product Name"))))
+        or (_str_val(row.get("Supplier")) and _str_val(row.get("Model/SKU")))
+    )
 
 
 def _apply_enrichment(
@@ -435,6 +475,198 @@ def _try_image_from_url(product_url: str, cache_key: str = "") -> str | None:
     return candidate
 
 
+_CONF_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3}
+
+
+def _is_manual_image(row: dict) -> bool:
+    return _str_val(row.get("image_source")).lower() == "manual_upload"
+
+
+def _apply_official_product_lookup(
+    row: dict,
+    *,
+    session_cache: "_SessionCache | None" = None,
+    force_refresh: bool = False,
+) -> tuple[dict, _DimensionResult | None, dict]:
+    """Incrementally fill product URL/image/specs from official brand registry lookup."""
+    updated = row.copy()
+    debug: dict = {
+        "brand_registry_match": False,
+        "brand_registry_domains_checked": [],
+        "brand_search_queries_used": [],
+        "candidate_pages_found": 0,
+        "candidate_page_scores": [],
+        "selected_product_page_url": "",
+        "selected_product_page_score": 0,
+        "selected_product_page_reason": "",
+        "image_candidates_found": 0,
+        "selected_image_url": "",
+        "selected_image_reason": "",
+        "dimensions_found": False,
+        "dimension_source_url": "",
+        "dimension_confidence": "",
+        "dimension_evidence": "",
+        "web_lookup_error": "",
+    }
+    def _stamp_debug_fields(target: dict) -> dict:
+        for key, value in debug.items():
+            if key in {
+                "brand_registry_match",
+                "brand_registry_domains_checked",
+                "brand_search_queries_used",
+                "candidate_pages_found",
+                "candidate_page_scores",
+                "selected_product_page_url",
+                "selected_product_page_score",
+                "selected_product_page_reason",
+                "image_candidates_found",
+                "selected_image_url",
+                "selected_image_reason",
+                "dimensions_found",
+                "dimension_source_url",
+                "dimension_confidence",
+                "dimension_evidence",
+                "web_lookup_error",
+            }:
+                target[key] = value
+        return target
+
+    dim_result: _DimensionResult | None = None
+    key = make_lookup_cache_key(row)
+    cached = None if force_refresh else _lookup_cache.get(key)
+
+    page_url = ""
+    if cached:
+        page_url = _str_val(cached.get("selected_product_page_url"))
+        debug.update({k: cached.get(k, debug.get(k)) for k in debug})
+    if not page_url:
+        page = lookup_official_product_page(row, session_cache=session_cache)
+        debug.update({
+            "brand_registry_match": page.registry_match,
+            "brand_registry_domains_checked": page.registry_domains_checked,
+            "brand_search_queries_used": page.queries_used,
+            "candidate_pages_found": len(page.candidate_pages),
+            "candidate_page_scores": page.candidate_pages,
+            "selected_product_page_url": page.selected_url,
+            "selected_product_page_score": page.score,
+            "selected_product_page_reason": page.reason,
+            "web_lookup_error": page.error,
+        })
+        if page.confidence in {"HIGH", "MEDIUM"}:
+            page_url = page.selected_url
+
+    if not page_url:
+        return _stamp_debug_fields(updated), None, debug
+
+    if not _str_val(updated.get("Product URL")):
+        updated["Product URL"] = page_url
+
+    html = _fetch_page_html(page_url)
+    if not html:
+        debug["web_lookup_error"] = debug.get("web_lookup_error") or "selected_page_fetch_failed"
+        return _stamp_debug_fields(updated), None, debug
+
+    selected_reason = _str_val(debug.get("selected_product_page_reason"))
+    sku_match = "sku_match" in selected_reason
+    official = any(token in selected_reason for token in ("brand_registry_domain", "official_brand_domain", "official_supplier_domain"))
+    name_match = "product_name_match" in selected_reason
+
+    specs = extract_product_page_specs(
+        html,
+        page_url,
+        updated,
+        official_domain=official,
+        sku_match=sku_match,
+        product_name_match=name_match,
+    )
+    debug.update({
+        "dimensions_found": bool(specs.dimensions),
+        "dimension_source_url": specs.source_url,
+        "dimension_confidence": specs.confidence,
+        "dimension_evidence": specs.evidence,
+    })
+
+    existing_dims = _str_val(updated.get("Dimensions"))
+    existing_dim_conf = _str_val(updated.get("Dimension Confidence")).lower() or "none"
+    if specs.dimensions and specs.confidence in {"high", "medium"}:
+        should_fill_dims = (
+            not existing_dims
+            or not has_complete_3d_dimensions(existing_dims)
+            or _CONF_RANK.get(specs.confidence, 0) > _CONF_RANK.get(existing_dim_conf, 0)
+        )
+        if should_fill_dims:
+            updated["Dimensions"] = specs.dimensions
+            if specs.width:
+                updated["Width (in)"] = specs.width
+            if specs.height:
+                updated["Height (in)"] = specs.height
+            if specs.depth:
+                updated["Depth (in)"] = specs.depth
+            if specs.length:
+                updated["Length (in)"] = specs.length
+            if specs.diameter:
+                updated["Diameter (in)"] = specs.diameter
+            updated["Dimension Source URL"] = specs.source_url
+            updated["Dimension Confidence"] = specs.confidence
+            updated["Dimension Source Type"] = "official_product_page"
+            updated["Dimension Lookup Status"] = "found"
+            updated["dimension_source_url"] = specs.source_url
+            updated["dimension_confidence"] = specs.confidence
+            updated["dimension_evidence"] = specs.evidence
+            updated["dimension_raw_text"] = specs.raw_text
+            dim_result = _DimensionResult(
+                dimensions=specs.dimensions,
+                width=specs.width,
+                height=specs.height,
+                depth=specs.depth,
+                length=specs.length,
+                source_url=specs.source_url,
+                confidence=specs.confidence,
+                source_type="official_product_page",
+                status="found",
+                queries_tried=list(debug.get("brand_search_queries_used") or []),
+                urls_checked=[page_url],
+                evidence_text=specs.evidence or specs.raw_text,
+            )
+
+    for source, dest in (("finish", "Finish / Color"), ("material", "Material"), ("lead_time", "Lead Time"), ("weight", "Weight")):
+        value = _str_val(getattr(specs, source))
+        if value and not _str_val(updated.get(dest)):
+            updated[dest] = value
+
+    image = extract_product_page_image(html, page_url, updated, source_prefix="official_site")
+    debug["image_candidates_found"] = image.debug.get("images_found", 0)
+    if image.image_found:
+        debug["selected_image_url"] = image.image_url
+        debug["selected_image_reason"] = ";".join(image.evidence)
+        if not _is_manual_image(updated) and not row_has_image(updated) and image.confidence in {"HIGH", "MEDIUM"}:
+            updated["Image URL"] = image.image_url
+            updated["image_source"] = image.image_source
+            updated["confidence"] = image.confidence
+            updated["evidence"] = ";".join(image.evidence)
+            updated["needs_image_review"] = str(image.confidence != "HIGH")
+
+    cache_payload = {
+        "selected_product_page_url": page_url,
+        "selected_image_url": debug.get("selected_image_url", ""),
+        "dimensions": specs.dimensions,
+        "width_in": specs.width,
+        "height_in": specs.height,
+        "depth_in": specs.depth,
+        "length_in": specs.length,
+        "diameter_in": specs.diameter,
+        "finish": specs.finish,
+        "material": specs.material,
+        "lead_time": specs.lead_time,
+        "confidence": specs.confidence or debug.get("dimension_confidence", ""),
+        "evidence": specs.evidence or debug.get("selected_product_page_reason", ""),
+        "source_domain": urllib.parse.urlparse(page_url).netloc,
+        **debug,
+    }
+    _lookup_cache.set(key, cache_payload)
+    return _stamp_debug_fields(updated), dim_result, debug
+
+
 def _build_extraction_prompt(page_text: str, row: dict) -> str:
     """Build the Claude Haiku prompt listing which fields are blank and need filling."""
     dims = _str_val(row.get("Dimensions"))
@@ -572,7 +804,8 @@ def enrich_row(
 
         if not use_web_enrichment:
             _log.info("[WEB ENRICHMENT DISABLED] skipping search and cache for row")
-            return row.copy(), None, None
+            updated, _debug = normalize_dimension_fields(row.copy())
+            return updated, None, None
 
         mode = _normalize_mode(enrichment_mode)
         budget = _budget_for_mode(mode)
@@ -602,7 +835,7 @@ def enrich_row(
                     # Image is not an essential cache field; try recovering it when
                     # the cache explicitly has null (tried before, but now extraction
                     # logic is improved / CDN URLs were previously rejected by extension filter).
-                    if not _str_val(updated.get("Image URL")) and "image_url" in cache_entry and cache_entry["image_url"] is None:
+                    if not row_has_image(updated) and "image_url" in cache_entry and cache_entry["image_url"] is None:
                         product_url = _str_val(updated.get("Product URL"))
                         if product_url:
                             img = _try_image_from_url(product_url, cache_key)
@@ -621,7 +854,31 @@ def enrich_row(
         # (dimension lookup will handle targeted search via the known domain)
         skip_general_search = (mode == "fast")
 
-        query = _build_search_query(row)
+        if not has_enough_search_identity(row):
+            updated = row.copy()
+            existing = _str_val(updated.get("Notes"))
+            note = "[Enrichment: skipped web search; not enough identifying info]"
+            if note not in existing:
+                updated["Notes"] = f"{existing} {note}".strip() if existing else note
+            updated, _debug = normalize_dimension_fields(updated)
+            return updated, None, None
+
+        updated, registry_dim_result, registry_debug = _apply_official_product_lookup(
+            row,
+            session_cache=session_cache,
+            force_refresh=force_refresh,
+        )
+        if registry_debug.get("selected_product_page_url"):
+            existing = _str_val(updated.get("Notes"))
+            note = f"[Official lookup: {registry_debug.get('selected_product_page_reason', 'matched product page')}]"
+            if note not in existing:
+                updated["Notes"] = f"{existing} {note}".strip() if existing else note
+        if registry_dim_result is not None and has_complete_3d_dimensions(_str_val(updated.get("Dimensions"))):
+            updated, _debug = normalize_dimension_fields(updated)
+            return updated, None, registry_dim_result
+
+        precise_queries = build_search_queries(updated)
+        query = precise_queries[0] if precise_queries else _build_search_query(updated)
         domain_match = get_domain_for_brand(brand)
         results = []
         if not skip_general_search and budget.can_search():
@@ -632,7 +889,6 @@ def enrich_row(
             _log.info("[BUDGET EXHAUSTED] skipping general search for key=%s", cache_key)
 
         if not results or results[0].domain_score < MIN_USE_SCORE:
-            updated = row.copy()
             existing = _str_val(updated.get("Notes"))
             note = "[Enrichment: no confident source found]"
             if note not in existing:
@@ -646,15 +902,14 @@ def enrich_row(
             page_text = _html_to_text(raw_html)
 
             if not raw_html:
-                updated = row.copy()
                 existing = _str_val(updated.get("Notes"))
                 domain = urllib.parse.urlparse(best.url).netloc or best.url[:50]
                 note = f"[Enrichment: could not fetch {domain}]"
                 if note not in existing:
                     updated["Notes"] = f"{existing} {note}".strip() if existing else note
             else:
-                extracted = _extract_with_claude(page_text, row)
-                updated = _apply_enrichment(row, extracted, best.url, best.domain_score)
+                extracted = _extract_with_claude(page_text, updated)
+                updated = _apply_enrichment(updated, extracted, best.url, best.domain_score)
 
                 # ── Image extraction (opportunistic — no extra Brave call) ─────
                 image_url_candidate = extract_image_url(raw_html)
@@ -663,7 +918,7 @@ def enrich_row(
                     if _check_image_content_type(image_url_candidate):
                         image_url_found = image_url_candidate
                         _log.info("[IMAGE FOUND] key=%s url=%s", cache_key, image_url_found[:80])
-                        if not _str_val(updated.get("Image URL")):
+                        if not _is_manual_image(updated) and not row_has_image(updated):
                             updated["Image URL"] = image_url_found
                     else:
                         _log.info(
@@ -736,6 +991,7 @@ def enrich_row(
             updated["Dimension Source Type"] = dim_result.source_type if dim_result.source_type not in ("", "none", None) else ""
             updated["Dimension Lookup Status"] = dim_result.status
 
+        updated, _debug = normalize_dimension_fields(updated)
         return updated, None, dim_result
     except Exception as exc:
         return row, str(exc), None
@@ -775,12 +1031,14 @@ def enrich_dataframe(
             if error:
                 errors.append(error)
             else:
-                # Only write back columns that already exist in the DataFrame.
-                # The intake schema guarantees all expected columns are present;
-                # this guard prevents accidental column creation mid-iteration.
+                # Ensure enrichment output columns survive even when an upstream
+                # DataFrame was built without the full intake schema.
                 for col, val in updated.items():
-                    if col in df.columns:
-                        df.at[idx, col] = val
+                    if col not in df.columns:
+                        df[col] = pd.Series([None] * len(df), index=df.index, dtype=object)
+                    elif str(df[col].dtype) == "string" and not isinstance(val, str):
+                        df[col] = df[col].astype(object)
+                    df.at[idx, col] = val
 
                 # Collect dimension diagnostics if lookup ran.
                 # Diagnostic is built from DimensionResult directly (not from row dict),

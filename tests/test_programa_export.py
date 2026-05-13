@@ -271,7 +271,7 @@ def test_photo_only_export_skips_non_https_image_url():
     summary = validate_for_export([row])
     assert summary["export_count"] == 0
     assert summary["missing_image_url"] == 1
-    assert summary["skipped"][0]["reason"] == "missing or invalid Image URL"
+    assert summary["skipped"][0]["reason"] == "missing image"
 
 
 def test_export_blanks_non_https_image_url_for_standard_rows():

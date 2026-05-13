@@ -7,6 +7,8 @@ import {
   ImageIcon,
   Loader2,
   Phone,
+  RefreshCw,
+  Trash2,
   Upload,
   X,
 } from "lucide-react";
@@ -16,12 +18,14 @@ import type { ReactNode } from "react";
 import {
   exportProgramaCsv,
   exportProgramaXlsx,
+  exportProgramaZip,
   fetchHealth,
   fetchSchema,
   fetchVendorCallStatus,
   enrichRows,
   generateIntakeTable,
   generateVendorCallScript,
+  recoverImages,
   refreshVendorCall,
   startVendorCall,
   uploadImage,
@@ -240,8 +244,9 @@ export function IntakeWorkspace() {
   const [sections, setSections] = useState<string[]>(fallbackSections);
   const [message, setMessage] = useState("");
   const [useWebEnrichment, setUseWebEnrichment] = useState(true);
+  const [includeLowConfidenceImages, setIncludeLowConfidenceImages] = useState(false);
   const [productImageUploads, setProductImageUploads] = useState<Record<number, string>>({});
-  const [busy, setBusy] = useState<"generate" | "validate" | "vendorCall" | "export" | "photoBulk" | "">("");
+  const [busy, setBusy] = useState<"generate" | "validate" | "vendorCall" | "export" | "photoBulk" | "imageRecovery" | "">("");
   const [exportSummary, setExportSummary] = useState({
     skipped: [] as { index: number; product_name: string }[],
     missing_section: [] as { index: number; product_name: string }[],
@@ -555,6 +560,10 @@ export function IntakeWorkspace() {
                 ...row,
                 "Image URL": secureUrl,
                 "Image Upload Status": "Uploaded",
+                image_source: "manual_upload",
+                confidence: "HIGH",
+                evidence: "manual_upload",
+                needs_image_review: "False",
               }
             : row,
         ),
@@ -598,6 +607,43 @@ export function IntakeWorkspace() {
     }
   }
 
+  async function handleRecoverImages(mode: "all" | "row", rowIndex?: number) {
+    const targetRows =
+      mode === "row" && typeof rowIndex === "number"
+        ? rows.map((row, index) => (index === rowIndex ? { ...row, "Image URL": "" } : row))
+        : rows;
+    setBusy("imageRecovery");
+    setMessage("");
+    try {
+      const response = await recoverImages(targetRows);
+      setRows(response.rows);
+      setErrors(response.errors);
+      setMessage("Image recovery complete.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not recover images.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function clearProductImage(rowIndex: number) {
+    setRows((current) =>
+      current.map((row, index) =>
+        index === rowIndex
+          ? {
+              ...row,
+              "Image URL": "",
+              "Image Upload Status": "Missing Image",
+              image_source: "",
+              confidence: "",
+              evidence: "",
+              needs_image_review: "True",
+            }
+          : row,
+      ),
+    );
+  }
+
   function downloadBlob(blob: Blob, filename: string) {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
@@ -607,16 +653,18 @@ export function IntakeWorkspace() {
     URL.revokeObjectURL(url);
   }
 
-  async function handleProgramaExport(format: "csv" | "xlsx") {
+  async function handleProgramaExport(format: "csv" | "xlsx" | "zip") {
     setBusy("export");
     try {
       const blob =
-        format === "xlsx"
+        format === "zip"
+          ? await exportProgramaZip(includedRows, includeLowConfidenceImages)
+          : format === "xlsx"
           ? await exportProgramaXlsx(includedRows)
           : await exportProgramaCsv(includedRows);
-      const suffix = format === "xlsx" ? "xlsx" : "csv";
+      const suffix = format === "zip" ? "zip" : format === "xlsx" ? "xlsx" : "csv";
       const today = new Date().toISOString().slice(0, 10);
-      const filename = `programa_import_${today}.${suffix}`;
+      const filename = format === "zip" ? `programa_export_${today}.zip` : `programa_import_${today}.${suffix}`;
       downloadBlob(blob, filename);
       setMessage("Use this file for Programa Import Products.");
     } catch (error) {
@@ -1008,20 +1056,31 @@ export function IntakeWorkspace() {
           </div>
         </Panel>
 
-        <Panel step="4" title="Export" subtitle="Download a file ready for Programa.">
+        <Panel step="4" title="Export" subtitle="Download product data and an image package for Programa.">
           <div className="grid gap-4">
             <div className="flex flex-wrap gap-2">
               <StatusBadge value={`${exportSummary.export_count} Export Ready`} />
-              <StatusBadge value={`Images ${exportSummary.image_url_present}/${exportSummary.image_url_total}`} />
+              <StatusBadge value={`Image refs ${exportSummary.image_url_present}/${exportSummary.image_url_total}`} />
               <StatusBadge value={`${exportSummary.missing_section.length} Missing Section`} />
             </div>
-            <div className="grid gap-3 sm:grid-cols-2">
+            <div className="rounded-xl border border-bronze/20 bg-bronze/10 p-3 text-sm text-charcoal">
+              Programa may not auto-import images from CSV. Use the ZIP export to keep product images matched to rows for manual upload.
+            </div>
+            <div className="grid gap-3 sm:grid-cols-3">
               <button
                 className="btn-primary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
                 disabled={busy === "export" || exportSummary.export_count === 0}
-                onClick={() => handleProgramaExport("csv")}
+                onClick={() => handleProgramaExport("zip")}
               >
                 {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                Download ZIP
+              </button>
+              <button
+                className="btn-secondary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                disabled={busy === "export" || exportSummary.export_count === 0}
+                onClick={() => handleProgramaExport("csv")}
+              >
+                <Download className="h-4 w-4" />
                 Download CSV
               </button>
               <button
@@ -1033,8 +1092,27 @@ export function IntakeWorkspace() {
                 Download XLSX
               </button>
             </div>
+            <label className="flex items-center gap-2 text-xs text-taupe">
+              <input
+                type="checkbox"
+                checked={includeLowConfidenceImages}
+                onChange={(event) => setIncludeLowConfidenceImages(event.target.checked)}
+                className="h-4 w-4 accent-bronze"
+              />
+              Include low-confidence images in ZIP
+            </label>
             <div className="border-t border-linen pt-4">
-              <h3 className="text-base font-semibold text-charcoal">Review &amp; Complete Product Data</h3>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <h3 className="text-base font-semibold text-charcoal">Review &amp; Complete Product Data</h3>
+                <button
+                  className="btn-secondary inline-flex h-9 items-center justify-center gap-2 rounded-xl px-3 text-xs font-semibold disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                  disabled={busy === "imageRecovery" || !rows.length}
+                  onClick={() => handleRecoverImages("all")}
+                >
+                  {busy === "imageRecovery" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                  Re-run Missing Images
+                </button>
+              </div>
               {includedRows.length ? (
                 <div className="mt-3 divide-y divide-linen rounded-xl border border-linen bg-white">
                   {rows.map((row, index) => {
@@ -1044,6 +1122,10 @@ export function IntakeWorkspace() {
                     const dimensions = rowText(row, "Dimensions");
                     const productUrl = rowText(row, "Product URL");
                     const imageUrl = rowText(row, "Image URL");
+                    const imageSource = rowText(row, "image_source");
+                    const confidence = rowText(row, "confidence");
+                    const evidence = rowText(row, "evidence");
+                    const needsReview = rowText(row, "needs_image_review").toLowerCase() === "true";
                     const uploadStatus = productImageUploads[index] || "";
                     return (
                       <div key={index} className="grid gap-3 p-4 md:grid-cols-[1fr_1.2fr_auto] md:items-center">
@@ -1056,6 +1138,11 @@ export function IntakeWorkspace() {
                         <div className="grid gap-1 text-xs text-taupe sm:grid-cols-2">
                           <div>Dimensions: <ReviewValue value={dimensions} /></div>
                           <div>Product URL: <ReviewValue value={productUrl} /></div>
+                          <div>Source: <ReviewValue value={imageSource} /></div>
+                          <div>
+                            Confidence:{" "}
+                            {confidence ? <StatusBadge value={`${confidence}${needsReview ? " Review" : ""}`} /> : <span className="font-semibold text-clay">Missing</span>}
+                          </div>
                           <div className="sm:col-span-2">
                             Image:{" "}
                             {imageUrl ? (
@@ -1072,10 +1159,11 @@ export function IntakeWorkspace() {
                               {uploadStatus}
                             </div>
                           ) : null}
+                          {evidence ? <div className="sm:col-span-2 truncate">Evidence: {evidence}</div> : null}
                         </div>
-                        {!imageUrl ? (
+                        <div className="flex flex-wrap gap-2">
                           <label className="btn-secondary inline-flex h-10 cursor-pointer items-center justify-center rounded-xl px-4 text-sm font-semibold">
-                            Upload Image
+                            {imageUrl ? "Replace" : "Upload Image"}
                             <input
                               className="hidden"
                               type="file"
@@ -1086,7 +1174,24 @@ export function IntakeWorkspace() {
                               }}
                             />
                           </label>
-                        ) : null}
+                          {imageUrl ? (
+                            <button
+                              className="btn-secondary inline-flex h-10 items-center justify-center rounded-xl px-3 text-sm font-semibold"
+                              onClick={() => clearProductImage(index)}
+                              aria-label="Clear image"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                          ) : null}
+                          <button
+                            className="btn-secondary inline-flex h-10 items-center justify-center rounded-xl px-3 text-sm font-semibold disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                            disabled={busy === "imageRecovery"}
+                            onClick={() => handleRecoverImages("row", index)}
+                            aria-label="Re-run image recovery"
+                          >
+                            {busy === "imageRecovery" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                          </button>
+                        </div>
                       </div>
                     );
                   })}

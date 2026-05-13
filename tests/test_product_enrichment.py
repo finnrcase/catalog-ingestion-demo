@@ -4,8 +4,10 @@ from src.product_enrichment import (
     _qualifies,
     _build_search_query,
     _apply_enrichment,
+    build_search_queries,
     enrich_row,
     enrich_dataframe,
+    has_enough_search_identity,
 )
 
 
@@ -23,6 +25,10 @@ def _isolate_caches(monkeypatch, tmp_path):
     fresh_cache._data = {}
     fresh_cache._path = str(tmp_path / "product_enrichment_cache.json")
     monkeypatch.setattr(pe, "_product_cache", fresh_cache)
+    from src.product_lookup_cache import ProductLookupCache
+    fresh_lookup_cache = ProductLookupCache(tmp_path / "product_lookup_cache.json")
+    fresh_lookup_cache._data = {}
+    monkeypatch.setattr(pe, "_lookup_cache", fresh_lookup_cache)
     # Isolate ManufacturerDomainCache singleton in dimension_enrichment
     fresh_mfr = ManufacturerDomainCache()
     fresh_mfr._data = {}
@@ -150,6 +156,22 @@ def test_build_search_query_uses_manufacturer_override_domain(monkeypatch):
     row = {"Brand": "Scotsman", "Model/SKU": "SCN60PA1SU", "Product Name": "Ice Machine"}
 
     assert _build_search_query(row).startswith("site:scotsman-ice.com Scotsman SCN60PA1SU")
+
+
+def test_precise_query_builder_prioritizes_brand_sku():
+    row = {"Brand": "Wolf", "Model/SKU": "MDD-30/TS", "Product Name": "Warming Drawer", "Supplier": "Ferguson"}
+    queries = build_search_queries(row)
+    assert queries[0] == '"Wolf" "MDD-30/TS"'
+    assert "MDD-30/TS" in queries[0]
+
+
+def test_precise_query_builder_does_not_run_with_insufficient_info():
+    assert has_enough_search_identity({"Product Name": "Chair"}) is False
+
+
+def test_precise_query_builder_preserves_sku_hyphens_slashes():
+    queries = build_search_queries({"Brand": "Sub-Zero", "Model/SKU": "DEC3650RID/R"})
+    assert queries[0] == '"Sub-Zero" "DEC3650RID/R"'
 
 
 # ── _apply_enrichment ──────────────────────────────────────────────────────────
@@ -1260,3 +1282,157 @@ def test_product_enrichment_delegates_to_image_recovery():
         assert kwargs["pdf_lookup"] == {"a": "/tmp/x.pdf"}
         assert kwargs["session_id"] == "s"
         assert kwargs["enable_screenshot"] is True
+
+
+# ── official brand/SKU lookup enhancement ─────────────────────────────────────
+
+def _official_html() -> str:
+    return """
+    <html>
+      <head>
+        <meta property="og:image" content="https://www.visualcomfort.com/images/tob-1234.jpg">
+        <script type="application/ld+json">
+        {
+          "@type": "Product",
+          "name": "Table Lamp",
+          "sku": "TOB 1234",
+          "additionalProperty": [
+            {"name": "Dimensions", "value": "Width: 36 in, Depth: 18 in, Height: 72 in"},
+            {"name": "Finish", "value": "Bronze"},
+            {"name": "Material", "value": "Steel"}
+          ]
+        }
+        </script>
+      </head>
+      <body>
+        <h1>Visual Comfort TOB 1234 Table Lamp</h1>
+        <table><tr><th>Dimensions</th><td>Width: 36 in, Depth: 18 in, Height: 72 in</td></tr></table>
+      </body>
+    </html>
+    """
+
+
+def test_enrich_row_uses_official_registry_page_for_specs_and_image(monkeypatch):
+    from src.brave_search import SearchResult
+    import src.official_product_lookup as opl
+    import src.product_enrichment as pe
+
+    def fake_search(query, brand="", session_cache=None):
+        return [SearchResult(
+            title="Visual Comfort TOB 1234 Table Lamp",
+            url="https://www.visualcomfort.com/products/tob-1234",
+            description="TOB 1234 dimensions",
+            domain_score=80,
+        )]
+
+    monkeypatch.setattr(opl, "search_product_candidates", fake_search)
+    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: _official_html())
+
+    row = {
+        "Source Type": "PDF",
+        "Brand": "Visual Comfort",
+        "Model/SKU": "TOB 1234",
+        "Product Name": "Table Lamp",
+        "Dimensions": "",
+        "Finish / Color": "",
+        "Product Category": "Lighting",
+        "Product URL": "",
+        "Notes": "",
+    }
+    updated, err, dim_result = enrich_row(row)
+    assert err is None
+    assert updated["Product URL"] == "https://www.visualcomfort.com/products/tob-1234"
+    assert updated["Dimensions"] == '36"W x 18"D x 72"H'
+    assert updated["Width (in)"] == "36"
+    assert updated["Depth (in)"] == "18"
+    assert updated["Height (in)"] == "72"
+    assert updated["Image URL"] == "https://www.visualcomfort.com/images/tob-1234.jpg"
+    assert updated["image_source"] == "official_site_og_image"
+    assert updated["brand_registry_match"] is True
+    assert dim_result is not None
+    assert dim_result.confidence == "high"
+
+
+def test_manual_uploaded_image_is_not_overwritten_by_official_lookup(monkeypatch):
+    from src.brave_search import SearchResult
+    import src.official_product_lookup as opl
+    import src.product_enrichment as pe
+
+    monkeypatch.setattr(opl, "search_product_candidates", lambda *a, **k: [SearchResult(
+        title="Visual Comfort TOB 1234 Table Lamp",
+        url="https://www.visualcomfort.com/products/tob-1234",
+        description="TOB 1234 dimensions",
+        domain_score=80,
+    )])
+    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: _official_html())
+
+    row = {
+        "Source Type": "PDF",
+        "Brand": "Visual Comfort",
+        "Model/SKU": "TOB 1234",
+        "Product Name": "Table Lamp",
+        "Dimensions": "",
+        "Product Category": "Lighting",
+        "Image URL": "https://res.cloudinary.com/demo/image/upload/manual.jpg",
+        "image_source": "manual_upload",
+        "confidence": "HIGH",
+    }
+    updated, err, _ = enrich_row(row)
+    assert err is None
+    assert updated["Image URL"] == "https://res.cloudinary.com/demo/image/upload/manual.jpg"
+    assert updated["image_source"] == "manual_upload"
+
+
+def test_existing_medium_pdf_image_not_overwritten_by_low_web_image(monkeypatch):
+    import src.official_product_lookup as opl
+    import src.product_enrichment as pe
+
+    monkeypatch.setattr(opl, "search_product_candidates", lambda *a, **k: [])
+    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: _official_html())
+
+    row = {
+        "Source Type": "PDF",
+        "Brand": "Unknown Brand",
+        "Model/SKU": "ABC-1",
+        "Product Name": "Lamp",
+        "Dimensions": "",
+        "Product Category": "Lighting",
+        "Image Filename": "unknown_abc_1.jpg",
+        "local_image_path": "/tmp/session/images/unknown_abc_1.jpg",
+        "image_source": "pdf_page_render_content_crop",
+        "confidence": "MEDIUM",
+    }
+    updated, err, _ = enrich_row(row)
+    assert err is None
+    assert updated["Image Filename"] == "unknown_abc_1.jpg"
+    assert updated["image_source"] == "pdf_page_render_content_crop"
+
+
+def test_existing_high_dimensions_not_overwritten_by_medium_page(monkeypatch):
+    from src.brave_search import SearchResult
+    import src.official_product_lookup as opl
+    import src.product_enrichment as pe
+
+    html = _official_html().replace("TOB 1234", "Table Lamp")
+    monkeypatch.setattr(opl, "search_product_candidates", lambda *a, **k: [SearchResult(
+        title="Visual Comfort Table Lamp",
+        url="https://www.visualcomfort.com/products/table-lamp",
+        description="Table Lamp dimensions",
+        domain_score=80,
+    )])
+    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: html)
+
+    row = {
+        "Source Type": "PDF",
+        "Brand": "Visual Comfort",
+        "Model/SKU": "TOB 1234",
+        "Product Name": "Table Lamp",
+        "Dimensions": '10"W x 20"H x 30"D',
+        "Dimension Confidence": "high",
+        "Finish / Color": "",
+        "Product Category": "Lighting",
+        "Product URL": "",
+    }
+    updated, err, _ = enrich_row(row)
+    assert err is None
+    assert updated["Dimensions"] == '10"W x 20"H x 30"D'

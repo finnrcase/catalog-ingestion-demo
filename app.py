@@ -52,9 +52,11 @@ from src.document_parser import parse_pdf_rows
 from src.category_ai import suggest_categories_batch
 from src.notes import remove_notes_row_prefix
 from src.product_enrichment import enrich_dataframe, recover_images_for_dataframe, has_complete_3d_dimensions
+from src.image_presence import row_has_image, row_image_status
 from src.brave_search import BRAVE_API_KEY as _BRAVE_API_KEY
 from src.manufacturer_domains import save_manufacturer_override
 from src.enrichment_debug import debug_enrich_dataframe, save_debug_report
+from src.enrichment_diagnostics import build_enrichment_debug_dataframe
 from src.vendor_call_agent import (
     build_minimal_call_task,
     build_call_goal,
@@ -130,6 +132,15 @@ def _save_bulk_photo_upload(uploaded_file) -> dict:
         "local_image_path": str(path),
         "image_upload_status": "Ready",
     }
+
+
+def _as_bool(value) -> bool:
+    """Convert pandas containers and scalar values to an explicit UI boolean."""
+    if isinstance(value, pd.DataFrame):
+        return not value.empty
+    if isinstance(value, pd.Series):
+        return bool(value.any())
+    return bool(value)
 
 # Phase 1 image recovery: prune session dirs older than 24h on app boot.
 @st.cache_resource
@@ -218,6 +229,8 @@ if "pending_enrichment" not in st.session_state:
     st.session_state.pending_enrichment = False
 if "enrichment_errors" not in st.session_state:
     st.session_state.enrichment_errors = []
+if "dimension_diagnostics" not in st.session_state:
+    st.session_state.dimension_diagnostics = []
 if "use_web_enrichment" not in st.session_state:
     st.session_state.use_web_enrichment = True
 if "manual_image_uploads" not in st.session_state:
@@ -764,11 +777,13 @@ if generate:
     # Bytes are persisted for both AI and standard-parser uploads. AI-extracted
     # rows do not carry _source_pdf_id (Phase 2 work), so PDF crop will not
     # fire for them; but the bytes survive for future recovery passes.
+    _uploaded_pdf_sources: dict[str, tuple[str, str]] = {}
     for pdf_file in (uploaded_files or []):
         try:
             _pdf_raw = pdf_file.read()
             pdf_file.seek(0)
-            _save_uploaded_pdf(_pdf_raw, getattr(pdf_file, "name", "upload.pdf"))
+            _pdf_name = getattr(pdf_file, "name", "upload.pdf")
+            _uploaded_pdf_sources[_pdf_name] = _save_uploaded_pdf(_pdf_raw, _pdf_name)
         except Exception:
             pass  # non-fatal; parse path will handle missing bytes gracefully
 
@@ -791,6 +806,21 @@ if generate:
                     )
                     ai_dfs.append(pd.DataFrame(fallback))
                 else:
+                    _pdf_source = _uploaded_pdf_sources.get(getattr(pdf_file, "name", "upload.pdf"))
+                    if _pdf_source is not None and not df_ai.empty:
+                        _pdf_id, _pdf_path = _pdf_source
+                        if "_source_pdf_id" not in df_ai.columns or df_ai["_source_pdf_id"].isna().all():
+                            df_ai["_source_pdf_id"] = _pdf_id
+                        else:
+                            df_ai["_source_pdf_id"] = df_ai["_source_pdf_id"].fillna(_pdf_id).replace("", _pdf_id)
+                        if "_source_page_number" not in df_ai.columns or df_ai["_source_page_number"].isna().all():
+                            df_ai["_source_page_number"] = 1
+                        else:
+                            df_ai["_source_page_number"] = df_ai["_source_page_number"].fillna(1).replace("", 1)
+                        if "_source_filename" not in df_ai.columns or df_ai["_source_filename"].isna().all():
+                            df_ai["_source_filename"] = getattr(pdf_file, "name", "")
+                        else:
+                            df_ai["_source_filename"] = df_ai["_source_filename"].fillna(getattr(pdf_file, "name", "")).replace("", getattr(pdf_file, "name", ""))
                     ai_dfs.append(df_ai)
 
             st.session_state.ai_errors = ai_errors
@@ -875,7 +905,7 @@ if st.session_state.intake_df is not None:
                 missing.append("Product Name")
             if not str(row.get("Product Category", "") or "").strip():
                 missing.append("Product Category")
-            if not is_public_https_image_url(str(row.get("Image URL", "") or "")):
+            if not row_has_image(row.to_dict() if isinstance(row, pd.Series) else row):
                 missing.append("Image URL")
             return missing
         missing = []
@@ -990,13 +1020,14 @@ if st.session_state.intake_df is not None:
     if st.session_state.pending_enrichment:
         if st.session_state.get("use_web_enrichment", True) and _BRAVE_API_KEY:
             with st.spinner("Searching manufacturer sources to fill missing product details…"):
-                _enriched_df, _enrich_errors, _ = enrich_dataframe(
+                _enriched_df, _enrich_errors, _dimension_diagnostics = enrich_dataframe(
                     df,
                     use_web_enrichment=st.session_state.get("use_web_enrichment", True),
                     force_refresh=st.session_state.get("force_refresh_enrichment", False),
                 )
                 st.session_state.intake_df = apply_confidence_checks(_enriched_df)
                 st.session_state.enrichment_errors = _enrich_errors
+                st.session_state.dimension_diagnostics = _dimension_diagnostics
                 st.session_state.pending_enrichment = False
             st.rerun()
         else:
@@ -1009,31 +1040,40 @@ if st.session_state.intake_df is not None:
             icon="⚠️",
         )
 
-    # ── Image status summary ───────────────────────────────────────────────────
-    def _has_valid_image(v) -> bool:
-        s = str(v or "").strip()
-        return bool(s) and s.lower() not in {"nan", "none", ""}
+    _enrichment_debug_df = build_enrichment_debug_dataframe(
+        st.session_state.intake_df if st.session_state.intake_df is not None else df,
+        dimension_diagnostics=st.session_state.get("dimension_diagnostics") or [],
+        image_diagnostics=st.session_state.get("image_recovery_diagnostics") or [],
+        search_enabled=st.session_state.get("use_web_enrichment", True),
+    )
+    with st.expander("Enrichment Debug", expanded=False):
+        st.dataframe(_enrichment_debug_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            label="Download enrichment_debug.csv",
+            data=_enrichment_debug_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"enrichment_debug_{datetime.date.today().isoformat()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
-    if "Image URL" in df.columns:
-        _total_n = len(df[df.get("Include", pd.Series([True] * len(df))) != False])
-        _with_image = int(df["Image URL"].apply(_has_valid_image).sum())
-        _missing_image_count = _total_n - _with_image
-    else:
-        _total_n = len(df)
-        _with_image = 0
-        _missing_image_count = _total_n
+    # ── Image status summary ───────────────────────────────────────────────────
+    _include_mask_img = df.get("Include", pd.Series([True] * len(df), index=df.index)) != False
+    _included_image_rows = df[_include_mask_img]
+    _total_n = len(_included_image_rows)
+    _with_image = int(_included_image_rows.apply(lambda r: row_has_image(r.to_dict()), axis=1).sum())
+    _missing_image_count = _total_n - _with_image
 
     with st.container(border=True):
         _img_title_col, _img_action_col = st.columns([5, 3])
         with _img_title_col:
             section_label("Image Status")
         with _img_action_col:
-            if _missing_image_count > 0 and _BRAVE_API_KEY:
+            if _missing_image_count > 0:
                 if st.button(
                     "Recover Missing Images",
                     type="secondary",
                     use_container_width=True,
-                    help="Fetches product pages for rows without Image URL and extracts images.",
+                    help="Uses Product URLs, official pages, and saved PDF pages to recover missing images.",
                 ):
                     with st.spinner(f"Recovering images for {_missing_image_count} row(s)…"):
                         sid = _ensure_session_id()
@@ -1054,7 +1094,7 @@ if st.session_state.intake_df is not None:
                     else:
                         st.warning(
                             "No images recovered automatically. "
-                            "Check that Product URL is populated, or upload images manually below."
+                            "Check Product URL/PDF metadata in the debug report, or upload images manually below."
                         )
                     st.rerun()
 
@@ -1094,6 +1134,28 @@ if st.session_state.intake_df is not None:
                 st.text(f"Outcomes — {_conf_summary}")
                 # Render the full per-row debug table.
                 st.dataframe(_debug_df, use_container_width=True, hide_index=True)
+                _status_cols = [
+                    "row_id",
+                    "product_name",
+                    "brand",
+                    "model_sku",
+                    "source_pdf_path_exists",
+                    "page_number",
+                    "product_url_present",
+                    "pdf_images_found",
+                    "pdf_page_render_fallback_used",
+                    "local_image_path",
+                    "image_filename",
+                    "image_url",
+                    "confidence",
+                    "image_source",
+                    "exported_to_zip",
+                    "export_skip_reason",
+                    "final_ui_status",
+                ]
+                _status_cols = [c for c in _status_cols if c in _debug_df.columns]
+                st.markdown("**End-to-end image status**")
+                st.dataframe(_debug_df[_status_cols], use_container_width=True, hide_index=True)
                 _debug_today = datetime.date.today().isoformat()
                 st.download_button(
                     label="Download image_recovery_debug.csv",
@@ -1110,7 +1172,9 @@ if st.session_state.intake_df is not None:
         # Per-product upload fallback
         if _missing_image_count > 0:
             st.caption("Upload images manually for products that could not be recovered automatically.")
-            _missing_rows = df[df["Image URL"].apply(lambda v: not _has_valid_image(v))] if "Image URL" in df.columns else df
+            _missing_rows = _included_image_rows[
+                _included_image_rows.apply(lambda r: not row_has_image(r.to_dict()), axis=1)
+            ]
 
             with st.expander(f"Upload Images for {len(_missing_rows)} Product(s)", expanded=False):
                 from src.image_assets import _convert_to_jpeg
@@ -1227,7 +1291,7 @@ if st.session_state.intake_df is not None:
             return (
                 bool(str(row.get("Product Name", "") or "").strip())
                 and bool(str(row.get("Product Category", "") or "").strip())
-                and is_public_https_image_url(str(row.get("Image URL", "") or ""))
+                and row_has_image(row.to_dict())
             )
         if not str(row.get("Product Name", "") or "").strip():
             return False
@@ -1253,8 +1317,8 @@ if st.session_state.intake_df is not None:
                 reasons.append("No product name")
             if not str(row.get("Product Category", "") or "").strip():
                 reasons.append("No category")
-            if not is_public_https_image_url(str(row.get("Image URL", "") or "")):
-                reasons.append("No hosted image URL")
+            if not row_has_image(row.to_dict()):
+                reasons.append("No image")
             return "; ".join(reasons) if reasons else "Unknown"
         if not str(row.get("Product Name", "") or "").strip():
             reasons.append("No product name")
@@ -1795,14 +1859,14 @@ if st.session_state.intake_df is not None:
     # ── Export CSV ─────────────────────────────────────────────────────────────
     _export_col, _, __ = st.columns([2, 6, 2])
     with _export_col:
-        included = (
+        included_df = (
             edited_df[edited_df["Include"] == True]
             if "Include" in edited_df.columns else edited_df
         )
         safe_name = selected_project.strip().replace(" ", "_") or "intake"
         st.download_button(
             label="Download Internal Intake CSV (not for Programa)",
-            data=get_csv_bytes(included),
+            data=get_csv_bytes(included_df),
             file_name=f"{safe_name}_internal_intake_not_for_programa.csv",
             mime="text/csv",
             use_container_width=True,
@@ -1814,8 +1878,8 @@ if st.session_state.intake_df is not None:
     st.divider()
     section_label("Export for Programa Import")
 
-    _export_summary = validate_for_export(included)
-    _programa_df = build_programa_import_dataframe(included)
+    _export_summary = validate_for_export(included_df)
+    _programa_df = build_programa_import_dataframe(included_df)
     _today = datetime.date.today().isoformat()
 
     _export_count = _export_summary["export_count"]
@@ -1846,8 +1910,12 @@ if st.session_state.intake_df is not None:
     if _missing_url > 0:
         st.warning(f"⚠  {_missing_url} row{'s' if _missing_url != 1 else ''} missing Product URL", icon=None)
     if _missing_img > 0:
-        st.warning(f"⚠  {_missing_img} row{'s' if _missing_img != 1 else ''} missing Image URL", icon=None)
-    st.info(f"Image URLs present: {_image_url_present} / {_image_url_total}", icon=None)
+        st.warning(f"⚠  {_missing_img} row{'s' if _missing_img != 1 else ''} missing image reference", icon=None)
+    st.info(f"Image URLs/references present: {_image_url_present} / {_image_url_total}", icon=None)
+    st.warning(
+        "Programa may not auto-import images from CSV. Use the ZIP export to keep product images matched to rows for manual upload.",
+        icon="⚠️",
+    )
     if _skipped:
         with st.expander(f"✕  {len(_skipped)} row{'s' if len(_skipped) != 1 else ''} skipped"):
             for item in _skipped:
@@ -1884,17 +1952,17 @@ if st.session_state.intake_df is not None:
             )
         st.download_button(
             label="Download ZIP (CSV + images)",
-            data=export_programa_zip(included, manual_images=_manual_uploads, session_id=_ensure_session_id()),
+            data=export_programa_zip(included_df, manual_images=_manual_uploads, session_id=_ensure_session_id()),
             file_name=f"programa_export_{_today}.zip",
             mime="application/zip",
             use_container_width=True,
-            disabled=not included,
-            help="ZIP archive containing the Programa CSV, downloaded product images (JPG), and a per-product image manifest.",
+            disabled=not _as_bool(included_df),
+            help="ZIP archive containing Programa CSV/XLSX, JPG images, manifest.csv, and manual_image_upload_guide.csv.",
         )
 
     _include_debug = st.checkbox("Include debug columns", key="programa_debug_export")
     if _include_debug:
-        _debug_df = build_programa_debug_dataframe(included)
+        _debug_df = build_programa_debug_dataframe(included_df)
         st.download_button(
             label="Download Debug CSV",
             data=export_programa_csv(_debug_df),

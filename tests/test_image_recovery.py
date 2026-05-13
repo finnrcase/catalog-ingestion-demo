@@ -96,7 +96,7 @@ def test_url_recover_high_when_sku_in_url_path():
          patch("src.image_recovery.httpx.get", return_value=_mock_get(_jpeg_bytes())):
         result = recover_from_url(row)
     assert result.confidence == "HIGH"
-    assert result.image_source == "url"
+    assert result.image_source == "product_url_html_image"
     assert "sku_in_image_url" in result.evidence
     assert result.image_url == "https://www.subzero-wolf.com/img/MDD30TS_hero.jpg"
     assert len(result.jpeg_bytes) > 0
@@ -165,7 +165,7 @@ def test_pdf_crop_high_when_sku_on_same_page(tmp_path):
         "_source_page_number": 1,
     }
     result = recover_from_pdf_crop(row, pdf_path)
-    assert result.image_source == "pdf_crop"
+    assert result.image_source == "pdf_embedded_image"
     assert result.confidence == "HIGH"
     assert "sku_on_pdf_page" in result.evidence
     assert len(result.jpeg_bytes) > 0
@@ -566,14 +566,16 @@ def test_orchestrator_pdf_high_returns_immediately():
     m_shot.assert_not_called()
 
 
-def test_orchestrator_screenshot_high_beats_pdf_medium():
+def test_orchestrator_uses_pdf_after_product_page_and_official_lookup_miss():
     row = {"Image URL": "", "_source_pdf_id": "abc", "Product URL": "https://x.com/p"}
     with patch("src.image_recovery.recover_from_url", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_product_page", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_official_lookup", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
          patch("src.image_recovery.recover_from_pdf_crop", return_value=_result(confidence="MEDIUM", source="pdf_crop")), \
          patch("src.image_recovery.recover_from_screenshot", return_value=_result(confidence="HIGH", source="page_screenshot")):
         out = recover_image_for_row(row, pdf_lookup={"abc": "/tmp/x.pdf"}, session_id="s1")
-    assert out.image_source == "page_screenshot"
-    assert out.confidence == "HIGH"
+    assert out.image_source == "pdf_crop"
+    assert out.confidence == "MEDIUM"
 
 
 def test_orchestrator_pdf_medium_wins_tie_against_screenshot_medium():
@@ -673,6 +675,29 @@ def test_dataframe_recovery_skips_high_confidence_rows(tmp_path):
         )
     # Called only for the second row.
     assert m.call_count == 1
+
+
+def test_dataframe_recovery_skips_manual_uploaded_image_rows(tmp_path):
+    df = pd.DataFrame([
+        {
+            "Product Name": "Manual Image",
+            "Brand": "Visual Comfort",
+            "Model/SKU": "TOB 1234",
+            "Image URL": "https://res.cloudinary.com/demo/image/upload/manual.jpg",
+            "image_source": "manual_upload",
+            "confidence": "",
+            "_source_pdf_id": "",
+        }
+    ])
+    with patch("src.image_recovery.recover_image_for_row") as m:
+        out_df, diags = recover_images_for_dataframe(
+            df,
+            pdf_lookup=None,
+            session_id="testsess",
+            enable_screenshot=True,
+        )
+    m.assert_not_called()
+    assert out_df.iloc[0]["Image URL"].endswith("manual.jpg")
 
 
 def test_dataframe_recovery_writes_files_to_session_images_dir(tmp_path, monkeypatch):

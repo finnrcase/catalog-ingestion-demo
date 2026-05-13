@@ -29,12 +29,15 @@ from __future__ import annotations
 
 import io
 import re
+import hashlib
 import zipfile
 from pathlib import Path
 
 import pandas as pd
+from PIL import Image, ImageOps
 
 from src.dimensions import extract_labeled_dimensions, has_complete_3d_dimensions
+from src.image_presence import image_filename, local_image_path, row_has_image
 from src.notes import remove_notes_row_prefix
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -320,7 +323,7 @@ def _is_exportable(row: dict) -> bool:
     if not (_is_included(row) and _str_val(row.get("Product Name"))):
         return False
     if _is_photo_only(row):
-        return _is_public_https_image_url(row.get("Image URL"))
+        return row_has_image(row)
     return True
 
 
@@ -396,13 +399,13 @@ def validate_for_export(rows) -> dict:
             skipped.append({"index": i, "product_name": "(no name)"})
             continue
         image_url_total += 1
-        if _is_public_https_image_url(row.get("Image URL")):
+        if row_has_image(row):
             image_url_present += 1
         raw_section = _str_val(row.get("Product Category") or row.get("Section"))
         section = normalize_section(raw_section)
-        if _is_photo_only(row) and not _is_public_https_image_url(row.get("Image URL")):
+        if _is_photo_only(row) and not row_has_image(row):
             missing_image_url += 1
-            skipped.append({"index": i, "product_name": name, "reason": "missing or invalid Image URL"})
+            skipped.append({"index": i, "product_name": name, "reason": "missing image"})
             continue
 
         export_count += 1
@@ -417,9 +420,7 @@ def validate_for_export(rows) -> dict:
             missing_dimensions += 1
         if not _str_val(row.get("Product URL")):
             missing_product_url += 1
-        if _str_val(row.get("Image URL")) and not _is_public_https_image_url(row.get("Image URL")):
-            missing_image_url += 1
-        elif not _str_val(row.get("Image URL")):
+        if not row_has_image(row):
             missing_image_url += 1
 
     return {
@@ -506,15 +507,90 @@ _MANIFEST_COLUMNS: list[str] = [
     "Error",
 ]
 
+_MANUAL_GUIDE_COLUMNS: list[str] = [
+    "Product Name",
+    "Brand",
+    "SKU/Model",
+    "Product URL",
+    "Image Filename",
+    "Image Folder Path",
+    "Image Source",
+    "Confidence",
+    "Needs Image Review",
+    "Manual Upload Action",
+]
+
+
+def _manual_image_readme() -> str:
+    return (
+        "SCH DesignOps Programa Image Package\n"
+        "====================================\n\n"
+        "Programa CSV/XLSX imports may not automatically create product photos from "
+        "Image URL or Image Filename columns. Treat those columns as references unless "
+        "your Programa import screen explicitly confirms image support.\n\n"
+        "Recommended workflow:\n"
+        "1. Import product data with programa_import.csv or programa_import.xlsx.\n"
+        "2. Open manual_image_upload_guide.csv to match each product to its JPG.\n"
+        "3. In Programa, attach the matching file from the images/ folder to each product.\n"
+        "4. Use manifest.csv for source, confidence, and troubleshooting details.\n\n"
+        "Image notes:\n"
+        "- All packaged images are normalized JPG files.\n"
+        "- HIGH and MEDIUM confidence images are included by default.\n"
+        "- LOW confidence images are excluded unless explicitly enabled before export.\n"
+        "- Rows without an image are listed in the guide and manifest for review.\n"
+    )
+
+
+def _manual_upload_action(manifest_row: dict) -> str:
+    status = _str_val(manifest_row.get("Image Status"))
+    filename = _str_val(manifest_row.get("Local Image Filename"))
+    if filename:
+        return "Attach images/{filename} to this product in Programa.".format(filename=filename)
+    if status == "low_confidence_skipped":
+        return "Review low-confidence image before attaching, or re-export with low-confidence images enabled."
+    if status == "missing_image_url":
+        return "No image was packaged; upload or recover an image before attaching."
+    if status in {"fetch_error", "conversion_error", "invalid_local_path"}:
+        return "Image was found but could not be packaged; check manifest.csv error and upload manually."
+    return "Review this row before attaching an image."
+
+
+def _manual_guide_dataframe(manifest_rows: list[dict]) -> pd.DataFrame:
+    records = []
+    for row in manifest_rows:
+        filename = _str_val(row.get("Local Image Filename"))
+        records.append(
+            {
+                "Product Name": _str_val(row.get("Product Name")),
+                "Brand": _str_val(row.get("Brand")),
+                "SKU/Model": _str_val(row.get("SKU/Model")),
+                "Product URL": _str_val(row.get("Product URL")),
+                "Image Filename": filename,
+                "Image Folder Path": f"images/{filename}" if filename else "",
+                "Image Source": _str_val(row.get("Image Source")),
+                "Confidence": _str_val(row.get("Confidence")),
+                "Needs Image Review": _str_val(row.get("Needs Image Review")),
+                "Manual Upload Action": _manual_upload_action(row),
+            }
+        )
+    return pd.DataFrame(records, columns=_MANUAL_GUIDE_COLUMNS)
+
 
 def export_programa_zip(
     rows,
     include_images: bool = True,
     manual_images: dict | None = None,
     session_id: str | None = None,
+    include_low_confidence_images: bool = False,
 ) -> bytes:
     """
     Build a ZIP archive for the Programa export.
+
+    The CSV/XLSX keep Image URL and Image Filename as helper/reference fields,
+    but the reliable image handoff is the images/ folder plus
+    manual_image_upload_guide.csv. Do not assume Programa imports product
+    photos from CSV text fields unless that behavior is verified in the target
+    account.
 
     Image-resolution priority per row:
       1. local_image_path (validated under .tmp/uploads/{session_id}/images/, .jpg)
@@ -522,45 +598,55 @@ def export_programa_zip(
       3. row's Image URL (download via download_and_convert_image)
       4. otherwise: status "missing_image_url"
 
-    LOW-confidence rows are never copied to images/, even if local_image_path
-    is set; manifest records "low_confidence_skipped".
+    LOW-confidence rows are only copied to images/ when
+    include_low_confidence_images=True; manifest records the skip otherwise.
     """
     from src.image_assets import download_and_convert_image as _download_convert, build_image_filename
 
     manual_images = manual_images or {}
     row_list = _to_row_list(rows)
 
-    df = build_programa_import_dataframe(rows)
-    csv_bytes = export_programa_csv(df)
-
     seen_filenames: dict[str, int] = {}
 
-    def _unique_filename(filename: str) -> str:
+    def _unique_filename(filename: str, salt: str = "") -> str:
         if filename not in seen_filenames:
             seen_filenames[filename] = 1
             return filename
         seen_filenames[filename] += 1
+        digest = hashlib.sha1(f"{filename}:{salt}:{seen_filenames[filename]}".encode("utf-8")).hexdigest()[:8]
         if "." in filename:
             stem, ext = filename.rsplit(".", 1)
-            return f"{stem}_{seen_filenames[filename]}.{ext}"
-        return f"{filename}_{seen_filenames[filename]}"
+            return f"{stem}_{digest}.{ext}"
+        return f"{filename}_{digest}"
+
+    def _normalize_manual_jpeg(raw: bytes) -> bytes:
+        with Image.open(io.BytesIO(raw)) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=85, optimize=True)
+            return out.getvalue()
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("programa_import.csv", csv_bytes.decode("utf-8"))
-
         manifest_rows: list[dict] = []
+        export_rows: list[dict] = []
+        export_image_filenames: list[str] = []
         for i, r in enumerate(row_list):
             if not _is_exportable(r):
                 continue
+            export_row = _row_to_programa_dict(r)
+            export_rows.append(export_row)
+            export_image_filename = ""
 
             image_url = _str_val(r.get("Image URL"))
             brand = _str_val(r.get("Brand"))
             sku = _str_val(r.get("Model/SKU"))
             product_name = _str_val(r.get("Product Name"))
             confidence = _str_val(r.get("confidence")).upper()
-            local_path = _str_val(r.get("local_image_path"))
-            local_filename = _str_val(r.get("local_image_filename"))
+            local_path = local_image_path(r)
+            local_filename = image_filename(r)
 
             # needs_image_review is stored as string "True"/"False" by image_recovery
             # (Task 7 contract — pandas string dtype constraint). Compare against the
@@ -584,12 +670,13 @@ def export_programa_zip(
 
             if not include_images:
                 manifest_rows.append(manifest_row)
+                export_image_filenames.append("")
                 continue
 
-            # LOW-confidence rows are never written to images/.
-            if confidence == "LOW":
+            if confidence == "LOW" and not include_low_confidence_images:
                 manifest_row["Image Status"] = "low_confidence_skipped"
                 manifest_rows.append(manifest_row)
+                export_image_filenames.append("")
                 continue
 
             wrote_image = False
@@ -598,10 +685,14 @@ def export_programa_zip(
             if local_path:
                 ok, reason = _validate_local_path(local_path, session_id)
                 if ok:
-                    filename = _unique_filename(local_filename or build_image_filename(brand, sku, product_name))
+                    filename = _unique_filename(
+                        local_filename or build_image_filename(brand, sku, product_name),
+                        salt=f"{i}:{product_name}",
+                    )
                     manifest_row["Local Image Filename"] = filename
                     manifest_row["Image Status"] = "downloaded"
                     zf.writestr(f"images/{filename}", Path(local_path).read_bytes())
+                    export_image_filename = filename
                     wrote_image = True
                 else:
                     manifest_row["Image Status"] = "invalid_local_path"
@@ -609,12 +700,21 @@ def export_programa_zip(
 
             # 2) manual_images
             if not wrote_image and manual_images.get(i):
-                filename = _unique_filename(build_image_filename(brand, sku, product_name))
-                manifest_row["Local Image Filename"] = filename
-                manifest_row["Image Status"] = "manually_uploaded"
-                manifest_row["Error"] = ""
-                zf.writestr(f"images/{filename}", manual_images[i])
-                wrote_image = True
+                try:
+                    jpeg = _normalize_manual_jpeg(manual_images[i])
+                    filename = _unique_filename(
+                        build_image_filename(brand, sku, product_name),
+                        salt=f"{i}:{product_name}",
+                    )
+                    manifest_row["Local Image Filename"] = filename
+                    manifest_row["Image Status"] = "manually_uploaded"
+                    manifest_row["Error"] = ""
+                    zf.writestr(f"images/{filename}", jpeg)
+                    export_image_filename = filename
+                    wrote_image = True
+                except Exception as exc:
+                    manifest_row["Image Status"] = "conversion_error"
+                    manifest_row["Error"] = str(exc)
 
             # 3) remote URL download
             if not wrote_image and _is_public_https_image_url(image_url):
@@ -627,16 +727,34 @@ def export_programa_zip(
                 manifest_row["Image Status"] = result["image_status"]
                 manifest_row["Error"] = result.get("error", "")
                 if result["image_status"] == "downloaded" and result.get("jpeg_bytes"):
-                    filename = _unique_filename(result["local_image_filename"])
+                    filename = _unique_filename(result["local_image_filename"], salt=f"{i}:{product_name}:{image_url}")
                     manifest_row["Local Image Filename"] = filename
+                    export_image_filename = filename
                     zf.writestr(f"images/{filename}", result["jpeg_bytes"])
 
             manifest_rows.append(manifest_row)
+            export_image_filenames.append(export_image_filename)
+
+        if export_rows:
+            df = pd.DataFrame(export_rows, columns=PROGRAMA_COLUMNS)
+            df["Image Filename"] = export_image_filenames
+        else:
+            df = pd.DataFrame(columns=PROGRAMA_COLUMNS + ["Image Filename"])
+
+        zf.writestr("programa_import.csv", export_programa_csv(df).decode("utf-8"))
+        zf.writestr("programa_import.xlsx", export_programa_xlsx(df))
 
         if manifest_rows:
             manifest_df = pd.DataFrame(manifest_rows, columns=_MANIFEST_COLUMNS)
             mbuf = io.StringIO()
             manifest_df.to_csv(mbuf, index=False)
             zf.writestr("manifest.csv", mbuf.getvalue())
+
+            guide_df = _manual_guide_dataframe(manifest_rows)
+            gbuf = io.StringIO()
+            guide_df.to_csv(gbuf, index=False)
+            zf.writestr("manual_image_upload_guide.csv", gbuf.getvalue())
+
+        zf.writestr("README_manual_image_upload.txt", _manual_image_readme())
 
     return buf.getvalue()

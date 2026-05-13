@@ -68,7 +68,7 @@ def test_photo_only_rows_require_public_image_url():
     )
 
     assert ok is False
-    assert blockers == ["Missing hosted image URL"]
+    assert blockers == ["Missing image"]
 
 
 def test_photo_only_rows_are_send_eligible_with_public_image_url():
@@ -102,4 +102,4 @@ def test_photo_only_ignored_rows_still_do_not_send():
     )
 
     assert ok is False
-    assert blockers == ["Ignored or excluded", "Missing product name", "Missing category", "Missing hosted image URL"]
+    assert blockers == ["Ignored or excluded", "Missing product name", "Missing category", "Missing image"]
