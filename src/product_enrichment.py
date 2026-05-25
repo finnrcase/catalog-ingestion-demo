@@ -749,6 +749,34 @@ def _is_manual_image(row: dict) -> bool:
     return _str_val(row.get("image_source")).lower() == "manual_upload"
 
 
+def _budget_diagnostics(budget) -> dict:
+    if budget is None:
+        return {
+            "API Budget Search Usage": "",
+            "API Budget Fetch Usage": "",
+            "API Budget AI Usage": "",
+            "API Budget Stopped Reason": "",
+        }
+    if hasattr(budget, "diagnostics"):
+        data = budget.diagnostics()
+        return {
+            "API Budget Search Usage": data.get("search_usage", ""),
+            "API Budget Fetch Usage": data.get("fetch_usage", ""),
+            "API Budget AI Usage": data.get("ai_usage", ""),
+            "API Budget Stopped Reason": data.get("stopped_reason", ""),
+        }
+    return {
+        "API Budget Search Usage": f"Used {getattr(budget, 'searches_used', 0)}/{getattr(budget, 'max_searches', 0)} search calls",
+        "API Budget Fetch Usage": f"Used {getattr(budget, 'urls_used', 0)}/{getattr(budget, 'max_urls', 0)} page fetches",
+        "API Budget AI Usage": "",
+        "API Budget Stopped Reason": getattr(budget, "stopped_reason", ""),
+    }
+
+
+def _merge_budget_debug(debug: dict, budget) -> None:
+    debug.update(_budget_diagnostics(budget))
+
+
 def _apply_product_lookup_cache_entry(row: dict, cache_entry: dict, debug: dict) -> tuple[dict, _DimensionResult | None]:
     """Fill blank row fields from a HIGH/MEDIUM verified product lookup cache entry."""
     updated = row.copy()
@@ -760,6 +788,11 @@ def _apply_product_lookup_cache_entry(row: dict, cache_entry: dict, debug: dict)
 
     debug.update({
         "product_lookup_cache_status": "hit",
+        "AI Extraction Status": "Skipped AI: cached result",
+        "API Budget Search Usage": "Used 0/0 search calls",
+        "API Budget Fetch Usage": "Used 0/0 page fetches",
+        "API Budget AI Usage": "Used 0/0 AI calls",
+        "API Budget Stopped Reason": "Used cached result: no API cost",
         "selected_product_page_url": product_url,
         "selected_product_page_score": int(cache_entry.get("evidence_score") or 0),
         "selected_product_page_reason": evidence or "product_lookup_cache",
@@ -871,6 +904,11 @@ def _apply_official_product_lookup(
         "Image Recovery Source": "",
         "Search Diagnostics": "",
         "product_lookup_cache_status": "miss",
+        "AI Extraction Status": "",
+        "API Budget Search Usage": "",
+        "API Budget Fetch Usage": "",
+        "API Budget AI Usage": "",
+        "API Budget Stopped Reason": "",
     }
     def _stamp_debug_fields(target: dict) -> dict:
         for key, value in debug.items():
@@ -898,6 +936,11 @@ def _apply_official_product_lookup(
                 "Image Recovery Source",
                 "Search Diagnostics",
                 "product_lookup_cache_status",
+                "AI Extraction Status",
+                "API Budget Search Usage",
+                "API Budget Fetch Usage",
+                "API Budget AI Usage",
+                "API Budget Stopped Reason",
             }:
                 target[key] = value
         return target
@@ -917,11 +960,16 @@ def _apply_official_product_lookup(
         if is_no_result(cached):
             debug.update({
                 "product_lookup_cache_status": "searched_no_result",
+                "AI Extraction Status": "Skipped AI: cached no-result",
+                "API Budget Stopped Reason": "Used cached no-result: no API cost",
                 "Product Resolution Confidence": _str_val(cached.get("confidence")) or "none",
                 "Product Resolution Evidence": _str_val(cached.get("evidence_summary")) or "cached searched_no_result",
                 "Search Diagnostics": "product_lookup_cache_searched_no_result",
                 "web_lookup_error": "cached_searched_no_result",
             })
+            _merge_budget_debug(debug, budget)
+            if not debug.get("API Budget Stopped Reason"):
+                debug["API Budget Stopped Reason"] = "Used cached no-result: no API cost"
             updated["manufacturer_page_exact_sku"] = False
             return _stamp_debug_fields(updated), None, debug
     elif force_refresh:
@@ -955,6 +1003,7 @@ def _apply_official_product_lookup(
             "Product Resolution URL": page.url if page else "",
             "Search Diagnostics": resolution.diagnostics,
         })
+        _merge_budget_debug(debug, budget)
         if page:
             page_url = page.url
             selected_html = page.html
@@ -982,6 +1031,11 @@ def _apply_official_product_lookup(
             )
 
     if not page_url:
+        if not debug.get("AI Extraction Status"):
+            debug["AI Extraction Status"] = "Skipped AI: no verified page"
+        _merge_budget_debug(debug, budget)
+        if not debug.get("API Budget Stopped Reason"):
+            debug["API Budget Stopped Reason"] = debug.get("web_lookup_error") or "no_verified_product_page"
         _lookup_cache.record_no_result(
             row,
             confidence=_str_val(debug.get("Product Resolution Confidence")).lower() or "none",
@@ -999,6 +1053,7 @@ def _apply_official_product_lookup(
         extracted_fields = getattr(selected_resolution_candidate, "extracted_fields", {}) or {}
         if not extracted_fields:
             debug["web_lookup_error"] = debug.get("web_lookup_error") or "selected_page_fetch_failed"
+            _merge_budget_debug(debug, budget)
             return _stamp_debug_fields(updated), None, debug
         updated = _apply_verified_page_extraction(updated, {
             "Product Name": extracted_fields.get("Product Name", ""),
@@ -1012,6 +1067,7 @@ def _apply_official_product_lookup(
         updated["manufacturer_page_exact_sku"] = bool(getattr(selected_resolution_candidate, "matched_sku", False))
         if extracted_fields.get("Image URL") and not row_has_image(updated) and extracted_fields.get("image_confidence") in {"HIGH", "MEDIUM"}:
             updated["Image URL"] = extracted_fields["Image URL"]
+        _merge_budget_debug(debug, budget)
         return _stamp_debug_fields(updated), None, debug
 
     selected_reason = _str_val(debug.get("selected_product_page_reason"))
@@ -1114,9 +1170,17 @@ def _apply_official_product_lookup(
             updated[dest] = value
 
     if _needs_verified_page_extraction(updated):
-        extracted = _extract_with_claude(_html_to_text(html), updated)
-        if extracted:
-            updated = _apply_verified_page_extraction(updated, extracted)
+        if budget is not None and not getattr(budget, "can_ai_call", lambda: True)():
+            debug["AI Extraction Status"] = f"Skipped AI: {getattr(budget, 'stopped_reason', '') or 'AI budget exhausted'}"
+        else:
+            if budget is not None and hasattr(budget, "consume_ai_call"):
+                budget.consume_ai_call()
+            debug["AI Extraction Status"] = "AI extraction used verified page text"
+            extracted = _extract_with_claude(_html_to_text(html), updated)
+            if extracted:
+                updated = _apply_verified_page_extraction(updated, extracted)
+    else:
+        debug["AI Extraction Status"] = "Skipped AI: deterministic extraction complete"
 
     image = extract_product_page_image(
         html,
@@ -1200,6 +1264,7 @@ def _apply_official_product_lookup(
         source_domain=urllib.parse.urlparse(page_url).netloc,
         **debug,
     )
+    _merge_budget_debug(debug, budget)
     return _stamp_debug_fields(updated), dim_result, debug
 
 

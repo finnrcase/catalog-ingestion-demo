@@ -148,6 +148,16 @@ def resolve_product_page(row: dict, session_cache=None, budget=None) -> ProductR
                     budget.stop("Stopped early: HIGH confidence official product page found")
                 stop_all = True
                 break
+            if (
+                candidate.is_official_domain
+                and candidate.confidence == "medium"
+                and candidate.extracted_dimensions
+                and candidate.extracted_image_url
+            ):
+                if budget is not None:
+                    budget.stop("Stopped early: dimensions and image found from verified product page")
+                stop_all = True
+                break
 
     selected = _select_candidate(candidates)
     diagnostics = [_diagnostic_record(candidate) for candidate in candidates]
