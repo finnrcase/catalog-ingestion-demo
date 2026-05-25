@@ -20,7 +20,10 @@ import {
   exportProgramaXlsx,
   exportProgramaXlsxWithImages,
   exportProgramaZip,
+  cancelPdfParseJob,
   fetchHealth,
+  fetchPdfParseJob,
+  fetchPdfParseLogs,
   fetchSchema,
   fetchVendorCallStatus,
   enrichRows,
@@ -28,13 +31,15 @@ import {
   generateVendorCallScript,
   recoverImages,
   refreshVendorCall,
+  retryPdfParseJob,
   startVendorCall,
+  uploadPdfForParsing,
   uploadImage,
   validateProgramaExport,
   validateRows,
 } from "@/lib/api";
 import { hasComplete3dDimensions } from "@/lib/dimensions";
-import type { IntakeRow, PhotoDiscoveryReport } from "@/lib/types";
+import type { IntakeResponse, IntakeRow, PdfParseJob, PhotoDiscoveryReport } from "@/lib/types";
 
 const reviewColumns = [
   "Include",
@@ -146,6 +151,11 @@ type UploadDebugInfo = {
   failedStep: string;
   errorMessage: string;
   suggestedFix: string;
+  parserAttempted?: string;
+  timeoutReason?: string;
+  stackTraceSnippet?: string;
+  rawLogs?: string;
+  retryJobId?: string;
 };
 
 const UPLOAD_TIMEOUT_MS = 90_000;
@@ -174,8 +184,9 @@ function suggestedUploadFix(kind: UploadFileKind, message: string) {
   if (kind === "unsupported") return "Upload a PDF, JPG, PNG, or WebP file.";
   if (kind === "image" && lower.includes("cloudinary")) return "Check Cloudinary settings, then retry the image upload.";
   if (kind === "image") return "Try a JPG, PNG, or WebP image under the upload size limit.";
-  if (lower.includes("timed out")) return "Try a smaller file or retry after the backend finishes starting.";
-  return "Retry the upload. If it repeats, try a smaller file or a different supported format.";
+  if (lower.includes("backend")) return "The backend may be waking up. Wait a moment, then retry parsing without reuploading.";
+  if (lower.includes("timed out") || lower.includes("timeout")) return "Parsing is taking longer than expected. Retry with the fallback parser from diagnostics.";
+  return "Retry parsing. The uploaded file is preserved, so you should not need to reupload.";
 }
 
 function logUploadStage(stage: "selected" | "validating" | "parsing" | "complete" | "error", detail: Record<string, unknown> = {}) {
@@ -197,6 +208,51 @@ function formatFileSize(bytes: number) {
   const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   const value = bytes / 1024 ** exponent;
   return `${value >= 10 || exponent === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[exponent]}`;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function pdfStageLabel(job: PdfParseJob) {
+  const stage = (job.stage || job.status || "").toLowerCase();
+  if (stage === "queued") return "Queued";
+  if (stage === "parsing") return "Parsing";
+  if (stage === "ocr_fallback") return "OCR fallback running";
+  if (stage === "complete") return "Complete";
+  if (stage === "failed") return "Failed";
+  if (stage === "cancelled") return "Cancelled";
+  return stage || "Parsing";
+}
+
+function pdfJobDebug(file: File, job: PdfParseJob, rawLogs = ""): UploadDebugInfo {
+  const attempts = Array.isArray(job.telemetry?.attempts) ? job.telemetry.attempts as Record<string, unknown>[] : [];
+  const parserAttempted = attempts.map((attempt) => String(attempt.parser || "")).filter(Boolean).join(" → ");
+  const failedAttempt = attempts.find((attempt) => attempt.status === "timeout" || attempt.status === "failed");
+  const stack = String(failedAttempt?.stack || job.telemetry?.stack || "");
+  return {
+    fileName: file.name,
+    fileType: file.type || "application/pdf",
+    fileSize: formatFileSize(file.size),
+    failedStep: pdfStageLabel(job),
+    errorMessage: job.errors?.join(" ") || "PDF parsing failed.",
+    suggestedFix: suggestedUploadFix("pdf", job.errors?.join(" ") || ""),
+    parserAttempted,
+    timeoutReason: String(failedAttempt?.error || job.telemetry?.parse_status || ""),
+    stackTraceSnippet: stack.slice(0, 900),
+    rawLogs,
+    retryJobId: job.job_id,
+  };
+}
+
+async function downloadText(filename: string, text: string) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
 function cleanNotes(value: string) {
@@ -294,6 +350,7 @@ export function IntakeWorkspace() {
   const [uploadDebug, setUploadDebug] = useState<UploadDebugInfo | null>(null);
   const [showUploadDebug, setShowUploadDebug] = useState(false);
   const [uploadStatusText, setUploadStatusText] = useState("");
+  const [activePdfParseJobId, setActivePdfParseJobId] = useState("");
   const [useAiPdf, setUseAiPdf] = useState(true);
   const [rows, setRows] = useState<IntakeRow[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
@@ -330,6 +387,7 @@ export function IntakeWorkspace() {
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const bulkImageInputRef = useRef<HTMLInputElement>(null);
+  const pdfSessionIdRef = useRef<string>("");
 
   useEffect(() => {
     fetchHealth().catch(() => {
@@ -475,6 +533,94 @@ export function IntakeWorkspace() {
       throw error;
     } finally {
       window.clearTimeout(timeoutId);
+    }
+  }
+
+  async function pollPdfParseJob(jobId: string, file: File, allowAutoRetry = true): Promise<PdfParseJob> {
+    const started = Date.now();
+    let retried = false;
+    let lastJob: PdfParseJob | null = null;
+    while (Date.now() - started < 150_000) {
+      const job = await fetchPdfParseJob(jobId);
+      lastJob = job;
+      setActivePdfParseJobId(job.job_id);
+      const label = pdfStageLabel(job);
+      setUploadStatusText(`${file.name}: ${label}`);
+      if (job.stage === "ocr_fallback") {
+        setMessage("OCR fallback running.");
+      } else if (job.status === "queued") {
+        setMessage("Queued for parsing.");
+      } else if (job.status === "parsing") {
+        setMessage("Parsing is taking longer than expected. Retrying with fallback parser if needed.");
+      }
+      if (job.status === "complete") return job;
+      if (job.status === "failed" || job.status === "cancelled") {
+        const logs = await fetchPdfParseLogs(job.job_id).catch(() => job);
+        const rawLogs = JSON.stringify(logs, null, 2);
+        if (allowAutoRetry && !retried && job.status === "failed") {
+          retried = true;
+          setUploadStatusText(`${file.name}: Retrying with fallback parser`);
+          setMessage("Retrying with fallback parser.");
+          const retry = await retryPdfParseJob(job.job_id);
+          jobId = retry.job_id;
+          setActivePdfParseJobId(retry.job_id);
+          await sleep(500);
+          continue;
+        }
+        setUploadDebug(pdfJobDebug(file, job, rawLogs));
+        setShowUploadDebug(true);
+        const parseError = new Error(job.errors?.join(" ") || `${file.name} parsing failed.`);
+        Object.assign(parseError, { hasUploadDebug: true });
+        throw parseError;
+      }
+      await sleep(1000);
+    }
+    if (lastJob) {
+      const logs = await fetchPdfParseLogs(lastJob.job_id).catch(() => lastJob);
+      setUploadDebug(pdfJobDebug(file, lastJob, JSON.stringify(logs, null, 2)));
+      setShowUploadDebug(true);
+    }
+    const timeoutError = new Error("Parsing is taking longer than expected. The uploaded file is preserved; retry from diagnostics.");
+    Object.assign(timeoutError, { hasUploadDebug: true });
+    throw timeoutError;
+  }
+
+  async function parsePdfFilesWithJobs(pdfFiles: File[]): Promise<IntakeRow[]> {
+    const parsedRows: IntakeRow[] = [];
+    for (const [index, file] of pdfFiles.entries()) {
+      setUploadStatusText(`${file.name}: Uploading`);
+      setMessage("Uploading PDF.");
+      const upload = await runUploadWithTimeout(
+        (signal) => uploadPdfForParsing({
+          file,
+          project,
+          room,
+          sessionId: pdfSessionIdRef.current || undefined,
+        }, { signal }),
+        "Backend waking up. Upload did not finish in time; retry once the backend is warm.",
+      );
+      pdfSessionIdRef.current = upload.session_id;
+      setActivePdfParseJobId(upload.parse_job_id);
+      setUploadStatusText(`${file.name}: Queued`);
+      setMessage(`Queued ${index + 1}/${pdfFiles.length} PDF${pdfFiles.length === 1 ? "" : "s"} for parsing.`);
+      try {
+        const job = await pollPdfParseJob(upload.parse_job_id, file);
+        parsedRows.push(...job.rows);
+      } finally {
+        setActivePdfParseJobId("");
+      }
+    }
+    return parsedRows;
+  }
+
+  async function handleCancelPdfParse() {
+    if (!activePdfParseJobId) return;
+    try {
+      await cancelPdfParseJob(activePdfParseJobId);
+      setMessage("Cancellation requested.");
+      setUploadStatusText("Cancelling PDF parse");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not cancel PDF parsing.");
     }
   }
 
@@ -776,7 +922,7 @@ export function IntakeWorkspace() {
       return;
     }
     setBusy("generate");
-    setUploadStatusText(files.length > 0 ? "Reading PDF..." : "Creating intake...");
+    setUploadStatusText(files.length > 0 ? "Uploading PDF..." : "Creating intake...");
     setMessage("");
     setErrors([]);
     resetUploadErrorState();
@@ -787,10 +933,23 @@ export function IntakeWorkspace() {
       hasUrls: Boolean(urls.trim()),
     });
     try {
-      const response = await runUploadWithTimeout(
-        (signal) => generateIntakeTable({ project, room, urls, useAiPdf, files }, { signal }),
-        "PDF reading timed out. Please retry with a smaller PDF.",
-      );
+      let response: IntakeResponse;
+      if (files.length > 0) {
+        await fetchHealth().catch(() => {
+          setMessage("Backend waking up.");
+        });
+        const pdfRows = await parsePdfFilesWithJobs(files);
+        const urlResponse = urls.trim()
+          ? await generateIntakeTable({ project, room, urls, useAiPdf, files: [] })
+          : { rows: [] as IntakeRow[], errors: [] as string[] };
+        response = await validateRows([...urlResponse.rows, ...pdfRows]);
+        response.errors = [...(urlResponse.errors || []), ...(response.errors || [])];
+      } else {
+        response = await runUploadWithTimeout(
+          (signal) => generateIntakeTable({ project, room, urls, useAiPdf, files }, { signal }),
+          "Backend waking up. Creating intake took longer than expected.",
+        );
+      }
       setRows(response.rows);
       setErrors(response.errors);
       setPhotoDiscoveryReport(null);
@@ -800,12 +959,17 @@ export function IntakeWorkspace() {
       const message = error instanceof Error ? error.message : "Could not generate the intake table.";
       setMessage(message);
       if (files.length || bulkImages.length) {
-        setUploadFailure(
-          files.length ? files : bulkImages,
-          "parsing",
-          message,
-          files.length ? "pdf" : "image",
-        );
+        if (typeof error === "object" && error && "hasUploadDebug" in error) {
+          setUploadError(message);
+          logUploadStage("error", { source: "intake_generate", error: message });
+        } else {
+          setUploadFailure(
+            files.length ? files : bulkImages,
+            "parsing",
+            message,
+            files.length ? "pdf" : "image",
+          );
+        }
       } else {
         logUploadStage("error", { source: "intake_generate", error: message });
       }
@@ -818,7 +982,7 @@ export function IntakeWorkspace() {
   async function handleValidate() {
     setBusy("validate");
     try {
-      const response = await enrichRows({ rows, useWebEnrichment });
+      const response = await enrichRows({ rows, useWebEnrichment, sessionId: pdfSessionIdRef.current || undefined });
       setRows(response.rows);
       setErrors(response.errors);
       setPhotoDiscoveryReport(photoReportFromDiagnostics(response.dimension_diagnostics));
@@ -838,7 +1002,7 @@ export function IntakeWorkspace() {
     setBusy("imageRecovery");
     setMessage("");
     try {
-      const response = await recoverImages(targetRows);
+      const response = await recoverImages(targetRows, pdfSessionIdRef.current || undefined);
       setRows(response.rows);
       setErrors(response.errors);
       setPhotoDiscoveryReport(photoReportFromDiagnostics(response.dimension_diagnostics));
@@ -1056,7 +1220,52 @@ export function IntakeWorkspace() {
                     <div><span className="font-semibold">Size:</span> {uploadDebug.fileSize}</div>
                     <div><span className="font-semibold">Failed step:</span> {uploadDebug.failedStep}</div>
                     <div><span className="font-semibold">Error:</span> {uploadDebug.errorMessage}</div>
+                    {uploadDebug.parserAttempted ? <div><span className="font-semibold">Parser attempted:</span> {uploadDebug.parserAttempted}</div> : null}
+                    {uploadDebug.timeoutReason ? <div><span className="font-semibold">Timeout reason:</span> {uploadDebug.timeoutReason}</div> : null}
+                    {uploadDebug.stackTraceSnippet ? (
+                      <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-md bg-charcoal/5 p-2">{uploadDebug.stackTraceSnippet}</pre>
+                    ) : null}
                     <div><span className="font-semibold">Suggested fix:</span> {uploadDebug.suggestedFix}</div>
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      {uploadDebug.retryJobId ? (
+                        <button
+                          type="button"
+                          className="rounded-full border border-clay/30 px-2 py-0.5 text-xs font-semibold"
+                          onClick={async () => {
+                            try {
+                              setBusy("generate");
+                              setUploadStatusText("Retrying parser");
+                              const retry = await retryPdfParseJob(uploadDebug.retryJobId || "");
+                              const file = files[0];
+                              if (!file) return;
+                              const job = await pollPdfParseJob(retry.job_id, file, false);
+                              const validated = await validateRows(job.rows);
+                              setRows(validated.rows);
+                              setErrors(validated.errors);
+                              setUploadError("");
+                              setShowUploadDebug(false);
+                              setMessage("PDF parsing retry complete.");
+                            } catch (error) {
+                              setUploadError(error instanceof Error ? error.message : "Retry failed.");
+                            } finally {
+                              setBusy("");
+                              setUploadStatusText("");
+                            }
+                          }}
+                        >
+                          Retry parsing
+                        </button>
+                      ) : null}
+                      {uploadDebug.rawLogs ? (
+                        <button
+                          type="button"
+                          className="rounded-full border border-clay/30 px-2 py-0.5 text-xs font-semibold"
+                          onClick={() => downloadText("pdf-parse-logs.json", uploadDebug.rawLogs || "")}
+                        >
+                          Download raw logs
+                        </button>
+                      ) : null}
+                    </div>
                   </div>
                 ) : null}
               </div>
@@ -1172,6 +1381,16 @@ export function IntakeWorkspace() {
                 )}
                 {uploadBusy ? uploadStatusText || (busy === "photoBulk" ? "Processing image..." : "Reading PDF...") : onlyPhotosSelected ? "Upload Photos" : "Upload"}
               </button>
+              {busy === "generate" && activePdfParseJobId ? (
+                <button
+                  type="button"
+                  className="inline-flex h-12 items-center justify-center gap-2 rounded-xl border border-clay/30 px-4 text-sm font-semibold text-clay hover:bg-clay/10"
+                  onClick={handleCancelPdfParse}
+                >
+                  <X className="h-4 w-4" />
+                  Cancel parse
+                </button>
+              ) : null}
               {message ? <p className="text-sm text-charcoal/65">{message}</p> : null}
             </div>
           </div>

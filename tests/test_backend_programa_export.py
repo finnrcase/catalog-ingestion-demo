@@ -61,7 +61,8 @@ def test_health_endpoint():
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json()["status"] == "ok"
+    assert "uptime_seconds" in response.json()
 
 
 def test_programa_xlsx_with_images_endpoint_returns_xlsx():

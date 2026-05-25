@@ -6,7 +6,11 @@ import io
 import logging
 import os
 import sys
+import threading
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +26,10 @@ if str(ROOT) not in sys.path:
 
 _TMP_UPLOADS = ROOT / ".tmp" / "uploads"
 logger = logging.getLogger(__name__)
+_STARTED_AT = time.time()
+_PDF_PARSE_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("PDF_PARSE_WORKERS", "2")))
+_PDF_JOBS_LOCK = threading.Lock()
+_PDF_JOBS: dict[str, "PdfParseJob"] = {}
 
 from src.ai_extraction import extract_products_from_pdf_with_ai
 from src.confidence import apply_confidence_checks
@@ -38,6 +46,12 @@ from src.image_recovery import build_photo_discovery_report
 from src.pdf_product_workflow import (
     enrich_pdf_rows_with_official_product_urls,
     normalize_pdf_product_rows,
+)
+from src.pdf_parsing_pipeline import (
+    HARD_TIMEOUT_SECONDS,
+    SOFT_TIMEOUT_SECONDS,
+    PdfParseCancelledError,
+    parse_pdf_file_resilient,
 )
 from src.product_enrichment import enrich_dataframe, recover_images_for_dataframe
 from src.programa_export import (
@@ -78,6 +92,59 @@ class UploadedPDF:
 
     def seek(self, *args: Any, **kwargs: Any) -> int:
         return self._buffer.seek(*args, **kwargs)
+
+
+@dataclass
+class PdfParseJob:
+    job_id: str
+    session_id: str
+    pdf_id: str
+    filename: str
+    pdf_path: str
+    project: str = ""
+    room: str = ""
+    supplier: str = ""
+    notes: str = ""
+    status: str = "queued"
+    stage: str = "queued"
+    rows: list[dict] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    logs: list[dict] = field(default_factory=list)
+    telemetry: dict = field(default_factory=dict)
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+    def log(self, stage: str, message: str, **extra: Any) -> None:
+        self.stage = stage
+        self.updated_at = time.time()
+        item = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "stage": stage,
+            "message": message,
+            **extra,
+        }
+        self.logs.append(item)
+        logger.info("[pdf-parse] job=%s stage=%s %s", self.job_id, stage, message)
+
+    def public(self, include_rows: bool = True, include_logs: bool = False) -> dict:
+        payload = {
+            "job_id": self.job_id,
+            "session_id": self.session_id,
+            "pdf_id": self.pdf_id,
+            "filename": self.filename,
+            "status": self.status,
+            "stage": self.stage,
+            "rows": self.rows if include_rows else [],
+            "errors": self.errors,
+            "telemetry": self.telemetry,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "log_count": len(self.logs),
+        }
+        if include_logs:
+            payload["logs"] = self.logs
+        return payload
 
 
 class RowsPayload(BaseModel):
@@ -132,7 +199,26 @@ class IntakeResponse(BaseModel):
 class UploadPdfResponse(BaseModel):
     session_id: str
     pdf_id: str
+    parse_job_id: str = ""
+    status: str = "queued"
+    stage: str = "queued"
     rows: list[dict] = Field(default_factory=list)
+
+
+class PdfParseJobResponse(BaseModel):
+    job_id: str
+    session_id: str
+    pdf_id: str
+    filename: str = ""
+    status: str = "queued"
+    stage: str = "queued"
+    rows: list[dict] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    telemetry: dict = Field(default_factory=dict)
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    log_count: int = 0
+    logs: list[dict] | None = None
 
 
 class ImageUploadResponse(BaseModel):
@@ -220,7 +306,16 @@ def _df_response(
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "uptime_seconds": round(time.time() - _STARTED_AT, 2),
+        "cold_start_window": (time.time() - _STARTED_AT) < 30,
+    }
+
+
+@app.get("/warmup")
+def warmup() -> dict:
+    return {"status": "warm", "uptime_seconds": round(time.time() - _STARTED_AT, 2)}
 
 
 @app.get("/schema")
@@ -267,6 +362,142 @@ def _log_upload_stage(stage: str, upload: UploadFile, file_type: str = "") -> No
         upload.content_type or "unknown",
         file_type or "unknown",
     )
+
+
+def _get_pdf_job(job_id: str) -> PdfParseJob:
+    with _PDF_JOBS_LOCK:
+        job = _PDF_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="PDF parse job not found.")
+    return job
+
+
+def _store_pdf_job(job: PdfParseJob) -> None:
+    with _PDF_JOBS_LOCK:
+        _PDF_JOBS[job.job_id] = job
+
+
+def _enqueue_pdf_parse_job(job: PdfParseJob) -> None:
+    job.status = "queued"
+    job.log("queued", "PDF parsing queued")
+    _store_pdf_job(job)
+    _PDF_PARSE_EXECUTOR.submit(_run_pdf_parse_job, job.job_id)
+
+
+def _run_pdf_parse_job(job_id: str) -> None:
+    job = _get_pdf_job(job_id)
+    if job.cancel_event.is_set():
+        job.status = "cancelled"
+        job.log("cancelled", "PDF parsing cancelled before start")
+        return
+    job.status = "parsing"
+    job.log("parsing", "PDF parser started", soft_timeout=SOFT_TIMEOUT_SECONDS, hard_timeout=HARD_TIMEOUT_SECONDS)
+    try:
+        result = parse_pdf_file_resilient(
+            job.pdf_path,
+            filename=job.filename,
+            project=job.project,
+            room=job.room,
+            supplier=job.supplier,
+            notes=job.notes,
+            soft_timeout=SOFT_TIMEOUT_SECONDS,
+            hard_timeout=HARD_TIMEOUT_SECONDS,
+            cancel_check=job.cancel_event.is_set,
+            status_callback=lambda stage: job.log(stage, _status_message_for_stage(stage)),
+        )
+        if result.rows:
+            normalized_rows = normalize_pdf_product_rows(
+                result.rows,
+                source_rows=result.rows,
+                source_filename=job.filename,
+            )
+            df = apply_confidence_checks(build_intake_dataframe([], normalized_rows))
+            if "Notes" in df.columns:
+                df["Notes"] = df["Notes"].apply(remove_notes_row_prefix)
+            job.rows = df.fillna("").to_dict("records")
+        else:
+            job.rows = []
+        job.telemetry = {
+            "parser_used": result.parser_used,
+            "parse_status": result.status,
+            "page_count": result.page_count,
+            "ocr_triggered": result.ocr_triggered,
+            "extracted_text_length": result.extracted_text_length,
+            "attempts": [
+                {key: value for key, value in attempt.__dict__.items() if key != "extra_rows"}
+                for attempt in result.attempts
+            ],
+            "backend_uptime_seconds": round(time.time() - _STARTED_AT, 2),
+            "cold_start_window": (time.time() - _STARTED_AT) < 30,
+        }
+        if result.rows:
+            job.status = "complete"
+            job.log("complete", "PDF parsing complete", rows=len(result.rows), parser=result.parser_used)
+        else:
+            job.status = "failed"
+            job.errors.append(result.error or "No parseable product rows found.")
+            job.log("failed", job.errors[-1], telemetry=job.telemetry)
+    except PdfParseCancelledError:
+        job.status = "cancelled"
+        job.errors.append("PDF parsing cancelled.")
+        job.log("cancelled", "PDF parsing cancelled")
+    except Exception as exc:
+        import traceback
+
+        stack = traceback.format_exc(limit=20)
+        job.status = "failed"
+        job.errors.append(f"{type(exc).__name__}: {exc}")
+        job.telemetry = {
+            "parser_used": job.telemetry.get("parser_used", ""),
+            "parse_status": "failed",
+            "stack": stack,
+            "backend_uptime_seconds": round(time.time() - _STARTED_AT, 2),
+            "cold_start_window": (time.time() - _STARTED_AT) < 30,
+        }
+        job.log("failed", job.errors[-1], stack=stack)
+    finally:
+        job.stage = job.status
+        job.updated_at = time.time()
+
+
+def _status_message_for_stage(stage: str) -> str:
+    return {
+        "queued": "Queued",
+        "parsing": "Parsing",
+        "ocr_fallback": "OCR fallback running",
+        "complete": "Complete",
+        "failed": "Failed",
+        "cancelled": "Cancelled",
+    }.get(stage, stage)
+
+
+async def _stream_pdf_upload(file: UploadFile, session_id: str) -> tuple[str, Path, int]:
+    pdfs_dir = _TMP_UPLOADS / session_id / "pdfs"
+    pdfs_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = pdfs_dir / f".{uuid.uuid4().hex}.upload"
+    digest = hashlib.sha1()
+    total_bytes = 0
+    with temp_path.open("wb") as out:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            digest.update(chunk)
+            out.write(chunk)
+    if total_bytes == 0:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail="Uploaded PDF was empty.")
+    pdf_id = digest.hexdigest()[:12]
+    pdf_path = pdfs_dir / f"{pdf_id}.pdf"
+    if pdf_path.exists():
+        temp_path.unlink(missing_ok=True)
+    else:
+        temp_path.replace(pdf_path)
+    return pdf_id, pdf_path, total_bytes
 
 
 @app.post("/intake/generate", response_model=IntakeResponse)
@@ -432,28 +663,98 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
 
 @app.post("/intake/upload-pdf", response_model=UploadPdfResponse)
 async def upload_pdf(
+    project: str = Form(""),
+    room: str = Form(""),
+    supplier: str = Form(""),
+    notes: str = Form(""),
     file: UploadFile = File(...),
     x_session_id: str | None = Header(default=None),
 ):
     """
     Persist an uploaded PDF to .tmp/uploads/{session_id}/pdfs/{pdf_id}.pdf
-    and return parsed rows.
+    and enqueue parsing in the background.
 
     The session_id is generated server-side if absent in the X-Session-Id
     header. pdf_id is SHA1[:12] of the bytes (so re-uploads dedupe).
     """
-    raw = await file.read()
+    if _upload_file_type(file) != "pdf":
+        raise HTTPException(status_code=400, detail="Only PDF files can be uploaded to this endpoint.")
     session_id = x_session_id or uuid.uuid4().hex[:12]
-    pdf_id = hashlib.sha1(raw).hexdigest()[:12]
+    pdf_id, pdf_path, total_bytes = await _stream_pdf_upload(file, session_id)
+    job = PdfParseJob(
+        job_id=uuid.uuid4().hex[:12],
+        session_id=session_id,
+        pdf_id=pdf_id,
+        filename=file.filename or "upload.pdf",
+        pdf_path=str(pdf_path),
+        project=project,
+        room=room,
+        supplier=supplier,
+        notes=notes,
+    )
+    job.telemetry.update({
+        "uploaded_bytes": total_bytes,
+        "soft_timeout_seconds": SOFT_TIMEOUT_SECONDS,
+        "hard_timeout_seconds": HARD_TIMEOUT_SECONDS,
+        "backend_uptime_seconds": round(time.time() - _STARTED_AT, 2),
+        "cold_start_window": (time.time() - _STARTED_AT) < 30,
+    })
+    job.log("uploading", "Upload stored; parse will run asynchronously", bytes=total_bytes)
+    _enqueue_pdf_parse_job(job)
+    return {
+        "session_id": session_id,
+        "pdf_id": pdf_id,
+        "parse_job_id": job.job_id,
+        "status": job.status,
+        "stage": job.stage,
+        "rows": [],
+    }
 
-    pdfs_dir = _TMP_UPLOADS / session_id / "pdfs"
-    pdfs_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = pdfs_dir / f"{pdf_id}.pdf"
-    if not pdf_path.exists():
-        pdf_path.write_bytes(raw)
 
-    rows = parse_pdf_rows(UploadedPDF(file.filename or "upload.pdf", raw))
-    return {"session_id": session_id, "pdf_id": pdf_id, "rows": rows}
+@app.get("/intake/pdf-jobs/{job_id}", response_model=PdfParseJobResponse)
+def pdf_parse_job_status(job_id: str) -> PdfParseJobResponse:
+    job = _get_pdf_job(job_id)
+    return PdfParseJobResponse(**job.public(include_rows=True, include_logs=False))
+
+
+@app.get("/intake/pdf-jobs/{job_id}/logs")
+def pdf_parse_job_logs(job_id: str) -> dict:
+    job = _get_pdf_job(job_id)
+    return job.public(include_rows=False, include_logs=True)
+
+
+@app.post("/intake/pdf-jobs/{job_id}/retry", response_model=PdfParseJobResponse)
+def retry_pdf_parse_job(job_id: str) -> PdfParseJobResponse:
+    previous = _get_pdf_job(job_id)
+    if previous.status in {"queued", "parsing"}:
+        raise HTTPException(status_code=409, detail="PDF parse job is still running.")
+    job = PdfParseJob(
+        job_id=uuid.uuid4().hex[:12],
+        session_id=previous.session_id,
+        pdf_id=previous.pdf_id,
+        filename=previous.filename,
+        pdf_path=previous.pdf_path,
+        project=previous.project,
+        room=previous.room,
+        supplier=previous.supplier,
+        notes=previous.notes,
+    )
+    job.log("queued", f"Retry queued from {previous.job_id}")
+    _enqueue_pdf_parse_job(job)
+    return PdfParseJobResponse(**job.public(include_rows=True, include_logs=False))
+
+
+@app.post("/intake/pdf-jobs/{job_id}/cancel", response_model=PdfParseJobResponse)
+def cancel_pdf_parse_job(job_id: str) -> PdfParseJobResponse:
+    job = _get_pdf_job(job_id)
+    job.cancel_event.set()
+    if job.status == "queued":
+        job.status = "cancelled"
+        job.stage = "cancelled"
+        job.log("cancelled", "PDF parsing cancelled before worker started")
+    else:
+        job.log("cancelled", "Cancellation requested")
+    return PdfParseJobResponse(**job.public(include_rows=True, include_logs=False))
 
 
 @app.post("/intake/recover-images", response_model=IntakeResponse)

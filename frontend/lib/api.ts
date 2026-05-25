@@ -1,6 +1,7 @@
 import type {
   IntakeResponse,
   IntakeRow,
+  PdfParseJob,
   ProgramaExportValidation,
   SchemaResponse,
   VendorCallRefreshResponse,
@@ -87,6 +88,58 @@ export async function generateIntakeTable(input: {
 
 export const generateIntake = generateIntakeTable;
 
+export async function uploadPdfForParsing(input: {
+  file: File;
+  project: string;
+  room: string;
+  sessionId?: string;
+}, options?: { signal?: AbortSignal }): Promise<{
+  session_id: string;
+  pdf_id: string;
+  parse_job_id: string;
+  status: string;
+  stage: string;
+  rows: IntakeRow[];
+}> {
+  const form = new FormData();
+  form.append("project", input.project);
+  form.append("room", input.room);
+  form.append("file", input.file);
+  const headers: HeadersInit = {};
+  if (input.sessionId) headers["X-Session-Id"] = input.sessionId;
+  return parseJson<{
+    session_id: string;
+    pdf_id: string;
+    parse_job_id: string;
+    status: string;
+    stage: string;
+    rows: IntakeRow[];
+  }>(
+    await apiFetch(apiUrl("/intake/upload-pdf"), {
+      method: "POST",
+      body: form,
+      headers,
+      signal: options?.signal,
+    }),
+  );
+}
+
+export async function fetchPdfParseJob(jobId: string): Promise<PdfParseJob> {
+  return parseJson<PdfParseJob>(await apiFetch(apiUrl(`/intake/pdf-jobs/${jobId}`), { cache: "no-store" }));
+}
+
+export async function retryPdfParseJob(jobId: string): Promise<PdfParseJob> {
+  return parseJson<PdfParseJob>(await apiFetch(apiUrl(`/intake/pdf-jobs/${jobId}/retry`), { method: "POST" }));
+}
+
+export async function cancelPdfParseJob(jobId: string): Promise<PdfParseJob> {
+  return parseJson<PdfParseJob>(await apiFetch(apiUrl(`/intake/pdf-jobs/${jobId}/cancel`), { method: "POST" }));
+}
+
+export async function fetchPdfParseLogs(jobId: string): Promise<PdfParseJob> {
+  return parseJson<PdfParseJob>(await apiFetch(apiUrl(`/intake/pdf-jobs/${jobId}/logs`), { cache: "no-store" }));
+}
+
 export async function uploadImage(file: File, options?: { signal?: AbortSignal }): Promise<{ secure_url: string }> {
   const form = new FormData();
   form.append("file", file);
@@ -108,6 +161,7 @@ export async function validateRows(rows: IntakeRow[]): Promise<IntakeResponse> {
 export async function enrichRows(input: {
   rows: IntakeRow[];
   useWebEnrichment: boolean;
+  sessionId?: string;
 }): Promise<IntakeResponse> {
   return parseJson<IntakeResponse>(
     await apiFetch(apiUrl("/intake/enrich"), {
@@ -116,17 +170,18 @@ export async function enrichRows(input: {
       body: JSON.stringify({
         rows: input.rows,
         use_web_enrichment: input.useWebEnrichment,
+        session_id: input.sessionId,
       }),
     }),
   );
 }
 
-export async function recoverImages(rows: IntakeRow[]): Promise<IntakeResponse> {
+export async function recoverImages(rows: IntakeRow[], sessionId?: string): Promise<IntakeResponse> {
   return parseJson<IntakeResponse>(
     await apiFetch(apiUrl("/intake/recover-images"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rows }),
+      body: JSON.stringify({ rows, session_id: sessionId }),
     }),
   );
 }

@@ -28,6 +28,22 @@ export type IntakeResponse = {
   dimension_diagnostics?: Record<string, unknown>[];
 };
 
+export type PdfParseJob = {
+  job_id: string;
+  session_id: string;
+  pdf_id: string;
+  filename: string;
+  status: "queued" | "parsing" | "ocr_fallback" | "complete" | "failed" | "cancelled" | string;
+  stage: string;
+  rows: IntakeRow[];
+  errors: string[];
+  telemetry: Record<string, unknown>;
+  created_at: number;
+  updated_at: number;
+  log_count: number;
+  logs?: Record<string, unknown>[] | null;
+};
+
 export type PhotoDiscoveryReport = {
   total_rows: number;
   official_product_pages_found: number;
