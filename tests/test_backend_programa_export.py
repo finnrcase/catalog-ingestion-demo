@@ -64,6 +64,14 @@ def test_health_endpoint():
     assert response.json() == {"status": "ok"}
 
 
+def test_programa_xlsx_with_images_endpoint_returns_xlsx():
+    response = client.post("/export/programa/xlsx-with-images", json=_rows())
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    assert response.content.startswith(b"PK")
+
+
 def test_upload_image_endpoint_returns_secure_url(monkeypatch):
     monkeypatch.setattr(
         "backend.main.upload_image",
@@ -136,6 +144,42 @@ def test_intake_enrich_endpoint_passes_web_enrichment_flag(monkeypatch):
 
     assert response.status_code == 200
     assert captured["use_web_enrichment"] is False
+
+
+def test_intake_enrich_endpoint_returns_photo_discovery_report(monkeypatch):
+    rows = [{
+        "Product Name": "Wolf Drawer",
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product URL": "https://www.subzero-wolf.com/products/mdd30ts",
+    }]
+
+    def fake_enrich_dataframe(df, enrichment_mode="standard", force_refresh=False, use_web_enrichment=True):
+        return df, [], []
+
+    def fake_recover_images_for_dataframe(df, pdf_lookup=None, session_id=None, enable_screenshot=True):
+        out = df.copy()
+        out["confidence"] = "HIGH"
+        out["local_image_path"] = "/tmp/images/wolf_mdd30ts.jpg"
+        return out, [{
+            "brand": "Wolf",
+            "product_name": "Wolf Drawer",
+            "model_sku": "MDD30TS",
+            "confidence": "HIGH",
+            "selected_product_page_url": "https://www.subzero-wolf.com/products/mdd30ts",
+            "local_image_path": "/tmp/images/wolf_mdd30ts.jpg",
+        }]
+
+    monkeypatch.setattr("backend.main.enrich_dataframe", fake_enrich_dataframe)
+    monkeypatch.setattr("backend.main.recover_images_for_dataframe", fake_recover_images_for_dataframe)
+
+    response = client.post("/intake/enrich", json={"rows": rows, "use_web_enrichment": True})
+
+    assert response.status_code == 200
+    diagnostics = response.json()["dimension_diagnostics"]
+    report = next(d for d in diagnostics if d.get("report_type") == "photo_discovery")["summary"]
+    assert report["official_product_pages_found"] == 1
+    assert report["images_inserted_into_excel"] == 1
 
 
 def test_programa_export_csv_endpoint_uses_programa_columns():

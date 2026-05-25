@@ -283,6 +283,14 @@ export async function exportProgramaXlsx(rows: IntakeRow[]): Promise<Blob> {
   return exportProgramaFile(rows, "/export/programa/xlsx", "Could not export Programa XLSX.");
 }
 
+export async function exportProgramaXlsxWithImages(rows: IntakeRow[]): Promise<Blob> {
+  return exportProgramaFile(
+    rows,
+    "/export/programa/xlsx-with-images",
+    "Could not export Programa Excel with Images.",
+  );
+}
+
 export async function exportProgramaZip(rows: IntakeRow[], includeLowConfidenceImages = false): Promise<Blob> {
   const response = await apiFetch(apiUrl("/export/programa/zip"), {
     method: "POST",

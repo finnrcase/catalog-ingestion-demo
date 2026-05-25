@@ -33,11 +33,15 @@ from src.photo_inventory import (
     upload_image_to_cloudinary,
 )
 from src.programa_export import (
+    PROGRAMA_IMAGE_FORMAT_NOTE,
+    build_programa_image_compatibility_dataframe,
     build_programa_debug_dataframe,
     build_programa_import_dataframe,
     export_programa_csv,
     export_programa_xlsx,
+    export_programa_xlsx_with_images,
     export_programa_zip,
+    validate_programa_image_compatibility,
     validate_for_export,
 )
 from src.programa_automation import (
@@ -1115,16 +1119,23 @@ if st.session_state.intake_df is not None:
         if _diag:
             from src.image_recovery import (
                 build_image_recovery_debug_dataframe as _build_debug_df,
+                build_photo_discovery_report as _build_photo_report,
             )
             with st.expander(
-                f"🔍 Image Recovery Debug Report ({len(_diag)} row{'s' if len(_diag) != 1 else ''})",
+                f"Photo Discovery Report ({len(_diag)} row{'s' if len(_diag) != 1 else ''})",
                 expanded=False,
             ):
-                st.caption(
-                    "Developer-only diagnostic from the most recent Recover Missing "
-                    "Images pass. Shows each fallback step the pipeline tried, why "
-                    "candidates were rejected, and the final confidence/evidence."
-                )
+                _photo_report = _build_photo_report(df, _diag)
+                _pr_cols = st.columns(6)
+                _pr_cols[0].metric("Rows", _photo_report["total_rows"])
+                _pr_cols[1].metric("Official pages", _photo_report["official_product_pages_found"])
+                _pr_cols[2].metric("Images found", _photo_report["images_found"])
+                _pr_cols[3].metric("Excel images", _photo_report["images_inserted_into_excel"])
+                _pr_cols[4].metric("Needs review", _photo_report["rows_needing_review"])
+                _pr_cols[5].metric("Missing images", _photo_report["rows_missing_images"])
+                if _photo_report["failed_rows"]:
+                    st.markdown("**Failed rows / next action**")
+                    st.dataframe(pd.DataFrame(_photo_report["failed_rows"]), use_container_width=True, hide_index=True)
                 _debug_df = _build_debug_df(_diag)
                 # Group rows by their final outcome to surface what the pipeline did.
                 _by_conf = _debug_df["confidence"].value_counts(dropna=False).to_dict()
@@ -1879,7 +1890,19 @@ if st.session_state.intake_df is not None:
     section_label("Export for Programa Import")
 
     _export_summary = validate_for_export(included_df)
-    _programa_df = build_programa_import_dataframe(included_df)
+    _manual_uploads_by_index = st.session_state.get("manual_image_uploads", {})
+    _manual_uploads = {
+        _pos: _manual_uploads_by_index[_idx]
+        for _pos, _idx in enumerate(included_df.index)
+        if _idx in _manual_uploads_by_index
+    }
+    _session_id_for_export = _ensure_session_id()
+    _programa_image_summary = validate_programa_image_compatibility(
+        included_df,
+        manual_images=_manual_uploads,
+        session_id=_session_id_for_export,
+    )
+    _programa_df = build_programa_import_dataframe(included_df, validate_image_urls=True)
     _today = datetime.date.today().isoformat()
 
     _export_count = _export_summary["export_count"]
@@ -1890,6 +1913,11 @@ if st.session_state.intake_df is not None:
     _missing_img = _export_summary["missing_image_url"]
     _image_url_present = _export_summary["image_url_present"]
     _image_url_total = _export_summary["image_url_total"]
+    _image_ready = _programa_image_summary["ready_for_programa"]
+    _image_manual_needed = _programa_image_summary["manual_upload_needed"]
+    _image_invalid_urls = _programa_image_summary["invalid_urls"]
+    _image_local_jpgs = _programa_image_summary["local_jpg_available"]
+    _image_valid_urls = _programa_image_summary["valid_public_image_urls"]
 
     if _export_count > 0:
         st.success(
@@ -1912,8 +1940,25 @@ if st.session_state.intake_df is not None:
     if _missing_img > 0:
         st.warning(f"⚠  {_missing_img} row{'s' if _missing_img != 1 else ''} missing image reference", icon=None)
     st.info(f"Image URLs/references present: {_image_url_present} / {_image_url_total}", icon=None)
+    st.caption(PROGRAMA_IMAGE_FORMAT_NOTE)
+    _compat_cols = st.columns(5)
+    _compat_cols[0].metric("Image-ready rows", _image_ready)
+    _compat_cols[1].metric("Local JPGs", _image_local_jpgs)
+    _compat_cols[2].metric("Valid image URLs", _image_valid_urls)
+    _compat_cols[3].metric("Invalid URLs", _image_invalid_urls)
+    _compat_cols[4].metric("Manual upload needed", _image_manual_needed)
+    with st.expander("Programa image compatibility details", expanded=_image_manual_needed > 0 or _image_invalid_urls > 0):
+        _compat_df = build_programa_image_compatibility_dataframe(_programa_image_summary)
+        st.dataframe(_compat_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            label="Download programa_image_compatibility.csv",
+            data=_compat_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"programa_image_compatibility_{_today}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
     st.warning(
-        "Programa may not auto-import images from CSV. Use the ZIP export to keep product images matched to rows for manual upload.",
+        "CSV cannot carry embedded images. Use Excel with Images for the best Programa image import attempt, or ZIP for matched manual upload.",
         icon="⚠️",
     )
     if _skipped:
@@ -1922,7 +1967,7 @@ if st.session_state.intake_df is not None:
                 reason = item.get("reason") or "missing Product Name"
                 st.markdown(f"- Row {item['index']}: {reason}")
 
-    _dl_col1, _dl_col2, _dl_col3 = st.columns(3)
+    _dl_col1, _dl_col2, _dl_col3, _dl_col4 = st.columns(4)
     with _dl_col1:
         st.download_button(
             label="Download Programa CSV",
@@ -1942,7 +1987,20 @@ if st.session_state.intake_df is not None:
             disabled=_programa_df.empty,
         )
     with _dl_col3:
-        _manual_uploads = st.session_state.get("manual_image_uploads", {})
+        st.download_button(
+            label="Download Excel with Images",
+            data=export_programa_xlsx_with_images(
+                included_df,
+                manual_images=_manual_uploads,
+                session_id=_session_id_for_export,
+            ),
+            file_name=f"programa_import_with_images_{_today}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            disabled=_programa_df.empty,
+            help="XLSX with product images embedded in the same row as each product, plus Image URL/Filename backup columns.",
+        )
+    with _dl_col4:
         _covered_by_manual = len(_manual_uploads)
         _net_missing = max(0, _missing_img - _covered_by_manual)
         if _net_missing > 0:
@@ -1952,7 +2010,7 @@ if st.session_state.intake_df is not None:
             )
         st.download_button(
             label="Download ZIP (CSV + images)",
-            data=export_programa_zip(included_df, manual_images=_manual_uploads, session_id=_ensure_session_id()),
+            data=export_programa_zip(included_df, manual_images=_manual_uploads, session_id=_session_id_for_export),
             file_name=f"programa_export_{_today}.zip",
             mime="application/zip",
             use_container_width=True,

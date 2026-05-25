@@ -1,7 +1,9 @@
 import io
 
+import openpyxl
 import pandas as pd
 import pytest
+from PIL import Image
 
 from src.programa_export import (
     _clean_notes,
@@ -669,3 +671,313 @@ def test_internal_source_columns_present_in_debug_export():
     assert df.iloc[0]["_source_pdf_id"] == "abc123"
     assert df.iloc[0]["_source_page_number"] == 2
     assert df.iloc[0]["_source_filename"] == "spec.pdf"
+
+
+# ── Programa-compatible image exports ─────────────────────────────────────────
+
+def _jpg_bytes(color: str = "red") -> bytes:
+    img = Image.new("RGB", (120, 90), color)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    return buf.getvalue()
+
+
+def test_strict_programa_export_rejects_invalid_image_url(monkeypatch):
+    from src.programa_export import build_programa_import_dataframe
+
+    monkeypatch.setattr(
+        "src.programa_export.validate_public_image_url",
+        lambda url: {"ok": False, "reason": "not_image_content_type:text/html"},
+    )
+
+    df = build_programa_import_dataframe(
+        _make_rows([{"Image URL": "https://example.com/product-page.jpg"}]),
+        validate_image_urls=True,
+    )
+
+    assert df.iloc[0]["Image URL"] == ""
+
+
+def test_standard_csv_never_writes_local_image_paths(tmp_path):
+    from src.programa_export import build_programa_import_dataframe, export_programa_csv
+
+    local = tmp_path / "lamp.jpg"
+    local.write_bytes(_jpg_bytes())
+    rows = _make_rows([
+        {
+            "Image URL": "",
+            "local_image_path": str(local),
+            "local_image_filename": "lamp.jpg",
+        }
+    ])
+
+    csv_text = export_programa_csv(build_programa_import_dataframe(rows)).decode("utf-8")
+
+    assert str(local) not in csv_text
+    assert "local_image_path" not in csv_text
+    assert "Image Filename" not in csv_text.splitlines()[0]
+
+
+def test_excel_with_images_has_programa_image_columns_and_no_local_path(tmp_path, monkeypatch):
+    from src.programa_export import PROGRAMA_XLSX_WITH_IMAGES_COLUMNS, export_programa_xlsx_with_images
+
+    images_dir = tmp_path / ".tmp" / "uploads" / "sess1" / "images"
+    images_dir.mkdir(parents=True)
+    local = images_dir / "lamp.jpg"
+    local.write_bytes(_jpg_bytes())
+    rows = _make_rows([
+        {
+            "Image URL": "",
+            "local_image_path": str(local.resolve()),
+            "local_image_filename": "lamp.jpg",
+            "confidence": "HIGH",
+        }
+    ])
+
+    with monkeypatch.context() as m:
+        m.setattr("src.programa_export._REPO_ROOT", tmp_path)
+        xlsx = export_programa_xlsx_with_images(rows, session_id="sess1")
+
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx))
+    ws = wb.active
+    headers = [cell.value for cell in ws[1]]
+
+    assert headers == PROGRAMA_XLSX_WITH_IMAGES_COLUMNS
+    assert "Local Image Path" not in headers
+    assert headers[headers.index("Image URL") + 1:headers.index("Image URL") + 4] == [
+        "Product Image",
+        "Image Filename",
+        "Image Import Status",
+    ]
+    assert ws.cell(row=2, column=headers.index("Product Image") + 1).value == "embedded"
+    assert ws.cell(row=2, column=headers.index("Image Filename") + 1).value == "lamp.jpg"
+    assert ws.cell(row=2, column=headers.index("Image Import Status") + 1).value == "embedded_local_jpg"
+
+
+def test_excel_with_images_preserves_programa_sheet_and_thumbnail_formatting(tmp_path, monkeypatch):
+    from src.programa_export import export_programa_xlsx_with_images
+
+    images_dir = tmp_path / ".tmp" / "uploads" / "sess1" / "images"
+    images_dir.mkdir(parents=True)
+    local = images_dir / "lamp.jpg"
+    local.write_bytes(_jpg_bytes())
+    rows = _make_rows([
+        {
+            "Image URL": "",
+            "local_image_path": str(local.resolve()),
+            "local_image_filename": "lamp.jpg",
+            "confidence": "HIGH",
+        }
+    ])
+
+    with monkeypatch.context() as m:
+        m.setattr("src.programa_export._REPO_ROOT", tmp_path)
+        xlsx = export_programa_xlsx_with_images(rows, session_id="sess1")
+
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx))
+    ws = wb.active
+    headers = [cell.value for cell in ws[1]]
+    image_col_idx = headers.index("Product Image") + 1
+    image_col_letter = ws.cell(row=1, column=image_col_idx).column_letter
+
+    assert ws.title == "Programa Import"
+    assert ws.column_dimensions[image_col_letter].width == 18
+    assert ws.row_dimensions[2].height == 78
+    assert len(ws._images) == 1
+    assert ws._images[0].width == 96
+    assert ws._images[0].height == 72
+
+
+def test_excel_with_images_embeds_thumbnail_on_matching_product_row(tmp_path, monkeypatch):
+    from src.programa_export import export_programa_xlsx_with_images
+
+    images_dir = tmp_path / ".tmp" / "uploads" / "sess1" / "images"
+    images_dir.mkdir(parents=True)
+    first = images_dir / "first.jpg"
+    second = images_dir / "second.jpg"
+    first.write_bytes(_jpg_bytes("red"))
+    second.write_bytes(_jpg_bytes("blue"))
+    rows = _make_rows([
+        {
+            "Product Name": "First Lamp",
+            "Image URL": "",
+            "local_image_path": str(first.resolve()),
+            "local_image_filename": "first.jpg",
+            "confidence": "HIGH",
+        },
+        {
+            "Product Name": "Second Lamp",
+            "Image URL": "",
+            "local_image_path": str(second.resolve()),
+            "local_image_filename": "second.jpg",
+            "confidence": "HIGH",
+        },
+    ])
+
+    with monkeypatch.context() as m:
+        m.setattr("src.programa_export._REPO_ROOT", tmp_path)
+        xlsx = export_programa_xlsx_with_images(rows, session_id="sess1")
+
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx))
+    ws = wb.active
+    headers = [cell.value for cell in ws[1]]
+    image_col = headers.index("Product Image")
+
+    assert len(ws._images) == 2
+    assert [img.anchor._from.row for img in ws._images] == [1, 2]
+    assert all(img.anchor._from.col == image_col for img in ws._images)
+    assert ws.cell(row=2, column=headers.index("Product Name") + 1).value == "First Lamp"
+    assert ws.cell(row=3, column=headers.index("Product Name") + 1).value == "Second Lamp"
+
+
+def test_excel_with_images_duplicate_filenames_are_unique_and_row_aligned(tmp_path, monkeypatch):
+    from src.programa_export import export_programa_xlsx_with_images
+
+    images_dir = tmp_path / ".tmp" / "uploads" / "sess1" / "images"
+    images_dir.mkdir(parents=True)
+    first = images_dir / "dup.jpg"
+    second = images_dir / "dup_2.jpg"
+    first.write_bytes(_jpg_bytes("red"))
+    second.write_bytes(_jpg_bytes("blue"))
+    rows = _make_rows([
+        {
+            "Product Name": "First Lamp",
+            "Image URL": "",
+            "local_image_path": str(first.resolve()),
+            "local_image_filename": "dup.jpg",
+            "confidence": "HIGH",
+        },
+        {
+            "Product Name": "Second Lamp",
+            "Image URL": "",
+            "local_image_path": str(second.resolve()),
+            "local_image_filename": "dup.jpg",
+            "confidence": "HIGH",
+        },
+    ])
+
+    with monkeypatch.context() as m:
+        m.setattr("src.programa_export._REPO_ROOT", tmp_path)
+        xlsx = export_programa_xlsx_with_images(rows, session_id="sess1")
+
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx))
+    ws = wb.active
+    headers = [cell.value for cell in ws[1]]
+    filename_col = headers.index("Image Filename") + 1
+    image_col = headers.index("Product Image")
+
+    first_filename = ws.cell(row=2, column=filename_col).value
+    second_filename = ws.cell(row=3, column=filename_col).value
+    assert first_filename == "dup.jpg"
+    assert second_filename.startswith("dup_")
+    assert second_filename.endswith(".jpg")
+    assert first_filename != second_filename
+    assert [img.anchor._from.row for img in ws._images] == [1, 2]
+    assert all(img.anchor._from.col == image_col for img in ws._images)
+
+
+def test_excel_with_images_skips_medium_review_candidates(tmp_path, monkeypatch):
+    from src.programa_export import export_programa_xlsx_with_images
+
+    images_dir = tmp_path / ".tmp" / "uploads" / "sess1" / "images"
+    images_dir.mkdir(parents=True)
+    local = images_dir / "candidate.jpg"
+    local.write_bytes(_jpg_bytes("green"))
+    rows = _make_rows([
+        {
+            "Product Name": "Review Lamp",
+            "Image URL": "",
+            "local_image_path": str(local.resolve()),
+            "local_image_filename": "candidate.jpg",
+            "image_source": "page_screenshot",
+            "confidence": "MEDIUM",
+        }
+    ])
+
+    with monkeypatch.context() as m:
+        m.setattr("src.programa_export._REPO_ROOT", tmp_path)
+        xlsx = export_programa_xlsx_with_images(rows, session_id="sess1")
+
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx))
+    ws = wb.active
+    headers = [cell.value for cell in ws[1]]
+    assert len(ws._images) == 0
+    assert ws.cell(row=2, column=headers.index("Product Image") + 1).value is None
+    assert ws.cell(row=2, column=headers.index("Image Filename") + 1).value is None
+    assert ws.cell(row=2, column=headers.index("Image Import Status") + 1).value == "review_confidence_skipped"
+
+
+def test_excel_with_images_row_alignment_after_filtering_excluded_rows(tmp_path, monkeypatch):
+    from src.programa_export import export_programa_xlsx_with_images
+
+    images_dir = tmp_path / ".tmp" / "uploads" / "sess1" / "images"
+    images_dir.mkdir(parents=True)
+    keep_a = images_dir / "keep_a.jpg"
+    skip = images_dir / "skip.jpg"
+    keep_b = images_dir / "keep_b.jpg"
+    keep_a.write_bytes(_jpg_bytes("red"))
+    skip.write_bytes(_jpg_bytes("blue"))
+    keep_b.write_bytes(_jpg_bytes("green"))
+    rows = _make_rows([
+        {
+            "Product Name": "Z Last",
+            "Image URL": "",
+            "local_image_path": str(keep_a.resolve()),
+            "local_image_filename": "keep_a.jpg",
+            "confidence": "HIGH",
+        },
+        {
+            "Include": False,
+            "Product Name": "Excluded",
+            "Image URL": "",
+            "local_image_path": str(skip.resolve()),
+            "local_image_filename": "skip.jpg",
+            "confidence": "HIGH",
+        },
+        {
+            "Product Name": "A First",
+            "Image URL": "",
+            "local_image_path": str(keep_b.resolve()),
+            "local_image_filename": "keep_b.jpg",
+            "confidence": "HIGH",
+        },
+    ])
+
+    with monkeypatch.context() as m:
+        m.setattr("src.programa_export._REPO_ROOT", tmp_path)
+        xlsx = export_programa_xlsx_with_images(rows, session_id="sess1")
+
+    wb = openpyxl.load_workbook(io.BytesIO(xlsx))
+    ws = wb.active
+    headers = [cell.value for cell in ws[1]]
+    assert [ws.cell(row=r, column=headers.index("Product Name") + 1).value for r in (2, 3)] == ["Z Last", "A First"]
+    assert [ws.cell(row=r, column=headers.index("Image Filename") + 1).value for r in (2, 3)] == ["keep_a.jpg", "keep_b.jpg"]
+    assert [img.anchor._from.row for img in ws._images] == [1, 2]
+
+
+def test_image_compatibility_reports_missing_and_ready_rows(tmp_path, monkeypatch):
+    from src.programa_export import validate_programa_image_compatibility
+
+    images_dir = tmp_path / ".tmp" / "uploads" / "sess1" / "images"
+    images_dir.mkdir(parents=True)
+    local = images_dir / "lamp.jpg"
+    local.write_bytes(_jpg_bytes())
+    rows = _make_rows([
+        {
+            "Image URL": "",
+            "local_image_path": str(local.resolve()),
+            "local_image_filename": "lamp.jpg",
+            "confidence": "HIGH",
+        },
+        {"Product Name": "Missing Image", "Image URL": ""},
+    ])
+
+    with monkeypatch.context() as m:
+        m.setattr("src.programa_export._REPO_ROOT", tmp_path)
+        summary = validate_programa_image_compatibility(rows, session_id="sess1")
+
+    assert summary["ready_for_programa"] == 1
+    assert summary["missing_images"] == 1
+    assert summary["manual_upload_needed"] == 1
+    assert summary["rows"][0]["Image Import Status"] == "embedded_local_jpg"
+    assert summary["rows"][1]["Needs Manual Upload"] is True

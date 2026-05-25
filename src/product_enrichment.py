@@ -26,6 +26,7 @@ from src.category_ai import _normalise_category
 from src.dimension_enrichment import DimensionResult as _DimensionResult, find_dimensions as _find_dimensions
 from src.dimensions import has_complete_3d_dimensions
 from src.image_presence import row_has_image
+from src.image_evidence import sku_appears_in_text
 from src.measurement_parser import normalize_dimension_fields
 from src.manufacturer_domains import get_domain_for_brand, record_discovered_domain
 from src.official_product_lookup import lookup_official_product_page
@@ -586,6 +587,22 @@ def _apply_official_product_lookup(
         "dimension_evidence": specs.evidence,
     })
 
+    row_sku = _str_val(updated.get("Model/SKU"))
+    exact_sku_confirmation = bool(
+        sku_match
+        or (
+            row_sku
+            and _str_val(getattr(specs, "sku", ""))
+            and sku_appears_in_text(row_sku, _str_val(getattr(specs, "sku", "")))
+        )
+    )
+    updated = _apply_manufacturer_page_fields(
+        updated,
+        specs,
+        exact_sku_confirmation=exact_sku_confirmation,
+    )
+    updated["manufacturer_page_exact_sku"] = exact_sku_confirmation
+
     existing_dims = _str_val(updated.get("Dimensions"))
     existing_dim_conf = _str_val(updated.get("Dimension Confidence")).lower() or "none"
     if specs.dimensions and specs.confidence in {"high", "medium"}:
@@ -783,6 +800,58 @@ def _apply_cache_to_row(
         if not val or (f == "dimensions" and not has_complete_3d_dimensions(val)):
             missing.append(f)
     return updated, filled, missing
+
+
+def _should_write_manufacturer_value(updated: dict, field: str, exact_sku_confirmation: bool) -> bool:
+    existing = _str_val(updated.get(field))
+    if not existing:
+        return True
+    return bool(exact_sku_confirmation)
+
+
+def _apply_manufacturer_page_fields(updated: dict, specs, *, exact_sku_confirmation: bool) -> dict:
+    """Fill Programa-required fields from a confirmed manufacturer page.
+
+    Existing PDF values are preserved unless the selected page has exact SKU
+    confirmation. Blank fields are always safe to fill because they add missing
+    manufacturer facts rather than replacing extraction output.
+    """
+    field_map = (
+        ("brand", "Brand"),
+        ("product_name", "Product Name"),
+        ("sku", "Model/SKU"),
+        ("category", "Product Category"),
+        ("color", "Color"),
+        ("material", "Material"),
+    )
+    for source_attr, dest in field_map:
+        value = _str_val(getattr(specs, source_attr, ""))
+        if not value:
+            continue
+        if dest == "Product Category":
+            value = _normalise_category(value) or value
+        if _should_write_manufacturer_value(updated, dest, exact_sku_confirmation):
+            updated[dest] = value
+
+    # Finish can come from either explicit finish or color. Keep the combined
+    # SCH-facing field filled even when Color is also available separately.
+    finish_value = _str_val(getattr(specs, "finish", "")) or _str_val(getattr(specs, "color", ""))
+    if finish_value and _should_write_manufacturer_value(updated, "Finish / Color", exact_sku_confirmation):
+        updated["Finish / Color"] = finish_value
+
+    description = _str_val(getattr(specs, "description", ""))
+    if description:
+        if _should_write_manufacturer_value(updated, "Description", exact_sku_confirmation):
+            updated["Description"] = description
+        existing_notes = _str_val(updated.get("Notes"))
+        note = f"[Manufacturer Description: {description}]"
+        if note not in existing_notes:
+            updated["Notes"] = f"{existing_notes} {note}".strip() if existing_notes else note
+
+    qty = _str_val(updated.get("Quantity"))
+    if qty in {"", "0"}:
+        updated["Quantity"] = 1
+    return updated
 
 
 def enrich_row(

@@ -39,7 +39,10 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import time
+import urllib.parse
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,6 +56,8 @@ from src.image_evidence import (
     product_name_appears_in_text,
     sku_appears_in_text,
 )
+from src.brand_lookup_registry import registry_domains_for_brand
+from src.manufacturer_domains import get_domain_for_brand
 from src.image_presence import row_has_image, row_image_status
 from src.product_page_images import extract_image_from_url
 from src.web_product_lookup import lookup_official_product_image
@@ -605,22 +610,25 @@ except Exception:  # pragma: no cover - playwright optional at import
 
 
 _SCREENSHOT_SELECTORS = [
-    "img[class*=product-image]",
-    "[class*=product] img",
     "[class*=gallery] img",
-    "[class*=hero] img",
-    "[class*=media] img",
+    "[class*=product-image]",
+    "[class*=product-media] img",
+    "[class*=carousel] img",
+    "[class*=pdp] img",
+    "picture img",
+    "source[srcset]",
+    "[class*=product] img",
     'img[id*="product"]',
 ]
 _SCREENSHOT_MIN_DIMENSION = 200            # px each side
 _SCREENSHOT_PAGE_LOAD_TIMEOUT_MS = 15_000
-_SCREENSHOT_LOGO_HINTS = ("logo", "icon", "sprite", "favicon")
+_SCREENSHOT_LOGO_HINTS = ("logo", "icon", "sprite", "favicon", "banner", "badge", "swatch", "placeholder")
 _SCREENSHOT_ASPECT_RATIO_MIN = 0.25
 _SCREENSHOT_ASPECT_RATIO_MAX = 4.0
 
 
-def _is_logo_url(src: str) -> bool:
-    s = (src or "").lower()
+def _is_logo_url(src: str, *extra_text: str) -> bool:
+    s = " ".join([src or "", *[t or "" for t in extra_text]]).lower()
     return any(hint in s for hint in _SCREENSHOT_LOGO_HINTS)
 
 
@@ -640,12 +648,42 @@ def _crop_jpeg_bytes_from_full_page(full_page_png: bytes, bbox: dict) -> bytes:
         img = ImageOps.exif_transpose(img)
         if img.mode != "RGB":
             img = img.convert("RGB")
-        x, y = int(bbox["x"]), int(bbox["y"])
+        x, y = max(0, int(bbox["x"])), max(0, int(bbox["y"]))
         w, h = int(bbox["width"]), int(bbox["height"])
-        cropped = img.crop((x, y, x + w, y + h))
+        right = min(img.width, x + max(1, w))
+        bottom = min(img.height, y + max(1, h))
+        cropped = img.crop((x, y, right, bottom))
         buf = io.BytesIO()
         cropped.save(buf, format="JPEG", quality=85, optimize=True)
         return buf.getvalue()
+
+
+def _domain_matches(domain: str, root: str) -> bool:
+    return domain == root or domain.endswith("." + root)
+
+
+def _is_official_or_brand_domain(product_url: str, brand: str, supplier: str = "") -> bool:
+    if not product_url:
+        return False
+    domain = urllib.parse.urlparse(product_url).netloc.lower()
+    if domain.startswith("www."):
+        domain = domain[4:]
+    for value in (brand, supplier):
+        if value and is_official_domain(product_url, value):
+            return True
+    domains: list[str] = []
+    direct = get_domain_for_brand(brand)
+    if direct:
+        domains.append(direct[0])
+    domains.extend(registry_domains_for_brand(brand))
+    if any(_domain_matches(domain, d) for d in domains):
+        return True
+    compact_domain = re.sub(r"[^a-z0-9]+", "", domain)
+    for value in (brand, supplier):
+        slug = re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+        if len(slug) >= 3 and slug in compact_domain:
+            return True
+    return False
 
 
 def _score_screenshot_confidence(
@@ -664,10 +702,178 @@ def _score_screenshot_confidence(
     if product_name and product_name_appears_in_text(product_name, page_text):
         evidence.append("product_name_on_page")
         return "HIGH", evidence
-    if is_official_domain(product_url, brand):
+    if _is_official_or_brand_domain(product_url, brand):
         evidence.append("official_domain")
         return "MEDIUM", evidence
     return "LOW", evidence
+
+
+def _score_screenshot_product_candidate(candidate: dict, row: dict, page_text: str, product_url: str) -> tuple[int, list[str]]:
+    sku = _str_val(row.get("Model/SKU"))
+    product_name = _str_val(row.get("Product Name"))
+    evidence: list[str] = []
+    width = float(candidate.get("naturalWidth") or candidate.get("width") or 0)
+    height = float(candidate.get("naturalHeight") or candidate.get("height") or 0)
+    area = width * height
+    score = int(min(area / 1000, 1000))
+    source_selector = _str_val(candidate.get("selector"))
+    source_kind = _str_val(candidate.get("sourceKind"))
+    class_text = _str_val(candidate.get("classText"))
+    alt = _str_val(candidate.get("alt"))
+    src = _str_val(candidate.get("src"))
+    haystack = f"{src} {alt} {class_text}"
+
+    if source_selector in _SCREENSHOT_SELECTORS[:6]:
+        score += 180
+        evidence.append(f"selector:{source_selector}")
+    if re.search(r"product|gallery|pdp|carousel|main|primary|hero|media|zoom", f"{class_text} {source_kind}", re.I):
+        score += 150
+        evidence.append("product_like_candidate")
+    if sku and (sku_appears_in_text(sku, page_text) or sku_appears_in_text(sku, haystack)):
+        score += 220
+        evidence.append("sku_match")
+    if product_name and (product_name_appears_in_text(product_name, page_text) or product_name_appears_in_text(product_name, haystack)):
+        score += 80
+        evidence.append("product_name_match")
+    return score, evidence
+
+
+def _screenshot_confidence_for_candidate(
+    *,
+    row: dict,
+    page_text: str,
+    product_url: str,
+    candidate: dict,
+) -> tuple[str, list[str]]:
+    brand = _str_val(row.get("Brand"))
+    supplier = _str_val(row.get("Supplier"))
+    sku = _str_val(row.get("Model/SKU"))
+    product_name = _str_val(row.get("Product Name"))
+    official = _is_official_or_brand_domain(product_url, brand, supplier)
+    src = _str_val(candidate.get("src"))
+    alt = _str_val(candidate.get("alt"))
+    class_text = _str_val(candidate.get("classText"))
+    candidate_text = f"{src} {alt} {class_text}"
+
+    evidence: list[str] = []
+    if official:
+        evidence.append("official_manufacturer_page")
+    sku_hit = bool(sku and (sku_appears_in_text(sku, page_text) or sku_appears_in_text(sku, candidate_text)))
+    name_hit = bool(product_name and product_name_appears_in_text(product_name, page_text))
+    if sku_hit:
+        evidence.append("exact_sku_match")
+    if name_hit:
+        evidence.append("product_name_match")
+    if candidate.get("product_like"):
+        evidence.append("correct_product_image_candidate")
+
+    if official and sku_hit and candidate.get("product_like"):
+        return "HIGH", evidence
+    if official:
+        evidence.append("weak_sku_or_image_evidence")
+        return "MEDIUM", evidence
+    evidence.append("retailer_or_generic_page")
+    return "LOW", evidence
+
+
+def _collect_rendered_image_candidates(page, selectors: list[str]) -> list[dict]:
+    js = """
+    (selectors) => {
+      const bestFromSrcset = (srcset) => {
+        if (!srcset) return "";
+        let best = "", bestScore = -1;
+        for (const part of srcset.split(",")) {
+          const bits = part.trim().split(/\\s+/);
+          if (!bits[0]) continue;
+          let score = 0;
+          if (bits[1] && bits[1].endsWith("w")) score = parseInt(bits[1], 10) || 0;
+          else if (bits[1] && bits[1].endsWith("x")) score = Math.round((parseFloat(bits[1]) || 1) * 1000);
+          if (score >= bestScore) { best = bits[0]; bestScore = score; }
+        }
+        return best;
+      };
+      const rows = [];
+      const seen = new Set();
+      for (const selector of selectors) {
+        for (const el of Array.from(document.querySelectorAll(selector))) {
+          const img = el.tagName.toLowerCase() === "source"
+            ? (el.closest("picture") && el.closest("picture").querySelector("img"))
+            : el;
+          const sourceEl = el.tagName.toLowerCase() === "source" ? el : img;
+          if (!img && !sourceEl) continue;
+          const rectEl = img || sourceEl;
+          const rect = rectEl.getBoundingClientRect();
+          const src = (img && (img.currentSrc || img.src)) ||
+            bestFromSrcset(sourceEl.getAttribute("srcset") || sourceEl.getAttribute("data-srcset") || "") ||
+            sourceEl.getAttribute("src") || sourceEl.getAttribute("data-src") || "";
+          const key = `${src}|${Math.round(rect.left)}|${Math.round(rect.top)}|${Math.round(rect.width)}|${Math.round(rect.height)}`;
+          if (!src || seen.has(key)) continue;
+          seen.add(key);
+          rows.push({
+            selector,
+            sourceKind: sourceEl.tagName.toLowerCase(),
+            src,
+            x: rect.left + window.scrollX,
+            y: rect.top + window.scrollY,
+            width: rect.width,
+            height: rect.height,
+            naturalWidth: img ? img.naturalWidth : 0,
+            naturalHeight: img ? img.naturalHeight : 0,
+            alt: img ? (img.getAttribute("alt") || "") : "",
+            classText: `${rectEl.className || ""} ${rectEl.id || ""}`,
+          });
+        }
+      }
+      return rows;
+    }
+    """
+    try:
+        rows = page.evaluate(js, selectors)
+    except Exception:
+        return []
+    return rows if isinstance(rows, list) else []
+
+
+def _filter_screenshot_candidates(candidates: list[dict], row: dict, page_text: str, product_url: str) -> tuple[list[dict], list[str]]:
+    filtered: list[dict] = []
+    rejections: list[str] = []
+    for candidate in candidates:
+        src = _str_val(candidate.get("src"))
+        class_text = _str_val(candidate.get("classText"))
+        alt = _str_val(candidate.get("alt"))
+        if _is_logo_url(src, class_text, alt):
+            rejections.append(f"{src}: logo_icon_banner_hint")
+            continue
+        natural_w = float(candidate.get("naturalWidth") or 0)
+        natural_h = float(candidate.get("naturalHeight") or 0)
+        rendered_w = float(candidate.get("width") or 0)
+        rendered_h = float(candidate.get("height") or 0)
+        width = max(natural_w, rendered_w)
+        height = max(natural_h, rendered_h)
+        if width < _SCREENSHOT_MIN_DIMENSION or height < _SCREENSHOT_MIN_DIMENSION:
+            rejections.append(f"{src}: too_small:{int(width)}x{int(height)}")
+            continue
+        if (width * height) < (_SCREENSHOT_MIN_DIMENSION * _SCREENSHOT_MIN_DIMENSION):
+            rejections.append(f"{src}: area_too_small")
+            continue
+        ratio = width / height if height else 0
+        if ratio < _SCREENSHOT_ASPECT_RATIO_MIN or ratio > _SCREENSHOT_ASPECT_RATIO_MAX:
+            rejections.append(f"{src}: extreme_aspect:{ratio:.2f}")
+            continue
+        if rendered_w <= 1 or rendered_h <= 1:
+            rejections.append(f"{src}: not_rendered")
+            continue
+        score, evidence = _score_screenshot_product_candidate(candidate, row, page_text, product_url)
+        candidate = dict(candidate)
+        candidate["score"] = score
+        candidate["product_like"] = bool(
+            score >= 250
+            or re.search(r"product|gallery|pdp|carousel|main|primary|hero|media|zoom", f"{class_text} {candidate.get('selector', '')}", re.I)
+        )
+        candidate["evidence"] = evidence
+        filtered.append(candidate)
+    filtered.sort(key=lambda c: (int(c.get("score", 0)), float(c.get("width", 0)) * float(c.get("height", 0))), reverse=True)
+    return filtered, rejections
 
 
 def recover_from_screenshot(
@@ -688,6 +894,12 @@ def recover_from_screenshot(
     sku = _str_val(row.get("Model/SKU"))
     brand = _str_val(row.get("Brand"))
     product_name = _str_val(row.get("Product Name"))
+    if debug is not None:
+        debug["screenshot_ran"] = True
+        debug["screenshot_url_attempted"] = product_url
+        debug.setdefault("screenshot_selector_matched", "")
+        debug.setdefault("screenshot_candidates_found", 0)
+        debug.setdefault("screenshot_rejection_reasons", [])
 
     try:
         sp_ctx = sync_playwright()
@@ -715,10 +927,86 @@ def recover_from_screenshot(
                         image_source="page_screenshot",
                         error="page_load_timeout",
                     )
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5_000)
+                except Exception:
+                    pass
+
+                def _candidate_pass() -> list[dict]:
+                    candidates = _collect_rendered_image_candidates(page, _SCREENSHOT_SELECTORS)
+                    page_text_inner = page.content() or ""
+                    filtered_inner, rejected = _filter_screenshot_candidates(
+                        candidates,
+                        row,
+                        page_text_inner,
+                        product_url,
+                    )
+                    if debug is not None:
+                        debug["screenshot_candidates_found"] = max(
+                            int(debug.get("screenshot_candidates_found") or 0),
+                            len(filtered_inner),
+                        )
+                        debug.setdefault("screenshot_rejection_reasons", []).extend(rejected)
+                    return filtered_inner
 
                 page_text = page.content() or ""
 
-                # 1) Element-selector pass
+                # 1) DOM candidate pass using rendered/natural image dimensions.
+                filtered = _candidate_pass()
+                if not filtered:
+                    try:
+                        page.mouse.wheel(0, 900)
+                        page.wait_for_timeout(700)
+                    except Exception:
+                        pass
+                    filtered = _candidate_pass()
+
+                if filtered:
+                    best = filtered[0]
+                    try:
+                        full_png = page.screenshot(full_page=True, type="png")
+                    except Exception:
+                        return ImageRecoveryResult(
+                            image_source="page_screenshot",
+                            error="screenshot_failed",
+                        )
+                    try:
+                        jpeg = _crop_jpeg_bytes_from_full_page(full_png, best)
+                    except Exception as exc:
+                        return ImageRecoveryResult(
+                            image_source="page_screenshot",
+                            error=f"crop_failed: {exc}",
+                        )
+
+                    page_text = page.content() or page_text
+                    confidence, confidence_evidence = _screenshot_confidence_for_candidate(
+                        row=row,
+                        page_text=page_text,
+                        product_url=product_url,
+                        candidate=best,
+                    )
+                    evidence = list(dict.fromkeys(list(best.get("evidence", [])) + confidence_evidence))
+                    evidence.append(f"candidate_score:{best.get('score', 0)}")
+                    if debug is not None:
+                        debug["screenshot_selector_matched"] = best.get("selector", "")
+                        debug["screenshot_selected_image"] = best.get("src", "")
+                        debug["screenshot_selected_bbox"] = {
+                            "x": best.get("x"),
+                            "y": best.get("y"),
+                            "width": best.get("width"),
+                            "height": best.get("height"),
+                            "naturalWidth": best.get("naturalWidth"),
+                            "naturalHeight": best.get("naturalHeight"),
+                        }
+                    return ImageRecoveryResult(
+                        image_source="page_screenshot",
+                        confidence=confidence,
+                        evidence=evidence,
+                        jpeg_bytes=jpeg,
+                    )
+
+                # 2) Element-selector compatibility fallback for sites/tests
+                # where DOM candidate evaluation is blocked.
                 for selector in _SCREENSHOT_SELECTORS:
                     try:
                         loc = page.locator(selector)
@@ -740,6 +1028,11 @@ def recover_from_screenshot(
                             brand=brand,
                             product_url=product_url,
                         )
+                        if confidence == "HIGH" and not _is_official_or_brand_domain(product_url, brand, _str_val(row.get("Supplier"))):
+                            confidence = "LOW"
+                            evidence.append("retailer_or_generic_page")
+                        if confidence == "HIGH":
+                            evidence.append("correct_product_image_candidate")
                         evidence.append(f"selector:{selector}")
                         if debug is not None:
                             debug["screenshot_selector_matched"] = selector
@@ -752,7 +1045,7 @@ def recover_from_screenshot(
                     except Exception:
                         continue
 
-                # 2) Bounding-box fallback over all <img>
+                # 3) Legacy bounding-box fallback over all <img>.
                 try:
                     candidates = page.eval_on_selector_all(
                         "img",
@@ -813,6 +1106,11 @@ def recover_from_screenshot(
                     brand=brand,
                     product_url=product_url,
                 )
+                if confidence == "HIGH" and not _is_official_or_brand_domain(product_url, brand, _str_val(row.get("Supplier"))):
+                    confidence = "LOW"
+                    evidence.append("retailer_or_generic_page")
+                if confidence == "HIGH":
+                    evidence.append("correct_product_image_candidate")
                 evidence.append("bbox_crop")
                 return ImageRecoveryResult(
                     image_source="page_screenshot",
@@ -903,6 +1201,12 @@ def recover_image_for_row(
         debug.setdefault("image_candidates_found", 0)
         debug.setdefault("selected_image_url", "")
         debug.setdefault("selected_image_reason", "")
+        debug.setdefault("screenshot_ran", False)
+        debug.setdefault("screenshot_url_attempted", "")
+        debug.setdefault("screenshot_selector_matched", "")
+        debug.setdefault("screenshot_candidates_found", 0)
+        debug.setdefault("screenshot_selected_image", "")
+        debug.setdefault("screenshot_rejection_reasons", [])
 
     # 1) Product/Supplier/Source URL page extraction.
     for page_key in ("Product URL", "Supplier URL", "Source URL"):
@@ -916,6 +1220,14 @@ def recover_image_for_row(
             return page_result
         if page_result.confidence in ("MEDIUM", "LOW"):
             held = page_result
+        if enable_screenshot:
+            shot_result = recover_from_screenshot(row, page_url, debug=debug)
+            if shot_result.confidence == "HIGH":
+                if debug is not None:
+                    _record_final_debug(debug, shot_result)
+                return shot_result
+            if shot_result.confidence in ("MEDIUM", "LOW"):
+                held = _better(held, shot_result)
         break
 
     # 2) Official manufacturer/supplier web lookup.
@@ -926,6 +1238,15 @@ def recover_image_for_row(
         return web_result
     if web_result.confidence in ("MEDIUM", "LOW"):
         held = _better(held, web_result)
+    selected_page = _str_val(debug.get("selected_product_page_url")) if debug is not None else ""
+    if enable_screenshot and selected_page and not _str_val(row.get("Product URL")):
+        shot_result = recover_from_screenshot(row, selected_page, debug=debug)
+        if shot_result.confidence == "HIGH":
+            if debug is not None:
+                _record_final_debug(debug, shot_result)
+            return shot_result
+        if shot_result.confidence in ("MEDIUM", "LOW"):
+            held = _better(held, shot_result)
 
     # 3) Existing image URL on row.
     url_val = _str_val(row.get("Image URL"))
@@ -983,6 +1304,7 @@ def _session_image_dir(session_id: str) -> Path:
 _RECOVERY_COLUMNS = [
     "image_source", "confidence", "evidence", "needs_image_review",
     "local_image_filename", "local_image_path",
+    "review_image_filename", "review_image_path", "Review Image URL",
 ]
 
 
@@ -992,6 +1314,10 @@ def _ensure_recovery_columns(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = ""
     if "Image URL" not in df.columns:
         df["Image URL"] = ""
+    if "Image Filename" not in df.columns:
+        df["Image Filename"] = ""
+    if "Local Image Path" not in df.columns:
+        df["Local Image Path"] = ""
     return df
 
 
@@ -1050,11 +1376,15 @@ def recover_images_for_dataframe(
         # True because non-empty strings are truthy.
         df.at[idx, "needs_image_review"] = str(result.needs_image_review)
 
-        if result.image_url:
+        if result.image_url and result.confidence == "HIGH":
             df.at[idx, "Image URL"] = result.image_url
+        elif result.image_url:
+            df.at[idx, "Review Image URL"] = result.image_url
 
-        # Only write files for HIGH/MEDIUM. LOW results are diagnostic only.
-        if result.confidence in ("HIGH", "MEDIUM") and result.jpeg_bytes:
+        # Only HIGH images feed the Excel-with-images export path. MEDIUM
+        # screenshots are saved as review candidates, and LOW stays diagnostic
+        # only; missing image is better than a wrong image.
+        if result.confidence == "HIGH" and result.jpeg_bytes:
             try:
                 images_dir.mkdir(parents=True, exist_ok=True)
                 filename = build_image_filename(
@@ -1076,9 +1406,32 @@ def recover_images_for_dataframe(
                 df.at[idx, "local_image_filename"] = filename
                 df.at[idx, "Image Filename"] = filename
                 df.at[idx, "local_image_path"] = str(target.resolve())
+                df.at[idx, "Local Image Path"] = str(target.resolve())
                 df.at[idx, "recovered_image_path"] = str(target.resolve())
             except Exception as exc:
                 _log.warning("[IMAGE RECOVERY] disk write failed idx=%s err=%s", idx, exc)
+        elif result.confidence == "MEDIUM" and result.jpeg_bytes:
+            try:
+                review_dir = images_dir / "review"
+                review_dir.mkdir(parents=True, exist_ok=True)
+                filename = build_image_filename(
+                    brand=_str_val(row_dict.get("Brand")),
+                    model_sku=_str_val(row_dict.get("Model/SKU")),
+                    product_name=_str_val(row_dict.get("Product Name")),
+                )
+                target = review_dir / filename
+                counter = 2
+                stem = Path(filename).stem
+                ext = Path(filename).suffix.lstrip(".") or "jpg"
+                while target.exists():
+                    filename = f"{stem}_{counter}.{ext}"
+                    target = review_dir / filename
+                    counter += 1
+                target.write_bytes(result.jpeg_bytes)
+                df.at[idx, "review_image_filename"] = filename
+                df.at[idx, "review_image_path"] = str(target.resolve())
+            except Exception as exc:
+                _log.warning("[IMAGE RECOVERY] review candidate write failed idx=%s err=%s", idx, exc)
 
         row_after = df.loc[idx].to_dict()
         local_path_after = _str_val(row_after.get("local_image_path") or row_after.get("recovered_image_path"))
@@ -1088,7 +1441,7 @@ def recover_images_for_dataframe(
         confidence_after = result.confidence
         local_path_exists = bool(local_path_after and Path(local_path_after).exists())
         exported_to_zip = bool(
-            confidence_after in {"HIGH", "MEDIUM"}
+            confidence_after == "HIGH"
             and (local_path_exists or image_url_after.lower().startswith("https://"))
         )
         if exported_to_zip:
@@ -1167,6 +1520,10 @@ def recover_images_for_dataframe(
             "screenshot_url_attempted": debug.get("screenshot_url_attempted", ""),
             "screenshot_selector_matched": debug.get("screenshot_selector_matched", ""),
             "screenshot_candidates_found": debug.get("screenshot_candidates_found", 0),
+            "screenshot_selected_image": debug.get("screenshot_selected_image", ""),
+            "screenshot_rejection_reasons": list(debug.get("screenshot_rejection_reasons", [])),
+            "review_image_path": _str_val(row_after.get("review_image_path")),
+            "review_image_filename": _str_val(row_after.get("review_image_filename")),
         })
 
     return df, diagnostics
@@ -1227,12 +1584,16 @@ _DEBUG_REPORT_COLUMNS = [
     "screenshot_url_attempted",
     "screenshot_selector_matched",
     "screenshot_candidates_found",
+    "screenshot_selected_image",
+    "screenshot_rejection_reasons",
     "image_source",
     "confidence",
     "evidence",
     "error",
     "local_image_path",
     "image_filename",
+    "review_image_path",
+    "review_image_filename",
     "image_url",
     "row_has_image",
     "exported_to_zip",
@@ -1263,11 +1624,91 @@ def build_image_recovery_debug_dataframe(diagnostics: list[dict]) -> pd.DataFram
             "web_queries_used",
             "official_candidate_pages",
             "web_rejection_reasons",
+            "screenshot_rejection_reasons",
         ):
             if isinstance(row.get(key), list):
                 row[key] = " | ".join(str(v) for v in row[key])
         rows.append(row)
     return pd.DataFrame(rows, columns=_DEBUG_REPORT_COLUMNS)
+
+
+def _recommended_image_action(diagnostic: dict) -> str:
+    confidence = _str_val(diagnostic.get("confidence")).upper()
+    reason = _str_val(diagnostic.get("export_skip_reason") or diagnostic.get("error") or diagnostic.get("final_error"))
+    if confidence == "MEDIUM":
+        return "Review the saved candidate image, then approve or manually upload the correct JPG."
+    if confidence == "LOW":
+        return "Do not use automatically; upload a verified manufacturer product image manually."
+    if "product_url" in reason or not _str_val(diagnostic.get("product_url")):
+        return "Confirm the official manufacturer product URL, then rerun image recovery."
+    if "no_usable_image" in reason or "missing_image" in reason:
+        return "Open the product page and manually upload the main product image if it is correct."
+    return "Verify brand/SKU and upload the correct image manually if recovery cannot confirm it."
+
+
+def build_photo_discovery_report(rows: list[dict] | pd.DataFrame, diagnostics: list[dict]) -> dict:
+    """Summarize image discovery for the PDF → official page → Excel path."""
+    row_records = rows.to_dict("records") if isinstance(rows, pd.DataFrame) else list(rows or [])
+    diag_records = list(diagnostics or [])
+    total_rows = len(row_records) if row_records else len(diag_records)
+    official_pages_found = sum(1 for d in diag_records if _str_val(d.get("selected_product_page_url") or d.get("product_url")))
+    images_found = sum(1 for d in diag_records if _str_val(d.get("confidence")).upper() in {"HIGH", "MEDIUM"})
+    images_inserted = sum(
+        1
+        for d in diag_records
+        if _str_val(d.get("confidence")).upper() == "HIGH"
+        and bool(_str_val(d.get("local_image_path")))
+    )
+    rows_needing_review = sum(1 for d in diag_records if _str_val(d.get("confidence")).upper() != "HIGH")
+    rows_missing_images = sum(
+        1
+        for d in diag_records
+        if not _str_val(d.get("local_image_path")) and _str_val(d.get("confidence")).upper() != "HIGH"
+    )
+    failure_reasons = Counter(
+        _str_val(d.get("export_skip_reason") or d.get("error") or d.get("final_error") or "needs_review")
+        for d in diag_records
+        if _str_val(d.get("confidence")).upper() != "HIGH"
+    )
+
+    failed_rows = []
+    for d in diag_records:
+        if _str_val(d.get("confidence")).upper() == "HIGH":
+            continue
+        queries = d.get("brand_search_queries_used") or d.get("web_queries_used") or []
+        if isinstance(queries, str):
+            query_used = queries.split("|")[0].strip()
+        elif isinstance(queries, list) and queries:
+            query_used = str(queries[0])
+        else:
+            query_used = ""
+        candidate_url = _str_val(
+            d.get("selected_product_page_url")
+            or d.get("selected_web_image_url")
+            or d.get("product_url_selected_image")
+            or d.get("product_url")
+        )
+        why = _str_val(d.get("export_skip_reason") or d.get("error") or d.get("final_error") or d.get("confidence") or "needs_review")
+        failed_rows.append({
+            "brand": _str_val(d.get("brand")),
+            "product_name": _str_val(d.get("product_name")),
+            "model_sku": _str_val(d.get("model_sku")),
+            "search_query_used": query_used,
+            "candidate_url_found": candidate_url,
+            "why_it_failed": why,
+            "recommended_next_action": _recommended_image_action(d),
+        })
+
+    return {
+        "total_rows": total_rows,
+        "official_product_pages_found": official_pages_found,
+        "images_found": images_found,
+        "images_inserted_into_excel": images_inserted,
+        "rows_needing_review": rows_needing_review,
+        "rows_missing_images": rows_missing_images,
+        "failure_reasons": dict(failure_reasons),
+        "failed_rows": failed_rows,
+    }
 
 
 # ── cleanup_old_sessions ──────────────────────────────────────────────────────

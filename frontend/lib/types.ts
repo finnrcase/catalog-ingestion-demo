@@ -25,6 +25,26 @@ export type IntakeResponse = {
   errors: string[];
   eligible_count: number;
   blocked_count: number;
+  dimension_diagnostics?: Record<string, unknown>[];
+};
+
+export type PhotoDiscoveryReport = {
+  total_rows: number;
+  official_product_pages_found: number;
+  images_found: number;
+  images_inserted_into_excel: number;
+  rows_needing_review: number;
+  rows_missing_images: number;
+  failure_reasons: Record<string, number>;
+  failed_rows: {
+    brand: string;
+    product_name: string;
+    model_sku: string;
+    search_query_used: string;
+    candidate_url_found: string;
+    why_it_failed: string;
+    recommended_next_action: string;
+  }[];
 };
 
 export type SchemaResponse = {

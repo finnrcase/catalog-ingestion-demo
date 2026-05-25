@@ -66,3 +66,32 @@ def test_recover_images_endpoint_uses_pdf_lookup(tmp_path, monkeypatch):
     assert kwargs["pdf_lookup"] == {"deadbeef0001": str(pdfs_dir / "deadbeef0001.pdf")}
     assert kwargs["session_id"] == sid
     assert kwargs["enable_screenshot"] is True
+
+
+def test_generate_intake_ai_error_falls_back_to_local_pdf_parser(monkeypatch):
+    from unittest.mock import patch as _patch
+    from fastapi.testclient import TestClient
+    import backend.main as bm
+
+    import fitz
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((50, 50), "Model #: MDD30TS Wolf Warming Drawer $999")
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    with _patch("backend.main.extract_products_from_pdf_with_ai", return_value=(None, "missing api key")), \
+         _patch("backend.main.enrich_pdf_rows_with_official_product_urls", side_effect=lambda rows: (rows, [])):
+        client = TestClient(bm.app)
+        resp = client.post(
+            "/intake/generate",
+            data={"project": "SCH", "room": "Kitchen", "use_ai_pdf": "true"},
+            files={"files": ("spec.pdf", pdf_bytes, "application/pdf")},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["rows"][0]["Model/SKU"] == "MDD30TS"
+    assert body["rows"][0]["_source_filename"] == "spec.pdf"
+    assert body["rows"][0]["_source_page_number"] == 1
+    assert body["rows"][0]["_extracted_model_sku"] == "MDD30TS"

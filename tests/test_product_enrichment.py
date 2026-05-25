@@ -1294,8 +1294,12 @@ def _official_html() -> str:
         <script type="application/ld+json">
         {
           "@type": "Product",
-          "name": "Table Lamp",
+          "name": "Visual Comfort Table Lamp",
+          "brand": {"name": "Visual Comfort"},
           "sku": "TOB 1234",
+          "category": "Lighting",
+          "color": "Bronze",
+          "description": "A table lamp for living spaces.",
           "additionalProperty": [
             {"name": "Dimensions", "value": "Width: 36 in, Depth: 18 in, Height: 72 in"},
             {"name": "Finish", "value": "Bronze"},
@@ -1342,12 +1346,20 @@ def test_enrich_row_uses_official_registry_page_for_specs_and_image(monkeypatch)
     updated, err, dim_result = enrich_row(row)
     assert err is None
     assert updated["Product URL"] == "https://www.visualcomfort.com/products/tob-1234"
+    assert updated["Brand"] == "Visual Comfort"
+    assert updated["Product Name"] == "Visual Comfort Table Lamp"
+    assert updated["Model/SKU"] == "TOB 1234"
     assert updated["Dimensions"] == '36"W x 18"D x 72"H'
     assert updated["Width (in)"] == "36"
     assert updated["Depth (in)"] == "18"
     assert updated["Height (in)"] == "72"
     assert updated["Image URL"] == "https://www.visualcomfort.com/images/tob-1234.jpg"
     assert updated["image_source"] == "official_site_og_image"
+    assert updated["Color"] == "Bronze"
+    assert updated["Material"] == "Steel"
+    assert updated["Description"] == "A table lamp for living spaces."
+    assert "[Manufacturer Description: A table lamp for living spaces.]" in updated["Notes"]
+    assert updated["manufacturer_page_exact_sku"] is True
     assert updated["brand_registry_match"] is True
     assert dim_result is not None
     assert dim_result.confidence == "high"
@@ -1436,3 +1448,37 @@ def test_existing_high_dimensions_not_overwritten_by_medium_page(monkeypatch):
     updated, err, _ = enrich_row(row)
     assert err is None
     assert updated["Dimensions"] == '10"W x 20"H x 30"D'
+
+
+def test_manufacturer_page_does_not_overwrite_pdf_values_without_exact_sku(monkeypatch):
+    from src.brave_search import SearchResult
+    import src.official_product_lookup as opl
+    import src.product_enrichment as pe
+
+    html = _official_html().replace("TOB 1234", "OTHER 999").replace("Visual Comfort Table Lamp", "Manufacturer Name")
+    monkeypatch.setattr(opl, "search_product_candidates", lambda *a, **k: [SearchResult(
+        title="Visual Comfort Table Lamp",
+        url="https://www.visualcomfort.com/products/table-lamp",
+        description="dimensions",
+        domain_score=80,
+    )])
+    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: html)
+
+    row = {
+        "Source Type": "PDF",
+        "Brand": "Visual Comfort",
+        "Model/SKU": "TOB 1234",
+        "Product Name": "PDF Extracted Name",
+        "Dimensions": "",
+        "Finish / Color": "PDF Bronze",
+        "Product Category": "Lighting",
+        "Product URL": "",
+        "Notes": "",
+    }
+    updated, err, _ = enrich_row(row)
+
+    assert err is None
+    assert updated["Product Name"] == "PDF Extracted Name"
+    assert updated["Model/SKU"] == "TOB 1234"
+    assert updated["Finish / Color"] == "PDF Bronze"
+    assert updated["manufacturer_page_exact_sku"] is False

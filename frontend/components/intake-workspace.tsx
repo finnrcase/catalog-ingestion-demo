@@ -18,6 +18,7 @@ import type { ReactNode } from "react";
 import {
   exportProgramaCsv,
   exportProgramaXlsx,
+  exportProgramaXlsxWithImages,
   exportProgramaZip,
   fetchHealth,
   fetchSchema,
@@ -33,7 +34,7 @@ import {
   validateRows,
 } from "@/lib/api";
 import { hasComplete3dDimensions } from "@/lib/dimensions";
-import type { IntakeRow } from "@/lib/types";
+import type { IntakeRow, PhotoDiscoveryReport } from "@/lib/types";
 
 const reviewColumns = [
   "Include",
@@ -112,6 +113,13 @@ function isPhotoOnlyRow(row: IntakeRow) {
 
 function isPublicHttpsImageUrl(value: string) {
   return value.trim().toLowerCase().startsWith("https://");
+}
+
+function photoReportFromDiagnostics(diagnostics?: Record<string, unknown>[]): PhotoDiscoveryReport | null {
+  const item = diagnostics?.find((entry) => entry.report_type === "photo_discovery");
+  const summary = item?.summary;
+  if (!summary || typeof summary !== "object") return null;
+  return summary as PhotoDiscoveryReport;
 }
 
 function filenameStem(filename: string) {
@@ -245,6 +253,7 @@ export function IntakeWorkspace() {
   const [message, setMessage] = useState("");
   const [useWebEnrichment, setUseWebEnrichment] = useState(true);
   const [includeLowConfidenceImages, setIncludeLowConfidenceImages] = useState(false);
+  const [photoDiscoveryReport, setPhotoDiscoveryReport] = useState<PhotoDiscoveryReport | null>(null);
   const [productImageUploads, setProductImageUploads] = useState<Record<number, string>>({});
   const [busy, setBusy] = useState<"generate" | "validate" | "vendorCall" | "export" | "photoBulk" | "imageRecovery" | "">("");
   const [exportSummary, setExportSummary] = useState({
@@ -318,6 +327,8 @@ export function IntakeWorkspace() {
     [includedRows],
   );
   const ignored = useMemo(() => rows.filter((row) => row.Include === false || row.Status === "Ignored").length, [rows]);
+  const onlyPhotosSelected = bulkImages.length > 0 && files.length === 0 && !urls.trim();
+  const uploadBusy = busy === "generate" || busy === "photoBulk";
 
   useEffect(() => {
     if (includedRows.length === 0) {
@@ -578,6 +589,14 @@ export function IntakeWorkspace() {
   }
 
   async function handleGenerate() {
+    if (!urls.trim() && files.length === 0 && bulkImages.length > 0) {
+      await handlePhotoBulkCreate();
+      return;
+    }
+    if (!urls.trim() && files.length === 0) {
+      setMessage("Upload images, PDFs, or paste product links first.");
+      return;
+    }
     setBusy("generate");
     setMessage("");
     setErrors([]);
@@ -585,6 +604,7 @@ export function IntakeWorkspace() {
       const response = await generateIntakeTable({ project, room, urls, useAiPdf, files });
       setRows(response.rows);
       setErrors(response.errors);
+      setPhotoDiscoveryReport(null);
       setMessage("Intake table is ready for review.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not generate the intake table.");
@@ -599,6 +619,7 @@ export function IntakeWorkspace() {
       const response = await enrichRows({ rows, useWebEnrichment });
       setRows(response.rows);
       setErrors(response.errors);
+      setPhotoDiscoveryReport(photoReportFromDiagnostics(response.dimension_diagnostics));
       setMessage(useWebEnrichment ? "Missing info search complete." : "Input updates saved without web search.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not save input updates.");
@@ -618,6 +639,7 @@ export function IntakeWorkspace() {
       const response = await recoverImages(targetRows);
       setRows(response.rows);
       setErrors(response.errors);
+      setPhotoDiscoveryReport(photoReportFromDiagnostics(response.dimension_diagnostics));
       setMessage("Image recovery complete.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not recover images.");
@@ -653,18 +675,24 @@ export function IntakeWorkspace() {
     URL.revokeObjectURL(url);
   }
 
-  async function handleProgramaExport(format: "csv" | "xlsx" | "zip") {
+  async function handleProgramaExport(format: "csv" | "xlsx" | "xlsx-images" | "zip") {
     setBusy("export");
     try {
       const blob =
         format === "zip"
           ? await exportProgramaZip(includedRows, includeLowConfidenceImages)
+          : format === "xlsx-images"
+          ? await exportProgramaXlsxWithImages(includedRows)
           : format === "xlsx"
           ? await exportProgramaXlsx(includedRows)
           : await exportProgramaCsv(includedRows);
-      const suffix = format === "zip" ? "zip" : format === "xlsx" ? "xlsx" : "csv";
       const today = new Date().toISOString().slice(0, 10);
-      const filename = format === "zip" ? `programa_export_${today}.zip` : `programa_import_${today}.${suffix}`;
+      const filename =
+        format === "zip"
+          ? `programa_export_${today}.zip`
+          : format === "xlsx-images"
+          ? `programa_import_with_images_${today}.xlsx`
+          : `programa_import_${today}.${format}`;
       downloadBlob(blob, filename);
       setMessage("Use this file for Programa Import Products.");
     } catch (error) {
@@ -909,11 +937,17 @@ export function IntakeWorkspace() {
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
               <button
                 className="btn-primary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-6 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze disabled:shadow-none"
-                disabled={busy === "generate"}
+                disabled={uploadBusy}
                 onClick={handleGenerate}
               >
-                {busy === "generate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-                Upload
+                {uploadBusy ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : onlyPhotosSelected ? (
+                  <ImageIcon className="h-4 w-4" />
+                ) : (
+                  <FileText className="h-4 w-4" />
+                )}
+                {onlyPhotosSelected ? "Upload Photos" : "Upload"}
               </button>
               {message ? <p className="text-sm text-charcoal/65">{message}</p> : null}
             </div>
@@ -1064,15 +1098,23 @@ export function IntakeWorkspace() {
               <StatusBadge value={`${exportSummary.missing_section.length} Missing Section`} />
             </div>
             <div className="rounded-xl border border-bronze/20 bg-bronze/10 p-3 text-sm text-charcoal">
-              Programa may not auto-import images from CSV. Use the ZIP export to keep product images matched to rows for manual upload.
+              Programa's importer expects images on the same spreadsheet row as the product. Use Excel with Images for image import, or ZIP for matched manual upload.
             </div>
-            <div className="grid gap-3 sm:grid-cols-3">
+            <div className="grid gap-3 sm:grid-cols-4">
               <button
                 className="btn-primary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
                 disabled={busy === "export" || exportSummary.export_count === 0}
-                onClick={() => handleProgramaExport("zip")}
+                onClick={() => handleProgramaExport("xlsx-images")}
               >
                 {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                Excel with Images
+              </button>
+              <button
+                className="btn-secondary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                disabled={busy === "export" || exportSummary.export_count === 0}
+                onClick={() => handleProgramaExport("zip")}
+              >
+                <Download className="h-4 w-4" />
                 Download ZIP
               </button>
               <button
@@ -1113,6 +1155,31 @@ export function IntakeWorkspace() {
                   Re-run Missing Images
                 </button>
               </div>
+              {photoDiscoveryReport ? (
+                <div className="mt-3 rounded-xl border border-linen bg-ivory/50 p-3">
+                  <div className="grid gap-2 text-xs text-taupe sm:grid-cols-3 lg:grid-cols-6">
+                    <div><span className="block font-semibold text-charcoal">{photoDiscoveryReport.total_rows}</span>Rows</div>
+                    <div><span className="block font-semibold text-charcoal">{photoDiscoveryReport.official_product_pages_found}</span>Official pages</div>
+                    <div><span className="block font-semibold text-charcoal">{photoDiscoveryReport.images_found}</span>Images found</div>
+                    <div><span className="block font-semibold text-charcoal">{photoDiscoveryReport.images_inserted_into_excel}</span>Excel images</div>
+                    <div><span className="block font-semibold text-charcoal">{photoDiscoveryReport.rows_needing_review}</span>Needs review</div>
+                    <div><span className="block font-semibold text-charcoal">{photoDiscoveryReport.rows_missing_images}</span>Missing images</div>
+                  </div>
+                  {photoDiscoveryReport.failed_rows.length ? (
+                    <div className="mt-3 space-y-2">
+                      {photoDiscoveryReport.failed_rows.slice(0, 3).map((failed, failedIndex) => (
+                        <div key={`${failed.model_sku}-${failedIndex}`} className="rounded-lg border border-linen bg-white p-2 text-xs text-taupe">
+                          <div className="font-semibold text-charcoal">
+                            {failed.product_name || "Unnamed product"} {failed.brand || failed.model_sku ? <span className="font-normal text-taupe">· {[failed.brand, failed.model_sku].filter(Boolean).join(" ")}</span> : null}
+                          </div>
+                          <div className="mt-1">{failed.why_it_failed || "Needs review"}</div>
+                          <div className="mt-1 text-charcoal">{failed.recommended_next_action}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
               {includedRows.length ? (
                 <div className="mt-3 divide-y divide-linen rounded-xl border border-linen bg-white">
                   {rows.map((row, index) => {

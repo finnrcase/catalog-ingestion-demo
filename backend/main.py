@@ -32,6 +32,11 @@ from src.image_uploader import is_public_https_image_url, upload_image
 from src.manufacturer_domains import save_manufacturer_override
 from src.notes import remove_notes_row_prefix
 from src.image_recovery import cleanup_old_sessions
+from src.image_recovery import build_photo_discovery_report
+from src.pdf_product_workflow import (
+    enrich_pdf_rows_with_official_product_urls,
+    normalize_pdf_product_rows,
+)
 from src.product_enrichment import enrich_dataframe, recover_images_for_dataframe
 from src.programa_export import (
     CANONICAL_SECTIONS,
@@ -39,6 +44,7 @@ from src.programa_export import (
     build_programa_import_dataframe,
     export_programa_csv,
     export_programa_xlsx,
+    export_programa_xlsx_with_images,
     export_programa_zip,
     validate_for_export,
 )
@@ -262,20 +268,57 @@ async def generate_intake(
             df_ai, error = extract_products_from_pdf_with_ai(pdf, project, room, "")
             if error:
                 errors.append(f"{pdf.name}: {error}")
-                pdf.seek(0)
-                pdf_rows.extend(create_pdf_rows([pdf], project, room, "", ""))
+                try:
+                    pdf.seek(0)
+                    fallback = parse_pdf_rows(pdf, project, room, "", "")
+                except Exception as exc:
+                    errors.append(f"{pdf.name}: local PDF parser fallback failed: {exc}")
+                    fallback = []
+                if not fallback:
+                    fallback = create_pdf_rows([pdf], project, room, "", "")
+                pdf_rows.extend(normalize_pdf_product_rows(
+                    fallback,
+                    source_rows=fallback,
+                    source_pdf_bytes=content,
+                    source_filename=pdf.name,
+                ))
             else:
-                pdf_rows.extend(df_ai.to_dict("records"))
+                source_rows: list[dict] = []
+                try:
+                    pdf.seek(0)
+                    source_rows = parse_pdf_rows(pdf, project, room, "", "")
+                except Exception:
+                    source_rows = []
+                pdf_rows.extend(normalize_pdf_product_rows(
+                    df_ai.to_dict("records"),
+                    source_rows=source_rows,
+                    source_pdf_bytes=content,
+                    source_filename=pdf.name,
+                ))
         else:
             try:
                 parsed = parse_pdf_rows(pdf, project, room, "", "")
-                pdf_rows.extend(parsed or create_pdf_rows([pdf], project, room, "", ""))
+                rows = parsed or create_pdf_rows([pdf], project, room, "", "")
+                pdf_rows.extend(normalize_pdf_product_rows(
+                    rows,
+                    source_rows=parsed,
+                    source_pdf_bytes=content,
+                    source_filename=pdf.name,
+                ))
             except Exception as exc:
                 errors.append(f"{pdf.name}: {exc}")
-                pdf_rows.extend(create_pdf_rows([pdf], project, room, "", ""))
+                fallback = create_pdf_rows([pdf], project, room, "", "")
+                pdf_rows.extend(normalize_pdf_product_rows(
+                    fallback,
+                    source_pdf_bytes=content,
+                    source_filename=pdf.name,
+                ))
 
     if not url_rows and not pdf_rows:
         raise HTTPException(status_code=400, detail="Upload a PDF or paste at least one URL.")
+
+    pdf_rows, lookup_errors = enrich_pdf_rows_with_official_product_urls(pdf_rows)
+    errors.extend(lookup_errors)
 
     df = build_intake_dataframe(url_rows, pdf_rows)
     df = apply_confidence_checks(df)
@@ -314,6 +357,25 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
         force_refresh=payload.force_refresh,
         use_web_enrichment=payload.use_web_enrichment,
     )
+    if payload.use_web_enrichment:
+        session_id = payload.session_id or "default"
+        pdfs_dir = _TMP_UPLOADS / session_id / "pdfs"
+        pdf_lookup = {f.stem: str(f) for f in pdfs_dir.glob("*.pdf")} if pdfs_dir.exists() else {}
+        df, image_diagnostics = recover_images_for_dataframe(
+            df,
+            pdf_lookup=pdf_lookup,
+            session_id=session_id,
+            enable_screenshot=True,
+        )
+        if image_diagnostics:
+            dimension_diagnostics = [
+                *dimension_diagnostics,
+                {
+                    "report_type": "photo_discovery",
+                    "summary": build_photo_discovery_report(df, image_diagnostics),
+                },
+                *image_diagnostics,
+            ]
     df = apply_confidence_checks(df)
     return _df_response(df, errors, dimension_diagnostics)
 
@@ -361,6 +423,14 @@ def recover_images(payload: RowsPayload) -> IntakeResponse:
         session_id=session_id,
         enable_screenshot=True,
     )
+    if diagnostics:
+        diagnostics = [
+            {
+                "report_type": "photo_discovery",
+                "summary": build_photo_discovery_report(df, diagnostics),
+            },
+            *diagnostics,
+        ]
     df = apply_confidence_checks(df)
     return _df_response(df, dimension_diagnostics=diagnostics)
 
@@ -618,6 +688,22 @@ def export_programa_import_xlsx(payload: RowsPayload) -> Response:
         content=export_programa_xlsx(df),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="programa_import_{today}.xlsx"'},
+    )
+
+
+@app.post("/export/programa/xlsx-with-images")
+def export_programa_import_xlsx_with_images(payload: RowsPayload) -> Response:
+    """XLSX with same-row embedded product images for Programa's custom importer."""
+    today = datetime.date.today().isoformat()
+    xlsx_bytes = export_programa_xlsx_with_images(
+        payload.rows,
+        session_id=payload.session_id,
+        include_low_confidence_images=payload.include_low_confidence_images,
+    )
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="programa_import_with_images_{today}.xlsx"'},
     )
 
 

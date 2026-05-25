@@ -154,4 +154,8 @@ def build_intake_dataframe(
     for col in COLUMNS:
         if col not in df.columns:
             df[col] = _col_defaults.get(col, "")
-    return df[COLUMNS]
+    # Keep internal extraction metadata available to downstream image recovery,
+    # debug exports, and manufacturer lookup. Programa exports explicitly choose
+    # their public columns, so these audit fields do not leak into import files.
+    extra = [col for col in df.columns if col not in COLUMNS]
+    return df[COLUMNS + extra]

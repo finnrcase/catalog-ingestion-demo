@@ -14,6 +14,12 @@ from src.measurement_parser import combined_dimensions, parse_dimensions
 
 @dataclass
 class ProductPageSpecResult:
+    product_name: str = ""
+    brand: str = ""
+    sku: str = ""
+    category: str = ""
+    color: str = ""
+    description: str = ""
     dimensions: str = ""
     width: str = ""
     height: str = ""
@@ -78,6 +84,44 @@ def _jsonld_product_text(soup: BeautifulSoup) -> str:
     return "\n".join(chunks)
 
 
+def _jsonld_product_metadata(soup: BeautifulSoup) -> dict[str, str]:
+    """Extract structured Product metadata from JSON-LD without inventing."""
+    for script in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.I)}):
+        try:
+            data = json.loads(script.string or script.get_text() or "")
+        except Exception:
+            continue
+        stack = data if isinstance(data, list) else [data]
+        while stack:
+            item = stack.pop(0)
+            if isinstance(item, list):
+                stack.extend(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            graph = item.get("@graph")
+            if isinstance(graph, list):
+                stack.extend(graph)
+            type_value = item.get("@type")
+            types = type_value if isinstance(type_value, list) else [type_value]
+            if not any(str(t).lower() == "product" for t in types):
+                continue
+            brand = item.get("brand", "")
+            if isinstance(brand, dict):
+                brand = brand.get("name", "")
+            metadata = {
+                "product_name": _text(item.get("name")),
+                "brand": _text(brand),
+                "sku": _text(item.get("sku") or item.get("mpn") or item.get("model")),
+                "category": _text(item.get("category") or item.get("productType")),
+                "color": _text(item.get("color")),
+                "material": _text(item.get("material")),
+                "description": _text(item.get("description")),
+            }
+            return {k: v for k, v in metadata.items() if v}
+    return {}
+
+
 def _spec_table_text(soup: BeautifulSoup) -> str:
     chunks: list[str] = []
     spec_hint = re.compile(r"dimension|width|height|depth|length|diameter|finish|color|material|lead|weight|spec", re.I)
@@ -114,6 +158,7 @@ def extract_product_page_specs(
         return ProductPageSpecResult(source_url=page_url, debug={"error": "empty_html"})
 
     soup = BeautifulSoup(html, "html.parser")
+    metadata = _jsonld_product_metadata(soup)
     jsonld_text = _jsonld_product_text(soup)
     table_text = _spec_table_text(soup)
     body_text = soup.get_text(" ", strip=True)
@@ -143,6 +188,12 @@ def extract_product_page_specs(
             confidence = "low"
 
     return ProductPageSpecResult(
+        product_name=metadata.get("product_name", "") or _text(soup.select_one("h1").get_text(" ", strip=True) if soup.select_one("h1") else ""),
+        brand=metadata.get("brand", ""),
+        sku=metadata.get("sku", "") or _first_labeled_value(candidate_text, ("SKU", "Model", "Model Number", "MPN")),
+        category=metadata.get("category", "") or _first_labeled_value(candidate_text, ("Category", "Type", "Product Type")),
+        color=metadata.get("color", "") or _first_labeled_value(candidate_text, ("Color", "Colour")),
+        description=metadata.get("description", ""),
         dimensions=dims,
         width=parts.get("width", ""),
         height=parts.get("height", ""),
@@ -150,7 +201,7 @@ def extract_product_page_specs(
         length=parts.get("length", ""),
         diameter=parts.get("diameter", ""),
         finish=_first_labeled_value(candidate_text, ("Finish", "Color")),
-        material=_first_labeled_value(candidate_text, ("Material", "Materials")),
+        material=metadata.get("material", "") or _first_labeled_value(candidate_text, ("Material", "Materials")),
         lead_time=_first_labeled_value(candidate_text, ("Lead Time", "Availability")),
         weight=_first_labeled_value(candidate_text, ("Weight",)),
         source_url=page_url,

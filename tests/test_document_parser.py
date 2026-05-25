@@ -134,3 +134,5 @@ def test_parsed_rows_carry_source_pdf_id_and_page(tmp_path):
 
     # Filename preserved.
     assert all(r.get("_source_filename") == "spec.pdf" for r in rows)
+    assert all("_extracted_model_sku" in r for r in rows)
+    assert all("_extraction_confidence" in r for r in rows)

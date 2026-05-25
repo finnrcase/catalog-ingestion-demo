@@ -109,6 +109,23 @@ def _compute_status(row: dict) -> str:
     return "Needs Enrichment" if (has_serial and missing) else "Needs Review"
 
 
+def _stamp_extraction_audit_fields(row: dict) -> dict:
+    """Attach the raw extracted lookup key and a simple parser confidence."""
+    model = str(row.get("Model/SKU", "") or "").strip()
+    row["_extracted_model_sku"] = model
+    score = 55
+    if str(row.get("Product Name", "") or "").strip():
+        score += 15
+    if str(row.get("Brand", "") or "").strip():
+        score += 15
+    if model:
+        score += 15
+    if str(row.get("Dimensions", "") or "").strip():
+        score += 5
+    row["_extraction_confidence"] = min(100, score)
+    return row
+
+
 def _row_from_line(
     line: str, project: str, room: str, supplier: str, notes: str
 ) -> dict | None:
@@ -136,7 +153,7 @@ def _row_from_line(
         row["Notes"] = f"{notes} {note_tag}".strip() if notes else note_tag
 
     row["Status"] = _compute_status(row)
-    return row
+    return _stamp_extraction_audit_fields(row)
 
 
 def _parse_table_rows(
@@ -210,6 +227,7 @@ def _parse_table_rows(
                 continue
 
             row["Status"] = _compute_status(row)
+            _stamp_extraction_audit_fields(row)
             rows.append(row)
 
     return rows

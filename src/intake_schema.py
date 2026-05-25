@@ -133,6 +133,10 @@ def make_base_row(
     intentionally NOT in ALL_COLUMNS so the standard Programa CSV/XLSX
     export stays clean. They surface only in the debug export and in the
     manifest CSV inside the Programa ZIP.
+
+    Internal `_extracted_*` fields are the PDF extraction audit trail. They
+    keep the raw model/SKU key and extraction confidence available for later
+    manufacturer lookup without leaking into standard Programa exports.
     """
     base = {
         "Include":          True,
@@ -169,4 +173,6 @@ def make_base_row(
     base["_source_pdf_id"] = ""
     base["_source_page_number"] = None
     base["_source_filename"] = ""
+    base["_extracted_model_sku"] = ""
+    base["_extraction_confidence"] = ""
     return base

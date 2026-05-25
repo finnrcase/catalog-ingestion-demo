@@ -485,6 +485,101 @@ def test_screenshot_filters_logo_url(mock_playwright):
     assert result.error == "no_usable_image_element"
 
 
+def test_screenshot_dom_candidate_prefers_large_product_gallery_image(mock_playwright):
+    page = mock_playwright
+    page.content.return_value = "<html><body>Wolf MDD30TS Warming Drawer</body></html>"
+    full = Image.new("RGB", (1400, 1400), "white")
+    full.paste(Image.new("RGB", (700, 700), "blue"), (120, 120))
+    full_buf = io.BytesIO()
+    full.save(full_buf, format="PNG")
+    page.screenshot.return_value = full_buf.getvalue()
+    page.evaluate.return_value = [
+        {
+            "selector": "[class*=gallery] img",
+            "sourceKind": "img",
+            "src": "https://www.subzero-wolf.com/logo.png",
+            "x": 0, "y": 0, "width": 600, "height": 240,
+            "naturalWidth": 1200, "naturalHeight": 480,
+            "alt": "Wolf logo",
+            "classText": "site-logo",
+        },
+        {
+            "selector": "[class*=gallery] img",
+            "sourceKind": "img",
+            "src": "https://www.subzero-wolf.com/images/mdd30ts-main.jpg",
+            "x": 120, "y": 120, "width": 700, "height": 700,
+            "naturalWidth": 1400, "naturalHeight": 1400,
+            "alt": "Wolf MDD30TS Warming Drawer",
+            "classText": "product-gallery main",
+        },
+    ]
+
+    debug = {}
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "Product Name": "Warming Drawer"}
+    result = recover_from_screenshot(row, "https://www.subzero-wolf.com/products/mdd30ts", debug=debug)
+
+    assert result.confidence == "HIGH"
+    assert result.image_source == "page_screenshot"
+    assert "official_manufacturer_page" in result.evidence
+    assert "exact_sku_match" in result.evidence
+    assert "correct_product_image_candidate" in result.evidence
+    assert debug["screenshot_selected_image"].endswith("mdd30ts-main.jpg")
+    assert len(result.jpeg_bytes) > 0
+
+
+def test_screenshot_scrolls_and_rechecks_lazy_loaded_images(mock_playwright):
+    page = mock_playwright
+    page.content.return_value = "<html><body>Visual Comfort TOB 1234 Table Lamp</body></html>"
+    full = Image.new("RGB", (1600, 2000), "white")
+    full.paste(Image.new("RGB", (800, 800), "green"), (200, 900))
+    full_buf = io.BytesIO()
+    full.save(full_buf, format="PNG")
+    page.screenshot.return_value = full_buf.getvalue()
+    page.evaluate.side_effect = [
+        [],
+        [{
+            "selector": "picture img",
+            "sourceKind": "img",
+            "src": "https://visualcomfort.com/images/tob-1234.jpg",
+            "x": 200, "y": 900, "width": 800, "height": 800,
+            "naturalWidth": 1600, "naturalHeight": 1600,
+            "alt": "TOB 1234 Table Lamp",
+            "classText": "pdp product-media",
+        }],
+    ]
+
+    row = {"Brand": "Visual Comfort", "Model/SKU": "TOB 1234", "Product Name": "Table Lamp"}
+    result = recover_from_screenshot(row, "https://visualcomfort.com/products/tob-1234")
+
+    page.mouse.wheel.assert_called()
+    assert result.confidence == "HIGH"
+    assert "selector:picture img" in result.evidence
+
+
+def test_screenshot_generic_page_stays_low_even_with_sku(mock_playwright):
+    page = mock_playwright
+    page.content.return_value = "<html><body>Wolf MDD30TS Warming Drawer</body></html>"
+    full = Image.new("RGB", (1200, 1200), "red")
+    full_buf = io.BytesIO()
+    full.save(full_buf, format="PNG")
+    page.screenshot.return_value = full_buf.getvalue()
+    page.evaluate.return_value = [{
+        "selector": "[class*=gallery] img",
+        "sourceKind": "img",
+        "src": "https://retailer.example.com/mdd30ts.jpg",
+        "x": 0, "y": 0, "width": 700, "height": 700,
+        "naturalWidth": 1000, "naturalHeight": 1000,
+        "alt": "Wolf MDD30TS",
+        "classText": "product-gallery",
+    }]
+
+    row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "Product Name": "Warming Drawer"}
+    result = recover_from_screenshot(row, "https://retailer.example.com/products/mdd30ts")
+
+    assert result.confidence == "LOW"
+    assert "retailer_or_generic_page" in result.evidence
+
+
 def test_screenshot_returns_none_on_browser_unavailable():
     with patch("src.image_recovery.sync_playwright", side_effect=Exception("browser fail")):
         result = recover_from_screenshot({"Brand": "Wolf"}, "https://example.com")
@@ -514,8 +609,8 @@ def test_screenshot_uses_first_matching_selector_in_priority_order(mock_playwrig
     hit.first.is_visible.return_value = True
     hit.first.screenshot.return_value = _jpeg_bytes()
 
-    # First selector misses (img[class*=product-image]),
-    # second selector hits ([class*=product] img).
+    # First selector misses ([class*=gallery] img),
+    # second selector hits ([class*=product-image]).
     page.locator.side_effect = [no_match, hit]
 
     row = {"Brand": "Wolf", "Model/SKU": "MDD30TS", "Product Name": "Warming Drawer"}
@@ -524,8 +619,8 @@ def test_screenshot_uses_first_matching_selector_in_priority_order(mock_playwrig
     # Evidence should record which selector matched.
     selector_evidence = [e for e in result.evidence if e.startswith("selector:")]
     assert len(selector_evidence) == 1
-    # The second selector in the list, "[class*=product] img", was the winner.
-    assert selector_evidence[0] == "selector:[class*=product] img"
+    # The second selector in the list, "[class*=product-image]", was the winner.
+    assert selector_evidence[0] == "selector:[class*=product-image]"
 
 
 # ── recover_image_for_row orchestrator ────────────────────────────────────────
@@ -558,12 +653,14 @@ def test_orchestrator_returns_url_high_immediately():
 def test_orchestrator_pdf_high_returns_immediately():
     row = {"Image URL": "", "_source_pdf_id": "abc", "Product URL": "https://x.com/p"}
     with patch("src.image_recovery.recover_from_url", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_product_page", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_official_lookup", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
          patch("src.image_recovery.recover_from_pdf_crop", return_value=_result(confidence="HIGH", source="pdf_crop")) as m_pdf, \
          patch("src.image_recovery.recover_from_screenshot") as m_shot:
         out = recover_image_for_row(row, pdf_lookup={"abc": "/tmp/x.pdf"}, session_id="s1")
     assert out.image_source == "pdf_crop"
     assert out.confidence == "HIGH"
-    m_shot.assert_not_called()
+    m_shot.assert_called_once()
 
 
 def test_orchestrator_uses_pdf_after_product_page_and_official_lookup_miss():
@@ -572,7 +669,7 @@ def test_orchestrator_uses_pdf_after_product_page_and_official_lookup_miss():
          patch("src.image_recovery.recover_from_product_page", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
          patch("src.image_recovery.recover_from_official_lookup", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
          patch("src.image_recovery.recover_from_pdf_crop", return_value=_result(confidence="MEDIUM", source="pdf_crop")), \
-         patch("src.image_recovery.recover_from_screenshot", return_value=_result(confidence="HIGH", source="page_screenshot")):
+         patch("src.image_recovery.recover_from_screenshot", return_value=_result(confidence="NONE", source="page_screenshot", jpeg=b"")):
         out = recover_image_for_row(row, pdf_lookup={"abc": "/tmp/x.pdf"}, session_id="s1")
     assert out.image_source == "pdf_crop"
     assert out.confidence == "MEDIUM"
@@ -581,20 +678,24 @@ def test_orchestrator_uses_pdf_after_product_page_and_official_lookup_miss():
 def test_orchestrator_pdf_medium_wins_tie_against_screenshot_medium():
     row = {"Image URL": "", "_source_pdf_id": "abc", "Product URL": "https://x.com/p"}
     with patch("src.image_recovery.recover_from_url", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_product_page", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_official_lookup", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
          patch("src.image_recovery.recover_from_pdf_crop", return_value=_result(confidence="MEDIUM", source="pdf_crop")), \
          patch("src.image_recovery.recover_from_screenshot", return_value=_result(confidence="MEDIUM", source="page_screenshot")):
         out = recover_image_for_row(row, pdf_lookup={"abc": "/tmp/x.pdf"}, session_id="s1")
-    assert out.image_source == "pdf_crop"
+    assert out.image_source == "page_screenshot"
 
 
 def test_orchestrator_low_low_returns_first_low_no_file_attached():
     row = {"Image URL": "", "_source_pdf_id": "abc", "Product URL": "https://x.com/p"}
     with patch("src.image_recovery.recover_from_url", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_product_page", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
+         patch("src.image_recovery.recover_from_official_lookup", return_value=_result(confidence="NONE", source="none", jpeg=b"")), \
          patch("src.image_recovery.recover_from_pdf_crop", return_value=_result(confidence="LOW", source="pdf_crop")), \
          patch("src.image_recovery.recover_from_screenshot", return_value=_result(confidence="LOW", source="page_screenshot")):
         out = recover_image_for_row(row, pdf_lookup={"abc": "/tmp/x.pdf"}, session_id="s1")
     assert out.confidence == "LOW"
-    assert out.image_source == "pdf_crop"  # first LOW returned
+    assert out.image_source == "page_screenshot"  # product page screenshot is held before PDF
 
 
 def test_orchestrator_all_none_returns_none_result():
@@ -723,7 +824,37 @@ def test_dataframe_recovery_writes_files_to_session_images_dir(tmp_path, monkeyp
     assert row["confidence"] == "HIGH"
     assert row["image_source"] == "page_screenshot"
     assert row["local_image_filename"].endswith(".jpg")
+    assert row["local_image_filename"] == "wolf_mdd30ts.jpg"
     assert Path(row["local_image_path"]).resolve() == files[0].resolve()
+    assert Path(row["Local Image Path"]).resolve() == files[0].resolve()
+
+
+def test_dataframe_recovery_medium_saved_as_review_candidate_not_excel_image(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    df = pd.DataFrame([
+        {
+            "Product Name": "Wolf Drawer", "Brand": "Wolf", "Model/SKU": "MDD30TS",
+            "Image URL": "", "Product URL": "https://www.subzero-wolf.com/products/mdd30ts",
+            "_source_pdf_id": "",
+        },
+    ])
+    with patch("src.image_recovery._TMP_ROOT", tmp_path / ".tmp" / "uploads"), \
+         patch("src.image_recovery.recover_image_for_row") as m:
+        m.return_value = _result(confidence="MEDIUM", source="page_screenshot", jpeg=_jpeg_bytes())
+        out_df, diags = recover_images_for_dataframe(
+            df, pdf_lookup=None, session_id="sess123",
+            enable_screenshot=True,
+        )
+    excel_dir = tmp_path / ".tmp" / "uploads" / "sess123" / "images"
+    review_dir = excel_dir / "review"
+    assert not list(excel_dir.glob("*.jpg"))
+    assert list(review_dir.glob("*.jpg"))
+    row = out_df.iloc[0]
+    assert row["confidence"] == "MEDIUM"
+    assert row["local_image_filename"] == ""
+    assert row["Image Filename"] == ""
+    assert row["review_image_filename"] == "wolf_mdd30ts.jpg"
+    assert Path(row["review_image_path"]).exists()
 
 
 def test_dataframe_recovery_does_not_write_files_for_low_confidence(tmp_path, monkeypatch):
@@ -859,6 +990,51 @@ def test_build_image_recovery_debug_dataframe_empty_input():
     out = build_image_recovery_debug_dataframe([])
     assert list(out.columns) == _DEBUG_REPORT_COLUMNS
     assert len(out) == 0
+
+
+def test_photo_discovery_report_summarizes_failures_and_next_actions():
+    from src.image_recovery import build_photo_discovery_report
+
+    diagnostics = [
+        {
+            "brand": "Wolf",
+            "product_name": "Warming Drawer",
+            "model_sku": "MDD30TS",
+            "confidence": "HIGH",
+            "selected_product_page_url": "https://www.subzero-wolf.com/products/mdd30ts",
+            "local_image_path": "/tmp/images/wolf_mdd30ts.jpg",
+        },
+        {
+            "brand": "Visual Comfort",
+            "product_name": "Table Lamp",
+            "model_sku": "TOB 1234",
+            "confidence": "MEDIUM",
+            "brand_search_queries_used": ["Visual Comfort TOB 1234 official product page"],
+            "selected_product_page_url": "https://visualcomfort.com/products/tob-1234",
+            "export_skip_reason": "medium_confidence_requires_review",
+        },
+        {
+            "brand": "Unknown",
+            "product_name": "Chair",
+            "model_sku": "ABC",
+            "confidence": "NONE",
+            "web_queries_used": ["Unknown ABC official product page"],
+            "error": "no_usable_image_element",
+        },
+    ]
+
+    report = build_photo_discovery_report([{}, {}, {}], diagnostics)
+
+    assert report["total_rows"] == 3
+    assert report["official_product_pages_found"] == 2
+    assert report["images_found"] == 2
+    assert report["images_inserted_into_excel"] == 1
+    assert report["rows_needing_review"] == 2
+    assert report["rows_missing_images"] == 2
+    assert report["failure_reasons"]["medium_confidence_requires_review"] == 1
+    assert report["failed_rows"][0]["search_query_used"] == "Visual Comfort TOB 1234 official product page"
+    assert report["failed_rows"][0]["candidate_url_found"].endswith("/tob-1234")
+    assert "Review the saved candidate image" in report["failed_rows"][0]["recommended_next_action"]
 
 
 # ── cleanup_old_sessions ──────────────────────────────────────────────────────

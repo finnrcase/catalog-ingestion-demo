@@ -6,9 +6,12 @@ import re
 import urllib.parse
 from dataclasses import dataclass, field
 
+import httpx
+
 from src.brand_lookup_registry import build_brand_search_queries, registry_domains_for_brand
 from src.brave_search import search_product_candidates
 from src.image_evidence import product_name_appears_in_text, sku_appears_in_text
+from src.manufacturer_domains import get_domain_for_brand
 
 _BAD_DOMAINS = ("pinterest.", "blogspot.", "reddit.", "houzz.", "amazon.", "ebay.")
 
@@ -27,6 +30,18 @@ class ProductPageLookupResult:
     error: str = ""
 
 
+@dataclass
+class ProductPageValidationResult:
+    valid: bool = False
+    reason: str = ""
+    status_code: int = 0
+    content_type: str = ""
+    sku_match: bool = False
+    brand_match: bool = False
+    product_name_match: bool = False
+    generic_page: bool = False
+
+
 def _text(value: object) -> str:
     text = str(value or "").strip()
     return "" if text.lower() in {"nan", "none", "null"} else text
@@ -41,19 +56,43 @@ def _domain_matches(domain: str, root: str) -> bool:
     return domain == root or domain.endswith("." + root)
 
 
+def _manufacturer_domains_for_row(row: dict) -> list[str]:
+    brand = _text(row.get("Brand"))
+    domains: list[str] = []
+    direct = get_domain_for_brand(brand)
+    if direct:
+        domains.append(direct[0])
+    for domain in registry_domains_for_brand(brand):
+        if domain not in domains:
+            domains.append(domain)
+    return domains
+
+
 def build_official_lookup_queries(row: dict) -> tuple[list[str], bool, list[str]]:
-    registry_queries, entry = build_brand_search_queries(row)
     brand = _text(row.get("Brand"))
     sku = _text(row.get("Model/SKU") or row.get("SKU"))
     name = _text(row.get("Product Name"))
     supplier = _text(row.get("Supplier"))
-    queries = list(registry_queries)
+    registry_queries, entry = build_brand_search_queries(row)
+    registry_domains = _manufacturer_domains_for_row(row)
+    queries: list[str] = []
 
     def add(query: str) -> None:
         cleaned = " ".join(query.split()).strip()
         if cleaned and cleaned not in queries:
             queries.append(cleaned)
 
+    # PDF manufacturer lookup flow: use extracted SKU/model as the primary
+    # search key, prefer confirmed manufacturer domains, and only save Product
+    # URL after page validation when validate_pages=True.
+    if brand and sku:
+        add(f"{brand} {sku} official product page")
+        add(f"{brand} {sku} dimensions")
+    for domain in registry_domains:
+        if sku:
+            add(f"site:{domain} {sku}")
+    for query in registry_queries:
+        add(query)
     if brand and sku:
         add(f'"{brand}" "{sku}" product')
     if brand and name and sku:
@@ -62,7 +101,7 @@ def build_official_lookup_queries(row: dict) -> tuple[list[str], bool, list[str]
         add(f'"{supplier}" "{name}" "{sku}"')
     if brand and name:
         add(f'"{brand}" "{name}" dimensions')
-    return queries, bool(entry), registry_domains_for_brand(brand)
+    return queries, bool(entry), registry_domains
 
 
 def score_search_result(row: dict, result, registry_domains: list[str] | None = None) -> tuple[int, list[str]]:
@@ -112,6 +151,8 @@ def score_search_result(row: dict, result, registry_domains: list[str] | None = 
 
 
 def confidence_from_score(score: int, reasons: list[str]) -> str:
+    if any(reason.startswith("page_validation_failed") for reason in reasons):
+        return "NONE"
     if score >= 135 and "sku_match" in reasons and any(r in reasons for r in ("brand_registry_domain", "official_brand_domain", "official_supplier_domain")):
         return "HIGH"
     if score >= 95 and any(r in reasons for r in ("brand_registry_domain", "official_brand_domain", "official_supplier_domain")):
@@ -121,7 +162,121 @@ def confidence_from_score(score: int, reasons: list[str]) -> str:
     return "NONE"
 
 
-def lookup_official_product_page(row: dict, *, session_cache=None, search_fn=None) -> ProductPageLookupResult:
+_GENERIC_PATH_RE = re.compile(
+    r"(^|/)(search|results|category|categories|collections?|catalog|shop|browse|cart|account|login)(/)?$"
+    r"|/(search|results)(/|$)",
+    re.IGNORECASE,
+)
+
+
+def _html_text(html: str) -> str:
+    text = re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", html or "")
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _brand_appears(row: dict, url: str, page_text: str, registry_domains: list[str]) -> bool:
+    brand = _text(row.get("Brand"))
+    supplier = _text(row.get("Supplier"))
+    domain = domain_from_url(url)
+    if registry_domains and any(_domain_matches(domain, d) for d in registry_domains):
+        return True
+    for value in (brand, supplier):
+        slug = re.sub(r"[^a-z0-9]+", "", value.lower())
+        if len(slug) >= 3 and slug in re.sub(r"[^a-z0-9]+", "", domain):
+            return True
+        if value and re.search(re.escape(value), page_text, re.IGNORECASE):
+            return True
+    return False
+
+
+def _looks_generic_page(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.strip("/").lower()
+    query = parsed.query.lower()
+    if not path and not query:
+        return True
+    if _GENERIC_PATH_RE.search("/" + path):
+        return True
+    return "search" in query or "q=" in query
+
+
+def validate_official_product_page(
+    row: dict,
+    url: str,
+    *,
+    registry_domains: list[str] | None = None,
+    timeout: float = 8.0,
+) -> ProductPageValidationResult:
+    """Fetch and validate an official product page before saving Product URL."""
+    registry_domains = registry_domains or _manufacturer_domains_for_row(row)
+    sku = _text(row.get("Model/SKU") or row.get("SKU") or row.get("_extracted_model_sku"))
+    name = _text(row.get("Product Name"))
+    generic_page = _looks_generic_page(url)
+    if not sku:
+        return ProductPageValidationResult(reason="missing_sku", generic_page=generic_page)
+
+    try:
+        resp = httpx.get(
+            url,
+            headers={"User-Agent": "SCH-DesignOps/1.0"},
+            timeout=timeout,
+            follow_redirects=True,
+        )
+    except Exception as exc:
+        return ProductPageValidationResult(reason=f"fetch_failed:{exc}", generic_page=generic_page)
+
+    content_type = str(resp.headers.get("content-type", "") or "").lower()
+    status_code = int(getattr(resp, "status_code", 0) or 0)
+    if status_code != 200:
+        return ProductPageValidationResult(
+            reason=f"status_{status_code}",
+            status_code=status_code,
+            content_type=content_type,
+            generic_page=generic_page,
+        )
+    if content_type and "html" not in content_type and "text/" not in content_type:
+        return ProductPageValidationResult(
+            reason=f"non_html_content:{content_type}",
+            status_code=status_code,
+            content_type=content_type,
+            generic_page=generic_page,
+        )
+
+    page_text = _html_text(getattr(resp, "text", "") or "")
+    sku_match = sku_appears_in_text(sku, page_text)
+    brand_match = _brand_appears(row, url, page_text, registry_domains)
+    name_match = product_name_appears_in_text(name, page_text) if name else True
+
+    missing = []
+    if generic_page:
+        missing.append("generic_page")
+    if not sku_match:
+        missing.append("sku_not_on_page")
+    if not brand_match:
+        missing.append("brand_not_confirmed")
+    if not name_match:
+        missing.append("product_name_not_similar")
+
+    return ProductPageValidationResult(
+        valid=not missing,
+        reason="validated" if not missing else ";".join(missing),
+        status_code=status_code,
+        content_type=content_type,
+        sku_match=sku_match,
+        brand_match=brand_match,
+        product_name_match=name_match,
+        generic_page=generic_page,
+    )
+
+
+def lookup_official_product_page(
+    row: dict,
+    *,
+    session_cache=None,
+    search_fn=None,
+    validate_pages: bool = False,
+) -> ProductPageLookupResult:
     search_fn = search_fn or search_product_candidates
     queries, registry_match, registry_domains = build_official_lookup_queries(row)
     debug_candidates: list[dict] = []
@@ -145,6 +300,18 @@ def lookup_official_product_page(row: dict, *, session_cache=None, search_fn=Non
         for result in results:
             score, reasons = score_search_result(row, result, registry_domains)
             url = _text(getattr(result, "url", ""))
+            if validate_pages and url:
+                validation = validate_official_product_page(
+                    row,
+                    url,
+                    registry_domains=registry_domains,
+                )
+                if validation.valid:
+                    score += 40
+                    reasons.append("page_validation_ok")
+                else:
+                    score -= 100
+                    reasons.append(f"page_validation_failed:{validation.reason}")
             record = {"url": url, "score": score, "reasons": ";".join(reasons)}
             debug_candidates.append(record)
             if score > best_score:

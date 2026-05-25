@@ -102,6 +102,60 @@ JSON body:
 
 Returns `text/csv`.
 
+## `POST /export/programa/csv`
+
+JSON body:
+
+```json
+{ "rows": [] }
+```
+
+Returns a Programa custom-import CSV. The image column is text-only and contains
+only direct public HTTPS image URLs when present.
+
+## `POST /export/programa/xlsx`
+
+JSON body:
+
+```json
+{ "rows": [] }
+```
+
+Returns the same Programa custom-import data as a plain XLSX.
+
+## `POST /export/programa/xlsx-with-images`
+
+JSON body:
+
+```json
+{
+  "rows": [],
+  "session_id": "abc123",
+  "include_low_confidence_images": false
+}
+```
+
+Returns an XLSX with product images embedded in a `Product Image` column on the
+same row as each product, plus `Image URL`, `Image Filename`, and
+`Image Import Status` backup columns. This is the preferred image-import file
+because Programa's public import guidance says images should be included on the
+same row as the product.
+
+## `POST /export/programa/zip`
+
+JSON body:
+
+```json
+{
+  "rows": [],
+  "session_id": "abc123",
+  "include_low_confidence_images": false
+}
+```
+
+Returns `programa_import.csv`, `programa_import.xlsx`, `images/*.jpg`,
+`manifest.csv`, and manual-upload instructions as a fallback image package.
+
 ## `POST /intake/upload-pdf`
 
 Multipart form data:

@@ -5,7 +5,11 @@ import pandas as pd
 from src.brave_search import SearchResult
 from src.brand_lookup_registry import build_brand_search_queries, get_brand_lookup_entry
 from src.enrichment_diagnostics import ENRICHMENT_DEBUG_COLUMNS, build_enrichment_debug_dataframe
-from src.official_product_lookup import lookup_official_product_page
+from src.official_product_lookup import (
+    build_official_lookup_queries,
+    lookup_official_product_page,
+    validate_official_product_page,
+)
 from src.product_lookup_cache import ProductLookupCache, make_lookup_cache_key
 
 
@@ -51,6 +55,78 @@ def test_official_sku_page_beats_generic_marketplace():
     assert result.confidence == "HIGH"
     assert "brand_registry_domain" in result.reason
     assert "sku_match" in result.reason
+
+
+def test_official_lookup_queries_prioritize_pdf_sku_workflow():
+    row = {
+        "Brand": "Visual Comfort",
+        "Model/SKU": "TOB 1234",
+        "Product Name": "Table Lamp",
+    }
+
+    queries, registry_match, domains = build_official_lookup_queries(row)
+
+    assert registry_match is True
+    assert "visualcomfort.com" in domains
+    assert queries[:3] == [
+        "Visual Comfort TOB 1234 official product page",
+        "Visual Comfort TOB 1234 dimensions",
+        "site:visualcomfort.com TOB 1234",
+    ]
+
+
+def test_validate_official_product_page_requires_sku_brand_and_name(monkeypatch):
+    class Resp:
+        status_code = 200
+        headers = {"content-type": "text/html; charset=utf-8"}
+        text = """
+        <html><title>Visual Comfort TOB 1234 Table Lamp</title>
+        <body>Visual Comfort TOB 1234 Table Lamp dimensions and finishes.</body></html>
+        """
+
+    monkeypatch.setattr("src.official_product_lookup.httpx.get", lambda *args, **kwargs: Resp())
+
+    result = validate_official_product_page(
+        {"Brand": "Visual Comfort", "Model/SKU": "TOB 1234", "Product Name": "Table Lamp"},
+        "https://www.visualcomfort.com/products/tob-1234",
+        registry_domains=["visualcomfort.com"],
+    )
+
+    assert result.valid is True
+    assert result.sku_match is True
+    assert result.brand_match is True
+    assert result.product_name_match is True
+
+
+def test_lookup_with_page_validation_rejects_generic_category_page(monkeypatch):
+    row = {
+        "Brand": "Visual Comfort",
+        "Model/SKU": "TOB 1234",
+        "Product Name": "Table Lamp",
+    }
+
+    def fake_search(query, brand="", session_cache=None):
+        return [
+            SearchResult(
+                title="Visual Comfort search results for TOB 1234",
+                url="https://www.visualcomfort.com/search?q=TOB+1234",
+                description="TOB 1234 table lamp",
+                domain_score=90,
+            )
+        ]
+
+    class Resp:
+        status_code = 200
+        headers = {"content-type": "text/html"}
+        text = "<html><body>Search results for Visual Comfort TOB 1234 Table Lamp</body></html>"
+
+    monkeypatch.setattr("src.official_product_lookup.httpx.get", lambda *args, **kwargs: Resp())
+
+    result = lookup_official_product_page(row, search_fn=fake_search, validate_pages=True)
+
+    assert result.selected_url == ""
+    assert result.confidence == "NONE"
+    assert "page_validation_failed:generic_page" in result.candidate_pages[0]["reasons"]
 
 
 def test_product_lookup_cache_saves_and_reloads(tmp_path):
