@@ -36,6 +36,7 @@ from src.product_evidence import ProductEvidence, score_product_page
 from src.product_images import extract_product_page_image
 from src.product_lookup_cache import ProductLookupCache as _ProductLookupCache, make_lookup_cache_key
 from src.product_page_specs import extract_product_page_specs
+from src.product_resolver import resolve_product_page
 
 try:
     import html2text as _html2text
@@ -767,6 +768,12 @@ def _apply_official_product_lookup(
         "dimension_confidence": "",
         "dimension_evidence": "",
         "web_lookup_error": "",
+        "Product Resolution Confidence": "",
+        "Product Resolution Evidence": "",
+        "Product Resolution URL": "",
+        "Image Recovery Confidence": "",
+        "Image Recovery Source": "",
+        "Search Diagnostics": "",
     }
     def _stamp_debug_fields(target: dict) -> dict:
         for key, value in debug.items():
@@ -787,6 +794,12 @@ def _apply_official_product_lookup(
                 "dimension_confidence",
                 "dimension_evidence",
                 "web_lookup_error",
+                "Product Resolution Confidence",
+                "Product Resolution Evidence",
+                "Product Resolution URL",
+                "Image Recovery Confidence",
+                "Image Recovery Source",
+                "Search Diagnostics",
             }:
                 target[key] = value
         return target
@@ -798,30 +811,54 @@ def _apply_official_product_lookup(
     page_url = ""
     selected_html = ""
     selected_evidence: ProductEvidence | None = None
+    selected_resolution_candidate = None
     if cached:
         page_url = _str_val(cached.get("selected_product_page_url"))
         debug.update({k: cached.get(k, debug.get(k)) for k in debug})
     if not page_url:
-        page, diagnostics, queries, domains = _find_best_product_page_with_diagnostics(
+        resolution = resolve_product_page(
             row,
             session_cache=session_cache,
             budget=budget,
         )
+        page = resolution.selected
+        domains = _manufacturer_domains_for_search(row)
         debug.update({
             "brand_registry_match": bool(domains),
             "brand_registry_domains_checked": domains,
-            "brand_search_queries_used": queries,
-            "candidate_pages_found": len(diagnostics),
-            "candidate_page_scores": diagnostics,
+            "brand_search_queries_used": resolution.queries_tried,
+            "candidate_pages_found": len(resolution.diagnostics),
+            "candidate_page_scores": resolution.diagnostics,
             "selected_product_page_url": page.url if page else "",
-            "selected_product_page_score": page.evidence.score if page else 0,
-            "selected_product_page_reason": page.evidence.evidence_summary if page else "no_verified_product_page",
+            "selected_product_page_score": page.evidence_score if page else 0,
+            "selected_product_page_reason": (
+                f"resolver_confidence:{page.confidence};score:{page.evidence_score}"
+                if page else "no_verified_product_page"
+            ),
             "web_lookup_error": "" if page else "no_verified_product_page",
+            "Product Resolution Confidence": page.confidence if page else "none",
+            "Product Resolution Evidence": (
+                f"score={page.evidence_score};sku={page.matched_sku};brand={page.matched_brand};official={page.is_official_domain}"
+                if page else "no_verified_product_page"
+            ),
+            "Product Resolution URL": page.url if page else "",
+            "Search Diagnostics": resolution.diagnostics,
         })
         if page:
             page_url = page.url
             selected_html = page.html
-            selected_evidence = page.evidence
+            selected_resolution_candidate = page
+            selected_evidence = ProductEvidence(
+                confidence=page.confidence,
+                score=page.evidence_score,
+                matched_sku=page.matched_sku,
+                matched_brand=page.matched_brand,
+                matched_product_name=page.matched_product_name,
+                official_domain=page.is_official_domain,
+                domain=page.domain,
+                evidence_summary=_str_val(debug.get("selected_product_page_reason")),
+                rejection_reason=page.rejection_reason,
+            )
 
     if not page_url:
         updated["manufacturer_page_exact_sku"] = False
@@ -832,7 +869,22 @@ def _apply_official_product_lookup(
 
     html = selected_html or _fetch_page_html(page_url)
     if not html:
-        debug["web_lookup_error"] = debug.get("web_lookup_error") or "selected_page_fetch_failed"
+        extracted_fields = getattr(selected_resolution_candidate, "extracted_fields", {}) or {}
+        if not extracted_fields:
+            debug["web_lookup_error"] = debug.get("web_lookup_error") or "selected_page_fetch_failed"
+            return _stamp_debug_fields(updated), None, debug
+        updated = _apply_verified_page_extraction(updated, {
+            "Product Name": extracted_fields.get("Product Name", ""),
+            "Brand": extracted_fields.get("Brand", ""),
+            "Model/SKU": extracted_fields.get("Model/SKU", ""),
+            "Dimensions": extracted_fields.get("Dimensions", ""),
+            "Finish / Color": extracted_fields.get("Finish / Color", ""),
+            "Material": extracted_fields.get("Material", ""),
+            "Product Category": extracted_fields.get("Product Category", ""),
+        })
+        updated["manufacturer_page_exact_sku"] = bool(getattr(selected_resolution_candidate, "matched_sku", False))
+        if extracted_fields.get("Image URL") and not row_has_image(updated) and extracted_fields.get("image_confidence") in {"HIGH", "MEDIUM"}:
+            updated["Image URL"] = extracted_fields["Image URL"]
         return _stamp_debug_fields(updated), None, debug
 
     selected_reason = _str_val(debug.get("selected_product_page_reason"))
@@ -876,52 +928,57 @@ def _apply_official_product_lookup(
         specs,
         allow_overwrite=allow_verified_overwrite and page_confidence == "high",
     )
+    resolver_fields = getattr(selected_resolution_candidate, "extracted_fields", {}) or {}
+    if resolver_fields:
+        updated = _apply_verified_page_extraction(updated, resolver_fields)
     updated["manufacturer_page_exact_sku"] = exact_sku_confirmation
 
     existing_dims = _str_val(updated.get("Dimensions"))
     existing_dim_conf = _str_val(updated.get("Dimension Confidence")).lower() or "none"
-    if specs.dimensions and specs.confidence in {"high", "medium"}:
+    resolved_dimensions = specs.dimensions or _str_val(resolver_fields.get("Dimensions"))
+    resolved_dim_confidence = specs.confidence or _str_val(resolver_fields.get("dimension_confidence")) or "none"
+    if resolved_dimensions and resolved_dim_confidence in {"high", "medium"}:
         should_fill_dims = (
             not existing_dims
             or (
                 allow_verified_overwrite
-                and specs.confidence == "high"
-                and _CONF_RANK.get(specs.confidence, 0) > _CONF_RANK.get(existing_dim_conf, 0)
+                and resolved_dim_confidence == "high"
+                and _CONF_RANK.get(resolved_dim_confidence, 0) > _CONF_RANK.get(existing_dim_conf, 0)
             )
         )
         if should_fill_dims:
-            updated["Dimensions"] = specs.dimensions
-            if specs.width:
-                updated["Width (in)"] = specs.width
-            if specs.height:
-                updated["Height (in)"] = specs.height
-            if specs.depth:
-                updated["Depth (in)"] = specs.depth
+            updated["Dimensions"] = resolved_dimensions
+            if specs.width or resolver_fields.get("width"):
+                updated["Width (in)"] = specs.width or resolver_fields.get("width")
+            if specs.height or resolver_fields.get("height"):
+                updated["Height (in)"] = specs.height or resolver_fields.get("height")
+            if specs.depth or resolver_fields.get("depth"):
+                updated["Depth (in)"] = specs.depth or resolver_fields.get("depth")
             if specs.length:
                 updated["Length (in)"] = specs.length
             if specs.diameter:
                 updated["Diameter (in)"] = specs.diameter
             updated["Dimension Source URL"] = specs.source_url
-            updated["Dimension Confidence"] = specs.confidence
+            updated["Dimension Confidence"] = resolved_dim_confidence
             updated["Dimension Source Type"] = "official_product_page"
             updated["Dimension Lookup Status"] = "found"
             updated["dimension_source_url"] = specs.source_url
-            updated["dimension_confidence"] = specs.confidence
-            updated["dimension_evidence"] = specs.evidence
+            updated["dimension_confidence"] = resolved_dim_confidence
+            updated["dimension_evidence"] = specs.evidence or resolver_fields.get("dimension_evidence", "")
             updated["dimension_raw_text"] = specs.raw_text
             dim_result = _DimensionResult(
-                dimensions=specs.dimensions,
-                width=specs.width,
-                height=specs.height,
-                depth=specs.depth,
+                dimensions=resolved_dimensions,
+                width=specs.width or resolver_fields.get("width", ""),
+                height=specs.height or resolver_fields.get("height", ""),
+                depth=specs.depth or resolver_fields.get("depth", ""),
                 length=specs.length,
                 source_url=specs.source_url,
-                confidence=specs.confidence,
+                confidence=resolved_dim_confidence,
                 source_type="official_product_page",
                 status="found",
                 queries_tried=list(debug.get("brand_search_queries_used") or []),
                 urls_checked=[page_url],
-                evidence_text=specs.evidence or specs.raw_text,
+                evidence_text=specs.evidence or resolver_fields.get("dimension_evidence", "") or specs.raw_text,
             )
 
     for source, dest in (("finish", "Finish / Color"), ("material", "Material"), ("lead_time", "Lead Time"), ("weight", "Weight")):
@@ -945,12 +1002,29 @@ def _apply_official_product_lookup(
     if image.image_found:
         debug["selected_image_url"] = image.image_url
         debug["selected_image_reason"] = ";".join(image.evidence)
+        debug["Image Recovery Confidence"] = image.confidence
+        debug["Image Recovery Source"] = image.image_source
         if not _is_manual_image(updated) and not row_has_image(updated) and image.confidence in {"HIGH", "MEDIUM"}:
             updated["Image URL"] = image.image_url
             updated["image_source"] = image.image_source
             updated["confidence"] = image.confidence
             updated["evidence"] = ";".join(image.evidence)
             updated["needs_image_review"] = str(image.confidence != "HIGH")
+    if (
+        resolver_fields.get("Image URL")
+        and resolver_fields.get("image_confidence") in {"HIGH", "MEDIUM"}
+        and not _is_manual_image(updated)
+        and not row_has_image(updated)
+    ):
+        debug["selected_image_url"] = resolver_fields["Image URL"]
+        debug["selected_image_reason"] = resolver_fields.get("image_evidence", "")
+        debug["Image Recovery Confidence"] = resolver_fields.get("image_confidence", "")
+        debug["Image Recovery Source"] = resolver_fields.get("image_source", "verified_product_page")
+        updated["Image URL"] = resolver_fields["Image URL"]
+        updated["image_source"] = resolver_fields.get("image_source", "verified_product_page")
+        updated["confidence"] = resolver_fields.get("image_confidence", "")
+        updated["evidence"] = resolver_fields.get("image_evidence", "")
+        updated["needs_image_review"] = str(resolver_fields.get("image_confidence") != "HIGH")
 
     product_cache_key = ""
     brand_key = _str_val(updated.get("Brand"))
