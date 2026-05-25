@@ -113,12 +113,19 @@ _KNOWN_BRANDS = {
 
 
 def resolve_product_page(row: dict, session_cache=None, budget=None) -> ProductResolutionResult:
-    queries, official_domains = build_resolver_queries(row)
+    mode = _budget_mode(budget)
+    queries, official_domains = build_resolver_queries(row, mode=mode)
     candidates: list[ProductCandidate] = []
     urls_checked: list[str] = []
     seen_urls: set[str] = set()
+    stop_all = False
 
     for query in queries:
+        if stop_all:
+            break
+        if budget is not None and not budget.can_search() and not (session_cache is not None and query in session_cache.queries):
+            budget.stop("search budget exhausted")
+            break
         results = _search(query, row, session_cache, budget)
         for result in results[:5]:
             url = _text(getattr(result, "url", ""))
@@ -127,6 +134,8 @@ def resolve_product_page(row: dict, session_cache=None, budget=None) -> ProductR
                 continue
             seen_urls.add(key)
             if budget is not None and not _can_fetch(budget):
+                budget.stop("page fetch budget exhausted")
+                stop_all = True
                 break
             candidate = _candidate_from_search_result(result, official_domains)
             _fetch_candidate(candidate, session_cache, budget)
@@ -134,6 +143,11 @@ def resolve_product_page(row: dict, session_cache=None, budget=None) -> ProductR
             _extract_candidate_assets(candidate, row)
             candidates.append(candidate)
             urls_checked.append(url)
+            if candidate.confidence == "high":
+                if budget is not None:
+                    budget.stop("Stopped early: HIGH confidence official product page found")
+                stop_all = True
+                break
 
     selected = _select_candidate(candidates)
     diagnostics = [_diagnostic_record(candidate) for candidate in candidates]
@@ -141,12 +155,13 @@ def resolve_product_page(row: dict, session_cache=None, budget=None) -> ProductR
         setattr(session_cache, "product_resolution_diagnostics", diagnostics)
 
     if not selected:
+        reason = getattr(budget, "stopped_reason", "") or "no_high_or_medium_candidate"
         return ProductResolutionResult(
             candidates=candidates,
             diagnostics=diagnostics,
             queries_tried=queries,
             urls_checked=urls_checked,
-            rejection_reason="no_high_or_medium_candidate",
+            rejection_reason=reason,
         )
 
     return ProductResolutionResult(
@@ -161,7 +176,7 @@ def resolve_product_page(row: dict, session_cache=None, budget=None) -> ProductR
     )
 
 
-def build_resolver_queries(row: dict) -> tuple[list[str], list[str]]:
+def build_resolver_queries(row: dict, mode: str = "standard") -> tuple[list[str], list[str]]:
     brand = _text(row.get("Brand"))
     sku = _text(row.get("Model/SKU") or row.get("SKU") or row.get("_extracted_model_sku"))
     product_name = _text(row.get("Product Name"))
@@ -173,22 +188,35 @@ def build_resolver_queries(row: dict) -> tuple[list[str], list[str]]:
         if cleaned and cleaned not in queries:
             queries.append(cleaned)
 
-    for domain in official_domains:
-        if sku:
-            add(f'site:{domain} "{sku}"')
-            add(f'site:{domain} "{sku}" specifications')
-            add(f'site:{domain} "{sku}" dimensions')
-            add(f'site:{domain} "{sku}" product')
-            add(f'site:{domain} "{sku}" spec sheet')
-            add(f'site:{domain} "{sku}" filetype:pdf')
+    primary_domain = official_domains[0] if official_domains else ""
+    if primary_domain and sku:
+        add(f'site:{primary_domain} "{sku}"')
     if brand and sku:
         add(f'"{brand}" "{sku}" official product page')
-        add(f'"{brand}" "{sku}" specifications')
-        add(f'"{brand}" "{sku}" dimensions')
-    if brand and product_name and sku:
-        add(f'"{brand}" "{product_name}" "{sku}"')
-    if sku and product_name:
-        add(f'"{sku}" "{product_name}"')
+    if primary_domain and sku:
+        add(f'site:{primary_domain} "{sku}" spec sheet OR dimensions')
+
+    if mode in {"deep", "manual_retry"}:
+        for domain in official_domains:
+            if sku:
+                add(f'site:{domain} "{sku}" specifications')
+                add(f'site:{domain} "{sku}" dimensions')
+                add(f'site:{domain} "{sku}" product')
+                add(f'site:{domain} "{sku}" filetype:pdf')
+        if brand and sku:
+            add(f'"{brand}" "{sku}" specifications')
+            add(f'"{brand}" "{sku}" dimensions')
+        if brand and product_name and sku:
+            add(f'"{brand}" "{product_name}" "{sku}"')
+        if sku and product_name:
+            add(f'"{sku}" "{product_name}"')
+
+    if mode == "manual_retry" and brand and product_name:
+        add(f'"{brand}" "{product_name}" product image dimensions')
+    if mode == "fast":
+        queries = queries[:1]
+    elif mode == "standard":
+        queries = queries[:3]
     return queries, official_domains
 
 
@@ -422,6 +450,11 @@ def _official_domains(row: dict) -> list[str]:
 
 def _can_fetch(budget) -> bool:
     return budget is None or budget.can_fetch()
+
+
+def _budget_mode(budget) -> str:
+    mode = str(getattr(budget, "mode", "standard") or "standard")
+    return mode if mode in {"fast", "standard", "deep", "manual_retry"} else "standard"
 
 
 def _domain(url: str) -> str:
