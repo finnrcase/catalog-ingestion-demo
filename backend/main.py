@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import io
+import logging
 import os
 import sys
 import uuid
@@ -20,13 +21,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 _TMP_UPLOADS = ROOT / ".tmp" / "uploads"
+logger = logging.getLogger(__name__)
 
 from src.ai_extraction import extract_products_from_pdf_with_ai
 from src.confidence import apply_confidence_checks
 from src.document_parser import parse_pdf_rows
 from src.eligibility import split_eligible_rows
 from src.export import get_csv_bytes
-from src.intake import build_intake_dataframe, create_pdf_rows, create_url_rows
+from src.intake import build_intake_dataframe, create_pdf_rows, create_photo_rows, create_url_rows
 from src.intake_schema import CATEGORIES, STATUSES
 from src.image_uploader import is_public_https_image_url, upload_image
 from src.manufacturer_domains import save_manufacturer_override
@@ -247,6 +249,26 @@ def schema() -> dict:
     }
 
 
+def _upload_file_type(upload: UploadFile) -> str:
+    content_type = (upload.content_type or "").lower()
+    filename = (upload.filename or "").lower()
+    if content_type == "application/pdf" or filename.endswith(".pdf"):
+        return "pdf"
+    if content_type.startswith("image/") or filename.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif")):
+        return "image"
+    return "unsupported"
+
+
+def _log_upload_stage(stage: str, upload: UploadFile, file_type: str = "") -> None:
+    logger.info(
+        "[upload] stage=%s filename=%s mime=%s classified_type=%s",
+        stage,
+        upload.filename or "upload",
+        upload.content_type or "unknown",
+        file_type or "unknown",
+    )
+
+
 @app.post("/intake/generate", response_model=IntakeResponse)
 async def generate_intake(
     project: str = Form(""),
@@ -258,10 +280,36 @@ async def generate_intake(
     raw_urls = [line.strip() for line in urls.splitlines() if line.strip()]
     url_rows = create_url_rows(raw_urls, project, room, "", "")
     pdf_rows: list[dict] = []
+    photo_rows: list[dict] = []
     errors: list[str] = []
 
     for upload in files:
+        file_type = _upload_file_type(upload)
+        _log_upload_stage("validating", upload, file_type)
+        if file_type == "unsupported":
+            errors.append(
+                f"{upload.filename or 'upload'}: unsupported file type "
+                f"({upload.content_type or 'unknown'}). Upload a PDF or image file."
+            )
+            _log_upload_stage("error", upload, file_type)
+            continue
+
         content = await upload.read()
+
+        if file_type == "image":
+            _log_upload_stage("parsing", upload, file_type)
+            photo_rows.extend(create_photo_rows(
+                [{
+                    "image_filename": upload.filename or "product_photo",
+                    "image_upload_status": "Ready",
+                }],
+                project,
+                room,
+            ))
+            _log_upload_stage("complete", upload, file_type)
+            continue
+
+        _log_upload_stage("parsing", upload, file_type)
         pdf = UploadedPDF(upload.filename or "upload.pdf", content)
 
         if use_ai_pdf:
@@ -313,14 +361,16 @@ async def generate_intake(
                     source_pdf_bytes=content,
                     source_filename=pdf.name,
                 ))
+        _log_upload_stage("complete", upload, file_type)
 
-    if not url_rows and not pdf_rows:
-        raise HTTPException(status_code=400, detail="Upload a PDF or paste at least one URL.")
+    if not url_rows and not pdf_rows and not photo_rows:
+        detail = " ".join(errors) if errors else "Upload a PDF, image, or paste at least one URL."
+        raise HTTPException(status_code=400, detail=detail)
 
     pdf_rows, lookup_errors = enrich_pdf_rows_with_official_product_urls(pdf_rows)
     errors.extend(lookup_errors)
 
-    df = build_intake_dataframe(url_rows, pdf_rows)
+    df = build_intake_dataframe(url_rows, pdf_rows, manual_rows=photo_rows)
     df = apply_confidence_checks(df)
     return _df_response(df, errors)
 

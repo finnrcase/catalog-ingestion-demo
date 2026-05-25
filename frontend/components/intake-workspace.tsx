@@ -137,6 +137,51 @@ function bulkImageKey(file: File, index: number) {
   return `${index}:${file.name}:${file.size}:${file.lastModified}`;
 }
 
+type UploadFileKind = "pdf" | "image" | "unsupported";
+
+type UploadDebugInfo = {
+  fileName: string;
+  fileType: string;
+  fileSize: string;
+  failedStep: string;
+  errorMessage: string;
+  suggestedFix: string;
+};
+
+const UPLOAD_TIMEOUT_MS = 90_000;
+
+function classifyUploadFile(file: File): UploadFileKind {
+  const type = file.type.toLowerCase();
+  const name = file.name.toLowerCase();
+  if (type === "application/pdf" || name.endsWith(".pdf")) return "pdf";
+  if (type.startsWith("image/") || /\.(jpe?g|png|webp|gif|heic|heif)$/.test(name)) return "image";
+  return "unsupported";
+}
+
+function uploadFileSummary(filesToSummarize: File[]) {
+  if (!filesToSummarize.length) return "";
+  if (filesToSummarize.length === 1) return filesToSummarize[0].name;
+  return `${filesToSummarize[0].name} + ${filesToSummarize.length - 1} more`;
+}
+
+function uploadFileTypeSummary(filesToSummarize: File[]) {
+  const types = filesToSummarize.map((file) => file.type || "unknown").filter(Boolean);
+  return Array.from(new Set(types)).join(", ") || "unknown";
+}
+
+function suggestedUploadFix(kind: UploadFileKind, message: string) {
+  const lower = message.toLowerCase();
+  if (kind === "unsupported") return "Upload a PDF, JPG, PNG, or WebP file.";
+  if (kind === "image" && lower.includes("cloudinary")) return "Check Cloudinary settings, then retry the image upload.";
+  if (kind === "image") return "Try a JPG, PNG, or WebP image under the upload size limit.";
+  if (lower.includes("timed out")) return "Try a smaller file or retry after the backend finishes starting.";
+  return "Retry the upload. If it repeats, try a smaller file or a different supported format.";
+}
+
+function logUploadStage(stage: "selected" | "validating" | "parsing" | "complete" | "error", detail: Record<string, unknown> = {}) {
+  console.info("[upload]", { stage, ...detail });
+}
+
 function buildDefaultCallGoal(row: IntakeRow, missingFields: string[]) {
   const fieldText = missingFields.join(", ") || "details";
   const subject =
@@ -246,6 +291,9 @@ export function IntakeWorkspace() {
   }>>({});
   const [photoBulkSummary, setPhotoBulkSummary] = useState({ success: 0, failed: 0 });
   const [uploadError, setUploadError] = useState("");
+  const [uploadDebug, setUploadDebug] = useState<UploadDebugInfo | null>(null);
+  const [showUploadDebug, setShowUploadDebug] = useState(false);
+  const [uploadStatusText, setUploadStatusText] = useState("");
   const [useAiPdf, setUseAiPdf] = useState(true);
   const [rows, setRows] = useState<IntakeRow[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
@@ -376,29 +424,111 @@ export function IntakeWorkspace() {
     setRows((current) => current.map((row, i) => (i === index ? { ...row, [key]: value } : row)));
   }
 
-  function handleFileSelection(selectedFiles: FileList | null) {
+  function resetUploadErrorState() {
     setUploadError("");
+    setBulkImageError("");
+    setUploadDebug(null);
+    setShowUploadDebug(false);
+  }
+
+  function buildUploadDebug(filesForDebug: File[], failedStep: string, errorMessage: string, suggestedFix?: string): UploadDebugInfo {
+    const firstFile = filesForDebug[0];
+    return {
+      fileName: uploadFileSummary(filesForDebug) || "No file selected",
+      fileType: uploadFileTypeSummary(filesForDebug),
+      fileSize: firstFile ? formatFileSize(filesForDebug.reduce((total, file) => total + file.size, 0)) : "0 KB",
+      failedStep,
+      errorMessage,
+      suggestedFix: suggestedFix || suggestedUploadFix(firstFile ? classifyUploadFile(firstFile) : "unsupported", errorMessage),
+    };
+  }
+
+  function setUploadFailure(filesForDebug: File[], failedStep: string, errorMessage: string, target: "pdf" | "image" = "pdf", suggestedFix?: string) {
+    const debug = buildUploadDebug(filesForDebug, failedStep, errorMessage, suggestedFix);
+    if (target === "image") {
+      setBulkImageError(errorMessage);
+    } else {
+      setUploadError(errorMessage);
+    }
+    setUploadDebug(debug);
+    setShowUploadDebug(false);
+    logUploadStage("error", {
+      failedStep,
+      fileCount: filesForDebug.length,
+      fileTypes: debug.fileType,
+      error: errorMessage,
+    });
+  }
+
+  async function runUploadWithTimeout<T>(
+    run: (signal: AbortSignal) => Promise<T>,
+    timeoutMessage: string,
+  ): Promise<T> {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
+    try {
+      return await run(controller.signal);
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw new Error(timeoutMessage);
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+  }
+
+  function handleFileSelection(selectedFiles: FileList | null) {
+    resetUploadErrorState();
     try {
       const nextFiles = Array.from(selectedFiles ?? []);
-      const invalidFile = nextFiles.find(
-        (file) => file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf"),
-      );
+      logUploadStage("selected", { source: "primary_file_input", fileCount: nextFiles.length });
+      logUploadStage("validating", { source: "primary_file_input", fileTypes: uploadFileTypeSummary(nextFiles) });
+
+      const pdfFiles = nextFiles.filter((file) => classifyUploadFile(file) === "pdf");
+      const imageFiles = nextFiles.filter((file) => classifyUploadFile(file) === "image");
+      const invalidFile = nextFiles.find((file) => classifyUploadFile(file) === "unsupported");
+
       if (invalidFile) {
         setFiles([]);
-        setUploadError("Only PDF files can be uploaded.");
+        setUploadFailure(
+          [invalidFile],
+          "validating",
+          `Unsupported file type for ${invalidFile.name}. Upload a PDF or image file.`,
+          "pdf",
+          "Upload a PDF, JPG, PNG, or WebP file.",
+        );
         if (fileInputRef.current) fileInputRef.current.value = "";
         return;
       }
-      setFiles(nextFiles);
-    } catch {
+      setFiles(pdfFiles);
+      if (imageFiles.length) {
+        setBulkImages(imageFiles);
+        setPhotoBulkResults({});
+        setPhotoBulkSummary({ success: 0, failed: 0 });
+        if (bulkImageInputRef.current) bulkImageInputRef.current.value = "";
+      }
+      if (pdfFiles.length === 0 && imageFiles.length > 0 && fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+      logUploadStage("complete", {
+        source: "primary_file_input",
+        pdfCount: pdfFiles.length,
+        imageCount: imageFiles.length,
+      });
+    } catch (error) {
       setFiles([]);
-      setUploadError("Upload failed. Please choose the PDF again.");
+      setUploadFailure(
+        Array.from(selectedFiles ?? []),
+        "validating",
+        error instanceof Error ? error.message : "Upload failed. Please choose the file again.",
+      );
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   }
 
   function removeFile(index: number) {
-    setUploadError("");
+    resetUploadErrorState();
     setFiles((current) => {
       const nextFiles = current.filter((_, fileIndex) => fileIndex !== index);
       if (nextFiles.length === 0 && fileInputRef.current) fileInputRef.current.value = "";
@@ -407,25 +537,42 @@ export function IntakeWorkspace() {
   }
 
   function handleBulkImageSelection(selectedFiles: FileList | File[] | null) {
-    setBulkImageError("");
     const nextFiles = Array.from(selectedFiles ?? []);
-    const accepted = new Set(["image/jpeg", "image/png", "image/webp"]);
-    const invalidFile = nextFiles.find((file) => {
-      const name = file.name.toLowerCase();
-      return !accepted.has(file.type) && !/\.(jpe?g|png|webp)$/.test(name);
-    });
+    resetUploadErrorState();
+    logUploadStage("selected", { source: "photo_file_input", fileCount: nextFiles.length });
+    logUploadStage("validating", { source: "photo_file_input", fileTypes: uploadFileTypeSummary(nextFiles) });
+
+    const imageFiles = nextFiles.filter((file) => classifyUploadFile(file) === "image");
+    const pdfFiles = nextFiles.filter((file) => classifyUploadFile(file) === "pdf");
+    const invalidFile = nextFiles.find((file) => classifyUploadFile(file) === "unsupported");
+
     if (invalidFile) {
-      setBulkImageError("Only JPG, PNG, and WebP images can be uploaded.");
+      setUploadFailure(
+        [invalidFile],
+        "validating",
+        `Unsupported file type for ${invalidFile.name}. Upload a PDF or image file.`,
+        "image",
+        "Upload a PDF, JPG, PNG, or WebP file.",
+      );
       return;
     }
-    setBulkImages(nextFiles);
+    if (pdfFiles.length) {
+      setFiles(pdfFiles);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+    setBulkImages(imageFiles);
     setPhotoBulkResults({});
     setPhotoBulkSummary({ success: 0, failed: 0 });
+    logUploadStage("complete", {
+      source: "photo_file_input",
+      pdfCount: pdfFiles.length,
+      imageCount: imageFiles.length,
+    });
   }
 
   function clearBulkImages() {
     setBulkImages([]);
-    setBulkImageError("");
+    resetUploadErrorState();
     setPhotoBulkResults({});
     setPhotoBulkSummary({ success: 0, failed: 0 });
     if (bulkImageInputRef.current) bulkImageInputRef.current.value = "";
@@ -459,20 +606,23 @@ export function IntakeWorkspace() {
 
   async function handlePhotoBulkCreate() {
     if (!bulkImages.length) {
-      setBulkImageError("Choose at least one image first.");
+      setUploadFailure([], "validating", "Choose at least one image first.", "image", "Select one or more JPG, PNG, or WebP images.");
       return;
     }
     const selectedSection = photoBulkSection === "__custom__" ? photoBulkCustomSection.trim() : photoBulkSection;
     if (!selectedSection.trim()) {
-      setBulkImageError("Choose a section before creating rows.");
+      setUploadFailure(bulkImages, "validating", "Choose a section before creating rows.", "image", "Pick a section for the photo rows, then retry.");
       return;
     }
     setBusy("photoBulk");
-    setBulkImageError("");
+    setUploadStatusText("Processing image...");
+    resetUploadErrorState();
     setMessage("");
+    logUploadStage("parsing", { source: "photo_upload", fileCount: bulkImages.length });
     const nextResults: typeof photoBulkResults = {};
     let success = 0;
     let failed = 0;
+    let firstFailure: UploadDebugInfo | null = null;
     const createdRows: IntakeRow[] = [];
     const startIndex = rows.length;
 
@@ -481,7 +631,10 @@ export function IntakeWorkspace() {
       nextResults[key] = { status: "queued" };
       setPhotoBulkResults({ ...nextResults });
       try {
-        const response = await uploadImage(file);
+        const response = await runUploadWithTimeout(
+          (signal) => uploadImage(file, { signal }),
+          "Image processing timed out. Please retry with a smaller image.",
+        );
         const secureUrl = response.secure_url || "";
         if (!isPublicHttpsImageUrl(secureUrl)) throw new Error("Cloudinary did not return a public HTTPS URL.");
         const row = createPhotoOnlyRow(file, index, secureUrl, "Needs Review");
@@ -496,6 +649,14 @@ export function IntakeWorkspace() {
           error: error instanceof Error ? error.message : "Upload failed.",
           rowIndex: startIndex + createdRows.length - 1,
         };
+        if (!firstFailure) {
+          firstFailure = buildUploadDebug(
+            [file],
+            "parsing",
+            error instanceof Error ? error.message : "Upload failed.",
+            suggestedUploadFix("image", error instanceof Error ? error.message : "Upload failed."),
+          );
+        }
         failed += 1;
       }
       setPhotoBulkResults({ ...nextResults });
@@ -507,11 +668,22 @@ export function IntakeWorkspace() {
       setRows(response.rows);
       setErrors(response.errors);
       setMessage(`Photo-only bulk import created ${success} row${success === 1 ? "" : "s"} with images; ${failed} failed.`);
+      if (firstFailure) {
+        setBulkImageError(`${failed} image${failed === 1 ? "" : "s"} could not be processed.`);
+        setUploadDebug(firstFailure);
+      }
+      logUploadStage(failed ? "error" : "complete", { source: "photo_upload", success, failed });
     } catch {
       setRows((current) => [...current, ...createdRows]);
       setMessage(`Photo-only bulk import created ${success} row${success === 1 ? "" : "s"} with images; ${failed} failed.`);
+      if (firstFailure) {
+        setBulkImageError(`${failed} image${failed === 1 ? "" : "s"} could not be processed.`);
+        setUploadDebug(firstFailure);
+      }
+      logUploadStage(failed ? "error" : "complete", { source: "photo_upload", success, failed });
     } finally {
       setBusy("");
+      setUploadStatusText("");
     }
   }
 
@@ -521,7 +693,10 @@ export function IntakeWorkspace() {
     if (!result || result.rowIndex === undefined) return;
     setPhotoBulkResults((current) => ({ ...current, [key]: { ...result, status: "queued", error: "" } }));
     try {
-      const response = await uploadImage(file);
+      const response = await runUploadWithTimeout(
+        (signal) => uploadImage(file, { signal }),
+        "Image processing timed out. Please retry with a smaller image.",
+      );
       const secureUrl = response.secure_url || "";
       if (!isPublicHttpsImageUrl(secureUrl)) throw new Error("Cloudinary did not return a public HTTPS URL.");
       const nextRows = rows.map((row, rowIndex) =>
@@ -561,7 +736,10 @@ export function IntakeWorkspace() {
     if (!file) return;
     setProductImageUploads((current) => ({ ...current, [rowIndex]: "Uploading..." }));
     try {
-      const response = await uploadImage(file);
+      const response = await runUploadWithTimeout(
+        (signal) => uploadImage(file, { signal }),
+        "Image processing timed out. Please retry with a smaller image.",
+      );
       const secureUrl = response.secure_url || "";
       if (!isPublicHttpsImageUrl(secureUrl)) throw new Error("Upload did not return a public image URL.");
       setRows((current) =>
@@ -598,18 +776,42 @@ export function IntakeWorkspace() {
       return;
     }
     setBusy("generate");
+    setUploadStatusText(files.length > 0 ? "Reading PDF..." : "Creating intake...");
     setMessage("");
     setErrors([]);
+    resetUploadErrorState();
+    logUploadStage("parsing", {
+      source: "intake_generate",
+      pdfCount: files.length,
+      imageCount: bulkImages.length,
+      hasUrls: Boolean(urls.trim()),
+    });
     try {
-      const response = await generateIntakeTable({ project, room, urls, useAiPdf, files });
+      const response = await runUploadWithTimeout(
+        (signal) => generateIntakeTable({ project, room, urls, useAiPdf, files }, { signal }),
+        "PDF reading timed out. Please retry with a smaller PDF.",
+      );
       setRows(response.rows);
       setErrors(response.errors);
       setPhotoDiscoveryReport(null);
       setMessage("Intake table is ready for review.");
+      logUploadStage("complete", { source: "intake_generate", rows: response.rows.length, errors: response.errors.length });
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not generate the intake table.");
+      const message = error instanceof Error ? error.message : "Could not generate the intake table.";
+      setMessage(message);
+      if (files.length || bulkImages.length) {
+        setUploadFailure(
+          files.length ? files : bulkImages,
+          "parsing",
+          message,
+          files.length ? "pdf" : "image",
+        );
+      } else {
+        logUploadStage("error", { source: "intake_generate", error: message });
+      }
     } finally {
       setBusy("");
+      setUploadStatusText("");
     }
   }
 
@@ -787,7 +989,7 @@ export function IntakeWorkspace() {
                   ref={fileInputRef}
                   className="hidden"
                   type="file"
-                  accept="application/pdf"
+                  accept="application/pdf,image/jpeg,image/png,image/webp,.pdf,.jpg,.jpeg,.png,.webp"
                   multiple
                   onChange={(event) => handleFileSelection(event.target.files)}
                 />
@@ -835,7 +1037,28 @@ export function IntakeWorkspace() {
 
             {uploadError || bulkImageError ? (
               <div className="rounded-xl border border-clay/20 bg-clay/10 px-3 py-2 text-sm text-clay">
-                {uploadError || bulkImageError}
+                <div className="flex flex-wrap items-center gap-2">
+                  <span>{uploadError || bulkImageError}</span>
+                  {uploadDebug ? (
+                    <button
+                      type="button"
+                      className="rounded-full border border-clay/30 px-2 py-0.5 text-xs font-semibold"
+                      onClick={() => setShowUploadDebug((current) => !current)}
+                    >
+                      Debug
+                    </button>
+                  ) : null}
+                </div>
+                {uploadDebug && showUploadDebug ? (
+                  <div className="mt-2 grid gap-1 rounded-lg border border-clay/20 bg-white/70 p-2 text-xs text-charcoal">
+                    <div><span className="font-semibold">File:</span> {uploadDebug.fileName}</div>
+                    <div><span className="font-semibold">Type:</span> {uploadDebug.fileType}</div>
+                    <div><span className="font-semibold">Size:</span> {uploadDebug.fileSize}</div>
+                    <div><span className="font-semibold">Failed step:</span> {uploadDebug.failedStep}</div>
+                    <div><span className="font-semibold">Error:</span> {uploadDebug.errorMessage}</div>
+                    <div><span className="font-semibold">Suggested fix:</span> {uploadDebug.suggestedFix}</div>
+                  </div>
+                ) : null}
               </div>
             ) : null}
 
@@ -919,7 +1142,7 @@ export function IntakeWorkspace() {
                   onClick={handlePhotoBulkCreate}
                 >
                   {busy === "photoBulk" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageIcon className="h-4 w-4" />}
-                  Upload Photos
+                  {busy === "photoBulk" ? uploadStatusText || "Processing image..." : "Upload Photos"}
                 </button>
               </div>
             ) : null}
@@ -947,7 +1170,7 @@ export function IntakeWorkspace() {
                 ) : (
                   <FileText className="h-4 w-4" />
                 )}
-                {onlyPhotosSelected ? "Upload Photos" : "Upload"}
+                {uploadBusy ? uploadStatusText || (busy === "photoBulk" ? "Processing image..." : "Reading PDF...") : onlyPhotosSelected ? "Upload Photos" : "Upload"}
               </button>
               {message ? <p className="text-sm text-charcoal/65">{message}</p> : null}
             </div>

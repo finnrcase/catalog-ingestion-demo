@@ -38,6 +38,7 @@ async function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
   try {
     return await fetch(input, init);
   } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
     if (error instanceof Error && error.message === BACKEND_UNAVAILABLE) throw error;
     throw new Error(BACKEND_UNAVAILABLE);
   }
@@ -71,7 +72,7 @@ export async function generateIntakeTable(input: {
   urls: string;
   useAiPdf: boolean;
   files: File[];
-}): Promise<IntakeResponse> {
+}, options?: { signal?: AbortSignal }): Promise<IntakeResponse> {
   const form = new FormData();
   form.append("project", input.project);
   form.append("room", input.room);
@@ -80,17 +81,17 @@ export async function generateIntakeTable(input: {
   input.files.forEach((file) => form.append("files", file));
 
   return parseJson<IntakeResponse>(
-    await apiFetch(apiUrl("/intake/generate"), { method: "POST", body: form }),
+    await apiFetch(apiUrl("/intake/generate"), { method: "POST", body: form, signal: options?.signal }),
   );
 }
 
 export const generateIntake = generateIntakeTable;
 
-export async function uploadImage(file: File): Promise<{ secure_url: string }> {
+export async function uploadImage(file: File, options?: { signal?: AbortSignal }): Promise<{ secure_url: string }> {
   const form = new FormData();
   form.append("file", file);
   return parseJson<{ secure_url: string }>(
-    await apiFetch(apiUrl("/api/upload-image"), { method: "POST", body: form }),
+    await apiFetch(apiUrl("/api/upload-image"), { method: "POST", body: form, signal: options?.signal }),
   );
 }
 

@@ -95,3 +95,28 @@ def test_generate_intake_ai_error_falls_back_to_local_pdf_parser(monkeypatch):
     assert body["rows"][0]["_source_filename"] == "spec.pdf"
     assert body["rows"][0]["_source_page_number"] == 1
     assert body["rows"][0]["_extracted_model_sku"] == "MDD30TS"
+
+
+def test_generate_intake_routes_image_uploads_to_photo_rows(monkeypatch):
+    from unittest.mock import patch as _patch
+    from fastapi.testclient import TestClient
+    import backend.main as bm
+
+    image_bytes = b"\x89PNG\r\n\x1a\nfake"
+
+    with _patch("backend.main.parse_pdf_rows", side_effect=AssertionError("image should not use PDF parser")), \
+         _patch("backend.main.extract_products_from_pdf_with_ai", side_effect=AssertionError("image should not use AI PDF parser")), \
+         _patch("backend.main.enrich_pdf_rows_with_official_product_urls", side_effect=lambda rows: (rows, [])):
+        client = TestClient(bm.app)
+        resp = client.post(
+            "/intake/generate",
+            data={"project": "SCH", "room": "Living", "use_ai_pdf": "true"},
+            files={"files": ("chair.png", image_bytes, "image/png")},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["rows"][0]["Source Type"] == "Photo"
+    assert body["rows"][0]["Import Type"] == "Photo Upload"
+    assert body["rows"][0]["Image Filename"] == "chair.png"
+    assert body["rows"][0]["Image Upload Status"] == "Ready"
