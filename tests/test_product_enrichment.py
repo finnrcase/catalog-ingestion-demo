@@ -11,6 +11,19 @@ from src.product_enrichment import (
 )
 
 
+def _resolver_response(url: str, html: str):
+    class Resp:
+        status_code = 200
+        headers = {"content-type": "text/html"}
+        content = html.encode("utf-8")
+
+        def __init__(self):
+            self.text = html
+            self.url = url
+
+    return Resp()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_caches(monkeypatch, tmp_path):
     """Isolate each test from all cache singletons and manufacturer_domains disk writes."""
@@ -695,8 +708,8 @@ def test_enrich_row_extracts_and_fills_image_url():
         "Product Name": "Wolf Drawer Microwave",
         "Dimensions": "", "Finish / Color": "", "Product Category": "Appliance", "materials": "",
     }
-    with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
-         patch("src.product_enrichment._fetch_page_html", return_value=html_with_image), \
+    with patch("src.product_resolver.search_product_candidates", return_value=[good_result]), \
+         patch("src.product_resolver.httpx.get", return_value=_resolver_response(good_result.url, html_with_image)), \
          patch("src.product_enrichment._extract_with_claude", return_value=extracted), \
          patch("src.product_enrichment._check_image_content_type", return_value=True):
         updated, error, _ = enrich_row(_qualifying_row())
@@ -721,8 +734,8 @@ def test_enrich_row_invalid_image_not_stored(monkeypatch, tmp_path):
     </html>
     """
     extracted = {"Product Name": "", "Dimensions": "", "Finish / Color": "", "Product Category": "", "materials": ""}
-    with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
-         patch("src.product_enrichment._fetch_page_html", return_value=html_with_image), \
+    with patch("src.product_resolver.search_product_candidates", return_value=[good_result]), \
+         patch("src.product_resolver.httpx.get", return_value=_resolver_response(good_result.url, html_with_image)), \
          patch("src.product_enrichment._extract_with_claude", return_value=extracted), \
          patch("src.product_enrichment._check_image_content_type", return_value=False):
         updated, _, _ = enrich_row(_qualifying_row())
@@ -747,8 +760,8 @@ def test_enrich_row_image_written_to_cache(monkeypatch, tmp_path):
     </html>
     """
     extracted = {"Product Name": "", "Dimensions": "", "Finish / Color": "", "Product Category": "", "materials": ""}
-    with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
-         patch("src.product_enrichment._fetch_page_html", return_value=html), \
+    with patch("src.product_resolver.search_product_candidates", return_value=[good_result]), \
+         patch("src.product_resolver.httpx.get", return_value=_resolver_response(good_result.url, html)), \
          patch("src.product_enrichment._extract_with_claude", return_value=extracted), \
          patch("src.product_enrichment._check_image_content_type", return_value=True):
         enrich_row(_qualifying_row())
@@ -778,8 +791,8 @@ def test_enrich_row_does_not_overwrite_cached_image(monkeypatch, tmp_path):
     </html>
     """
     extracted = {"Product Name": "", "Dimensions": "", "Finish / Color": "", "Product Category": "", "materials": ""}
-    with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
-         patch("src.product_enrichment._fetch_page_html", return_value=html), \
+    with patch("src.product_resolver.search_product_candidates", return_value=[good_result]), \
+         patch("src.product_resolver.httpx.get", return_value=_resolver_response(good_result.url, html)), \
          patch("src.product_enrichment._extract_with_claude", return_value=extracted), \
          patch("src.product_enrichment._check_image_content_type", return_value=True):
         enrich_row(_qualifying_row())
@@ -864,8 +877,8 @@ def test_enrich_row_low_score_result_leaves_note():
 
 def test_enrich_row_fetch_failure_leaves_note():
     good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
-    with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
-         patch("src.product_enrichment._fetch_page_html", return_value=""):
+    with patch("src.product_resolver.search_product_candidates", return_value=[good_result]), \
+         patch("src.product_resolver.httpx.get", side_effect=RuntimeError("fetch failed")):
         updated, error, _ = enrich_row(_qualifying_row())
     assert "[Enrichment: no confident source found]" in updated["Notes"]
 
@@ -879,8 +892,8 @@ def test_enrich_row_fills_fields_on_success():
         "Product Category": "Appliance",
         "materials": "",
     }
-    with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
-         patch("src.product_enrichment._fetch_page_html", return_value="Wolf MDD30TS official page content"), \
+    with patch("src.product_resolver.search_product_candidates", return_value=[good_result]), \
+         patch("src.product_resolver.httpx.get", return_value=_resolver_response(good_result.url, "Wolf MDD30TS official page content")), \
          patch("src.product_enrichment._extract_with_claude", return_value=extracted):
         updated, error, _ = enrich_row(_qualifying_row())
 
@@ -1354,8 +1367,8 @@ def test_enrich_row_uses_official_registry_page_for_specs_and_image(monkeypatch)
             domain_score=80,
         )]
 
-    monkeypatch.setattr(pe, "search_product_candidates", fake_search)
-    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: _official_html())
+    monkeypatch.setattr("src.product_resolver.search_product_candidates", fake_search)
+    monkeypatch.setattr("src.product_resolver.httpx.get", lambda url, **kwargs: _resolver_response(url, _official_html()))
 
     row = {
         "Source Type": "PDF",
@@ -1394,13 +1407,13 @@ def test_manual_uploaded_image_is_not_overwritten_by_official_lookup(monkeypatch
     from src.brave_search import SearchResult
     import src.product_enrichment as pe
 
-    monkeypatch.setattr(pe, "search_product_candidates", lambda *a, **k: [SearchResult(
+    monkeypatch.setattr("src.product_resolver.search_product_candidates", lambda *a, **k: [SearchResult(
         title="Visual Comfort TOB 1234 Table Lamp",
         url="https://www.visualcomfort.com/products/tob-1234",
         description="TOB 1234 dimensions",
         domain_score=80,
     )])
-    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: _official_html())
+    monkeypatch.setattr("src.product_resolver.httpx.get", lambda url, **kwargs: _resolver_response(url, _official_html()))
 
     row = {
         "Source Type": "PDF",
@@ -1423,13 +1436,13 @@ def test_verified_page_preserves_existing_populated_fields(monkeypatch):
     from src.brave_search import SearchResult
     import src.product_enrichment as pe
 
-    monkeypatch.setattr(pe, "search_product_candidates", lambda *a, **k: [SearchResult(
+    monkeypatch.setattr("src.product_resolver.search_product_candidates", lambda *a, **k: [SearchResult(
         title="Visual Comfort TOB 1234 Table Lamp",
         url="https://www.visualcomfort.com/products/tob-1234",
         description="TOB 1234 dimensions",
         domain_score=80,
     )])
-    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: _official_html())
+    monkeypatch.setattr("src.product_resolver.httpx.get", lambda url, **kwargs: _resolver_response(url, _official_html()))
 
     row = {
         "Source Type": "PDF",
@@ -1459,13 +1472,13 @@ def test_low_confidence_page_image_is_diagnostic_only(monkeypatch):
     from src.product_page_images import ProductPageImageResult
     import src.product_enrichment as pe
 
-    monkeypatch.setattr(pe, "search_product_candidates", lambda *a, **k: [SearchResult(
+    monkeypatch.setattr("src.product_resolver.search_product_candidates", lambda *a, **k: [SearchResult(
         title="Visual Comfort TOB 1234 Table Lamp",
         url="https://www.visualcomfort.com/products/tob-1234",
         description="TOB 1234 dimensions",
         domain_score=80,
     )])
-    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: _official_html())
+    monkeypatch.setattr("src.product_resolver.httpx.get", lambda url, **kwargs: _resolver_response(url, _official_html()))
     monkeypatch.setattr(pe, "extract_product_page_image", lambda *a, **k: ProductPageImageResult(
         image_found=True,
         image_url="https://www.visualcomfort.com/images/low-confidence.jpg",
@@ -1498,8 +1511,8 @@ def test_low_confidence_page_image_is_diagnostic_only(monkeypatch):
 def test_existing_medium_pdf_image_not_overwritten_by_low_web_image(monkeypatch):
     import src.product_enrichment as pe
 
-    monkeypatch.setattr(pe, "search_product_candidates", lambda *a, **k: [])
-    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: _official_html())
+    monkeypatch.setattr("src.product_resolver.search_product_candidates", lambda *a, **k: [])
+    monkeypatch.setattr("src.product_resolver.httpx.get", lambda url, **kwargs: _resolver_response(url, _official_html()))
 
     row = {
         "Source Type": "PDF",
@@ -1524,13 +1537,13 @@ def test_existing_high_dimensions_not_overwritten_by_medium_page(monkeypatch):
     import src.product_enrichment as pe
 
     html = _official_html().replace("TOB 1234", "Table Lamp")
-    monkeypatch.setattr(pe, "search_product_candidates", lambda *a, **k: [SearchResult(
+    monkeypatch.setattr("src.product_resolver.search_product_candidates", lambda *a, **k: [SearchResult(
         title="Visual Comfort Table Lamp",
         url="https://www.visualcomfort.com/products/table-lamp",
         description="Table Lamp dimensions",
         domain_score=80,
     )])
-    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: html)
+    monkeypatch.setattr("src.product_resolver.httpx.get", lambda url, **kwargs: _resolver_response(url, html))
 
     row = {
         "Source Type": "PDF",
@@ -1552,14 +1565,19 @@ def test_manufacturer_page_does_not_overwrite_pdf_values_without_exact_sku(monke
     from src.brave_search import SearchResult
     import src.product_enrichment as pe
 
-    html = _official_html().replace("TOB 1234", "OTHER 999").replace("Visual Comfort Table Lamp", "Manufacturer Name")
-    monkeypatch.setattr(pe, "search_product_candidates", lambda *a, **k: [SearchResult(
+    html = (
+        _official_html()
+        .replace("TOB 1234", "OTHER 999")
+        .replace("tob-1234", "other-999")
+        .replace("Visual Comfort Table Lamp", "Manufacturer Name")
+    )
+    monkeypatch.setattr("src.product_resolver.search_product_candidates", lambda *a, **k: [SearchResult(
         title="Visual Comfort Table Lamp",
         url="https://www.visualcomfort.com/products/table-lamp",
         description="dimensions",
         domain_score=80,
     )])
-    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: html)
+    monkeypatch.setattr("src.product_resolver.httpx.get", lambda url, **kwargs: _resolver_response(url, html))
 
     row = {
         "Source Type": "PDF",

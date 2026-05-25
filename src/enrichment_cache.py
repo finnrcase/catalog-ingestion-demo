@@ -6,9 +6,10 @@ Public API
 ----------
 normalize_key(brand, model) -> str
 normalize_mode(mode) -> str
-budget_for_mode(mode) -> SearchBudget
+budget_for_mode(mode) -> ProductLookupBudget
 confidence_ok(entry, field_name) -> bool
-SearchBudget       — per-product Brave call counter
+ProductLookupBudget — per-product Brave/page/AI call counter
+SearchBudget       — backwards-compatible alias
 SessionCache       — in-memory per-run query/URL dedup store
 ManufacturerDomainCache  — persistent data/manufacturer_domain_cache.json
 ProductEnrichmentCache   — persistent data/product_enrichment_cache.json
@@ -22,6 +23,8 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from src.product_lookup_budget import ProductLookupBudget
+
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 _MFR_CACHE_PATH = os.path.normpath(os.path.join(_DATA_DIR, "manufacturer_domain_cache.json"))
 _PRODUCT_CACHE_PATH = os.path.normpath(os.path.join(_DATA_DIR, "product_enrichment_cache.json"))
@@ -29,9 +32,10 @@ _PRODUCT_CACHE_PATH = os.path.normpath(os.path.join(_DATA_DIR, "product_enrichme
 _CACHE_ENABLED: bool = os.getenv("ENRICHMENT_CACHE_ENABLED", "true").lower() != "false"
 
 _MODE_LIMITS: dict[str, dict] = {
-    "fast":     {"max_searches": 1, "max_urls": 3,  "retailer": False, "general_fallback": False},
-    "standard": {"max_searches": 4, "max_urls": 5,  "retailer": False, "general_fallback": True},
-    "deep":     {"max_searches": 8, "max_urls": 10, "retailer": True,  "general_fallback": True},
+    "fast": {"max_searches": 1, "max_urls": 2, "max_ai_calls": 0, "retailer": False, "general_fallback": False},
+    "standard": {"max_searches": 3, "max_urls": 6, "max_ai_calls": 1, "retailer": False, "general_fallback": True},
+    "deep": {"max_searches": 6, "max_urls": 12, "max_ai_calls": 2, "retailer": True, "general_fallback": True},
+    "manual_retry": {"max_searches": 10, "max_urls": 20, "max_ai_calls": 3, "retailer": True, "general_fallback": True},
 }
 
 VALID_MODES: frozenset[str] = frozenset(_MODE_LIMITS)
@@ -59,14 +63,17 @@ def normalize_mode(mode: str) -> str:
     return mode if mode in VALID_MODES else "standard"
 
 
-def budget_for_mode(mode: str) -> "SearchBudget":
-    """Create a SearchBudget for the given enrichment mode, respecting env overrides."""
+def budget_for_mode(mode: str) -> ProductLookupBudget:
+    """Create a ProductLookupBudget for the given enrichment mode, respecting env overrides."""
     limits = _MODE_LIMITS[normalize_mode(mode)]
     env_searches = os.getenv("BRAVE_MAX_SEARCHES_PER_PRODUCT")
     env_urls = os.getenv("ENRICHMENT_MAX_URLS_PER_PRODUCT")
-    return SearchBudget(
+    env_ai_calls = os.getenv("ENRICHMENT_MAX_AI_CALLS_PER_PRODUCT")
+    return ProductLookupBudget(
         max_searches=int(env_searches) if env_searches else limits["max_searches"],
         max_urls=int(env_urls) if env_urls else limits["max_urls"],
+        max_ai_calls=int(env_ai_calls) if env_ai_calls else limits["max_ai_calls"],
+        mode=normalize_mode(mode),
         allows_retailer=limits["retailer"],
         allows_general_fallback=limits["general_fallback"],
     )
@@ -80,26 +87,7 @@ def confidence_ok(entry: dict, field_name: str) -> bool:
 
 # ── SearchBudget ───────────────────────────────────────────────────────────────
 
-@dataclass
-class SearchBudget:
-    max_searches: int
-    max_urls: int
-    allows_retailer: bool = False
-    allows_general_fallback: bool = True
-    searches_used: int = 0
-    urls_used: int = 0
-
-    def can_search(self) -> bool:
-        return self.searches_used < self.max_searches
-
-    def can_fetch(self) -> bool:
-        return self.urls_used < self.max_urls
-
-    def consume_search(self) -> None:
-        self.searches_used += 1
-
-    def consume_fetch(self) -> None:
-        self.urls_used += 1
+SearchBudget = ProductLookupBudget
 
 
 # ── SessionCache ───────────────────────────────────────────────────────────────

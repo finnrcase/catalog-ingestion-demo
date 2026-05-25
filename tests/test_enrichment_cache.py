@@ -29,6 +29,7 @@ def test_normalize_mode_valid():
     assert normalize_mode("fast") == "fast"
     assert normalize_mode("standard") == "standard"
     assert normalize_mode("deep") == "deep"
+    assert normalize_mode("manual_retry") == "manual_retry"
 
 
 def test_normalize_mode_invalid_falls_back_to_standard():
@@ -59,8 +60,9 @@ def test_search_budget_exhausted():
 def test_budget_for_mode_standard_defaults():
     from src.enrichment_cache import budget_for_mode
     b = budget_for_mode("standard")
-    assert b.max_searches == 4
-    assert b.max_urls == 5
+    assert b.max_searches == 3
+    assert b.max_urls == 6
+    assert b.max_ai_calls == 1
     assert not b.allows_retailer
     assert b.allows_general_fallback
 
@@ -69,6 +71,8 @@ def test_budget_for_mode_fast():
     from src.enrichment_cache import budget_for_mode
     b = budget_for_mode("fast")
     assert b.max_searches == 1
+    assert b.max_urls == 2
+    assert b.max_ai_calls == 0
     assert not b.allows_retailer
     assert not b.allows_general_fallback
 
@@ -76,9 +80,20 @@ def test_budget_for_mode_fast():
 def test_budget_for_mode_deep():
     from src.enrichment_cache import budget_for_mode
     b = budget_for_mode("deep")
-    assert b.max_searches == 8
+    assert b.max_searches == 6
+    assert b.max_urls == 12
+    assert b.max_ai_calls == 2
     assert b.allows_retailer
     assert b.allows_general_fallback
+
+
+def test_budget_for_mode_manual_retry():
+    from src.enrichment_cache import budget_for_mode
+    b = budget_for_mode("manual_retry")
+    assert b.max_searches == 10
+    assert b.max_urls == 20
+    assert b.max_ai_calls == 3
+    assert b.allows_retailer
 
 
 # ── SessionCache ───────────────────────────────────────────────────────────────

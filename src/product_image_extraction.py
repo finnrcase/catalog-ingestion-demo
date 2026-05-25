@@ -129,7 +129,8 @@ def select_best_product_image(candidates: list[ImageCandidate], product_evidence
     page_verified = page_confidence in {"high", "medium"}
     best: ImageCandidate | None = None
     for candidate in candidates:
-        _score(candidate, getattr(product_evidence, "row", {}) or {}, page_verified, page_confidence)
+        if not candidate.evidence and not candidate.rejection_reason:
+            _score(candidate, getattr(product_evidence, "row", {}) or {}, page_verified, page_confidence)
         if candidate.rejection_reason:
             continue
         if best is None or (
@@ -279,11 +280,11 @@ def _large_enough(width: int | None, height: int | None) -> bool:
 
 def _source_score(source: str) -> int:
     return {
-        "jsonld_image": 45,
-        "og_image": 40,
+        "jsonld_image": 95,
+        "og_image": 85,
         "twitter_image": 35,
         "gallery_image": 35,
-        "source_srcset": 30,
+        "source_srcset": 60,
         "img_srcset": 28,
         "lazy_srcset": 25,
         "lazy_image": 24,

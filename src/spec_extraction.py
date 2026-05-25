@@ -129,7 +129,12 @@ def _html_dimension_chunks(soup: BeautifulSoup) -> tuple[list[str], list[str]]:
             cells = [cell.get_text(" ", strip=True) for cell in tr.find_all(["th", "td"])]
             if not cells:
                 continue
-            rows.append(": ".join(cells[:2]) if len(cells) >= 2 else cells[0])
+            row_text = ": ".join(cells[:2]) if len(cells) >= 2 else cells[0]
+            rows.append(row_text)
+            if _SPEC_HINT_RE.search(row_text):
+                chunks.append(row_text)
+                if _CUTOUT_RE.search(row_text):
+                    cutout_chunks.append(row_text)
         text = "\n".join(rows)
         if _SPEC_HINT_RE.search(text):
             chunks.append(text)

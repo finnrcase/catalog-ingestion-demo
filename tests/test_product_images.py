@@ -35,6 +35,19 @@ def _high_page_evidence() -> ProductEvidence:
     )
 
 
+def _resolver_response(url: str, html: str):
+    class Resp:
+        status_code = 200
+        headers = {"content-type": "text/html"}
+        content = html.encode("utf-8")
+
+        def __init__(self):
+            self.text = html
+            self.url = url
+
+    return Resp()
+
+
 @pytest.fixture
 def isolated_product_enrichment_caches(monkeypatch, tmp_path):
     import src.product_enrichment as pe
@@ -176,13 +189,13 @@ def test_low_confidence_page_image_not_assigned(monkeypatch, isolated_product_en
     }
     html = "<html><body>Wolf MDD30TS 30 Inch Warming Drawer</body></html>"
 
-    monkeypatch.setattr(pe, "search_product_candidates", lambda *a, **k: [SearchResult(
+    monkeypatch.setattr("src.product_resolver.search_product_candidates", lambda *a, **k: [SearchResult(
         title="Wolf MDD30TS 30 Inch Warming Drawer",
         url="https://wolfappliance.com/products/mdd30ts",
         description="Wolf MDD30TS specifications",
         domain_score=90,
     )])
-    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: html)
+    monkeypatch.setattr("src.product_resolver.httpx.get", lambda url, **kwargs: _resolver_response(url, html))
     monkeypatch.setattr(pe, "extract_product_page_image", lambda *a, **k: ProductPageImageResult(
         image_found=True,
         image_url="https://wolfappliance.com/images/low-confidence.jpg",
