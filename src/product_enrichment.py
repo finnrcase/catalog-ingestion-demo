@@ -16,11 +16,13 @@ import os
 import re
 import time
 import urllib.parse
+from dataclasses import dataclass, field
 
 import httpx
 import pandas as pd
 from dotenv import load_dotenv
 
+from src.brand_lookup_registry import registry_domains_for_brand
 from src.brave_search import BRAVE_API_KEY, search_product_candidates
 from src.category_ai import _normalise_category
 from src.dimension_enrichment import DimensionResult as _DimensionResult, find_dimensions as _find_dimensions
@@ -30,8 +32,9 @@ from src.image_evidence import sku_appears_in_text
 from src.measurement_parser import normalize_dimension_fields
 from src.manufacturer_domains import get_domain_for_brand, record_discovered_domain
 from src.official_product_lookup import lookup_official_product_page
+from src.product_evidence import ProductEvidence, score_product_page
+from src.product_images import extract_product_page_image
 from src.product_lookup_cache import ProductLookupCache as _ProductLookupCache, make_lookup_cache_key
-from src.product_page_images import extract_product_page_image
 from src.product_page_specs import extract_product_page_specs
 
 try:
@@ -87,6 +90,18 @@ _ENRICHABLE_FIELDS: list = [
 
 MIN_USE_SCORE = 40   # below this: skip entirely, note in Notes
 MIN_CONF_SCORE = 60  # 40–59: fill fields but force Review Required = True
+
+
+@dataclass
+class ProductPageCandidate:
+    url: str
+    title: str = ""
+    description: str = ""
+    html: str = ""
+    query: str = ""
+    search_rank: int = 0
+    evidence: ProductEvidence = field(default_factory=ProductEvidence)
+    rejected_candidates: list[dict] = field(default_factory=list)
 
 
 def _str_val(v) -> str:
@@ -164,6 +179,209 @@ def build_search_queries(row: dict) -> list[str]:
     if brand and product_name and category:
         add(f'"{brand}" "{product_name}" "{category}"')
     return queries
+
+
+def _manufacturer_domains_for_search(row: dict) -> list[str]:
+    brand = _str_val(row.get("Brand"))
+    domains: list[str] = []
+    direct = get_domain_for_brand(brand)
+    if direct and direct[0] not in domains:
+        domains.append(direct[0])
+    for domain in registry_domains_for_brand(brand):
+        if domain not in domains:
+            domains.append(domain)
+    return domains
+
+
+def build_product_search_queries(row: dict, manufacturer_domain: str | None = None) -> list[str]:
+    """Build page-verification search queries in strict priority order."""
+    brand = _str_val(row.get("Brand"))
+    sku = _str_val(row.get("Model/SKU") or row.get("SKU") or row.get("_extracted_model_sku"))
+    product_name = _str_val(row.get("Product Name"))
+    domain = _str_val(manufacturer_domain)
+    if not domain:
+        domains = _manufacturer_domains_for_search(row)
+        domain = domains[0] if domains else ""
+
+    queries: list[str] = []
+
+    def add(query: str) -> None:
+        cleaned = " ".join(query.split()).strip()
+        if cleaned and cleaned not in queries:
+            queries.append(cleaned)
+
+    if domain and sku:
+        add(f'site:{domain} "{sku}" specifications')
+        add(f'site:{domain} "{sku}" product')
+        add(f'site:{domain} "{sku}" images')
+    if brand and sku:
+        add(f'"{brand}" "{sku}" official product page')
+    if brand and product_name and sku:
+        add(f'"{brand}" "{product_name}" "{sku}"')
+    if sku and product_name:
+        add(f'"{sku}" "{product_name}"')
+    return queries
+
+
+def _candidate_debug_record(candidate: ProductPageCandidate, *, selected: bool = False) -> dict:
+    evidence = candidate.evidence
+    return {
+        "url": candidate.url,
+        "query": candidate.query,
+        "title": candidate.title,
+        "score": evidence.score,
+        "confidence": evidence.confidence,
+        "matched_sku": evidence.matched_sku,
+        "matched_brand": evidence.matched_brand,
+        "matched_product_name": evidence.matched_product_name,
+        "official_domain": evidence.official_domain,
+        "evidence_summary": evidence.evidence_summary,
+        "rejection_reason": evidence.rejection_reason,
+        "selected": selected,
+    }
+
+
+def _store_product_page_diagnostics(
+    session_cache: "_SessionCache | None",
+    row: dict,
+    diagnostics: list[dict],
+) -> None:
+    if session_cache is None:
+        return
+    try:
+        key = make_lookup_cache_key(row)
+    except Exception:
+        key = "|".join([
+            _str_val(row.get("Brand")),
+            _str_val(row.get("Model/SKU") or row.get("SKU")),
+            _str_val(row.get("Product Name")),
+        ])
+    current = getattr(session_cache, "product_page_diagnostics", {})
+    current[key] = diagnostics
+    setattr(session_cache, "product_page_diagnostics", current)
+
+
+def _search_results_for_query(
+    query: str,
+    brand: str,
+    session_cache: "_SessionCache | None",
+    budget: "_SearchBudget | None",
+) -> list:
+    cached = bool(session_cache is not None and query in session_cache.queries)
+    if budget is not None and not cached:
+        if not budget.can_search():
+            return []
+        budget.consume_search()
+    return search_product_candidates(query, brand, session_cache=session_cache)
+
+
+def _fetch_candidate_html(
+    url: str,
+    session_cache: "_SessionCache | None",
+    budget: "_SearchBudget | None",
+) -> str:
+    if session_cache is not None and url in session_cache.urls:
+        return session_cache.urls[url]
+    if budget is not None:
+        if not budget.can_fetch():
+            return ""
+        budget.consume_fetch()
+    html = _fetch_page_html(url)
+    if session_cache is not None:
+        session_cache.urls[url] = html
+    return html
+
+
+def _find_best_product_page_with_diagnostics(
+    row: dict,
+    session_cache: "_SessionCache | None" = None,
+    budget: "_SearchBudget | None" = None,
+) -> tuple[ProductPageCandidate | None, list[dict], list[str], list[str]]:
+    brand = _str_val(row.get("Brand"))
+    domains = _manufacturer_domains_for_search(row)
+    queries = build_product_search_queries(row, manufacturer_domain=domains[0] if domains else None)
+    seen_urls: set[str] = set()
+    all_candidates: list[ProductPageCandidate] = []
+    diagnostics: list[dict] = []
+
+    for query in queries:
+        results = _search_results_for_query(query, brand, session_cache, budget)
+        for rank, result in enumerate(results[:5], start=1):
+            url = _str_val(getattr(result, "url", ""))
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            html = _fetch_candidate_html(url, session_cache, budget)
+            candidate = ProductPageCandidate(
+                url=url,
+                title=_str_val(getattr(result, "title", "")),
+                description=_str_val(getattr(result, "description", "")),
+                html=html,
+                query=query,
+                search_rank=rank,
+            )
+            if not html:
+                candidate.evidence = ProductEvidence(
+                    confidence="none",
+                    domain=urllib.parse.urlparse(url).netloc.lower(),
+                    evidence_summary="fetch_failed",
+                    rejection_reason="fetch_failed",
+                )
+            else:
+                candidate.evidence = score_product_page(
+                    row,
+                    url,
+                    html,
+                    title=candidate.title,
+                    description=candidate.description,
+                )
+            all_candidates.append(candidate)
+            diagnostics.append(_candidate_debug_record(candidate))
+
+    eligible = [
+        candidate
+        for candidate in all_candidates
+        if candidate.evidence.confidence in {"high", "medium"}
+    ]
+    if not eligible:
+        _store_product_page_diagnostics(session_cache, row, diagnostics)
+        return None, diagnostics, queries, domains
+
+    rank = {"high": 2, "medium": 1}
+    best = max(
+        eligible,
+        key=lambda candidate: (
+            rank.get(candidate.evidence.confidence, 0),
+            candidate.evidence.score,
+            1 if candidate.evidence.official_domain else 0,
+            -candidate.search_rank,
+        ),
+    )
+    best.rejected_candidates = [
+        _candidate_debug_record(candidate, selected=(candidate.url == best.url))
+        for candidate in all_candidates
+        if candidate.url != best.url
+    ]
+    diagnostics = [
+        _candidate_debug_record(candidate, selected=(candidate.url == best.url))
+        for candidate in all_candidates
+    ]
+    _store_product_page_diagnostics(session_cache, row, diagnostics)
+    return best, diagnostics, queries, domains
+
+
+def find_best_product_page(
+    row: dict,
+    session_cache: "_SessionCache | None" = None,
+    budget: "_SearchBudget | None" = None,
+) -> ProductPageCandidate | None:
+    """Search, fetch, score, and return the best verified HIGH/MEDIUM page."""
+    best, _diagnostics, _queries, _domains = _find_best_product_page_with_diagnostics(
+        row,
+        session_cache=session_cache,
+        budget=budget,
+    )
+    return best
 
 
 def has_enough_search_identity(row: dict) -> bool:
@@ -245,6 +463,46 @@ def _apply_enrichment(
         updated["Review Required"] = True
         updated["Suggested Action"] = "Enriched from low-confidence source — verify fields"
 
+    return updated
+
+
+_VERIFIED_PAGE_FIELDS = (
+    "Product Name",
+    "Brand",
+    "Model/SKU",
+    "Dimensions",
+    "Finish / Color",
+    "Material",
+    "Product Category",
+)
+
+
+def _needs_verified_page_extraction(row: dict) -> bool:
+    for field in _VERIFIED_PAGE_FIELDS:
+        value = _str_val(row.get(field))
+        if not value:
+            return True
+        if field == "Dimensions" and not has_complete_3d_dimensions(value):
+            return True
+    return False
+
+
+def _apply_verified_page_extraction(row: dict, extracted: dict) -> dict:
+    """Fill blank fields from a verified page extraction without overwriting."""
+    updated = row.copy()
+    for field in _VERIFIED_PAGE_FIELDS:
+        if _str_val(updated.get(field)):
+            continue
+        value = _str_val(extracted.get(field))
+        if not value and field == "Material":
+            value = _str_val(extracted.get("materials"))
+        if not value:
+            continue
+        if field == "Dimensions" and not has_complete_3d_dimensions(value):
+            continue
+        if field == "Product Category":
+            value = _normalise_category(value) or value
+        updated[field] = value
     return updated
 
 
@@ -487,6 +745,7 @@ def _apply_official_product_lookup(
     row: dict,
     *,
     session_cache: "_SessionCache | None" = None,
+    budget: "_SearchBudget | None" = None,
     force_refresh: bool = False,
 ) -> tuple[dict, _DimensionResult | None, dict]:
     """Incrementally fill product URL/image/specs from official brand registry lookup."""
@@ -537,40 +796,52 @@ def _apply_official_product_lookup(
     cached = None if force_refresh else _lookup_cache.get(key)
 
     page_url = ""
+    selected_html = ""
+    selected_evidence: ProductEvidence | None = None
     if cached:
         page_url = _str_val(cached.get("selected_product_page_url"))
         debug.update({k: cached.get(k, debug.get(k)) for k in debug})
     if not page_url:
-        page = lookup_official_product_page(row, session_cache=session_cache)
+        page, diagnostics, queries, domains = _find_best_product_page_with_diagnostics(
+            row,
+            session_cache=session_cache,
+            budget=budget,
+        )
         debug.update({
-            "brand_registry_match": page.registry_match,
-            "brand_registry_domains_checked": page.registry_domains_checked,
-            "brand_search_queries_used": page.queries_used,
-            "candidate_pages_found": len(page.candidate_pages),
-            "candidate_page_scores": page.candidate_pages,
-            "selected_product_page_url": page.selected_url,
-            "selected_product_page_score": page.score,
-            "selected_product_page_reason": page.reason,
-            "web_lookup_error": page.error,
+            "brand_registry_match": bool(domains),
+            "brand_registry_domains_checked": domains,
+            "brand_search_queries_used": queries,
+            "candidate_pages_found": len(diagnostics),
+            "candidate_page_scores": diagnostics,
+            "selected_product_page_url": page.url if page else "",
+            "selected_product_page_score": page.evidence.score if page else 0,
+            "selected_product_page_reason": page.evidence.evidence_summary if page else "no_verified_product_page",
+            "web_lookup_error": "" if page else "no_verified_product_page",
         })
-        if page.confidence in {"HIGH", "MEDIUM"}:
-            page_url = page.selected_url
+        if page:
+            page_url = page.url
+            selected_html = page.html
+            selected_evidence = page.evidence
 
     if not page_url:
+        updated["manufacturer_page_exact_sku"] = False
         return _stamp_debug_fields(updated), None, debug
 
     if not _str_val(updated.get("Product URL")):
         updated["Product URL"] = page_url
 
-    html = _fetch_page_html(page_url)
+    html = selected_html or _fetch_page_html(page_url)
     if not html:
         debug["web_lookup_error"] = debug.get("web_lookup_error") or "selected_page_fetch_failed"
         return _stamp_debug_fields(updated), None, debug
 
     selected_reason = _str_val(debug.get("selected_product_page_reason"))
-    sku_match = "sku_match" in selected_reason
-    official = any(token in selected_reason for token in ("brand_registry_domain", "official_brand_domain", "official_supplier_domain"))
-    name_match = "product_name_match" in selected_reason
+    sku_match = selected_evidence.matched_sku if selected_evidence else "sku_match" in selected_reason
+    official = selected_evidence.official_domain if selected_evidence else any(
+        token in selected_reason
+        for token in ("brand_registry_domain", "official_brand_domain", "official_supplier_domain", "official_domain")
+    )
+    name_match = selected_evidence.matched_product_name if selected_evidence else "product_name_match" in selected_reason
 
     specs = extract_product_page_specs(
         html,
@@ -596,10 +867,14 @@ def _apply_official_product_lookup(
             and sku_appears_in_text(row_sku, _str_val(getattr(specs, "sku", "")))
         )
     )
+    page_confidence = selected_evidence.confidence if selected_evidence else ""
+    # No caller currently opts into replacing non-empty PDF/user values. Keep
+    # this explicit so a future overwrite path must prove HIGH confidence first.
+    allow_verified_overwrite = False
     updated = _apply_manufacturer_page_fields(
         updated,
         specs,
-        exact_sku_confirmation=exact_sku_confirmation,
+        allow_overwrite=allow_verified_overwrite and page_confidence == "high",
     )
     updated["manufacturer_page_exact_sku"] = exact_sku_confirmation
 
@@ -608,8 +883,11 @@ def _apply_official_product_lookup(
     if specs.dimensions and specs.confidence in {"high", "medium"}:
         should_fill_dims = (
             not existing_dims
-            or not has_complete_3d_dimensions(existing_dims)
-            or _CONF_RANK.get(specs.confidence, 0) > _CONF_RANK.get(existing_dim_conf, 0)
+            or (
+                allow_verified_overwrite
+                and specs.confidence == "high"
+                and _CONF_RANK.get(specs.confidence, 0) > _CONF_RANK.get(existing_dim_conf, 0)
+            )
         )
         if should_fill_dims:
             updated["Dimensions"] = specs.dimensions
@@ -651,7 +929,18 @@ def _apply_official_product_lookup(
         if value and not _str_val(updated.get(dest)):
             updated[dest] = value
 
-    image = extract_product_page_image(html, page_url, updated, source_prefix="official_site")
+    if _needs_verified_page_extraction(updated):
+        extracted = _extract_with_claude(_html_to_text(html), updated)
+        if extracted:
+            updated = _apply_verified_page_extraction(updated, extracted)
+
+    image = extract_product_page_image(
+        html,
+        page_url,
+        updated,
+        page_evidence=selected_evidence,
+        source_prefix="official_site",
+    )
     debug["image_candidates_found"] = image.debug.get("images_found", 0)
     if image.image_found:
         debug["selected_image_url"] = image.image_url
@@ -662,6 +951,23 @@ def _apply_official_product_lookup(
             updated["confidence"] = image.confidence
             updated["evidence"] = ";".join(image.evidence)
             updated["needs_image_review"] = str(image.confidence != "HIGH")
+
+    product_cache_key = ""
+    brand_key = _str_val(updated.get("Brand"))
+    model_key = _str_val(updated.get("Model/SKU"))
+    if brand_key and model_key:
+        product_cache_key = _normalize_key(brand_key, model_key)
+    if product_cache_key:
+        cache_fields: dict = {
+            "product_url": page_url,
+            "general_confidence": page_confidence if page_confidence in {"high", "medium"} else "medium",
+        }
+        if _str_val(updated.get("Finish / Color")):
+            cache_fields["finish"] = _str_val(updated.get("Finish / Color"))
+        existing_entry = _product_cache.get(product_cache_key) or {}
+        if image.image_found and image.confidence in {"HIGH", "MEDIUM"} and not existing_entry.get("image_url"):
+            cache_fields["image_url"] = image.image_url
+        _product_cache.update(product_cache_key, cache_fields)
 
     cache_payload = {
         "selected_product_page_url": page_url,
@@ -802,19 +1108,24 @@ def _apply_cache_to_row(
     return updated, filled, missing
 
 
-def _should_write_manufacturer_value(updated: dict, field: str, exact_sku_confirmation: bool) -> bool:
+def _should_write_manufacturer_value(updated: dict, field: str, allow_overwrite: bool = False) -> bool:
     existing = _str_val(updated.get(field))
     if not existing:
         return True
-    return bool(exact_sku_confirmation)
+    return bool(allow_overwrite)
 
 
-def _apply_manufacturer_page_fields(updated: dict, specs, *, exact_sku_confirmation: bool) -> dict:
+def _apply_manufacturer_page_fields(
+    updated: dict,
+    specs,
+    *,
+    allow_overwrite: bool = False,
+) -> dict:
     """Fill Programa-required fields from a confirmed manufacturer page.
 
-    Existing PDF values are preserved unless the selected page has exact SKU
-    confirmation. Blank fields are always safe to fill because they add missing
-    manufacturer facts rather than replacing extraction output.
+    Blank fields are safe to fill from a verified product page. Existing PDF or
+    user-entered values are preserved unless a caller explicitly enables
+    overwrite after its own high-confidence check.
     """
     field_map = (
         ("brand", "Brand"),
@@ -830,18 +1141,18 @@ def _apply_manufacturer_page_fields(updated: dict, specs, *, exact_sku_confirmat
             continue
         if dest == "Product Category":
             value = _normalise_category(value) or value
-        if _should_write_manufacturer_value(updated, dest, exact_sku_confirmation):
+        if _should_write_manufacturer_value(updated, dest, allow_overwrite):
             updated[dest] = value
 
     # Finish can come from either explicit finish or color. Keep the combined
     # SCH-facing field filled even when Color is also available separately.
     finish_value = _str_val(getattr(specs, "finish", "")) or _str_val(getattr(specs, "color", ""))
-    if finish_value and _should_write_manufacturer_value(updated, "Finish / Color", exact_sku_confirmation):
+    if finish_value and _should_write_manufacturer_value(updated, "Finish / Color", allow_overwrite):
         updated["Finish / Color"] = finish_value
 
     description = _str_val(getattr(specs, "description", ""))
     if description:
-        if _should_write_manufacturer_value(updated, "Description", exact_sku_confirmation):
+        if _should_write_manufacturer_value(updated, "Description", allow_overwrite):
             updated["Description"] = description
         existing_notes = _str_val(updated.get("Notes"))
         note = f"[Manufacturer Description: {description}]"
@@ -919,10 +1230,6 @@ def enrich_row(
                 fields_searched.extend(_ESSENTIAL_CACHE_FIELDS)
                 _log.info("[CACHE MISS] key=%s", cache_key)
 
-        # Fast mode: if manufacturer domain is known, skip general Brave search
-        # (dimension lookup will handle targeted search via the known domain)
-        skip_general_search = (mode == "fast")
-
         if not has_enough_search_identity(row):
             updated = row.copy()
             existing = _str_val(updated.get("Notes"))
@@ -935,6 +1242,7 @@ def enrich_row(
         updated, registry_dim_result, registry_debug = _apply_official_product_lookup(
             row,
             session_cache=session_cache,
+            budget=budget,
             force_refresh=force_refresh,
         )
         if registry_debug.get("selected_product_page_url"):
@@ -946,74 +1254,11 @@ def enrich_row(
             updated, _debug = normalize_dimension_fields(updated)
             return updated, None, registry_dim_result
 
-        precise_queries = build_search_queries(updated)
-        query = precise_queries[0] if precise_queries else _build_search_query(updated)
-        domain_match = get_domain_for_brand(brand)
-        results = []
-        if not skip_general_search and budget.can_search():
-            _log.info("[LIVE SEARCH] query=%s", query[:80])
-            results = search_product_candidates(query, brand, session_cache=session_cache)
-            budget.consume_search()
-        elif not budget.can_search():
-            _log.info("[BUDGET EXHAUSTED] skipping general search for key=%s", cache_key)
-
-        if not results or results[0].domain_score < MIN_USE_SCORE:
+        if not registry_debug.get("selected_product_page_url"):
             existing = _str_val(updated.get("Notes"))
             note = "[Enrichment: no confident source found]"
             if note not in existing:
                 updated["Notes"] = f"{existing} {note}".strip() if existing else note
-        else:
-            best = results[0]
-            parsed_domain = urllib.parse.urlparse(best.url).netloc
-            if parsed_domain and not domain_match:
-                record_discovered_domain(brand, parsed_domain)
-            raw_html = _fetch_page_html(best.url)
-            page_text = _html_to_text(raw_html)
-
-            if not raw_html:
-                existing = _str_val(updated.get("Notes"))
-                domain = urllib.parse.urlparse(best.url).netloc or best.url[:50]
-                note = f"[Enrichment: could not fetch {domain}]"
-                if note not in existing:
-                    updated["Notes"] = f"{existing} {note}".strip() if existing else note
-            else:
-                extracted = _extract_with_claude(page_text, updated)
-                updated = _apply_enrichment(updated, extracted, best.url, best.domain_score)
-
-                # ── Image extraction (opportunistic — no extra Brave call) ─────
-                image_url_candidate = extract_image_url(raw_html)
-                image_url_found: str | None = None
-                if image_url_candidate:
-                    if _check_image_content_type(image_url_candidate):
-                        image_url_found = image_url_candidate
-                        _log.info("[IMAGE FOUND] key=%s url=%s", cache_key, image_url_found[:80])
-                        if not _is_manual_image(updated) and not row_has_image(updated):
-                            updated["Image URL"] = image_url_found
-                    else:
-                        _log.info(
-                            "[IMAGE INVALID — skipped] url=%s failed content-type check",
-                            image_url_candidate[:80],
-                        )
-                else:
-                    _log.info("[IMAGE MISSING] key=%s", cache_key)
-
-                # ── Cache write-back (general fields found) ────────────────────
-                if cache_key:
-                    _cache_fields: dict = {}
-                    if _str_val(updated.get("Product URL")):
-                        _cache_fields["product_url"] = _str_val(updated.get("Product URL"))
-                    if _str_val(updated.get("Finish / Color")):
-                        _cache_fields["finish"] = _str_val(updated.get("Finish / Color"))
-                    if _cache_fields:
-                        _cache_fields["general_confidence"] = "medium"
-                        _product_cache.update(cache_key, _cache_fields)
-                    # Image cache write-back — never overwrite an existing valid entry
-                    existing_entry = _product_cache.get(cache_key) or {}
-                    if not existing_entry.get("image_url"):
-                        if image_url_found:
-                            _product_cache.update(cache_key, {"image_url": image_url_found, "general_confidence": "medium"})
-                        else:
-                            _product_cache.update(cache_key, {"image_url": None, "image_url__reason": "not found on page"})
 
         # ── Dimension enrichment pass ──────────────────────────────────────────
         brand_val = _str_val(updated.get("Brand"))
