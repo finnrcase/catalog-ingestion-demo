@@ -1636,6 +1636,11 @@ export function IntakeWorkspace() {
                     const evidence = rowText(row, "evidence");
                     const needsReview = rowText(row, "needs_image_review").toLowerCase() === "true";
                     const uploadStatus = productImageUploads[index] || "";
+                    const rawGroupedText = rowText(row, "_raw_grouped_text");
+                    const parsedFields = rowText(row, "_parsed_fields");
+                    const enrichmentQuery = rowText(row, "_enrichment_query_used");
+                    const confidenceReason = rowText(row, "_confidence_reason");
+                    const missingInitial = rowText(row, "_missing_fields_initial");
                     return (
                       <div key={index} className="grid gap-3 p-4 md:grid-cols-[1fr_1.2fr_auto] md:items-center">
                         <div className="min-w-0">
@@ -1669,6 +1674,20 @@ export function IntakeWorkspace() {
                             </div>
                           ) : null}
                           {evidence ? <div className="sm:col-span-2 truncate">Evidence: {evidence}</div> : null}
+                          {rawGroupedText || parsedFields || enrichmentQuery || confidenceReason || missingInitial ? (
+                            <details className="sm:col-span-2 rounded-lg border border-linen bg-ivory/40 p-2">
+                              <summary className="cursor-pointer text-xs font-semibold text-charcoal">Item debug</summary>
+                              <div className="mt-2 grid gap-1 text-xs text-taupe">
+                                {rawGroupedText ? (
+                                  <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-md bg-white p-2 text-charcoal">{rawGroupedText}</pre>
+                                ) : null}
+                                {parsedFields ? <div><span className="font-semibold text-charcoal">Parsed:</span> {parsedFields}</div> : null}
+                                {enrichmentQuery ? <div><span className="font-semibold text-charcoal">Query:</span> {enrichmentQuery}</div> : null}
+                                {missingInitial ? <div><span className="font-semibold text-charcoal">Missing:</span> {missingInitial}</div> : null}
+                                {confidenceReason ? <div><span className="font-semibold text-charcoal">Reason:</span> {confidenceReason}</div> : null}
+                              </div>
+                            </details>
+                          ) : null}
                         </div>
                         <div className="flex flex-wrap gap-2">
                           <label className="btn-secondary inline-flex h-10 cursor-pointer items-center justify-center rounded-xl px-4 text-sm font-semibold">

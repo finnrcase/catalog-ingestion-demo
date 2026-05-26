@@ -15,6 +15,7 @@ import hashlib
 import re
 
 from src.intake_schema import IMPORTANT_FIELDS, SOURCE_PDF, make_base_row
+from src.pdf_item_normalizer import build_quote_item_rows
 
 # ── Regex patterns ─────────────────────────────────────────────────────────────
 
@@ -165,6 +166,29 @@ def _parse_table_rows(
         tables = page.find_tables()
     except Exception:
         return rows
+    tables = list(tables)
+
+    page_lines = (page.get_text("text") or "").splitlines()
+    table_lines: list[str] = []
+    for table in tables:
+        extracted = table.extract()
+        if not extracted:
+            continue
+        for trow in extracted:
+            cells = [str(c or "").strip() for c in trow]
+            if any(cells):
+                table_lines.append(" | ".join(cells))
+
+    grouped_rows = build_quote_item_rows(
+        table_lines,
+        project=project,
+        room=room,
+        supplier=supplier,
+        notes=notes,
+        context_lines=page_lines,
+    )
+    if grouped_rows:
+        return grouped_rows
 
     for table in tables:
         extracted = table.extract()
@@ -280,7 +304,7 @@ def parse_pdf_rows(
     for page_index, page in enumerate(doc):
         page_number = page_index + 1
 
-        # 1. Try table extraction first
+        # 1. Try table extraction / quote item grouping first
         table_rows = _parse_table_rows(page, project, room, supplier, notes)
         if table_rows:
             for r in table_rows:
@@ -296,8 +320,30 @@ def parse_pdf_rows(
                     all_rows.append(r)
             continue
 
-        # 2. Fall back to line-by-line text parsing
+        # 2. Group raw text into quote items before falling back to line parsing.
         text = page.get_text("text")
+        grouped_rows = build_quote_item_rows(
+            text.splitlines(),
+            project=project,
+            room=room,
+            supplier=supplier,
+            notes=notes,
+        )
+        if grouped_rows:
+            for row in grouped_rows:
+                key = (
+                    str(row.get("Product Name", "")).lower().strip(),
+                    str(row.get("Model/SKU", "")).lower().strip(),
+                )
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    row["_source_pdf_id"] = pdf_id
+                    row["_source_page_number"] = page_number
+                    row["_source_filename"] = filename
+                    all_rows.append(row)
+            continue
+
+        # 3. Last resort: line-by-line text parsing
         for line in text.splitlines():
             line = line.strip()
             if len(line) < 3:

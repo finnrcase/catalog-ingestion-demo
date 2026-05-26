@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from src.document_parser import _parse_table_rows, _row_from_line
+from src.pdf_item_normalizer import build_quote_item_rows
 
 SOFT_TIMEOUT_SECONDS = 30
 HARD_TIMEOUT_SECONDS = 120
@@ -240,6 +241,17 @@ def _parse_with_pymupdf_tables(
                 continue
             text = page.get_text("text") or ""
             text_length += len(text)
+            grouped_rows = build_quote_item_rows(
+                text.splitlines(),
+                project=project,
+                room=room,
+                supplier=supplier,
+                notes=notes,
+            )
+            if grouped_rows:
+                for row in grouped_rows:
+                    _append_row(rows, seen, row, pdf_id, page_number, filename)
+                continue
             for line in text.splitlines():
                 row = _row_from_line(line.strip(), project, room, supplier, notes)
                 if row is not None:
@@ -284,6 +296,17 @@ def _parse_with_pymupdf_blocks(
                 text_length += len(raw_text)
                 lines = raw_text.splitlines()
             page_number = page_index + 1
+            grouped_rows = build_quote_item_rows(
+                lines,
+                project=project,
+                room=room,
+                supplier=supplier,
+                notes=notes,
+            )
+            if grouped_rows:
+                for row in grouped_rows:
+                    _append_row(rows, seen, row, pdf_id, page_number, filename)
+                continue
             for line in lines:
                 row = _row_from_line(line.strip(), project, room, supplier, notes)
                 if row is not None:
@@ -332,6 +355,17 @@ def _parse_with_ocr_placeholder(
             text = pytesseract.image_to_string(image) or ""
             text_length += len(text)
             page_number = page_index + 1
+            grouped_rows = build_quote_item_rows(
+                text.splitlines(),
+                project=project,
+                room=room,
+                supplier=supplier,
+                notes=notes,
+            )
+            if grouped_rows:
+                for row in grouped_rows:
+                    _append_row(rows, seen, row, pdf_id, page_number, filename)
+                continue
             for line in text.splitlines():
                 row = _row_from_line(line.strip(), project, room, supplier, notes)
                 if row is not None:
