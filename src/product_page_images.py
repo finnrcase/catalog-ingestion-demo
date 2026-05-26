@@ -26,11 +26,19 @@ USER_AGENT = "Mozilla/5.0 (compatible; SCH-Intake/1.0)"
 _BAD_IMAGE_HINTS = (
     "logo", "icon", "sprite", "favicon", "placeholder", "blank",
     "loading", "transparent", "tracking", "pixel", "spinner",
+    "default-meta-image", "default_meta_image", "default-image",
+    "defaultimage", "missing-image", "no-image", "noimage",
+    "swatch", "badge", "lifestyle", "roomscene", "room-scene",
+    "inspiration",
 )
-_MIN_DIMENSION = 120
-_MIN_AREA = 120 * 120
+_MIN_DIMENSION = 300
+_MIN_AREA = 300 * 300
 _ASPECT_MIN = 0.2
 _ASPECT_MAX = 5.0
+_GENERIC_ALT_TOKENS = {
+    "front", "side", "back", "detail", "details", "gallery", "hero",
+    "image", "main", "photo", "product", "view",
+}
 
 
 @dataclass
@@ -80,6 +88,64 @@ def _passes_url_filter(url: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _norm(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _identity_tokens(row: dict, *, product_only: bool = False) -> list[str]:
+    values = [row.get("Product Name")]
+    if not product_only:
+        values.extend([row.get("Brand"), row.get("Supplier")])
+    tokens: list[str] = []
+    for value in values:
+        for token in _norm(str(value or "")).split():
+            if len(token) > 2 and token not in {"the", "and", "for", "with", "inch"}:
+                tokens.append(token)
+    return tokens
+
+
+def _url_has_product_signal(url: str, row: dict) -> bool:
+    compact = re.sub(r"[^a-z0-9]", "", url.lower())
+    sku = _str_val(row.get("Model/SKU") or row.get("SKU"))
+    if sku and sku_appears_in_text(sku, url):
+        return True
+    return any(token in compact for token in _identity_tokens(row, product_only=True))
+
+
+def _alt_text_ok(alt: str, row: dict) -> tuple[bool, str]:
+    alt_norm = _norm(alt)
+    if not alt_norm:
+        return True, ""
+    for hint in _BAD_IMAGE_HINTS:
+        if hint in alt_norm:
+            return False, f"bad_alt_hint:{hint}"
+    if _url_has_product_signal(alt, row):
+        return True, ""
+    remaining = [token for token in alt_norm.split() if token not in _GENERIC_ALT_TOKENS]
+    if len(remaining) >= 2:
+        return False, "unrelated_alt_text"
+    return True, ""
+
+
+def _context_from_node(node) -> str:
+    parts: list[str] = []
+    current = node
+    for _ in range(5):
+        if current is None:
+            break
+        parts.extend(str(v) for v in (current.get("class") or []))
+        if current.get("id"):
+            parts.append(str(current.get("id")))
+        if current.name:
+            parts.append(str(current.name))
+        current = current.parent
+    return " ".join(parts).lower()
+
+
+def _has_product_media_context(context: str) -> bool:
+    return bool(re.search(r"gallery|product|media|carousel|pdp|picture|hero|zoom|main", context, re.I))
+
+
 def _parse_int(value: str | None) -> int | None:
     if not value:
         return None
@@ -107,13 +173,26 @@ def _score_candidate(
     page_text: str,
     source_kind: str,
     image_url: str,
-) -> tuple[str, list[str]]:
+    alt_text: str = "",
+    context: str = "",
+) -> tuple[str, int, list[str], str]:
     brand = _str_val(row.get("Brand"))
     sku = _str_val(row.get("Model/SKU") or row.get("SKU"))
     product_name = _str_val(row.get("Product Name"))
     supplier = _str_val(row.get("Supplier"))
 
     evidence: list[str] = [source_kind]
+    score = {
+        "jsonld_image": 90,
+        "og_image": 75,
+        "twitter_image": 65,
+        "gallery_image": 80,
+        "source_srcset": 65,
+        "img_srcset": 60,
+        "lazy_image": 55,
+        "lazy_srcset": 55,
+        "html_image": 40,
+    }.get(source_kind, 35)
     domain_text = urllib.parse.urlparse(page_url).netloc.lower().replace("-", "").replace(".", "")
     brand_slug = re.sub(r"[^a-z0-9]", "", brand.lower())
     supplier_slug = re.sub(r"[^a-z0-9]", "", supplier.lower())
@@ -125,21 +204,40 @@ def _score_candidate(
     )
     sku_hit = bool(sku and (sku_appears_in_text(sku, page_text) or sku_appears_in_text(sku, image_url)))
     name_hit = bool(product_name and product_name_appears_in_text(product_name, page_text))
+    image_signal = _url_has_product_signal(image_url, row)
+    alt_ok, alt_reason = _alt_text_ok(alt_text, row)
+
+    if not alt_ok:
+        return "NONE", 0, evidence, alt_reason
+
+    if image_url.lower().split("?", 1)[0].endswith(".svg") and not image_signal:
+        return "NONE", 0, evidence, "svg_without_product_signal"
 
     if official:
+        score += 20
         evidence.append("official_or_supplier_domain")
     if sku_hit:
+        score += 40
         evidence.append("sku_match")
     if name_hit:
+        score += 15
         evidence.append("product_name_match")
+    if image_signal:
+        score += 35
+        evidence.append("image_url_product_signal")
+    if _has_product_media_context(context):
+        score += 20
+        evidence.append("product_media_context")
 
-    if official and sku_hit and source_kind in {"og_image", "twitter_image", "jsonld_image", "gallery_image"}:
-        return "HIGH", evidence
-    if official and (name_hit or source_kind in {"og_image", "twitter_image", "jsonld_image", "gallery_image"}):
-        return "MEDIUM", evidence
-    if sku_hit or name_hit:
-        return "MEDIUM", evidence
-    return "LOW", evidence
+    if official and sku_hit and source_kind in {"jsonld_image", "gallery_image", "source_srcset", "img_srcset", "lazy_image", "lazy_srcset"}:
+        return "HIGH", score, evidence, ""
+    if official and sku_hit and image_signal and source_kind in {"og_image", "twitter_image"}:
+        return "HIGH", score, evidence, ""
+    if official and (sku_hit or name_hit or source_kind in {"og_image", "twitter_image", "jsonld_image", "gallery_image"}):
+        return "MEDIUM", score, evidence, ""
+    if sku_hit or name_hit or image_signal:
+        return "MEDIUM", score, evidence, ""
+    return "LOW", score, evidence, ""
 
 
 def fetch_page_html(url: str) -> tuple[str, int | None, str]:
@@ -220,7 +318,7 @@ def extract_product_page_image(
 
     soup = BeautifulSoup(html, "html.parser")
     page_text = soup.get_text(" ", strip=True)
-    candidates: list[tuple[str, str, int | None, int | None]] = []
+    candidates: list[tuple[str, str, int | None, int | None, str, str]] = []
 
     for selector in [
         ("meta[property='og:image']", "og_image"),
@@ -230,7 +328,7 @@ def extract_product_page_image(
     ]:
         tag = soup.select_one(selector[0])
         if tag and tag.get("content"):
-            candidates.append((selector[1], str(tag.get("content")), None, None))
+            candidates.append((selector[1], str(tag.get("content")), None, None, "", "metadata"))
 
     for script in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.I)}):
         try:
@@ -238,26 +336,50 @@ def extract_product_page_image(
         except Exception:
             continue
         for value in _jsonld_image_values(data):
-            candidates.append(("jsonld_image", value, None, None))
+            candidates.append(("jsonld_image", value, None, None, "", "jsonld_product"))
+
+    for source in soup.select("source[srcset], source[data-srcset]"):
+        raw_srcset = str(source.get("srcset") or source.get("data-srcset") or "")
+        src = _srcset_best(raw_srcset)
+        if not src:
+            continue
+        context = _context_from_node(source)
+        kind = "source_srcset" if not _has_product_media_context(context) else "gallery_image"
+        candidates.append((kind, src, None, None, "", context))
 
     for img in soup.find_all("img"):
         src = ""
+        kind = "html_image"
         if img.get("srcset"):
             src = _srcset_best(str(img.get("srcset")))
+            kind = "img_srcset"
         if not src:
-            for attr in ("src", "data-src", "data-original", "data-image", "data-zoom-image"):
+            for attr, attr_kind in (
+                ("src", "html_image"),
+                ("data-src", "lazy_image"),
+                ("data-srcset", "lazy_srcset"),
+                ("data-original", "lazy_image"),
+                ("data-image", "lazy_image"),
+                ("data-zoom", "lazy_image"),
+                ("data-large", "lazy_image"),
+                ("data-zoom-image", "lazy_image"),
+            ):
                 if img.get(attr):
-                    src = str(img.get(attr))
+                    raw = str(img.get(attr))
+                    src = _srcset_best(raw) if "srcset" in attr else raw
+                    kind = attr_kind
                     break
         if not src:
             continue
-        classes = " ".join(img.get("class") or [])
-        kind = "gallery_image" if re.search(r"product|gallery|hero|carousel|zoom|main", classes, re.I) else "html_image"
-        candidates.append((kind, src, _parse_int(img.get("width")), _parse_int(img.get("height"))))
+        context = _context_from_node(img)
+        if _has_product_media_context(context):
+            kind = "gallery_image"
+        alt_text = " ".join([str(img.get("alt") or ""), str(img.get("title") or "")]).strip()
+        candidates.append((kind, src, _parse_int(img.get("width")), _parse_int(img.get("height")), alt_text, context))
 
     debug["images_found"] = len(candidates)
     best: ProductPageImageResult | None = None
-    for kind, raw_url, width, height in candidates:
+    for kind, raw_url, width, height, alt_text, context in candidates:
         url = _absolute_url(raw_url, page_url)
         candidate_record = {
             "image_url": url,
@@ -266,6 +388,10 @@ def extract_product_page_image(
             "extraction_method": kind,
             "width": width,
             "height": height,
+            "alt": alt_text,
+            "context": context,
+            "score": 0,
+            "confidence": "NONE",
             "rejection_reason": "",
             "confidence_reason": "",
         }
@@ -282,13 +408,22 @@ def extract_product_page_image(
             debug["image_candidates"].append(candidate_record)
             continue
 
-        confidence, evidence = _score_candidate(
+        confidence, score, evidence, rejection_reason = _score_candidate(
             row=row,
             page_url=page_url,
             page_text=page_text,
             source_kind=kind,
             image_url=url,
+            alt_text=alt_text,
+            context=context,
         )
+        if rejection_reason:
+            debug["rejection_reasons"].append(f"{url}: {rejection_reason}")
+            candidate_record["rejection_reason"] = rejection_reason
+            debug["image_candidates"].append(candidate_record)
+            continue
+        candidate_record["score"] = score
+        candidate_record["confidence"] = confidence
         candidate_record["confidence_reason"] = ";".join(evidence)
         debug["image_candidates"].append(candidate_record)
         source_suffix = {
@@ -296,6 +431,10 @@ def extract_product_page_image(
             "twitter_image": "og_image",
             "jsonld_image": "jsonld_image",
             "gallery_image": "html_image",
+            "source_srcset": "html_image",
+            "img_srcset": "html_image",
+            "lazy_image": "html_image",
+            "lazy_srcset": "html_image",
             "html_image": "html_image",
         }.get(kind, "html_image")
         result = ProductPageImageResult(
@@ -306,9 +445,17 @@ def extract_product_page_image(
             evidence=evidence + [f"page:{page_url}"],
             debug=debug,
         )
-        if best is None or {"LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(confidence, 0) > {"LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(best.confidence, 0):
+        current_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(confidence, 0)
+        best_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(best.confidence, 0) if best else 0
+        best_score = 0
+        if best is not None:
+            for record in debug["image_candidates"]:
+                if record.get("image_url") == best.image_url:
+                    best_score = int(record.get("score") or 0)
+                    break
+        if best is None or (current_rank, score) > (best_rank, best_score):
             best = result
-        if confidence == "HIGH":
+        if confidence == "HIGH" and score >= 160:
             break
 
     if best is None:

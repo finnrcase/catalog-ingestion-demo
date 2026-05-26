@@ -581,8 +581,8 @@ def test_extract_image_url_twitter_before_jsonld():
 
 # ── enrich_row image recovery on full cache hit ───────────────────────────────
 
-def test_enrich_row_image_from_product_url_on_full_cache_hit(monkeypatch, tmp_path):
-    """On full cache hit where image_url is null, enrich_row fetches the product URL to get image."""
+def test_enrich_row_full_cache_hit_with_missing_image_spends_zero_calls(monkeypatch, tmp_path):
+    """A complete cache hit must not fetch the product URL just to improve a missing image."""
     from src.enrichment_cache import ProductEnrichmentCache, normalize_key
     import src.product_enrichment as pe
 
@@ -599,14 +599,18 @@ def test_enrich_row_image_from_product_url_on_full_cache_hit(monkeypatch, tmp_pa
     })
     monkeypatch.setattr(pe, "_product_cache", cache)
 
-    html_with_image = '<meta property="og:image" content="https://wolfappliance.com/img/mdd30ts.jpg">'
-
-    with patch("src.product_enrichment._fetch_page_html", return_value=html_with_image), \
-         patch("src.product_enrichment._check_image_content_type", return_value=True):
+    with patch("src.product_enrichment._fetch_page_html") as mock_fetch, \
+         patch("src.product_enrichment._check_image_content_type") as mock_check:
         updated, error, _ = enrich_row(_qualifying_row())
 
     assert error is None
-    assert updated.get("Image URL") == "https://wolfappliance.com/img/mdd30ts.jpg"
+    assert not updated.get("Image URL")
+    assert updated.get("Enrichment Stage") == "persistent_cache"
+    assert updated.get("API Budget Search Usage") == "Used 0/0 search calls"
+    assert updated.get("API Budget Fetch Usage") == "Used 0/0 page fetches"
+    assert updated.get("API Budget AI Usage") == "Used 0/0 AI calls"
+    mock_fetch.assert_not_called()
+    mock_check.assert_not_called()
 
 
 def test_enrich_row_full_cache_hit_no_extra_search_when_image_already_cached(monkeypatch, tmp_path):

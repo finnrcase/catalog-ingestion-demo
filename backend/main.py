@@ -24,7 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-_TMP_UPLOADS = ROOT / ".tmp" / "uploads"
+_DEFAULT_TMP_UPLOADS = Path("/tmp/sch-designops/uploads") if os.getenv("VERCEL") else ROOT / ".tmp" / "uploads"
+_TMP_UPLOADS = Path(os.getenv("SCH_TMP_UPLOAD_ROOT", str(_DEFAULT_TMP_UPLOADS))).expanduser()
+_MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(100 * 1024 * 1024)))
 logger = logging.getLogger(__name__)
 _STARTED_AT = time.time()
 _PDF_PARSE_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv("PDF_PARSE_WORKERS", "2")))
@@ -52,6 +54,11 @@ from src.pdf_parsing_pipeline import (
     SOFT_TIMEOUT_SECONDS,
     PdfParseCancelledError,
     parse_pdf_file_resilient,
+)
+from src.persistent_storage import (
+    persistent_upload_storage_enabled,
+    require_persistent_upload_storage,
+    upload_file_to_persistent_storage,
 )
 from src.product_enrichment import enrich_dataframe, recover_images_for_dataframe
 from src.programa_export import (
@@ -149,7 +156,7 @@ class PdfParseJob:
 
 class RowsPayload(BaseModel):
     rows: list[dict] = Field(default_factory=list)
-    enrichment_mode: str = "standard"
+    enrichment_mode: str = "fast"
     force_refresh: bool = False
     use_web_enrichment: bool = True
     include_low_confidence_images: bool = False
@@ -236,9 +243,10 @@ app = FastAPI(
     description="Extraction, enrichment, validation, export, and Programa automation API.",
 )
 
+_default_origins = "" if os.getenv("ENVIRONMENT", "").lower() == "production" else "http://localhost:3000,http://127.0.0.1:3000"
 _origins = [
     origin.strip()
-    for origin in os.getenv("FRONTEND_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+    for origin in os.getenv("FRONTEND_ORIGINS", _default_origins).split(",")
     if origin.strip()
 ]
 
@@ -310,6 +318,8 @@ def health() -> dict:
         "status": "ok",
         "uptime_seconds": round(time.time() - _STARTED_AT, 2),
         "cold_start_window": (time.time() - _STARTED_AT) < 30,
+        "max_upload_mb": round(_MAX_UPLOAD_BYTES / 1024 / 1024),
+        "upload_storage_provider": os.getenv("UPLOAD_STORAGE_PROVIDER", "local").strip().lower() or "local",
     }
 
 
@@ -483,6 +493,15 @@ async def _stream_pdf_upload(file: UploadFile, session_id: str) -> tuple[str, Pa
             if not chunk:
                 break
             total_bytes += len(chunk)
+            if total_bytes > _MAX_UPLOAD_BYTES:
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Uploaded PDF exceeds the {round(_MAX_UPLOAD_BYTES / 1024 / 1024)} MB limit.",
+                )
             digest.update(chunk)
             out.write(chunk)
     if total_bytes == 0:
@@ -498,6 +517,23 @@ async def _stream_pdf_upload(file: UploadFile, session_id: str) -> tuple[str, Pa
     else:
         temp_path.replace(pdf_path)
     return pdf_id, pdf_path, total_bytes
+
+
+async def _read_upload_with_limit(upload: UploadFile, *, max_bytes: int = _MAX_UPLOAD_BYTES) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{upload.filename or 'upload'} exceeds the {round(max_bytes / 1024 / 1024)} MB upload limit.",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @app.post("/intake/generate", response_model=IntakeResponse)
@@ -525,7 +561,7 @@ async def generate_intake(
             _log_upload_stage("error", upload, file_type)
             continue
 
-        content = await upload.read()
+        content = await _read_upload_with_limit(upload)
 
         if file_type == "image":
             _log_upload_stage("parsing", upload, file_type)
@@ -613,7 +649,8 @@ async def upload_image_endpoint(file: UploadFile = File(...)) -> ImageUploadResp
     if not (content_type.startswith("image/") or filename.endswith((".jpg", ".jpeg", ".png", ".webp"))):
         raise HTTPException(status_code=400, detail="Only image files can be uploaded.")
 
-    secure_url = upload_image(file.file)
+    content = await _read_upload_with_limit(file, max_bytes=min(_MAX_UPLOAD_BYTES, 25 * 1024 * 1024))
+    secure_url = upload_image(io.BytesIO(content))
     if not secure_url or not is_public_https_image_url(secure_url):
         raise HTTPException(status_code=502, detail="Cloudinary upload failed or did not return a secure HTTPS URL.")
     return ImageUploadResponse(secure_url=secure_url)
@@ -646,7 +683,8 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
             df,
             pdf_lookup=pdf_lookup,
             session_id=session_id,
-            enable_screenshot=True,
+            enable_screenshot=payload.enrichment_mode != "fast",
+            enable_web_lookup=payload.enrichment_mode != "fast",
         )
         if image_diagnostics:
             dimension_diagnostics = [
@@ -681,6 +719,17 @@ async def upload_pdf(
         raise HTTPException(status_code=400, detail="Only PDF files can be uploaded to this endpoint.")
     session_id = x_session_id or uuid.uuid4().hex[:12]
     pdf_id, pdf_path, total_bytes = await _stream_pdf_upload(file, session_id)
+    storage_prefix = os.getenv("UPLOAD_STORAGE_PREFIX", "uploads").strip().strip("/") or "uploads"
+    storage_path = f"{storage_prefix}/{session_id}/pdfs/{pdf_id}.pdf"
+    storage_result = upload_file_to_persistent_storage(
+        pdf_path,
+        storage_path,
+        content_type=file.content_type or "application/pdf",
+    )
+    if not storage_result.ok:
+        logger.warning("[upload] persistent storage failed provider=%s error=%s", storage_result.provider, storage_result.error)
+        if persistent_upload_storage_enabled() and require_persistent_upload_storage():
+            raise HTTPException(status_code=502, detail="PDF upload could not be persisted to configured storage.")
     job = PdfParseJob(
         job_id=uuid.uuid4().hex[:12],
         session_id=session_id,
@@ -698,6 +747,9 @@ async def upload_pdf(
         "hard_timeout_seconds": HARD_TIMEOUT_SECONDS,
         "backend_uptime_seconds": round(time.time() - _STARTED_AT, 2),
         "cold_start_window": (time.time() - _STARTED_AT) < 30,
+        "upload_storage_provider": storage_result.provider,
+        "upload_storage_persisted": storage_result.ok,
+        "upload_storage_path": storage_result.object_path,
     })
     job.log("uploading", "Upload stored; parse will run asynchronously", bytes=total_bytes)
     _enqueue_pdf_parse_job(job)

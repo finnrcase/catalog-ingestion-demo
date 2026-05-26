@@ -162,6 +162,7 @@ export async function enrichRows(input: {
   rows: IntakeRow[];
   useWebEnrichment: boolean;
   sessionId?: string;
+  enrichmentMode?: "fast" | "standard" | "deep" | "manual_retry";
 }): Promise<IntakeResponse> {
   return parseJson<IntakeResponse>(
     await apiFetch(apiUrl("/intake/enrich"), {
@@ -171,6 +172,7 @@ export async function enrichRows(input: {
         rows: input.rows,
         use_web_enrichment: input.useWebEnrichment,
         session_id: input.sessionId,
+        enrichment_mode: input.enrichmentMode || "fast",
       }),
     }),
   );

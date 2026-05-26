@@ -176,6 +176,30 @@ def test_logo_icon_rejected():
     assert "bad_image_hint" in ";".join(result.debug["rejection_reasons"])
 
 
+def test_default_meta_image_rejected_in_favor_of_gallery():
+    html = """
+    <html>
+      <head><meta property="og:image" content="https://wolfappliance.com/assets/default-meta-image.jpg"></head>
+      <body>
+        <div class="product-gallery">
+          <img alt="Wolf MDD30TS Warming Drawer" src="https://wolfappliance.com/images/mdd30ts-product.jpg" width="900" height="700">
+        </div>
+      </body>
+    </html>
+    """
+
+    result = extract_product_page_image(
+        html,
+        "https://wolfappliance.com/products/mdd30ts",
+        _row(),
+        page_evidence=_high_page_evidence(),
+    )
+
+    assert result.image_found is True
+    assert result.image_url == "https://wolfappliance.com/images/mdd30ts-product.jpg"
+    assert any("default-meta-image" in reason for reason in result.debug["rejection_reasons"])
+
+
 def test_low_confidence_page_image_not_assigned(monkeypatch, isolated_product_enrichment_caches):
     import src.product_enrichment as pe
 

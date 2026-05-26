@@ -62,6 +62,14 @@ def _make_df(dims="", brand="Kohler", model="K-3999") -> pd.DataFrame:
     }])
 
 
+def _metric_diagnostic(diagnostics):
+    return next((d for d in diagnostics if d.get("report_type") == "enrichment_metrics"), None)
+
+
+def _dimension_diagnostics(diagnostics):
+    return [d for d in diagnostics if d.get("report_type") != "enrichment_metrics"]
+
+
 def test_enrich_dataframe_returns_three_values():
     with patch("src.product_enrichment.search_product_candidates", return_value=[]):
         result = enrich_dataframe(_make_df())
@@ -83,8 +91,12 @@ def test_enrich_dataframe_diagnostics_populated_when_lookup_ran():
         with patch("src.product_enrichment._find_dimensions", return_value=mock_result):
             df, errors, diagnostics = enrich_dataframe(_make_df())
 
-    assert len(diagnostics) == 1
-    d = diagnostics[0]
+    metrics = _metric_diagnostic(diagnostics)
+    dimension_diagnostics = _dimension_diagnostics(diagnostics)
+    assert metrics is not None
+    assert metrics["summary"]["external_enrichment_rows"] == 1
+    assert len(dimension_diagnostics) == 1
+    d = dimension_diagnostics[0]
     assert d["row_index"] == 0
     assert d["product_name"] == "Test Product"
     assert d["model_searched"] == "K-3999"
@@ -103,7 +115,11 @@ def test_enrich_dataframe_no_diagnostics_when_lookup_not_triggered():
     with patch("src.product_enrichment.search_product_candidates", return_value=[]):
         df, errors, diagnostics = enrich_dataframe(_make_df(dims='28"W x 30"H x 17"D'))
 
-    assert diagnostics == []
+    metrics = _metric_diagnostic(diagnostics)
+    dimension_diagnostics = _dimension_diagnostics(diagnostics)
+    assert metrics is not None
+    assert metrics["summary"]["eligible_rows"] == 1
+    assert dimension_diagnostics == []
     assert errors == []
 
 
@@ -119,9 +135,12 @@ def test_enrich_dataframe_diagnostics_failure_reason_on_not_found():
         with patch("src.product_enrichment._find_dimensions", return_value=mock_result):
             df, errors, diagnostics = enrich_dataframe(_make_df())
 
-    assert len(diagnostics) == 1
-    assert diagnostics[0]["status"] == "not_found"
-    assert diagnostics[0]["failure_reason"] == "no dimensions found after 5 queries and 3 URLs checked"
-    assert diagnostics[0]["queries_tried"] == ["query1"]
-    assert diagnostics[0]["urls_checked"] == ["https://example.com"]
-    assert diagnostics[0]["domain_used"] == ""  # no source URL for not_found
+    metrics = _metric_diagnostic(diagnostics)
+    dimension_diagnostics = _dimension_diagnostics(diagnostics)
+    assert metrics is not None
+    assert len(dimension_diagnostics) == 1
+    assert dimension_diagnostics[0]["status"] == "not_found"
+    assert dimension_diagnostics[0]["failure_reason"] == "no dimensions found after 5 queries and 3 URLs checked"
+    assert dimension_diagnostics[0]["queries_tried"] == ["query1"]
+    assert dimension_diagnostics[0]["urls_checked"] == ["https://example.com"]
+    assert dimension_diagnostics[0]["domain_used"] == ""  # no source URL for not_found

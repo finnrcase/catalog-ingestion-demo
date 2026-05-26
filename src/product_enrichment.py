@@ -94,6 +94,37 @@ _ENRICHABLE_FIELDS: list = [
     "Product URL",
 ]
 
+_EXTERNAL_ENRICHMENT_FIELDS: tuple[str, ...] = (
+    "Dimensions",
+    "Product URL",
+    "Image URL",
+)
+
+_APPLIANCE_BRANDS: frozenset[str] = frozenset({
+    "asko", "bertazzoni", "bosch", "dacor", "fisher paykel", "fisher & paykel",
+    "frigidaire", "gaggenau", "ge", "ge appliances", "jennair", "kitchenaid",
+    "liebherr", "lynx", "miele", "monogram", "scotsman", "scotsman ice",
+    "sub zero", "sub-zero", "subzero", "thermador", "viking", "wolf",
+})
+
+_CATEGORY_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("refrigerator|freezer|icemaker|ice maker|dishwasher|range|oven|microwave|cooktop|hood|washer|dryer|appliance", "Appliances"),
+    ("sconce|pendant|chandelier|lamp|lantern|light|lighting", "Lighting"),
+    ("faucet|sink|toilet|tub|shower|valve|drain|lavatory|plumbing", "Plumbing"),
+    ("tile|stone|marble|travertine|slab", "Stone/Tile"),
+    ("floor|flooring|hardwood|carpet", "Flooring"),
+    ("sofa|chair|stool|bench|sectional|seating", "Seating"),
+    ("table|desk|console|nightstand", "Tables"),
+    ("rug|runner", "Rugs"),
+    ("mirror", "Mirrors"),
+    ("bed|mattress|headboard", "Beds/Mattresses"),
+    ("dresser|drawer|cabinet|armoire|storage", "Dressers/Drawers/Storage"),
+    ("paint|wallpaper|wallcovering", "Paint/Wallpaper"),
+    ("fabric|pillow|cushion", "Fabrics/Pillows"),
+    ("pull|knob|hinge|hardware", "Hardware"),
+    ("art|print|sculpture|photograph", "Artwork"),
+)
+
 MIN_USE_SCORE = 40   # below this: skip entirely, note in Notes
 MIN_CONF_SCORE = 60  # 40–59: fill fields but force Review Required = True
 
@@ -128,14 +159,65 @@ def _qualifies(row: dict) -> bool:
         return False
     if not _str_val(row.get("Model/SKU")):
         return False
-    # Qualify if any enrichable field is blank, OR if Dimensions exists but is
-    # not full W×H×D (a partial dimension still needs enrichment).
-    blank_or_incomplete = [
-        f for f in _ENRICHABLE_FIELDS
-        if not _str_val(row.get(f))
-        or (f == "Dimensions" and not has_complete_3d_dimensions(_str_val(row.get(f))))
-    ]
-    return bool(blank_or_incomplete)
+    return _needs_external_enrichment(row)
+
+
+def _norm_text(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+
+def _infer_category_locally(row: dict) -> tuple[str, int, str]:
+    existing = _normalise_category(_str_val(row.get("Product Category") or row.get("Category")))
+    if existing:
+        return existing, 95, "existing category normalized locally"
+
+    brand_norm = _norm_text(row.get("Brand"))
+    if brand_norm in _APPLIANCE_BRANDS:
+        return "Appliances", 90, "brand is a known appliance manufacturer"
+
+    haystack = _norm_text(" ".join([
+        _str_val(row.get("Product Name")),
+        _str_val(row.get("Description")),
+        _str_val(row.get("Notes")),
+        _str_val(row.get("Supplier")),
+    ]))
+    for pattern, category in _CATEGORY_KEYWORDS:
+        if re.search(pattern, haystack):
+            return category, 82, f"matched local category keyword: {pattern.split('|')[0]}"
+    return "", 0, ""
+
+
+def _apply_cheap_local_enrichment(row: dict) -> tuple[dict, dict]:
+    """Run deterministic, no-network cleanup before any expensive enrichment."""
+    updated, dim_debug = normalize_dimension_fields(row.copy())
+    metrics = {
+        "local_category_filled": False,
+        "local_dimension_normalized": bool(dim_debug),
+    }
+    category, confidence, reason = _infer_category_locally(updated)
+    if category and (
+        not _str_val(updated.get("Product Category"))
+        or _normalise_category(_str_val(updated.get("Product Category"))) != _str_val(updated.get("Product Category"))
+    ):
+        updated["Product Category"] = category
+        updated["Category Source"] = "local heuristic"
+        updated["AI Category Confidence"] = confidence
+        existing_reason = _str_val(updated.get("_confidence_reason"))
+        if reason and reason not in existing_reason:
+            updated["_confidence_reason"] = f"{existing_reason}; {reason}".strip("; ")
+        metrics["local_category_filled"] = True
+    return updated, metrics
+
+
+def _needs_external_enrichment(row: dict) -> bool:
+    """True only when a row is missing fields that require cache/web/page work."""
+    if not _str_val(row.get("Brand")) or not _str_val(row.get("Model/SKU")):
+        return False
+    if not has_complete_3d_dimensions(_str_val(row.get("Dimensions"))):
+        return True
+    if not _str_val(row.get("Product URL")):
+        return True
+    return False
 
 
 def _build_search_query(row: dict) -> str:
@@ -711,7 +793,12 @@ def extract_image_url(html: str) -> str | None:
     return best_url
 
 
-def _try_image_from_url(product_url: str, cache_key: str = "") -> str | None:
+def _try_image_from_url(
+    product_url: str,
+    cache_key: str = "",
+    row: dict | None = None,
+    page_confidence: str = "medium",
+) -> str | None:
     """Fetch product_url, extract the best image candidate, and validate via content-type.
 
     On success, updates the persistent cache so future cache hits carry the image.
@@ -725,7 +812,29 @@ def _try_image_from_url(product_url: str, cache_key: str = "") -> str | None:
         _log.info("[IMAGE PIPELINE] fetch failed url=%s", product_url[:80])
         return None
 
-    candidate = extract_image_url(raw_html)
+    candidate = None
+    if row:
+        page_evidence = ProductEvidence(
+            confidence=page_confidence if page_confidence in {"high", "medium"} else "medium",
+            score=80 if page_confidence == "high" else 65,
+            matched_sku=True,
+            matched_brand=True,
+            matched_product_name=bool(_str_val(row.get("Product Name"))),
+            official_domain=True,
+            domain=urllib.parse.urlparse(product_url).netloc.lower(),
+            evidence_summary="cached_verified_product_url",
+        )
+        image = extract_product_page_image(
+            raw_html,
+            product_url,
+            row,
+            page_evidence=page_evidence,
+            source_prefix="product_url",
+        )
+        if image.image_found and image.confidence in {"HIGH", "MEDIUM"}:
+            candidate = image.image_url
+    if not candidate:
+        candidate = extract_image_url(raw_html)
     if not candidate:
         _log.info("[IMAGE PIPELINE] no candidate found url=%s", product_url[:80])
         return None
@@ -775,6 +884,56 @@ def _budget_diagnostics(budget) -> dict:
 
 def _merge_budget_debug(debug: dict, budget) -> None:
     debug.update(_budget_diagnostics(budget))
+
+
+def _compact_image_candidate(record: dict) -> dict:
+    return {
+        "url": _str_val(record.get("image_url") or record.get("url")),
+        "source_page_url": _str_val(record.get("source_page_url")),
+        "source_domain": _str_val(record.get("source_domain")),
+        "source_type": _str_val(record.get("extraction_method") or record.get("source_kind")),
+        "confidence": _str_val(record.get("confidence")),
+        "score": record.get("score", ""),
+        "reason": _str_val(record.get("confidence_reason")),
+        "rejection_reason": _str_val(record.get("rejection_reason")),
+    }
+
+
+def _stamp_image_debug_fields(updated: dict, image, debug: dict) -> None:
+    image_debug = getattr(image, "debug", {}) or {}
+    raw_candidates = list(image_debug.get("image_candidates", []) or [])
+    accepted: list[dict] = []
+    rejected: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_candidates:
+        if not isinstance(raw, dict):
+            continue
+        compact = _compact_image_candidate(raw)
+        url = compact.get("url", "")
+        if compact.get("rejection_reason"):
+            rejected.append(f"{url}: {compact['rejection_reason']}")
+            continue
+        if url and url not in seen:
+            seen.add(url)
+            accepted.append(compact)
+    if getattr(image, "image_url", "") and image.image_url not in seen:
+        accepted.insert(0, {
+            "url": image.image_url,
+            "source_page_url": _str_val(debug.get("selected_product_page_url") or updated.get("Product URL")),
+            "source_domain": urllib.parse.urlparse(_str_val(debug.get("selected_product_page_url") or updated.get("Product URL"))).netloc,
+            "source_type": getattr(image, "image_source", ""),
+            "confidence": getattr(image, "confidence", ""),
+            "score": "",
+            "reason": ";".join(getattr(image, "evidence", []) or []),
+            "rejection_reason": "",
+        })
+    rejected.extend(str(v) for v in list(image_debug.get("rejection_reasons", []) or []) if str(v))
+    updated["_image_query_used"] = _str_val(image_debug.get("image_query_used")) or _str_val(debug.get("_enrichment_query_used"))
+    updated["_image_candidates"] = json.dumps(accepted[:3])
+    updated["_image_rejected_candidates"] = json.dumps(rejected[:12])
+    updated["_selected_image_candidate"] = getattr(image, "image_url", "") or _str_val(debug.get("selected_image_url"))
+    updated["_image_source_type"] = getattr(image, "image_source", "")
+    updated["_image_final_confidence"] = getattr(image, "confidence", "")
 
 
 def _apply_product_lookup_cache_entry(row: dict, cache_entry: dict, debug: dict) -> tuple[dict, _DimensionResult | None]:
@@ -1190,6 +1349,7 @@ def _apply_official_product_lookup(
         source_prefix="official_site",
     )
     debug["image_candidates_found"] = image.debug.get("images_found", 0)
+    _stamp_image_debug_fields(updated, image, debug)
     if image.image_found:
         debug["selected_image_url"] = image.image_url
         debug["selected_image_reason"] = ";".join(image.evidence)
@@ -1462,7 +1622,20 @@ def enrich_row(
 
         if not use_web_enrichment:
             _log.info("[WEB ENRICHMENT DISABLED] skipping search and cache for row")
-            updated, _debug = normalize_dimension_fields(row.copy())
+            return row, None, None
+
+        row, local_metrics = _apply_cheap_local_enrichment(row)
+
+        if not _needs_external_enrichment(row):
+            updated = row.copy()
+            updated["Enrichment Stage"] = "cheap_local_only"
+            updated["AI Extraction Status"] = "Skipped AI: local confidence sufficient"
+            updated["API Budget Search Usage"] = "Used 0/0 search calls"
+            updated["API Budget Fetch Usage"] = "Used 0/0 page fetches"
+            updated["API Budget AI Usage"] = "Used 0/0 AI calls"
+            updated["API Budget Stopped Reason"] = "Skipped expensive enrichment: row already has required fields"
+            if local_metrics.get("local_category_filled"):
+                updated["Search Diagnostics"] = "local_category_heuristic"
             return updated, None, None
 
         mode = _normalize_mode(enrichment_mode)
@@ -1490,15 +1663,12 @@ def enrich_row(
                     original = _str_val(updated.get("Source Type", ""))
                     if not original.endswith("_Enriched"):
                         updated["Source Type"] = f"{original}_Enriched" if original else "Enriched"
-                    # Image is not an essential cache field; try recovering it when
-                    # the cache explicitly has null (tried before, but now extraction
-                    # logic is improved / CDN URLs were previously rejected by extension filter).
-                    if not row_has_image(updated) and "image_url" in cache_entry and cache_entry["image_url"] is None:
-                        product_url = _str_val(updated.get("Product URL"))
-                        if product_url:
-                            img = _try_image_from_url(product_url, cache_key)
-                            if img:
-                                updated["Image URL"] = img
+                    updated["Enrichment Stage"] = "persistent_cache"
+                    updated["AI Extraction Status"] = "Skipped AI: product enrichment cache hit"
+                    updated["API Budget Search Usage"] = "Used 0/0 search calls"
+                    updated["API Budget Fetch Usage"] = "Used 0/0 page fetches"
+                    updated["API Budget AI Usage"] = "Used 0/0 AI calls"
+                    updated["API Budget Stopped Reason"] = "Used cached result: no API cost"
                     return updated, None, None
                 else:
                     product_cache_hit = "partial"
@@ -1592,6 +1762,90 @@ def enrich_row(
         return row, str(exc), None
 
 
+def _write_updated_row(df: pd.DataFrame, idx, updated: dict) -> None:
+    for col, val in updated.items():
+        if col not in df.columns:
+            df[col] = pd.Series([None] * len(df), index=df.index, dtype=object)
+        elif not isinstance(val, str):
+            dtype_name = str(df[col].dtype).lower()
+            if dtype_name in {"string", "str"} or pd.api.types.is_string_dtype(df[col].dtype):
+                df[col] = df[col].astype(object)
+        df.at[idx, col] = val
+
+
+def _duplicate_key(row: dict) -> str:
+    brand = _str_val(row.get("Brand"))
+    model = _str_val(row.get("Model/SKU"))
+    if not brand or not model:
+        return ""
+    try:
+        return _normalize_key(brand, model)
+    except Exception:
+        return ""
+
+
+def _apply_duplicate_enrichment_result(row: dict, template: dict) -> dict:
+    """Reuse expensive lookup results for duplicate brand/model rows in one upload."""
+    updated = row.copy()
+    for field in (
+        "Product URL",
+        "Image URL",
+        "image_source",
+        "confidence",
+        "evidence",
+        "needs_image_review",
+        "Dimensions",
+        "Width (in)",
+        "Height (in)",
+        "Depth (in)",
+        "Length (in)",
+        "Dimension Source URL",
+        "Dimension Confidence",
+        "Dimension Source Type",
+        "Dimension Lookup Status",
+        "Finish / Color",
+        "Material",
+        "Product Category",
+        "_image_candidates",
+        "_image_rejected_candidates",
+        "_selected_image_candidate",
+        "_image_source_type",
+        "_image_final_confidence",
+    ):
+        value = template.get(field)
+        if _str_val(value) and not _str_val(updated.get(field)):
+            updated[field] = value
+    if not _str_val(updated.get("Dimensions")) and has_complete_3d_dimensions(_str_val(template.get("Dimensions"))):
+        updated["Dimensions"] = template.get("Dimensions")
+    original = _str_val(updated.get("Source Type", ""))
+    if original and not original.endswith("_Enriched"):
+        updated["Source Type"] = f"{original}_Enriched"
+    updated["Enrichment Stage"] = "duplicate_reuse"
+    updated["AI Extraction Status"] = "Skipped AI: duplicate brand/model reused"
+    updated["API Budget Search Usage"] = "Used 0/0 search calls"
+    updated["API Budget Fetch Usage"] = "Used 0/0 page fetches"
+    updated["API Budget AI Usage"] = "Used 0/0 AI calls"
+    updated["API Budget Stopped Reason"] = "Duplicate brand/model reused: no API cost"
+    return updated
+
+
+def _parse_usage_count(value: object) -> int:
+    match = re.search(r"Used\s+(\d+)\s*/", str(value or ""))
+    return int(match.group(1)) if match else 0
+
+
+def _metrics_from_updated_row(updated: dict) -> dict:
+    return {
+        "search_calls": _parse_usage_count(updated.get("API Budget Search Usage")),
+        "page_fetches": _parse_usage_count(updated.get("API Budget Fetch Usage")),
+        "ai_calls": _parse_usage_count(updated.get("API Budget AI Usage")),
+        "cache_hit": _str_val(updated.get("product_lookup_cache_status")) in {"hit", "searched_no_result"}
+            or _str_val(updated.get("Enrichment Stage")) == "persistent_cache",
+        "duplicate_reuse": _str_val(updated.get("Enrichment Stage")) == "duplicate_reuse",
+        "cheap_local_only": _str_val(updated.get("Enrichment Stage")) == "cheap_local_only",
+    }
+
+
 def enrich_dataframe(
     df: pd.DataFrame,
     enrichment_mode: str = "standard",
@@ -1605,17 +1859,69 @@ def enrich_dataframe(
     df = df.copy()
     errors: list[str] = []
     dimension_diagnostics: list[dict] = []
+    started_at = time.perf_counter()
+    metrics = {
+        "report_type": "enrichment_metrics",
+        "summary": {
+            "mode": _normalize_mode(enrichment_mode),
+            "total_rows": int(len(df)),
+            "eligible_rows": 0,
+            "external_enrichment_rows": 0,
+            "skipped_enrichments": 0,
+            "cheap_local_only": 0,
+            "duplicate_reuse": 0,
+            "cache_hits": 0,
+            "search_calls": 0,
+            "page_fetches": 0,
+            "ai_calls": 0,
+            "ai_calls_avoided": 0,
+            "estimated_cost_usd": 0.0,
+            "cache_hit_rate": 0.0,
+            "duration_ms": 0,
+        },
+    }
 
     if not use_web_enrichment:
         return df, errors, dimension_diagnostics
 
     from src.enrichment_cache import SessionCache as _SC
     _session = _SC(force_refresh=force_refresh)
+    duplicate_results: dict[str, dict] = {}
 
     for idx, row in df.iterrows():
-        r = row.to_dict()
-        if not _qualifies(r):
+        raw = row.to_dict()
+        r, local_metrics = _apply_cheap_local_enrichment(raw)
+        if r != raw:
+            _write_updated_row(df, idx, r)
+
+        if not _str_val(r.get("Brand")) or not _str_val(r.get("Model/SKU")):
+            metrics["summary"]["skipped_enrichments"] += 1
             continue
+
+        metrics["summary"]["eligible_rows"] += 1
+
+        if not _needs_external_enrichment(r):
+            metrics["summary"]["cheap_local_only"] += 1
+            metrics["summary"]["skipped_enrichments"] += 1
+            r["Enrichment Stage"] = "cheap_local_only"
+            r["AI Extraction Status"] = "Skipped AI: local confidence sufficient"
+            r["API Budget Search Usage"] = "Used 0/0 search calls"
+            r["API Budget Fetch Usage"] = "Used 0/0 page fetches"
+            r["API Budget AI Usage"] = "Used 0/0 AI calls"
+            r["API Budget Stopped Reason"] = "Skipped expensive enrichment: row already has required fields"
+            _write_updated_row(df, idx, r)
+            continue
+
+        dup_key = _duplicate_key(r)
+        if dup_key and not force_refresh and dup_key in duplicate_results:
+            updated = _apply_duplicate_enrichment_result(r, duplicate_results[dup_key])
+            _write_updated_row(df, idx, updated)
+            metrics["summary"]["duplicate_reuse"] += 1
+            metrics["summary"]["skipped_enrichments"] += 1
+            metrics["summary"]["ai_calls_avoided"] += 1
+            continue
+
+        metrics["summary"]["external_enrichment_rows"] += 1
 
         try:
             updated, error, dim_result = enrich_row(
@@ -1626,14 +1932,18 @@ def enrich_dataframe(
             if error:
                 errors.append(error)
             else:
-                # Ensure enrichment output columns survive even when an upstream
-                # DataFrame was built without the full intake schema.
-                for col, val in updated.items():
-                    if col not in df.columns:
-                        df[col] = pd.Series([None] * len(df), index=df.index, dtype=object)
-                    elif str(df[col].dtype) == "string" and not isinstance(val, str):
-                        df[col] = df[col].astype(object)
-                    df.at[idx, col] = val
+                _write_updated_row(df, idx, updated)
+                if dup_key:
+                    duplicate_results[dup_key] = updated
+                row_metrics = _metrics_from_updated_row(updated)
+                metrics["summary"]["search_calls"] += row_metrics["search_calls"]
+                metrics["summary"]["page_fetches"] += row_metrics["page_fetches"]
+                metrics["summary"]["ai_calls"] += row_metrics["ai_calls"]
+                metrics["summary"]["cache_hits"] += int(bool(row_metrics["cache_hit"]))
+                metrics["summary"]["duplicate_reuse"] += int(bool(row_metrics["duplicate_reuse"]))
+                metrics["summary"]["cheap_local_only"] += int(bool(row_metrics["cheap_local_only"]))
+                if row_metrics["ai_calls"] == 0:
+                    metrics["summary"]["ai_calls_avoided"] += 1
 
                 # Collect dimension diagnostics if lookup ran.
                 # Diagnostic is built from DimensionResult directly (not from row dict),
@@ -1658,8 +1968,15 @@ def enrich_dataframe(
             label = _str_val(r.get("Product Name")) or _str_val(r.get("Brand")) or _str_val(r.get("Model/SKU")) or str(idx)
             errors.append(f"Row '{label}': {exc}")
 
-        time.sleep(0.5)
+        time.sleep(0.05 if _normalize_mode(enrichment_mode) == "fast" else 0.2)
 
+    eligible = max(1, int(metrics["summary"]["eligible_rows"]))
+    metrics["summary"]["cache_hit_rate"] = round(metrics["summary"]["cache_hits"] / eligible, 3)
+    metrics["summary"]["duration_ms"] = int((time.perf_counter() - started_at) * 1000)
+    # Coarse diagnostic estimate: Brave/web requests are negligible compared
+    # with AI; this helps debug spend without trying to mirror vendor billing.
+    metrics["summary"]["estimated_cost_usd"] = round(metrics["summary"]["ai_calls"] * 0.01, 4)
+    dimension_diagnostics.insert(0, metrics)
     return df, errors, dimension_diagnostics
 
 
@@ -1668,6 +1985,7 @@ def recover_images_for_dataframe(
     pdf_lookup: dict[str, str] | None = None,
     session_id: str | None = None,
     enable_screenshot: bool = True,
+    enable_web_lookup: bool = True,
 ):
     """
     Backward-compatible alias for src.image_recovery.recover_images_for_dataframe.
@@ -1682,4 +2000,5 @@ def recover_images_for_dataframe(
         pdf_lookup=pdf_lookup,
         session_id=session_id,
         enable_screenshot=enable_screenshot,
+        enable_web_lookup=enable_web_lookup,
     )

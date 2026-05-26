@@ -77,6 +77,21 @@ def test_product_url_with_gallery_img_tags():
     assert result.image_url.endswith("wwd30-gallery.jpg")
 
 
+def test_product_url_rejects_default_meta_image_and_uses_product_gallery():
+    html = """
+    <head><meta property="og:image" content="https://wolfappliance.com/assets/default-meta-image.jpg"></head>
+    <body>Wolf WWD30
+      <div class="product-media">
+        <img src="https://wolfappliance.com/images/wwd30-product.jpg" alt="Wolf WWD30 product" width="900" height="900">
+      </div>
+    </body>
+    """
+    result = extract_product_page_image(html, "https://wolfappliance.com/product/wwd30", _row())
+    assert result.image_found is True
+    assert result.image_url.endswith("wwd30-product.jpg")
+    assert any("default-meta-image" in reason for reason in result.debug["rejection_reasons"])
+
+
 def test_brand_sku_official_lookup_success():
     from src.brave_search import SearchResult
 
@@ -97,10 +112,11 @@ def test_brand_sku_official_lookup_success():
 
 def test_lookup_queries_follow_required_order():
     queries = build_image_lookup_queries(_row(Supplier="Ferguson"))
-    assert queries[0] == '"Wolf" "WWD30" product'
+    assert queries[0] == '"Wolf" "WWD30" product image'
     assert queries[1] == '"Wolf" "Wolf Warming Drawer" "WWD30"'
-    assert queries[2] == '"Ferguson" "Wolf Warming Drawer" "WWD30"'
-    assert queries[3] == '"Wolf" "Wolf Warming Drawer" dimensions image'
+    assert queries[2] == '"Wolf" "WWD30" "Wolf Warming Drawer" product image'
+    assert queries[3] == 'site:wolfappliance.com "WWD30" product image'
+    assert queries[4] == 'site:wolfappliance.com "WWD30" images'
 
 
 def test_pdf_with_embedded_image(tmp_path):

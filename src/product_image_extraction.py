@@ -40,6 +40,18 @@ _BAD_HINTS = (
     "spinner",
     "swatch",
     "thumb-sprite",
+    "default-meta-image",
+    "default_meta_image",
+    "default-image",
+    "defaultimage",
+    "missing-image",
+    "no-image",
+    "noimage",
+    "badge",
+    "lifestyle",
+    "roomscene",
+    "room-scene",
+    "inspiration",
 )
 _GENERIC_ALT = {"product", "image", "photo", "view", "front", "side", "back", "detail", "gallery", "main"}
 _CONF_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
@@ -157,6 +169,14 @@ def _score(candidate: ImageCandidate, row: dict, page_verified: bool, page_confi
     ok, reason = _valid_url(candidate.url)
     if not ok:
         candidate.rejection_reason = reason
+        candidate.evidence = evidence
+        return
+    if urllib.parse.urlparse(candidate.url).path.lower().endswith(".svg") and not _identity_in_text(
+        f"{candidate.url} {candidate.alt} {candidate.title}",
+        row,
+        require_sku=False,
+    ):
+        candidate.rejection_reason = "svg_without_product_signal"
         candidate.evidence = evidence
         return
     alt_ok, alt_reason = _valid_alt(candidate, row)

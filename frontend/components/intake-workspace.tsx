@@ -1,7 +1,10 @@
 "use client";
 
 import {
+  ChevronDown,
+  ChevronRight,
   CheckCircle2,
+  Copy,
   Download,
   FileText,
   ImageIcon,
@@ -105,6 +108,9 @@ const fallbackSections = [
   "General",
 ];
 
+const INTERNAL_DEBUG_ENABLED =
+  process.env.NODE_ENV !== "production" || process.env.NEXT_PUBLIC_INTERNAL_DEBUG === "true";
+
 function rowText(row: IntakeRow, key: string) {
   return String(row[key] ?? "");
 }
@@ -156,6 +162,22 @@ type UploadDebugInfo = {
   stackTraceSnippet?: string;
   rawLogs?: string;
   retryJobId?: string;
+};
+
+type DebugUploadSnapshot = {
+  fileName: string;
+  fileType: string;
+  fileSize: string;
+  uploadedAt: string;
+  parser: string;
+  parseDurationMs: number;
+  pageCount: number | null;
+  ocrUsed: boolean;
+  rawTextLength: number;
+  detectedItemGroups: number;
+  finalProductEntries: number;
+  logs?: Record<string, unknown>[] | null;
+  telemetry?: Record<string, unknown>;
 };
 
 const UPLOAD_TIMEOUT_MS = 90_000;
@@ -245,6 +267,26 @@ function pdfJobDebug(file: File, job: PdfParseJob, rawLogs = ""): UploadDebugInf
   };
 }
 
+function debugUploadSnapshot(file: File, job: PdfParseJob, uploadedAt: string, logs?: PdfParseJob | null): DebugUploadSnapshot {
+  const attempts = Array.isArray(job.telemetry?.attempts) ? job.telemetry.attempts as Record<string, unknown>[] : [];
+  const durationMs = attempts.reduce((total, attempt) => total + Math.round(Number(attempt.duration_seconds || 0) * 1000), 0);
+  return {
+    fileName: file.name,
+    fileType: file.type || "application/pdf",
+    fileSize: formatFileSize(file.size),
+    uploadedAt,
+    parser: String(job.telemetry?.parser_used || attempts.map((attempt) => attempt.parser).filter(Boolean).join(" -> ") || ""),
+    parseDurationMs: durationMs,
+    pageCount: typeof job.telemetry?.page_count === "number" ? job.telemetry.page_count : null,
+    ocrUsed: Boolean(job.telemetry?.ocr_triggered),
+    rawTextLength: Number(job.telemetry?.extracted_text_length || 0),
+    detectedItemGroups: job.rows.filter((row) => rowText(row, "_raw_grouped_text")).length,
+    finalProductEntries: job.rows.length,
+    logs: logs?.logs || null,
+    telemetry: job.telemetry,
+  };
+}
+
 async function downloadText(filename: string, text: string) {
   const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -257,6 +299,299 @@ async function downloadText(filename: string, text: string) {
 
 function cleanNotes(value: string) {
   return value.replace(/^\s*(?:row\s*)?#?\d{1,3}\s*[-–—:.)]\s+(?=[A-Za-z\[\("'])/i, "").trim();
+}
+
+function safeParseRecord(value: string): Record<string, unknown> {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
+  } catch {
+    return {};
+  }
+}
+
+function safeParseArray(value: string): Record<string, unknown>[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter((item) => item && typeof item === "object") as Record<string, unknown>[] : [];
+  } catch {
+    return [];
+  }
+}
+
+function candidateImageUrl(candidate: Record<string, unknown>) {
+  return String(candidate.url || candidate.image_url || "").trim();
+}
+
+function missingFieldsForDebug(row: IntakeRow) {
+  const explicit = rowText(row, "Missing Fields");
+  if (explicit) return explicit.split(",").map((item) => item.trim()).filter(Boolean);
+  return missingFieldsForRow(row);
+}
+
+function traceField(row: IntakeRow, field: string, parsed: Record<string, unknown>) {
+  const value = rowText(row, field);
+  const mappedKeys: Record<string, string> = {
+    Project: "project",
+    Room: "room",
+    Supplier: "supplier",
+    "Product Category": "category",
+    Brand: "brand",
+    "Model/SKU": "model",
+    "Product Name": "description",
+    "Finish / Color": "finish",
+    Quantity: "quantity",
+    Price: "price",
+    Dimensions: "dimensions",
+    "Image URL": "image_url",
+    "Product URL": "product_url",
+  };
+  const parsedValue = parsed[mappedKeys[field] || field];
+  const hasParsedValue = parsedValue !== undefined && String(parsedValue || "").trim() !== "";
+  const grouped = Boolean(rowText(row, "_raw_grouped_text"));
+  const source =
+    !value
+      ? "missing"
+      : field === "Project" || field === "Supplier" || field === "Product Category"
+        ? hasParsedValue || grouped ? "global context" : "user input"
+        : ["Brand", "Model/SKU", "Product Name", "Finish / Color", "Quantity", "Price"].includes(field)
+          ? hasParsedValue || grouped ? "PDF grouped text" : "user input"
+          : ["Dimensions", "Image URL", "Product URL"].includes(field)
+            ? "enriched"
+            : "user input";
+  const confidence =
+    !value
+      ? 0
+      : Number(row["_extraction_confidence"] || row["Confidence Score"] || 0) / 100 || (source === "PDF grouped text" ? 0.85 : 0.7);
+  const reason =
+    !value
+      ? `${field} was not found in PDF text or enrichment output.`
+      : source === "PDF grouped text"
+        ? rowText(row, "_confidence_reason") || `Detected ${field} inside grouped quote item text.`
+        : source === "global context"
+          ? `Detected from quote-level context and applied to the item.`
+          : source === "enriched"
+            ? `Filled after validation/enrichment or manual image recovery.`
+            : `Current row value; may have been entered or edited by the user.`;
+  return { value: value || null, source, confidence: Math.min(1, Math.max(0, confidence)), reason };
+}
+
+function buildInternalDebugReport(
+  rows: IntakeRow[],
+  uploads: DebugUploadSnapshot[],
+  errors: string[],
+  exportSummary: { export_count: number },
+  diagnostics: Record<string, unknown>[],
+) {
+  const missingCounts: Record<string, number> = {};
+  rows.forEach((row) => {
+    missingFieldsForDebug(row).forEach((field) => {
+      missingCounts[field] = (missingCounts[field] || 0) + 1;
+    });
+  });
+  const parserWarnings = uploads.flatMap((upload) =>
+    (upload.logs || [])
+      .filter((entry) => ["failed", "cancelled"].includes(String(entry.stage || "")) || String(entry.message || "").toLowerCase().includes("warning"))
+      .map((entry) => String(entry.message || entry.stage || "")),
+  );
+  const groupingWarnings = rows
+    .filter((row) => rowText(row, "Source Type") === "PDF" && !rowText(row, "_raw_grouped_text"))
+    .map((row, index) => `Item ${index + 1} was parsed by line/table fallback without grouped quote text.`);
+  const enrichmentMetricsEntry = diagnostics.find((entry) => entry.report_type === "enrichment_metrics");
+  const enrichmentMetrics =
+    enrichmentMetricsEntry?.summary && typeof enrichmentMetricsEntry.summary === "object"
+      ? enrichmentMetricsEntry.summary as Record<string, unknown>
+      : null;
+
+  const products = rows.map((row, index) => {
+    const parsed = safeParseRecord(rowText(row, "_parsed_fields"));
+    const fields = [
+      "Project",
+      "Room",
+      "Supplier",
+      "Product Category",
+      "Brand",
+      "Model/SKU",
+      "Product Name",
+      "Finish / Color",
+      "Quantity",
+      "Price",
+      "Dimensions",
+      "Image URL",
+      "Product URL",
+    ].reduce<Record<string, ReturnType<typeof traceField>>>((acc, field) => {
+      acc[field] = traceField(row, field, parsed);
+      return acc;
+    }, {});
+    const missingFields = missingFieldsForDebug(row);
+    const imageCandidates = safeParseArray(rowText(row, "_image_candidates"));
+    const rejectedImageCandidates = safeParseArray(rowText(row, "_image_rejected_candidates"));
+    const rejectedImageText = rowText(row, "_image_rejected_candidates");
+    return {
+      id: rowText(row, "_item_number") || String(index + 1),
+      index: index + 1,
+      sourceLineNumber: row["_source_page_number"] || null,
+      rawGroupedText: rowText(row, "_raw_grouped_text"),
+      parsedFields: fields,
+      enrichment: {
+        query: rowText(row, "_enrichment_query_used") || [rowText(row, "Brand"), rowText(row, "Model/SKU"), rowText(row, "Product Name")].filter(Boolean).join(" "),
+        attempted: Boolean(rowText(row, "Product URL") || rowText(row, "Dimension Lookup Status") || rowText(row, "image_source") || diagnostics.length),
+        matchedUrl: rowText(row, "Product URL") || null,
+        extractedFields: {
+          dimensions: rowText(row, "Dimensions") || null,
+          imageUrl: rowText(row, "Image URL") || null,
+          productUrl: rowText(row, "Product URL") || null,
+          material: rowText(row, "Material") || null,
+          finish: rowText(row, "Finish / Color") || null,
+        },
+        failedFields: missingFields,
+        failureReason: rowText(row, "Suggested Action") || (missingFields.length ? `Missing ${missingFields.join(", ")}` : ""),
+        retryCount: Number(row["retry_count"] || 0),
+        status: rowText(row, "Status"),
+      },
+      imageTrace: {
+        queryUsed: rowText(row, "_image_query_used"),
+        candidatesFound: imageCandidates,
+        selectedCandidate: rowText(row, "_selected_image_candidate") || rowText(row, "Image URL") || null,
+        rejectedCandidates: rejectedImageCandidates.length ? rejectedImageCandidates : rejectedImageText,
+        sourceType: rowText(row, "_image_source_type") || rowText(row, "image_source"),
+        finalConfidence: rowText(row, "_image_final_confidence") || rowText(row, "confidence"),
+      },
+      finalStatus: rowText(row, "Status"),
+      missingFields,
+      confidenceScore: Number(row["Confidence Score"] || 0),
+      confidenceReasons: rowText(row, "_confidence_reason") || rowText(row, "Suggested Action"),
+    };
+  });
+
+  return {
+    generatedAt: new Date().toISOString(),
+    upload: uploads[uploads.length - 1] || null,
+    uploads,
+    summary: {
+      totalFinalProductEntries: rows.length,
+      numberReady: exportSummary.export_count,
+      numberNeedsReview: rows.filter((row) => row["Review Required"] === true || rowText(row, "Status").toLowerCase().includes("review")).length,
+    },
+    failureSummary: {
+      fieldsMostCommonlyMissing: Object.entries(missingCounts).sort((a, b) => b[1] - a[1]).map(([field, count]) => ({ field, count })),
+      itemsThatFailedEnrichment: products
+        .filter((product) => product.missingFields.length > 0)
+        .map((product) => ({ index: product.index, id: product.id, missingFields: product.missingFields, reason: product.enrichment.failureReason })),
+      parserWarnings,
+      groupingWarnings,
+      skippedRows: "Header/junk/warranty rows are filtered during grouping and are not emitted as products.",
+      duplicateOrLowConfidenceItems: rows
+        .map((row, index) => ({ index: index + 1, confidenceScore: Number(row["Confidence Score"] || 0), productName: rowText(row, "Product Name") }))
+        .filter((item) => item.confidenceScore > 0 && item.confidenceScore < 75),
+    },
+    enrichmentMetrics,
+    extraction: {
+      rawTextPreview: products.map((product) => product.rawGroupedText).filter(Boolean).join("\n---\n").slice(0, 4000),
+      detectedGlobals: uploads[uploads.length - 1] ? {
+        fileName: uploads[uploads.length - 1].fileName,
+        parser: uploads[uploads.length - 1].parser,
+      } : {},
+      itemGroups: products.map((product) => ({ id: product.id, rawGroupedText: product.rawGroupedText, parsedFields: product.parsedFields })),
+      skippedRows: "Filtered internally: quote headers, column headers, warranty rows, contact/address lines, totals/subtotals.",
+      warnings: [...parserWarnings, ...groupingWarnings],
+    },
+    products,
+    errors,
+    diagnostics,
+  };
+}
+
+function formatDebugReportText(report: ReturnType<typeof buildInternalDebugReport>) {
+  const lines = [
+    "SCH DesignOps Intake Debug Report",
+    `Generated: ${report.generatedAt}`,
+    "",
+    "Upload Summary",
+  ];
+  if (report.upload) {
+    lines.push(
+      `File: ${report.upload.fileName}`,
+      `Type: ${report.upload.fileType}`,
+      `Size: ${report.upload.fileSize}`,
+      `Uploaded At: ${report.upload.uploadedAt}`,
+      `Parser: ${report.upload.parser || "unknown"}`,
+      `Parse Duration: ${report.upload.parseDurationMs}ms`,
+      `Page Count: ${report.upload.pageCount ?? "unknown"}`,
+      `OCR Used: ${report.upload.ocrUsed ? "yes" : "no"}`,
+      `Raw Text Length: ${report.upload.rawTextLength}`,
+      `Detected Item Groups: ${report.upload.detectedItemGroups}`,
+      `Final Product Entries: ${report.upload.finalProductEntries}`,
+    );
+  } else {
+    lines.push("No upload telemetry captured in this browser session.");
+  }
+  lines.push(
+    `Ready: ${report.summary.numberReady}`,
+    `Needs Review: ${report.summary.numberNeedsReview}`,
+  );
+  if (report.enrichmentMetrics) {
+    const metrics = report.enrichmentMetrics;
+    lines.push(
+      "",
+      "Enrichment Metrics",
+      `Mode: ${metrics.mode ?? "unknown"}`,
+      `Estimated Cost: $${metrics.estimated_cost_usd ?? "0"}`,
+      `Search Calls: ${metrics.search_calls ?? 0}`,
+      `Page Fetches: ${metrics.page_fetches ?? 0}`,
+      `AI Calls: ${metrics.ai_calls ?? 0}`,
+      `AI Calls Avoided: ${metrics.ai_calls_avoided ?? 0}`,
+      `Cache Hit Rate: ${metrics.cache_hit_rate ?? 0}`,
+      `Cache Hits: ${metrics.cache_hits ?? 0}`,
+      `Duplicate Reuse: ${metrics.duplicate_reuse ?? 0}`,
+      `Cheap Local Only: ${metrics.cheap_local_only ?? 0}`,
+      `Skipped Enrichments: ${metrics.skipped_enrichments ?? 0}`,
+      `Duration: ${metrics.duration_ms ?? 0}ms`,
+    );
+  }
+  lines.push(
+    "",
+    "Failure Summary",
+    `Missing Fields: ${report.failureSummary.fieldsMostCommonlyMissing.map((item) => `${item.field} (${item.count})`).join(", ") || "none"}`,
+    `Parser Warnings: ${report.failureSummary.parserWarnings.join(" | ") || "none"}`,
+    `Grouping Warnings: ${report.failureSummary.groupingWarnings.join(" | ") || "none"}`,
+    "",
+    "Products",
+  );
+  report.products.forEach((product) => {
+    lines.push(
+      "",
+      `#${product.index} ${product.parsedFields["Product Name"].value || "Unnamed Item"}`,
+      `Source Line/Page: ${product.sourceLineNumber ?? "unknown"}`,
+      `Raw Grouped Text:\n${product.rawGroupedText || "(none)"}`,
+      "Parsed Fields:",
+    );
+    Object.entries(product.parsedFields).forEach(([field, trace]) => {
+      lines.push(`- ${field}: ${trace.value ?? "null"} | source=${trace.source} | confidence=${trace.confidence} | reason=${trace.reason}`);
+    });
+    lines.push(
+      "Enrichment:",
+      `- Query: ${product.enrichment.query || "(none)"}`,
+      `- Attempted: ${product.enrichment.attempted ? "yes" : "no"}`,
+      `- Matched URL: ${product.enrichment.matchedUrl || "none"}`,
+      `- Failed Fields: ${product.enrichment.failedFields.join(", ") || "none"}`,
+      `- Failure Reason: ${product.enrichment.failureReason || "none"}`,
+      `- Retry Count: ${product.enrichment.retryCount}`,
+      `- Final Status: ${product.finalStatus}`,
+      `- Confidence: ${product.confidenceScore}`,
+      `- Confidence Reason: ${product.confidenceReasons || "none"}`,
+      "Image Trace:",
+      `- Query Used: ${product.imageTrace.queryUsed || "none"}`,
+      `- Selected: ${product.imageTrace.selectedCandidate || "none"}`,
+      `- Source: ${product.imageTrace.sourceType || "none"}`,
+      `- Confidence: ${product.imageTrace.finalConfidence || "none"}`,
+      `- Candidates: ${JSON.stringify(product.imageTrace.candidatesFound)}`,
+      `- Rejected: ${typeof product.imageTrace.rejectedCandidates === "string" ? product.imageTrace.rejectedCandidates || "none" : JSON.stringify(product.imageTrace.rejectedCandidates)}`,
+    );
+  });
+  return lines.join("\n");
 }
 
 function isEligible(row: IntakeRow) {
@@ -351,12 +686,20 @@ export function IntakeWorkspace() {
   const [showUploadDebug, setShowUploadDebug] = useState(false);
   const [uploadStatusText, setUploadStatusText] = useState("");
   const [activePdfParseJobId, setActivePdfParseJobId] = useState("");
+  const [debugUploads, setDebugUploads] = useState<DebugUploadSnapshot[]>([]);
+  const [latestDiagnostics, setLatestDiagnostics] = useState<Record<string, unknown>[]>([]);
+  const [showInternalDebug, setShowInternalDebug] = useState(false);
+  const [debugCopyStatus, setDebugCopyStatus] = useState("");
+  const [showReviewItems, setShowReviewItems] = useState(false);
+  const [showMissingDetailItems, setShowMissingDetailItems] = useState(false);
+  const [showEnrichedItems, setShowEnrichedItems] = useState(false);
   const [useAiPdf, setUseAiPdf] = useState(true);
   const [rows, setRows] = useState<IntakeRow[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
   const [sections, setSections] = useState<string[]>(fallbackSections);
   const [message, setMessage] = useState("");
   const [useWebEnrichment, setUseWebEnrichment] = useState(true);
+  const [enrichmentMode, setEnrichmentMode] = useState<"fast" | "standard" | "deep" | "manual_retry">("fast");
   const [includeLowConfidenceImages, setIncludeLowConfidenceImages] = useState(false);
   const [photoDiscoveryReport, setPhotoDiscoveryReport] = useState<PhotoDiscoveryReport | null>(null);
   const [productImageUploads, setProductImageUploads] = useState<Record<number, string>>({});
@@ -428,9 +771,14 @@ export function IntakeWorkspace() {
     () => includedRows.filter((row) => missingFieldsForRow(row).length > 0),
     [includedRows],
   );
+  const productListNeedsReview = Math.max(0, includedRows.length - readyRows);
   const needsReview = useMemo(
     () => includedRows.filter((row) => row["Review Required"] === true).length,
     [includedRows],
+  );
+  const internalDebugReport = useMemo(
+    () => buildInternalDebugReport(rows, debugUploads, errors, exportSummary, latestDiagnostics),
+    [rows, debugUploads, errors, exportSummary, latestDiagnostics],
   );
   const ignored = useMemo(() => rows.filter((row) => row.Include === false || row.Status === "Ignored").length, [rows]);
   const onlyPhotosSelected = bulkImages.length > 0 && files.length === 0 && !urls.trim();
@@ -588,6 +936,7 @@ export function IntakeWorkspace() {
   async function parsePdfFilesWithJobs(pdfFiles: File[]): Promise<IntakeRow[]> {
     const parsedRows: IntakeRow[] = [];
     for (const [index, file] of pdfFiles.entries()) {
+      const uploadedAt = new Date().toISOString();
       setUploadStatusText(`${file.name}: Uploading`);
       setMessage("Uploading PDF.");
       const upload = await runUploadWithTimeout(
@@ -605,6 +954,8 @@ export function IntakeWorkspace() {
       setMessage(`Queued ${index + 1}/${pdfFiles.length} PDF${pdfFiles.length === 1 ? "" : "s"} for parsing.`);
       try {
         const job = await pollPdfParseJob(upload.parse_job_id, file);
+        const logs = await fetchPdfParseLogs(job.job_id).catch(() => null);
+        setDebugUploads((current) => [...current, debugUploadSnapshot(file, job, uploadedAt, logs)]);
         parsedRows.push(...job.rows);
       } finally {
         setActivePdfParseJobId("");
@@ -762,6 +1113,9 @@ export function IntakeWorkspace() {
     }
     setBusy("photoBulk");
     setUploadStatusText("Processing image...");
+    setShowReviewItems(false);
+    setShowMissingDetailItems(false);
+    setShowEnrichedItems(false);
     resetUploadErrorState();
     setMessage("");
     logUploadStage("parsing", { source: "photo_upload", fileCount: bulkImages.length });
@@ -923,8 +1277,14 @@ export function IntakeWorkspace() {
     }
     setBusy("generate");
     setUploadStatusText(files.length > 0 ? "Uploading PDF..." : "Creating intake...");
+    setShowReviewItems(false);
+    setShowMissingDetailItems(false);
+    setShowEnrichedItems(false);
     setMessage("");
     setErrors([]);
+    setDebugUploads([]);
+    setLatestDiagnostics([]);
+    setDebugCopyStatus("");
     resetUploadErrorState();
     logUploadStage("parsing", {
       source: "intake_generate",
@@ -952,6 +1312,7 @@ export function IntakeWorkspace() {
       }
       setRows(response.rows);
       setErrors(response.errors);
+      setLatestDiagnostics(response.dimension_diagnostics || []);
       setPhotoDiscoveryReport(null);
       setMessage("Intake table is ready for review.");
       logUploadStage("complete", { source: "intake_generate", rows: response.rows.length, errors: response.errors.length });
@@ -981,10 +1342,19 @@ export function IntakeWorkspace() {
 
   async function handleValidate() {
     setBusy("validate");
+    setShowReviewItems(false);
+    setShowMissingDetailItems(false);
+    setShowEnrichedItems(false);
     try {
-      const response = await enrichRows({ rows, useWebEnrichment, sessionId: pdfSessionIdRef.current || undefined });
+      const response = await enrichRows({
+        rows,
+        useWebEnrichment,
+        sessionId: pdfSessionIdRef.current || undefined,
+        enrichmentMode,
+      });
       setRows(response.rows);
       setErrors(response.errors);
+      setLatestDiagnostics(response.dimension_diagnostics || []);
       setPhotoDiscoveryReport(photoReportFromDiagnostics(response.dimension_diagnostics));
       setMessage(useWebEnrichment ? "Missing info search complete." : "Input updates saved without web search.");
     } catch (error) {
@@ -1005,6 +1375,7 @@ export function IntakeWorkspace() {
       const response = await recoverImages(targetRows, pdfSessionIdRef.current || undefined);
       setRows(response.rows);
       setErrors(response.errors);
+      setLatestDiagnostics(response.dimension_diagnostics || []);
       setPhotoDiscoveryReport(photoReportFromDiagnostics(response.dimension_diagnostics));
       setMessage("Image recovery complete.");
     } catch (error) {
@@ -1012,6 +1383,24 @@ export function IntakeWorkspace() {
     } finally {
       setBusy("");
     }
+  }
+
+  async function handleCopyInternalDebug() {
+    const text = formatDebugReportText(internalDebugReport);
+    try {
+      await navigator.clipboard.writeText(text);
+      setDebugCopyStatus("Copied debug report.");
+    } catch {
+      setDebugCopyStatus("Clipboard unavailable. Download the TXT report instead.");
+    }
+  }
+
+  function handleDownloadInternalDebug(format: "json" | "txt") {
+    if (format === "json") {
+      void downloadText("sch-intake-debug.json", JSON.stringify(internalDebugReport, null, 2));
+      return;
+    }
+    void downloadText("sch-intake-debug.txt", formatDebugReportText(internalDebugReport));
   }
 
   function clearProductImage(rowIndex: number) {
@@ -1026,6 +1415,29 @@ export function IntakeWorkspace() {
               confidence: "",
               evidence: "",
               needs_image_review: "True",
+            }
+          : row,
+      ),
+    );
+  }
+
+  function chooseImageCandidate(rowIndex: number, candidate: Record<string, unknown>) {
+    const url = candidateImageUrl(candidate);
+    if (!isPublicHttpsImageUrl(url)) return;
+    const confidence = String(candidate.confidence || "MEDIUM").toUpperCase();
+    setRows((current) =>
+      current.map((row, index) =>
+        index === rowIndex
+          ? {
+              ...row,
+              "Image URL": url,
+              image_source: String(candidate.source_type || "candidate_review"),
+              confidence,
+              evidence: String(candidate.reason || "selected_from_candidate_review"),
+              needs_image_review: confidence === "HIGH" ? "False" : "True",
+              _selected_image_candidate: url,
+              _image_source_type: String(candidate.source_type || "candidate_review"),
+              _image_final_confidence: confidence,
             }
           : row,
       ),
@@ -1112,7 +1524,7 @@ export function IntakeWorkspace() {
           </div>
         </header>
 
-        <Panel step="1" title="Upload" subtitle="Upload PDFs, links, or photos to create product entries.">
+        <Panel step="1" title="Upload" subtitle="Upload PDFs, links, or photos to create product entries." accent>
           <div className="grid gap-4">
             <div className="grid gap-3 sm:grid-cols-2">
               <Field label="Room / Location">
@@ -1404,60 +1816,70 @@ export function IntakeWorkspace() {
           </div>
         ) : null}
 
-        <Panel step="2" title="Review" subtitle="Check and edit product entries.">
+        <Panel step="2" title="Review" subtitle="Check and edit product entries." accent>
           {rows.length > 0 ? (
             <>
               <div className="mb-3 flex flex-wrap gap-2">
                 <StatusBadge value={`${readyRows} Ready`} />
                 <StatusBadge value={`${missingInputRows.length} Needs Review`} />
               </div>
-              <div className="overflow-x-auto rounded-xl border border-linen bg-white">
-                <table className="min-w-[1180px] w-full border-separate border-spacing-0 text-left text-sm">
-                  <thead>
-                    <tr>
-                      {reviewColumns.map((column) => (
-                        <th key={column} className="sticky top-0 border-b border-linen bg-ivory px-3 py-3 text-xs font-semibold text-charcoal/60">
-                          {column === "Room"
-                            ? "Location"
-                            : column === "Quantity"
-                              ? "Qty"
-                              : column === "Supplier"
-                                ? "Supplier / Who Bought From"
-                                : column === "Finish / Color"
-                                  ? "Finish"
-                                  : column === "Product Category"
-                                    ? "Category"
-                                    : column === "Confidence Score"
-                                      ? "Confidence"
-                                      : column === "Review Required"
-                                        ? "Needs Review"
-                                        : column === "Status"
-                                          ? "Status / Needs Review"
-                                          : column}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rows.map((row, index) => (
-                      <tr key={index} className="align-top transition-colors hover:bg-orangeSoft/30">
+              <ProductListDisclosure
+                expanded={showReviewItems}
+                onToggle={() => setShowReviewItems((current) => !current)}
+                collapsedLabel={`Review product items (${includedRows.length})`}
+                expandedLabel="Hide product items"
+                total={includedRows.length}
+                ready={readyRows}
+                needsReview={productListNeedsReview}
+              >
+                <div className="overflow-x-auto rounded-xl border border-linen bg-white">
+                  <table className="min-w-[1180px] w-full border-separate border-spacing-0 text-left text-sm">
+                    <thead>
+                      <tr>
                         {reviewColumns.map((column) => (
-                          <td key={column} className="border-b border-linen/70 px-3 py-3">
-                            <Cell
-                              row={row}
-                              column={column}
-                              categories={categories}
-                              sections={sections}
-                              onChange={(value) => updateRow(index, column, value)}
-                              onVendorCall={(fields) => openVendorCall(row, fields)}
-                            />
-                          </td>
+                          <th key={column} className="sticky top-0 border-b border-linen bg-ivory px-3 py-3 text-xs font-semibold text-charcoal/60">
+                            {column === "Room"
+                              ? "Location"
+                              : column === "Quantity"
+                                ? "Qty"
+                                : column === "Supplier"
+                                  ? "Supplier / Who Bought From"
+                                  : column === "Finish / Color"
+                                    ? "Finish"
+                                    : column === "Product Category"
+                                      ? "Category"
+                                      : column === "Confidence Score"
+                                        ? "Confidence"
+                                        : column === "Review Required"
+                                          ? "Needs Review"
+                                          : column === "Status"
+                                            ? "Status / Needs Review"
+                                            : column}
+                          </th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {rows.map((row, index) => (
+                        <tr key={index} className="align-top transition-colors hover:bg-orangeSoft/30">
+                          {reviewColumns.map((column) => (
+                            <td key={column} className="border-b border-linen/70 px-3 py-3">
+                              <Cell
+                                row={row}
+                                column={column}
+                                categories={categories}
+                                sections={sections}
+                                onChange={(value) => updateRow(index, column, value)}
+                                onVendorCall={(fields) => openVendorCall(row, fields)}
+                              />
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </ProductListDisclosure>
             </>
           ) : (
             <div className="rounded-xl border border-dashed border-linen bg-white/60 px-5 py-10 text-center">
@@ -1466,7 +1888,7 @@ export function IntakeWorkspace() {
           )}
         </Panel>
 
-        <Panel step="3" title="Enrich" subtitle="Fill missing product details automatically.">
+        <Panel step="3" title="Enrich" subtitle="Fill missing product details automatically." accent>
           <div className="grid gap-4">
             <label className="flex items-start gap-3 text-sm text-taupe">
               <input
@@ -1478,41 +1900,65 @@ export function IntakeWorkspace() {
               Use web search
             </label>
 
+            <Field label="Enrichment mode">
+              <select
+                className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
+                value={enrichmentMode}
+                onChange={(event) => setEnrichmentMode(event.target.value as typeof enrichmentMode)}
+                disabled={!useWebEnrichment}
+              >
+                <option value="fast">Fast - cheapest</option>
+                <option value="standard">Balanced</option>
+                <option value="deep">Deep enrichment</option>
+                <option value="manual_retry">Manual retry</option>
+              </select>
+            </Field>
+
             {rows.length > 0 && missingInputRows.length ? (
-              <div className="divide-y divide-linen rounded-xl border border-linen bg-white">
-                {rows.map((row, index) => {
-                  const missingFields = row.Include !== false ? missingFieldsForRow(row) : [];
-                  return missingFields.length > 0 ? (
-                    <div key={index} className="grid gap-3 p-4 lg:grid-cols-[0.8fr_1.2fr] lg:items-start">
-                      <div>
-                        <div className="text-sm font-semibold text-charcoal">{rowText(row, "Product Name") || "Unnamed Item"}</div>
-                        <div className="mt-2 flex flex-wrap gap-2">
-                          {missingFields.map((field) => (
-                            <StatusBadge
-                              key={field}
-                              value={field === "Dimensions" ? "Missing Dimensions" : field === "Image URL" ? "Missing Image" : `Missing ${field}`}
-                            />
-                          ))}
+              <ProductListDisclosure
+                expanded={showMissingDetailItems}
+                onToggle={() => setShowMissingDetailItems((current) => !current)}
+                collapsedLabel={`Review missing details (${missingInputRows.length})`}
+                expandedLabel="Hide missing details"
+                total={includedRows.length}
+                ready={readyRows}
+                needsReview={productListNeedsReview}
+              >
+                <div className="divide-y divide-linen rounded-xl border border-linen bg-white">
+                  {rows.map((row, index) => {
+                    const missingFields = row.Include !== false ? missingFieldsForRow(row) : [];
+                    return missingFields.length > 0 ? (
+                      <div key={index} className="grid gap-3 p-4 lg:grid-cols-[0.8fr_1.2fr] lg:items-start">
+                        <div>
+                          <div className="text-sm font-semibold text-charcoal">{rowText(row, "Product Name") || "Unnamed Item"}</div>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            {missingFields.map((field) => (
+                              <StatusBadge
+                                key={field}
+                                value={field === "Dimensions" ? "Missing Dimensions" : field === "Image URL" ? "Missing Image" : `Missing ${field}`}
+                              />
+                            ))}
+                          </div>
+                        </div>
+                        <div className="grid gap-2">
+                          {missingFields.map((field) => {
+                            const key = missingFieldKeys[field];
+                            return (
+                              <MissingInputField
+                                key={field}
+                                field={field}
+                                value={rowText(row, key)}
+                                onChange={(value) => updateRow(index, key, key === "Quantity" && value ? Number(value) : value)}
+                                onVendorCall={() => openVendorCall(row, [field])}
+                              />
+                            );
+                          })}
                         </div>
                       </div>
-                      <div className="grid gap-2">
-                        {missingFields.map((field) => {
-                          const key = missingFieldKeys[field];
-                          return (
-                            <MissingInputField
-                              key={field}
-                              field={field}
-                              value={rowText(row, key)}
-                              onChange={(value) => updateRow(index, key, key === "Quantity" && value ? Number(value) : value)}
-                              onVendorCall={() => openVendorCall(row, [field])}
-                            />
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ) : null;
-                })}
-              </div>
+                    ) : null;
+                  })}
+                </div>
+              </ProductListDisclosure>
             ) : rows.length > 0 ? (
               <div className="flex items-center gap-2 rounded-xl border border-sage/20 bg-sage/10 p-4 text-sm text-sage">
                 <CheckCircle2 className="h-4 w-4" />
@@ -1540,7 +1986,7 @@ export function IntakeWorkspace() {
               <StatusBadge value={`${exportSummary.missing_section.length} Missing Section`} />
             </div>
             <div className="rounded-xl border border-bronze/20 bg-bronze/10 p-3 text-sm text-charcoal">
-              Programa's importer expects images on the same spreadsheet row as the product. Use Excel with Images for image import, or ZIP for matched manual upload.
+              Programa&apos;s importer expects images on the same spreadsheet row as the product. Use Excel with Images for image import, or ZIP for matched manual upload.
             </div>
             <div className="grid gap-3 sm:grid-cols-4">
               <button
@@ -1623,106 +2069,145 @@ export function IntakeWorkspace() {
                 </div>
               ) : null}
               {includedRows.length ? (
-                <div className="mt-3 divide-y divide-linen rounded-xl border border-linen bg-white">
-                  {rows.map((row, index) => {
-                    if (row.Include === false) return null;
-                    const productName = rowText(row, "Product Name");
-                    const brand = rowText(row, "Brand");
-                    const dimensions = rowText(row, "Dimensions");
-                    const productUrl = rowText(row, "Product URL");
-                    const imageUrl = rowText(row, "Image URL");
-                    const imageSource = rowText(row, "image_source");
-                    const confidence = rowText(row, "confidence");
-                    const evidence = rowText(row, "evidence");
-                    const needsReview = rowText(row, "needs_image_review").toLowerCase() === "true";
-                    const uploadStatus = productImageUploads[index] || "";
-                    const rawGroupedText = rowText(row, "_raw_grouped_text");
-                    const parsedFields = rowText(row, "_parsed_fields");
-                    const enrichmentQuery = rowText(row, "_enrichment_query_used");
-                    const confidenceReason = rowText(row, "_confidence_reason");
-                    const missingInitial = rowText(row, "_missing_fields_initial");
-                    return (
-                      <div key={index} className="grid gap-3 p-4 md:grid-cols-[1fr_1.2fr_auto] md:items-center">
-                        <div className="min-w-0">
-                          <div className={productName ? "truncate text-sm font-semibold text-charcoal" : "text-sm font-semibold text-clay"}>
-                            {productName || "Missing"}
-                          </div>
-                          <div className="mt-1 text-xs text-taupe">Brand: <ReviewValue value={brand} /></div>
-                        </div>
-                        <div className="grid gap-1 text-xs text-taupe sm:grid-cols-2">
-                          <div>Dimensions: <ReviewValue value={dimensions} /></div>
-                          <div>Product URL: <ReviewValue value={productUrl} /></div>
-                          <div>Source: <ReviewValue value={imageSource} /></div>
-                          <div>
-                            Confidence:{" "}
-                            {confidence ? <StatusBadge value={`${confidence}${needsReview ? " Review" : ""}`} /> : <span className="font-semibold text-clay">Missing</span>}
-                          </div>
-                          <div className="sm:col-span-2">
-                            Image:{" "}
-                            {imageUrl ? (
-                              <span className="inline-flex max-w-full items-center gap-2 align-middle">
-                                <img src={imageUrl} alt={productName || "Product image"} className="h-8 w-8 rounded-lg object-cover" />
-                                <span className="truncate text-charcoal">{imageUrl}</span>
-                              </span>
-                            ) : (
-                              <span className="font-semibold text-clay">Missing</span>
-                            )}
-                          </div>
-                          {uploadStatus ? (
-                            <div className={`sm:col-span-2 ${uploadStatus === "Uploading..." ? "text-bronze" : "text-clay"}`}>
-                              {uploadStatus}
-                            </div>
-                          ) : null}
-                          {evidence ? <div className="sm:col-span-2 truncate">Evidence: {evidence}</div> : null}
-                          {rawGroupedText || parsedFields || enrichmentQuery || confidenceReason || missingInitial ? (
-                            <details className="sm:col-span-2 rounded-lg border border-linen bg-ivory/40 p-2">
-                              <summary className="cursor-pointer text-xs font-semibold text-charcoal">Item debug</summary>
-                              <div className="mt-2 grid gap-1 text-xs text-taupe">
-                                {rawGroupedText ? (
-                                  <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-md bg-white p-2 text-charcoal">{rawGroupedText}</pre>
-                                ) : null}
-                                {parsedFields ? <div><span className="font-semibold text-charcoal">Parsed:</span> {parsedFields}</div> : null}
-                                {enrichmentQuery ? <div><span className="font-semibold text-charcoal">Query:</span> {enrichmentQuery}</div> : null}
-                                {missingInitial ? <div><span className="font-semibold text-charcoal">Missing:</span> {missingInitial}</div> : null}
-                                {confidenceReason ? <div><span className="font-semibold text-charcoal">Reason:</span> {confidenceReason}</div> : null}
+                <div className="mt-3">
+                  <ProductListDisclosure
+                    expanded={showEnrichedItems}
+                    onToggle={() => setShowEnrichedItems((current) => !current)}
+                    collapsedLabel={`Review enriched items (${includedRows.length})`}
+                    expandedLabel="Hide product items"
+                    total={includedRows.length}
+                    ready={readyRows}
+                    needsReview={productListNeedsReview}
+                  >
+                    <div className="divide-y divide-linen rounded-xl border border-linen bg-white">
+                      {rows.map((row, index) => {
+                        if (row.Include === false) return null;
+                        const productName = rowText(row, "Product Name");
+                        const brand = rowText(row, "Brand");
+                        const dimensions = rowText(row, "Dimensions");
+                        const productUrl = rowText(row, "Product URL");
+                        const imageUrl = rowText(row, "Image URL");
+                        const imageSource = rowText(row, "image_source");
+                        const confidence = rowText(row, "confidence");
+                        const evidence = rowText(row, "evidence");
+                        const needsReview = rowText(row, "needs_image_review").toLowerCase() === "true";
+                        const uploadStatus = productImageUploads[index] || "";
+                        const rawGroupedText = rowText(row, "_raw_grouped_text");
+                        const parsedFields = rowText(row, "_parsed_fields");
+                        const enrichmentQuery = rowText(row, "_enrichment_query_used");
+                        const confidenceReason = rowText(row, "_confidence_reason");
+                        const missingInitial = rowText(row, "_missing_fields_initial");
+                        const imageQueryUsed = rowText(row, "_image_query_used");
+                        const imageCandidates = safeParseArray(rowText(row, "_image_candidates"))
+                          .filter((candidate) => isPublicHttpsImageUrl(candidateImageUrl(candidate)))
+                          .slice(0, 3);
+                        const imageRejectedCandidates = rowText(row, "_image_rejected_candidates");
+                        const imageDebugAvailable = Boolean(imageQueryUsed || imageCandidates.length || imageRejectedCandidates || rowText(row, "_selected_image_candidate"));
+                        return (
+                          <div key={index} className="grid gap-3 p-4 md:grid-cols-[1fr_1.2fr_auto] md:items-center">
+                            <div className="min-w-0">
+                              <div className={productName ? "truncate text-sm font-semibold text-charcoal" : "text-sm font-semibold text-clay"}>
+                                {productName || "Missing"}
                               </div>
-                            </details>
-                          ) : null}
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                          <label className="btn-secondary inline-flex h-10 cursor-pointer items-center justify-center rounded-xl px-4 text-sm font-semibold">
-                            {imageUrl ? "Replace" : "Upload Image"}
-                            <input
-                              className="hidden"
-                              type="file"
-                              accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
-                              onChange={(event) => {
-                                void handleProductImageUpload(index, event.target.files?.[0]);
-                                event.currentTarget.value = "";
-                              }}
-                            />
-                          </label>
-                          {imageUrl ? (
-                            <button
-                              className="btn-secondary inline-flex h-10 items-center justify-center rounded-xl px-3 text-sm font-semibold"
-                              onClick={() => clearProductImage(index)}
-                              aria-label="Clear image"
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </button>
-                          ) : null}
-                          <button
-                            className="btn-secondary inline-flex h-10 items-center justify-center rounded-xl px-3 text-sm font-semibold disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
-                            disabled={busy === "imageRecovery"}
-                            onClick={() => handleRecoverImages("row", index)}
-                            aria-label="Re-run image recovery"
-                          >
-                            {busy === "imageRecovery" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
+                              <div className="mt-1 text-xs text-taupe">Brand: <ReviewValue value={brand} /></div>
+                            </div>
+                            <div className="grid gap-1 text-xs text-taupe sm:grid-cols-2">
+                              <div>Dimensions: <ReviewValue value={dimensions} /></div>
+                              <div>Product URL: <ReviewValue value={productUrl} /></div>
+                              <div>Source: <ReviewValue value={imageSource} /></div>
+                              <div>
+                                Confidence:{" "}
+                                {confidence ? <StatusBadge value={`${confidence}${needsReview ? " Review" : ""}`} /> : <span className="font-semibold text-clay">Missing</span>}
+                              </div>
+                              <div className="sm:col-span-2">
+                                Image:{" "}
+                                {imageUrl ? (
+                                  <span className="inline-flex max-w-full items-center gap-2 align-middle">
+                                    <img src={imageUrl} alt={productName || "Product image"} className="h-8 w-8 rounded-lg object-cover" />
+                                    <span className="truncate text-charcoal">{imageUrl}</span>
+                                  </span>
+                                ) : (
+                                  <span className="font-semibold text-clay">Missing</span>
+                                )}
+                              </div>
+                              {uploadStatus ? (
+                                <div className={`sm:col-span-2 ${uploadStatus === "Uploading..." ? "text-bronze" : "text-clay"}`}>
+                                  {uploadStatus}
+                                </div>
+                              ) : null}
+                              {evidence ? <div className="sm:col-span-2 truncate">Evidence: {evidence}</div> : null}
+                              {imageCandidates.length ? (
+                                <div className="sm:col-span-2 mt-1 flex flex-wrap gap-2">
+                                  {imageCandidates.map((candidate, candidateIndex) => {
+                                    const candidateUrl = candidateImageUrl(candidate);
+                                    return (
+                                      <button
+                                        key={`${candidateUrl}-${candidateIndex}`}
+                                        type="button"
+                                        className="inline-flex max-w-full items-center gap-2 rounded-lg border border-orangeBorder/60 bg-orangeSoft/40 px-2 py-1 text-left text-xs text-charcoal hover:bg-orangeSoft"
+                                        onClick={() => chooseImageCandidate(index, candidate)}
+                                      >
+                                        <img src={candidateUrl} alt="" className="h-7 w-7 rounded-md object-cover" />
+                                        <span className="max-w-[220px] truncate">{String(candidate.source_type || candidate.confidence || "Candidate")}</span>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              ) : null}
+                              {rawGroupedText || parsedFields || enrichmentQuery || confidenceReason || missingInitial || imageDebugAvailable ? (
+                                <details className="sm:col-span-2 rounded-lg border border-linen bg-ivory/40 p-2">
+                                  <summary className="cursor-pointer text-xs font-semibold text-charcoal">Item debug</summary>
+                                  <div className="mt-2 grid gap-1 text-xs text-taupe">
+                                    {rawGroupedText ? (
+                                      <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-md bg-white p-2 text-charcoal">{rawGroupedText}</pre>
+                                    ) : null}
+                                    {parsedFields ? <div><span className="font-semibold text-charcoal">Parsed:</span> {parsedFields}</div> : null}
+                                    {enrichmentQuery ? <div><span className="font-semibold text-charcoal">Query:</span> {enrichmentQuery}</div> : null}
+                                    {imageQueryUsed ? <div><span className="font-semibold text-charcoal">Image query:</span> {imageQueryUsed}</div> : null}
+                                    {imageCandidates.length ? <div><span className="font-semibold text-charcoal">Image candidates:</span> {imageCandidates.map((candidate) => candidateImageUrl(candidate)).join(" | ")}</div> : null}
+                                    {imageRejectedCandidates ? <div><span className="font-semibold text-charcoal">Rejected images:</span> {imageRejectedCandidates}</div> : null}
+                                    {missingInitial ? <div><span className="font-semibold text-charcoal">Missing:</span> {missingInitial}</div> : null}
+                                    {confidenceReason ? <div><span className="font-semibold text-charcoal">Reason:</span> {confidenceReason}</div> : null}
+                                  </div>
+                                </details>
+                              ) : null}
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                              <label className="btn-secondary inline-flex h-10 cursor-pointer items-center justify-center rounded-xl px-4 text-sm font-semibold">
+                                {imageUrl ? "Replace" : "Upload Image"}
+                                <input
+                                  className="hidden"
+                                  type="file"
+                                  accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                                  onChange={(event) => {
+                                    void handleProductImageUpload(index, event.target.files?.[0]);
+                                    event.currentTarget.value = "";
+                                  }}
+                                />
+                              </label>
+                              {imageUrl ? (
+                                <button
+                                  className="btn-secondary inline-flex h-10 items-center justify-center rounded-xl px-3 text-sm font-semibold"
+                                  onClick={() => clearProductImage(index)}
+                                  aria-label="Clear image"
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </button>
+                              ) : null}
+                              <button
+                                className="btn-secondary inline-flex h-10 items-center justify-center rounded-xl px-3 text-sm font-semibold disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                                disabled={busy === "imageRecovery"}
+                                onClick={() => handleRecoverImages("row", index)}
+                                aria-label="Re-run image recovery"
+                              >
+                                {busy === "imageRecovery" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </ProductListDisclosure>
                 </div>
               ) : (
                 <p className="mt-2 text-sm text-taupe">Create product entries first.</p>
@@ -1740,6 +2225,16 @@ export function IntakeWorkspace() {
             </div>
           </div>
         </Panel>
+        {INTERNAL_DEBUG_ENABLED ? (
+          <InternalDebugPanel
+            report={internalDebugReport}
+            expanded={showInternalDebug}
+            copyStatus={debugCopyStatus}
+            onToggle={() => setShowInternalDebug((current) => !current)}
+            onCopy={handleCopyInternalDebug}
+            onDownload={handleDownloadInternalDebug}
+          />
+        ) : null}
         {vendorCall ? (
           <VendorCallDialog
             state={vendorCall}
@@ -1777,19 +2272,249 @@ function ReviewValue({ value }: { value: string }) {
   return value ? <span className="text-charcoal">{value}</span> : <span className="font-semibold text-clay">Missing</span>;
 }
 
+function ProductListDisclosure({
+  expanded,
+  onToggle,
+  collapsedLabel,
+  expandedLabel,
+  total,
+  ready,
+  needsReview,
+  children,
+}: {
+  expanded: boolean;
+  onToggle: () => void;
+  collapsedLabel: string;
+  expandedLabel: string;
+  total: number;
+  ready: number;
+  needsReview: number;
+  children: ReactNode;
+}) {
+  const summary = `${total} item${total === 1 ? "" : "s"} found · ${ready} ready · ${needsReview} ${needsReview === 1 ? "needs" : "need"} review`;
+  return (
+    <div className="rounded-xl border border-linen bg-white/70">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        className="flex w-full flex-wrap items-center justify-between gap-3 px-4 py-3 text-left hover:bg-orangeSoft/30"
+        onClick={onToggle}
+      >
+        <span className="inline-flex items-center gap-2 text-sm font-semibold text-charcoal">
+          {expanded ? <ChevronDown className="h-4 w-4 text-bronze" /> : <ChevronRight className="h-4 w-4 text-bronze" />}
+          {expanded ? expandedLabel : collapsedLabel}
+        </span>
+        <span className="text-xs text-taupe">{summary}</span>
+      </button>
+      {expanded ? (
+        <div className="border-t border-linen p-3">
+          {children}
+        </div>
+      ) : (
+        <div className="border-t border-linen bg-ivory/35 px-4 py-2 text-xs text-taupe">
+          {summary}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function InternalDebugPanel({
+  report,
+  expanded,
+  copyStatus,
+  onToggle,
+  onCopy,
+  onDownload,
+}: {
+  report: ReturnType<typeof buildInternalDebugReport>;
+  expanded: boolean;
+  copyStatus: string;
+  onToggle: () => void;
+  onCopy: () => void;
+  onDownload: (format: "json" | "txt") => void;
+}) {
+  const upload = report.upload;
+  return (
+    <section className="rounded-2xl border border-linen bg-white/60 p-4 text-sm text-charcoal">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="text-xs font-semibold uppercase tracking-[0.08em] text-taupe">Internal</div>
+          <div className="font-semibold text-charcoal">Debug report</div>
+        </div>
+        <button
+          type="button"
+          className="btn-secondary inline-flex h-9 items-center justify-center gap-2 rounded-xl px-3 text-xs font-semibold"
+          onClick={onToggle}
+        >
+          {expanded ? "Hide Debug" : "Debug"}
+        </button>
+      </div>
+      {expanded ? (
+        <div className="mt-4 grid gap-4 border-t border-linen pt-4">
+          <div className="flex flex-wrap gap-2">
+            <button type="button" className="btn-secondary inline-flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold" onClick={onCopy}>
+              <Copy className="h-3.5 w-3.5" />
+              Copy Debug Report
+            </button>
+            <button type="button" className="btn-secondary inline-flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold" onClick={() => onDownload("json")}>
+              <Download className="h-3.5 w-3.5" />
+              Download Debug JSON
+            </button>
+            <button type="button" className="btn-secondary inline-flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold" onClick={() => onDownload("txt")}>
+              <Download className="h-3.5 w-3.5" />
+              Download Debug TXT
+            </button>
+            {copyStatus ? <span className="self-center text-xs text-taupe">{copyStatus}</span> : null}
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-3">
+            <div className="rounded-xl border border-linen bg-ivory/40 p-3">
+              <div className="mb-2 font-semibold">Upload summary</div>
+              <DebugLine label="File" value={upload?.fileName || "No upload captured"} />
+              <DebugLine label="Type" value={upload?.fileType || ""} />
+              <DebugLine label="Size" value={upload?.fileSize || ""} />
+              <DebugLine label="Uploaded" value={upload?.uploadedAt || ""} />
+              <DebugLine label="Parser" value={upload?.parser || ""} />
+              <DebugLine label="Duration" value={upload ? `${upload.parseDurationMs}ms` : ""} />
+              <DebugLine label="Pages" value={upload?.pageCount ?? ""} />
+              <DebugLine label="OCR" value={upload ? (upload.ocrUsed ? "yes" : "no") : ""} />
+              <DebugLine label="Raw text" value={upload?.rawTextLength ?? ""} />
+              <DebugLine label="Item groups" value={upload?.detectedItemGroups ?? ""} />
+              <DebugLine label="Entries" value={upload?.finalProductEntries ?? report.summary.totalFinalProductEntries} />
+              <DebugLine label="Ready" value={report.summary.numberReady} />
+              <DebugLine label="Needs review" value={report.summary.numberNeedsReview} />
+            </div>
+            <div className="rounded-xl border border-linen bg-ivory/40 p-3">
+              <div className="mb-2 font-semibold">Failure summary</div>
+              <DebugLine label="Missing fields" value={report.failureSummary.fieldsMostCommonlyMissing.map((item) => `${item.field} (${item.count})`).join(", ") || "none"} />
+              <DebugLine label="Failed enrichment" value={report.failureSummary.itemsThatFailedEnrichment.length} />
+              <DebugLine label="Parser warnings" value={report.failureSummary.parserWarnings.join(" | ") || "none"} />
+              <DebugLine label="Grouping warnings" value={report.failureSummary.groupingWarnings.join(" | ") || "none"} />
+              <DebugLine label="Skipped rows" value={String(report.failureSummary.skippedRows)} />
+              <DebugLine label="Low confidence" value={report.failureSummary.duplicateOrLowConfidenceItems.length} />
+            </div>
+            {report.enrichmentMetrics ? (
+              <div className="rounded-xl border border-linen bg-ivory/40 p-3">
+                <div className="mb-2 font-semibold">Enrichment metrics</div>
+                <DebugLine label="Mode" value={report.enrichmentMetrics.mode || "unknown"} />
+                <DebugLine label="Est. cost" value={`$${report.enrichmentMetrics.estimated_cost_usd ?? "0"}`} />
+                <DebugLine label="Search calls" value={report.enrichmentMetrics.search_calls ?? 0} />
+                <DebugLine label="Page fetches" value={report.enrichmentMetrics.page_fetches ?? 0} />
+                <DebugLine label="AI calls" value={report.enrichmentMetrics.ai_calls ?? 0} />
+                <DebugLine label="AI avoided" value={report.enrichmentMetrics.ai_calls_avoided ?? 0} />
+                <DebugLine label="Cache hits" value={report.enrichmentMetrics.cache_hits ?? 0} />
+                <DebugLine label="Cache hit rate" value={report.enrichmentMetrics.cache_hit_rate ?? 0} />
+                <DebugLine label="Duplicates" value={report.enrichmentMetrics.duplicate_reuse ?? 0} />
+                <DebugLine label="Cheap only" value={report.enrichmentMetrics.cheap_local_only ?? 0} />
+                <DebugLine label="Skipped" value={report.enrichmentMetrics.skipped_enrichments ?? 0} />
+                <DebugLine label="Duration" value={`${report.enrichmentMetrics.duration_ms ?? 0}ms`} />
+              </div>
+            ) : null}
+          </div>
+
+          <div className="grid gap-3">
+            {report.products.length ? report.products.map((product) => (
+              <details key={`${product.index}-${product.id}`} className="rounded-xl border border-linen bg-white/70 p-3">
+                <summary className="cursor-pointer font-semibold">
+                  #{product.index} {product.parsedFields["Product Name"].value || "Unnamed Item"} · {product.finalStatus || "No status"}
+                </summary>
+                <div className="mt-3 grid gap-3">
+                  <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-ivory p-3 text-xs text-charcoal">
+                    {product.rawGroupedText || "No raw grouped text captured."}
+                  </pre>
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[720px] text-left text-xs">
+                      <thead>
+                        <tr className="text-charcoal/60">
+                          <th className="border-b border-linen py-2 pr-2">Field</th>
+                          <th className="border-b border-linen py-2 pr-2">Value</th>
+                          <th className="border-b border-linen py-2 pr-2">Source</th>
+                          <th className="border-b border-linen py-2 pr-2">Confidence</th>
+                          <th className="border-b border-linen py-2 pr-2">Reason</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Object.entries(product.parsedFields).map(([field, trace]) => (
+                          <tr key={field}>
+                            <td className="border-b border-linen/60 py-2 pr-2 font-semibold">{field}</td>
+                            <td className="border-b border-linen/60 py-2 pr-2">{String(trace.value ?? "null")}</td>
+                            <td className="border-b border-linen/60 py-2 pr-2">{trace.source}</td>
+                            <td className="border-b border-linen/60 py-2 pr-2">{trace.confidence.toFixed(2)}</td>
+                            <td className="border-b border-linen/60 py-2 pr-2">{trace.reason}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="rounded-lg border border-linen bg-ivory/50 p-3 text-xs">
+                    <div className="font-semibold text-charcoal">Enrichment trace</div>
+                    <DebugLine label="Query" value={product.enrichment.query || "none"} />
+                    <DebugLine label="Attempted" value={product.enrichment.attempted ? "yes" : "no"} />
+                    <DebugLine label="Matched URL" value={product.enrichment.matchedUrl || "none"} />
+                    <DebugLine label="Failed fields" value={product.enrichment.failedFields.join(", ") || "none"} />
+                    <DebugLine label="Failure reason" value={product.enrichment.failureReason || "none"} />
+                    <DebugLine label="Retry count" value={product.enrichment.retryCount} />
+                    <DebugLine label="Status" value={product.enrichment.status} />
+                  </div>
+                  <div className="rounded-lg border border-linen bg-ivory/50 p-3 text-xs">
+                    <div className="font-semibold text-charcoal">Image trace</div>
+                    <DebugLine label="Query" value={product.imageTrace.queryUsed || "none"} />
+                    <DebugLine label="Selected" value={product.imageTrace.selectedCandidate || "none"} />
+                    <DebugLine label="Source" value={product.imageTrace.sourceType || "none"} />
+                    <DebugLine label="Confidence" value={product.imageTrace.finalConfidence || "none"} />
+                    <DebugLine label="Candidates" value={JSON.stringify(product.imageTrace.candidatesFound)} />
+                    <DebugLine
+                      label="Rejected"
+                      value={
+                        typeof product.imageTrace.rejectedCandidates === "string"
+                          ? product.imageTrace.rejectedCandidates || "none"
+                          : JSON.stringify(product.imageTrace.rejectedCandidates)
+                      }
+                    />
+                  </div>
+                </div>
+              </details>
+            )) : (
+              <div className="rounded-xl border border-dashed border-linen bg-ivory/40 p-4 text-xs text-taupe">
+                No product rows available yet.
+              </div>
+            )}
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function DebugLine({ label, value }: { label: string; value: unknown }) {
+  return (
+    <div className="grid grid-cols-[130px_1fr] gap-2 py-0.5 text-xs">
+      <span className="font-semibold text-charcoal/60">{label}</span>
+      <span className="break-words text-charcoal">{value === null || value === undefined || value === "" ? "-" : String(value)}</span>
+    </div>
+  );
+}
+
 function Panel({
   step,
   title,
   subtitle,
+  accent = false,
   children,
 }: {
   step?: string;
   title: string;
   subtitle: string;
+  accent?: boolean;
   children: ReactNode;
 }) {
   return (
-    <section className="rounded-2xl border border-linen bg-white/72 p-5 sm:p-6">
+    <section
+      className={`rounded-2xl border bg-white/72 p-5 transition-colors sm:p-6 ${
+        accent ? "border-orangeBorder/70 hover:bg-orangeSoft/10" : "border-linen"
+      }`}
+    >
       <div className="mb-5">
         <div>
           <div className="flex items-center gap-3">

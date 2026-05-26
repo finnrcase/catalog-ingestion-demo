@@ -30,6 +30,7 @@ from __future__ import annotations
 import io
 import re
 import hashlib
+import os
 import zipfile
 import urllib.parse
 from pathlib import Path
@@ -146,6 +147,10 @@ _SIGNED_URL_QUERY_KEYS = {
 # Anchor to the repo root regardless of process cwd.
 # src/programa_export.py → src/ → repo root (two levels up).
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _tmp_upload_root() -> Path:
+    return Path(os.getenv("SCH_TMP_UPLOAD_ROOT", str(_REPO_ROOT / ".tmp" / "uploads"))).expanduser()
 
 _SECTION_ALIASES: dict[str, str] = {
     "": "General",
@@ -438,7 +443,7 @@ def _validate_local_path(path_str: str, session_id: str | None) -> tuple[bool, s
         return False, "wrong_extension"
     if p.stat().st_size <= 0:
         return False, "empty_file"
-    allowed_root = _REPO_ROOT / ".tmp" / "uploads" / session_id / "images"
+    allowed_root = _tmp_upload_root() / session_id / "images"
     try:
         p.relative_to(allowed_root)
     except ValueError:

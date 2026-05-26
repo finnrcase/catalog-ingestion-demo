@@ -628,12 +628,13 @@ def test_screenshot_uses_first_matching_selector_in_priority_order(mock_playwrig
 from src.image_recovery import recover_image_for_row
 
 
-def _result(confidence="NONE", source="url", evidence=None, jpeg=b"x"):
+def _result(confidence="NONE", source="url", evidence=None, jpeg=b"x", image_url=""):
     from src.image_recovery import ImageRecoveryResult
     return ImageRecoveryResult(
         image_source=source,
         confidence=confidence,
         evidence=evidence or [],
+        image_url=image_url,
         jpeg_bytes=jpeg,
     )
 
@@ -941,6 +942,51 @@ def test_dataframe_diagnostics_carry_debug_fields(tmp_path, monkeypatch):
         "screenshot_selector_matched", "screenshot_candidates_found",
     ):
         assert k in d
+
+
+def test_dataframe_recovery_stores_image_candidate_debug_fields(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    df = pd.DataFrame([
+        {"Product Name": "Wolf Drawer", "Brand": "Wolf", "Model/SKU": "MDD30TS",
+         "Image URL": "", "Product URL": "https://wolfappliance.com/products/mdd30ts",
+         "_source_pdf_id": ""},
+    ])
+
+    def fake_recover(*args, **kwargs):
+        debug = kwargs.get("debug")
+        if debug is not None:
+            debug.update({
+                "image_lookup_queries_used": ['"Wolf" "MDD30TS" product image'],
+                "web_image_candidates": [
+                    {
+                        "image_url": "https://wolfappliance.com/images/mdd30ts-main.jpg",
+                        "source_page_url": "https://wolfappliance.com/products/mdd30ts",
+                        "extraction_method": "gallery_image",
+                        "confidence": "MEDIUM",
+                        "score": 125,
+                        "confidence_reason": "gallery_image;sku_match",
+                    }
+                ],
+                "web_image_rejection_reasons": [
+                    "https://wolfappliance.com/assets/default-meta-image.jpg: bad_image_hint:default-meta-image"
+                ],
+            })
+        return _result(
+            confidence="MEDIUM",
+            source="official_site_html_image",
+            evidence=["gallery_image", "sku_match"],
+            jpeg=_jpeg_bytes(),
+            image_url="https://wolfappliance.com/images/mdd30ts-main.jpg",
+        )
+
+    with patch("src.image_recovery.recover_image_for_row", side_effect=fake_recover):
+        out_df, diags = recover_images_for_dataframe(df, pdf_lookup=None, session_id="s")
+
+    row = out_df.iloc[0]
+    assert row["_image_query_used"] == '"Wolf" "MDD30TS" product image'
+    assert "mdd30ts-main.jpg" in row["_image_candidates"]
+    assert "default-meta-image" in row["_image_rejected_candidates"]
+    assert diags[0]["selected_image_candidate"].endswith("mdd30ts-main.jpg")
 
 
 def test_build_image_recovery_debug_dataframe_returns_fixed_columns(tmp_path):

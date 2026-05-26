@@ -31,6 +31,19 @@ _BAD_IMAGE_HINTS = (
     "tracking",
     "pixel",
     "spinner",
+    "default-meta-image",
+    "default_meta_image",
+    "default-image",
+    "defaultimage",
+    "missing-image",
+    "no-image",
+    "noimage",
+    "badge",
+    "swatch",
+    "lifestyle",
+    "roomscene",
+    "room-scene",
+    "inspiration",
 )
 _GENERIC_ALT_TOKENS = {
     "front",
@@ -46,7 +59,7 @@ _GENERIC_ALT_TOKENS = {
     "product",
     "view",
 }
-_MIN_DIMENSION = 120
+_MIN_DIMENSION = 300
 _MIN_AREA = _MIN_DIMENSION * _MIN_DIMENSION
 _CONF_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
 
@@ -79,6 +92,7 @@ def extract_product_page_image(
         "selected_image": "",
         "rejection_reasons": [],
         "image_candidates": [],
+        "image_query_used": _image_query_for_row(row, page_url),
     }
     if not html:
         return ProductPageImageResult(error="empty_html", debug=debug)
@@ -146,8 +160,8 @@ def _collect_candidates(soup: BeautifulSoup, page_url: str) -> list[_ImageCandid
             context="jsonld_product",
         ))
 
-    for source in soup.select("source[srcset]"):
-        url, width = _srcset_best(str(source.get("srcset") or ""))
+    for source in soup.select("source[srcset], source[data-srcset]"):
+        url, width = _srcset_best(str(source.get("srcset") or source.get("data-srcset") or ""))
         if url:
             candidates.append(_ImageCandidate(
                 url=_absolute_url(url, page_url),
@@ -169,12 +183,18 @@ def _collect_candidates(soup: BeautifulSoup, page_url: str) -> list[_ImageCandid
             for attr, kind in (
                 ("src", "html_image"),
                 ("data-src", "lazy_image"),
+                ("data-srcset", "lazy_srcset"),
                 ("data-original", "lazy_image"),
                 ("data-image", "lazy_image"),
+                ("data-zoom", "lazy_image"),
+                ("data-large", "lazy_image"),
                 ("data-zoom-image", "lazy_image"),
             ):
                 if img.get(attr):
                     raw_url = str(img.get(attr))
+                    if "srcset" in attr:
+                        raw_url, srcset_width = _srcset_best(raw_url)
+                        width = width or srcset_width
                     source_kind = kind
                     break
         if not raw_url:
@@ -239,6 +259,10 @@ def _score_candidate(
     ok, reason = _passes_url_filter(url)
     if not ok:
         candidate.rejection_reason = reason
+        candidate.evidence = evidence
+        return
+    if _is_svg_url(url) and not _candidate_has_strong_product_signal(candidate, row):
+        candidate.rejection_reason = "svg_without_product_signal"
         candidate.evidence = evidence
         return
     ok, reason = _passes_dimension_filter(candidate.width, candidate.height)
@@ -358,6 +382,19 @@ def _passes_url_filter(url: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _is_svg_url(url: str) -> bool:
+    return urllib.parse.urlparse(url).path.lower().endswith(".svg")
+
+
+def _candidate_has_strong_product_signal(candidate: _ImageCandidate, row: dict) -> bool:
+    sku = normalize_sku(row.get("Model/SKU") or row.get("SKU"))
+    compact_url = re.sub(r"[^a-z0-9]", "", candidate.url.lower())
+    if sku and sku in compact_url:
+        return True
+    text = f"{candidate.url} {candidate.alt} {candidate.context}"
+    return _alt_matches(text, row)
+
+
 def _passes_dimension_filter(width: int | None, height: int | None) -> tuple[bool, str]:
     if width is None or height is None:
         return True, ""
@@ -453,6 +490,7 @@ def _source_score(source_kind: str) -> int:
         "gallery_image": 70,
         "source_srcset": 65,
         "img_srcset": 60,
+        "lazy_srcset": 55,
         "lazy_image": 55,
         "html_image": 40,
     }.get(source_kind, 35)
@@ -481,6 +519,19 @@ def _source_suffix(source_kind: str) -> str:
         "gallery_image": "html_image",
         "source_srcset": "html_image",
         "img_srcset": "html_image",
+        "lazy_srcset": "html_image",
         "lazy_image": "html_image",
         "html_image": "html_image",
     }.get(source_kind, "html_image")
+
+
+def _image_query_for_row(row: dict, page_url: str) -> str:
+    parts = [str(row.get("Brand") or "").strip(), str(row.get("Model/SKU") or row.get("SKU") or "").strip()]
+    product_name = str(row.get("Product Name") or "").strip()
+    domain = urllib.parse.urlparse(page_url).netloc.lower()
+    query = " ".join(part for part in parts if part)
+    if product_name:
+        query = f"{query} {product_name}".strip()
+    if domain:
+        query = f"{domain} {query}".strip()
+    return query

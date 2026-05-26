@@ -37,6 +37,7 @@ Sources for Phase 2 (image search) drop in alongside the existing three.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import re
@@ -249,6 +250,7 @@ def recover_from_product_page(row: dict, page_url: str, debug: dict | None = Non
         debug["product_url_images_found"] = pdebug.get("images_found", 0)
         debug["product_url_selected_image"] = pdebug.get("selected_image", "")
         debug["product_url_rejection_reasons"] = list(pdebug.get("rejection_reasons", []))
+        debug["product_url_image_candidates"] = list(pdebug.get("image_candidates", []))
     return _result_from_page_result(page_result)
 
 
@@ -1150,6 +1152,7 @@ def recover_image_for_row(
     pdf_lookup: dict[str, str] | None = None,
     session_id: str | None = None,  # forward-plumbing for recover_images_for_dataframe (Task 7) — not used here
     enable_screenshot: bool = True,
+    enable_web_lookup: bool = True,
     debug: dict | None = None,
 ) -> ImageRecoveryResult:
     """
@@ -1182,8 +1185,11 @@ def recover_image_for_row(
         debug.setdefault("product_url_images_found", 0)
         debug.setdefault("product_url_selected_image", "")
         debug.setdefault("product_url_rejection_reasons", [])
+        debug.setdefault("product_url_image_candidates", [])
         debug.setdefault("web_lookup_ran", False)
         debug.setdefault("web_queries_used", [])
+        debug.setdefault("image_lookup_queries_used", [])
+        debug.setdefault("fallback_image_queries_used", [])
         debug.setdefault("web_results_found", 0)
         debug.setdefault("official_candidate_pages", [])
         debug.setdefault("selected_product_page_url", "")
@@ -1191,6 +1197,9 @@ def recover_image_for_row(
         debug.setdefault("selected_web_image_url", "")
         debug.setdefault("web_confidence_reason", "")
         debug.setdefault("web_rejection_reasons", [])
+        debug.setdefault("web_image_rejection_reasons", [])
+        debug.setdefault("web_image_candidates", [])
+        debug.setdefault("fallback_image_candidate_pages", [])
         debug.setdefault("brand_registry_match", False)
         debug.setdefault("brand_registry_domains_checked", [])
         debug.setdefault("brand_search_queries_used", [])
@@ -1231,22 +1240,25 @@ def recover_image_for_row(
         break
 
     # 2) Official manufacturer/supplier web lookup.
-    web_result = recover_from_official_lookup(row, debug=debug)
-    if web_result.confidence == "HIGH":
-        if debug is not None:
-            _record_final_debug(debug, web_result)
-        return web_result
-    if web_result.confidence in ("MEDIUM", "LOW"):
-        held = _better(held, web_result)
-    selected_page = _str_val(debug.get("selected_product_page_url")) if debug is not None else ""
-    if enable_screenshot and selected_page and not _str_val(row.get("Product URL")):
-        shot_result = recover_from_screenshot(row, selected_page, debug=debug)
-        if shot_result.confidence == "HIGH":
+    if enable_web_lookup:
+        web_result = recover_from_official_lookup(row, debug=debug)
+        if web_result.confidence == "HIGH":
             if debug is not None:
-                _record_final_debug(debug, shot_result)
-            return shot_result
-        if shot_result.confidence in ("MEDIUM", "LOW"):
-            held = _better(held, shot_result)
+                _record_final_debug(debug, web_result)
+            return web_result
+        if web_result.confidence in ("MEDIUM", "LOW"):
+            held = _better(held, web_result)
+        selected_page = _str_val(debug.get("selected_product_page_url")) if debug is not None else ""
+        if enable_screenshot and selected_page and not _str_val(row.get("Product URL")):
+            shot_result = recover_from_screenshot(row, selected_page, debug=debug)
+            if shot_result.confidence == "HIGH":
+                if debug is not None:
+                    _record_final_debug(debug, shot_result)
+                return shot_result
+            if shot_result.confidence in ("MEDIUM", "LOW"):
+                held = _better(held, shot_result)
+    elif debug is not None:
+        debug["web_rejection_reasons"] = ["web_lookup_skipped_by_budget_mode"]
 
     # 3) Existing image URL on row.
     url_val = _str_val(row.get("Image URL"))
@@ -1294,7 +1306,7 @@ def _record_final_debug(debug: dict, result: "ImageRecoveryResult") -> None:
 # deployment doesn't divert recovered images away from the PDFs the
 # backend stored under the same .tmp/uploads/{sid}/ tree.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_TMP_ROOT = _REPO_ROOT / ".tmp" / "uploads"
+_TMP_ROOT = Path(os.getenv("SCH_TMP_UPLOAD_ROOT", str(_REPO_ROOT / ".tmp" / "uploads"))).expanduser()
 
 
 def _session_image_dir(session_id: str) -> Path:
@@ -1305,6 +1317,8 @@ _RECOVERY_COLUMNS = [
     "image_source", "confidence", "evidence", "needs_image_review",
     "local_image_filename", "local_image_path",
     "review_image_filename", "review_image_path", "Review Image URL",
+    "_image_query_used", "_image_candidates", "_image_rejected_candidates",
+    "_selected_image_candidate", "_image_source_type", "_image_final_confidence",
 ]
 
 
@@ -1328,11 +1342,78 @@ def _row_already_high(row: pd.Series) -> bool:
     return _str_val(row.get("confidence")).upper() == "HIGH" and row_has_image(row_dict)
 
 
+def _compact_candidate_record(record: dict) -> dict:
+    return {
+        "url": _str_val(record.get("image_url") or record.get("selected_image_url") or record.get("src")),
+        "source_page_url": _str_val(record.get("source_page_url") or record.get("url")),
+        "source_domain": _str_val(record.get("source_domain")),
+        "source_type": _str_val(record.get("extraction_method") or record.get("source") or record.get("query")),
+        "confidence": _str_val(record.get("confidence") or record.get("image_confidence")),
+        "score": record.get("score", ""),
+        "reason": _str_val(record.get("confidence_reason") or record.get("reasons")),
+        "rejection_reason": _str_val(record.get("rejection_reason")),
+    }
+
+
+def _image_candidate_debug_json(debug: dict, result: ImageRecoveryResult) -> str:
+    records: list[dict] = []
+    seen: set[str] = set()
+    for key in ("product_url_image_candidates", "web_image_candidates"):
+        for raw in list(debug.get(key, []) or []):
+            if not isinstance(raw, dict):
+                continue
+            compact = _compact_candidate_record(raw)
+            url = compact.get("url", "")
+            if not url or url in seen or compact.get("rejection_reason"):
+                continue
+            seen.add(url)
+            records.append(compact)
+    if result.image_url and result.image_url not in seen:
+        records.insert(0, {
+            "url": result.image_url,
+            "source_page_url": _str_val(debug.get("selected_product_page_url") or debug.get("screenshot_url_attempted")),
+            "source_domain": _str_val(debug.get("selected_product_page_domain")),
+            "source_type": result.image_source,
+            "confidence": result.confidence,
+            "score": "",
+            "reason": ";".join(result.evidence),
+            "rejection_reason": "",
+        })
+    return json.dumps(records[:3])
+
+
+def _image_rejection_debug_json(debug: dict) -> str:
+    values: list[str] = []
+    for key in (
+        "product_url_rejection_reasons",
+        "web_rejection_reasons",
+        "web_image_rejection_reasons",
+        "screenshot_rejection_reasons",
+    ):
+        values.extend(str(v) for v in list(debug.get(key, []) or []) if str(v))
+    for raw in list(debug.get("product_url_image_candidates", []) or []) + list(debug.get("web_image_candidates", []) or []):
+        if isinstance(raw, dict) and raw.get("rejection_reason"):
+            values.append(f"{raw.get('image_url') or raw.get('url')}: {raw.get('rejection_reason')}")
+    return json.dumps(values[:12])
+
+
+def _image_query_debug_text(debug: dict) -> str:
+    queries = (
+        list(debug.get("image_lookup_queries_used", []) or [])
+        or list(debug.get("brand_search_queries_used", []) or [])
+        or list(debug.get("web_queries_used", []) or [])
+    )
+    fallback = list(debug.get("fallback_image_queries_used", []) or [])
+    all_queries = [str(q) for q in [*queries, *fallback] if str(q)]
+    return " | ".join(dict.fromkeys(all_queries))
+
+
 def recover_images_for_dataframe(
     df: pd.DataFrame,
     pdf_lookup: dict[str, str] | None = None,
     session_id: str | None = None,
     enable_screenshot: bool = True,
+    enable_web_lookup: bool = True,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """
     Run the recovery pipeline on rows that don't already carry a HIGH-confidence
@@ -1361,6 +1442,7 @@ def recover_images_for_dataframe(
             pdf_lookup=pdf_lookup,
             session_id=session_id,
             enable_screenshot=enable_screenshot,
+            enable_web_lookup=enable_web_lookup,
             debug=debug,
         )
 
@@ -1368,6 +1450,12 @@ def recover_images_for_dataframe(
         df.at[idx, "image_source"] = result.image_source
         df.at[idx, "confidence"] = result.confidence
         df.at[idx, "evidence"] = ";".join(result.evidence)
+        df.at[idx, "_image_query_used"] = _image_query_debug_text(debug)
+        df.at[idx, "_image_candidates"] = _image_candidate_debug_json(debug, result)
+        df.at[idx, "_image_rejected_candidates"] = _image_rejection_debug_json(debug)
+        df.at[idx, "_selected_image_candidate"] = result.image_url or debug.get("selected_image_url", "")
+        df.at[idx, "_image_source_type"] = result.image_source
+        df.at[idx, "_image_final_confidence"] = result.confidence
         # CONTRACT: needs_image_review is stored as the string "True" or "False",
         # not the Python boolean. Pandas Arrow-backed StringDtype rejects bool
         # assignment to a string-typed column (and _ensure_recovery_columns
@@ -1497,15 +1585,21 @@ def recover_images_for_dataframe(
             "product_url_images_found": debug.get("product_url_images_found", 0),
             "product_url_selected_image": debug.get("product_url_selected_image", ""),
             "product_url_rejection_reasons": list(debug.get("product_url_rejection_reasons", [])),
+            "product_url_image_candidates": list(debug.get("product_url_image_candidates", [])),
             "web_lookup_ran": bool(debug.get("web_lookup_ran", False)),
             "web_queries_used": list(debug.get("web_queries_used", [])),
+            "image_lookup_queries_used": list(debug.get("image_lookup_queries_used", [])),
+            "fallback_image_queries_used": list(debug.get("fallback_image_queries_used", [])),
             "web_results_found": debug.get("web_results_found", 0),
             "official_candidate_pages": list(debug.get("official_candidate_pages", [])),
+            "fallback_image_candidate_pages": list(debug.get("fallback_image_candidate_pages", [])),
             "selected_product_page_url": debug.get("selected_product_page_url", ""),
             "selected_product_page_domain": debug.get("selected_product_page_domain", ""),
             "selected_web_image_url": debug.get("selected_web_image_url", ""),
             "web_confidence_reason": debug.get("web_confidence_reason", ""),
             "web_rejection_reasons": list(debug.get("web_rejection_reasons", [])),
+            "web_image_rejection_reasons": list(debug.get("web_image_rejection_reasons", [])),
+            "web_image_candidates": list(debug.get("web_image_candidates", [])),
             "brand_registry_match": debug.get("brand_registry_match", False),
             "brand_registry_domains_checked": list(debug.get("brand_registry_domains_checked", [])),
             "brand_search_queries_used": list(debug.get("brand_search_queries_used", [])),
@@ -1524,6 +1618,12 @@ def recover_images_for_dataframe(
             "screenshot_rejection_reasons": list(debug.get("screenshot_rejection_reasons", [])),
             "review_image_path": _str_val(row_after.get("review_image_path")),
             "review_image_filename": _str_val(row_after.get("review_image_filename")),
+            "image_query_used": _str_val(row_after.get("_image_query_used")),
+            "image_candidates": _str_val(row_after.get("_image_candidates")),
+            "image_rejected_candidates": _str_val(row_after.get("_image_rejected_candidates")),
+            "selected_image_candidate": _str_val(row_after.get("_selected_image_candidate")),
+            "image_source_type": _str_val(row_after.get("_image_source_type")),
+            "image_final_confidence": _str_val(row_after.get("_image_final_confidence")),
         })
 
     return df, diagnostics
@@ -1561,15 +1661,21 @@ _DEBUG_REPORT_COLUMNS = [
     "product_url_images_found",
     "product_url_selected_image",
     "product_url_rejection_reasons",
+    "product_url_image_candidates",
     "web_lookup_ran",
     "web_queries_used",
+    "image_lookup_queries_used",
+    "fallback_image_queries_used",
     "web_results_found",
     "official_candidate_pages",
+    "fallback_image_candidate_pages",
     "selected_product_page_url",
     "selected_product_page_domain",
     "selected_web_image_url",
     "web_confidence_reason",
     "web_rejection_reasons",
+    "web_image_rejection_reasons",
+    "web_image_candidates",
     "brand_registry_match",
     "brand_registry_domains_checked",
     "brand_search_queries_used",
@@ -1594,6 +1700,12 @@ _DEBUG_REPORT_COLUMNS = [
     "image_filename",
     "review_image_path",
     "review_image_filename",
+    "image_query_used",
+    "image_candidates",
+    "image_rejected_candidates",
+    "selected_image_candidate",
+    "image_source_type",
+    "image_final_confidence",
     "image_url",
     "row_has_image",
     "exported_to_zip",
@@ -1621,13 +1733,22 @@ def build_image_recovery_debug_dataframe(diagnostics: list[dict]) -> pd.DataFram
             row["pdf_rejection_reasons"] = " | ".join(row["pdf_rejection_reasons"])
         for key in (
             "product_url_rejection_reasons",
+            "product_url_image_candidates",
             "web_queries_used",
+            "image_lookup_queries_used",
+            "fallback_image_queries_used",
             "official_candidate_pages",
+            "fallback_image_candidate_pages",
             "web_rejection_reasons",
+            "web_image_rejection_reasons",
+            "web_image_candidates",
             "screenshot_rejection_reasons",
         ):
             if isinstance(row.get(key), list):
-                row[key] = " | ".join(str(v) for v in row[key])
+                row[key] = " | ".join(
+                    json.dumps(v, sort_keys=True) if isinstance(v, dict) else str(v)
+                    for v in row[key]
+                )
         rows.append(row)
     return pd.DataFrame(rows, columns=_DEBUG_REPORT_COLUMNS)
 
