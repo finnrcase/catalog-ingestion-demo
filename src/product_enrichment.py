@@ -64,6 +64,7 @@ from src.enrichment_cache import (
     normalize_key as _normalize_key,
     normalize_mode as _normalize_mode,
     budget_for_mode as _budget_for_mode,
+    run_budget_for_mode as _run_budget_for_mode,
     confidence_ok as _confidence_ok,
 )
 
@@ -209,9 +210,45 @@ def _apply_cheap_local_enrichment(row: dict) -> tuple[dict, dict]:
     return updated, metrics
 
 
+def _confidence_fraction(row: dict) -> float:
+    for key in ("Confidence Score", "_extraction_confidence", "confidence_score"):
+        raw = row.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        return value / 100 if value > 1 else value
+    confidence_text = _str_val(row.get("confidence") or row.get("Product Resolution Confidence")).lower()
+    if confidence_text == "high":
+        return 0.9
+    if confidence_text == "medium":
+        return 0.75
+    return 0.0
+
+
+def _is_usable_without_more_enrichment(row: dict) -> bool:
+    """Stop condition for cheap/default enrichment.
+
+    A row is usable enough when the core identity is present, category is known,
+    and it has either complete dimensions or a verified/product URL. Image is
+    intentionally optional in Fast mode so we do not spend money perfecting rows.
+    """
+    if not _str_val(row.get("Brand")) or not _str_val(row.get("Model/SKU")):
+        return False
+    if not _str_val(row.get("Product Category")):
+        return False
+    if not (has_complete_3d_dimensions(_str_val(row.get("Dimensions"))) or _str_val(row.get("Product URL"))):
+        return False
+    return _confidence_fraction(row) >= 0.85
+
+
 def _needs_external_enrichment(row: dict) -> bool:
     """True only when a row is missing fields that require cache/web/page work."""
     if not _str_val(row.get("Brand")) or not _str_val(row.get("Model/SKU")):
+        return False
+    if _is_usable_without_more_enrichment(row):
         return False
     if not has_complete_3d_dimensions(_str_val(row.get("Dimensions"))):
         return True
@@ -873,12 +910,17 @@ def _budget_diagnostics(budget) -> dict:
             "API Budget Fetch Usage": data.get("fetch_usage", ""),
             "API Budget AI Usage": data.get("ai_usage", ""),
             "API Budget Stopped Reason": data.get("stopped_reason", ""),
+            "API Budget Cost Usage": (
+                f"${data.get('run_estimated_cost_usd', 0):.4f}/${data.get('run_hard_budget_usd', 0):.2f}"
+                if "run_estimated_cost_usd" in data else ""
+            ),
         }
     return {
         "API Budget Search Usage": f"Used {getattr(budget, 'searches_used', 0)}/{getattr(budget, 'max_searches', 0)} search calls",
         "API Budget Fetch Usage": f"Used {getattr(budget, 'urls_used', 0)}/{getattr(budget, 'max_urls', 0)} page fetches",
         "API Budget AI Usage": "",
         "API Budget Stopped Reason": getattr(budget, "stopped_reason", ""),
+        "API Budget Cost Usage": "",
     }
 
 
@@ -1062,12 +1104,20 @@ def _apply_official_product_lookup(
         "Image Recovery Confidence": "",
         "Image Recovery Source": "",
         "Search Diagnostics": "",
+        "Source Domains Tried": "",
+        "Selected Source Domain": "",
+        "Source Selection Reason": "",
+        "Dimensions Extraction Method": "",
+        "Image Extraction Method": "",
+        "Successful Source Stored": "",
+        "Rejected URLs and Reasons": "",
         "product_lookup_cache_status": "miss",
         "AI Extraction Status": "",
         "API Budget Search Usage": "",
         "API Budget Fetch Usage": "",
         "API Budget AI Usage": "",
         "API Budget Stopped Reason": "",
+        "API Budget Cost Usage": "",
     }
     def _stamp_debug_fields(target: dict) -> dict:
         for key, value in debug.items():
@@ -1094,12 +1144,20 @@ def _apply_official_product_lookup(
                 "Image Recovery Confidence",
                 "Image Recovery Source",
                 "Search Diagnostics",
+                "Source Domains Tried",
+                "Selected Source Domain",
+                "Source Selection Reason",
+                "Dimensions Extraction Method",
+                "Image Extraction Method",
+                "Successful Source Stored",
+                "Rejected URLs and Reasons",
                 "product_lookup_cache_status",
                 "AI Extraction Status",
                 "API Budget Search Usage",
                 "API Budget Fetch Usage",
                 "API Budget AI Usage",
                 "API Budget Stopped Reason",
+                "API Budget Cost Usage",
             }:
                 target[key] = value
         return target
@@ -1153,6 +1211,27 @@ def _apply_official_product_lookup(
                 f"resolver_confidence:{page.confidence};score:{page.evidence_score}"
                 if page else "no_verified_product_page"
             ),
+            "Source Domains Tried": ", ".join(dict.fromkeys(
+                _str_val(item.get("domain")) for item in resolution.diagnostics if isinstance(item, dict) and _str_val(item.get("domain"))
+            )),
+            "Selected Source Domain": page.domain if page else "",
+            "Source Selection Reason": (
+                f"{page.diagnostics.get('candidate_origin', 'search')};source_success_boost={page.diagnostics.get('source_success_boost', 0)}"
+                if page else "no_verified_product_page"
+            ),
+            "Dimensions Extraction Method": page.diagnostics.get("dimension_method", "") if page else "",
+            "Image Extraction Method": page.diagnostics.get("image_method", "") if page else "",
+            "Successful Source Stored": page.diagnostics.get("source_registry_status", "") if page else "",
+            "Rejected URLs and Reasons": json.dumps([
+                {
+                    "url": item.get("url"),
+                    "domain": item.get("domain"),
+                    "reason": item.get("rejection_reason"),
+                    "confidence": item.get("confidence"),
+                }
+                for item in resolution.diagnostics
+                if isinstance(item, dict) and item.get("rejection_reason")
+            ][:12]),
             "web_lookup_error": "" if page else "no_verified_product_page",
             "Product Resolution Confidence": page.confidence if page else "none",
             "Product Resolution Evidence": (
@@ -1195,19 +1274,29 @@ def _apply_official_product_lookup(
         _merge_budget_debug(debug, budget)
         if not debug.get("API Budget Stopped Reason"):
             debug["API Budget Stopped Reason"] = debug.get("web_lookup_error") or "no_verified_product_page"
-        _lookup_cache.record_no_result(
-            row,
-            confidence=_str_val(debug.get("Product Resolution Confidence")).lower() or "none",
-            evidence_score=int(debug.get("selected_product_page_score") or 0),
-            evidence_summary=_str_val(debug.get("Product Resolution Evidence")) or _str_val(debug.get("web_lookup_error")),
-        )
+        stopped_reason = _str_val(debug.get("API Budget Stopped Reason")).lower()
+        if not any(token in stopped_reason for token in ("budget", "exhausted", "limit")):
+            _lookup_cache.record_no_result(
+                row,
+                confidence=_str_val(debug.get("Product Resolution Confidence")).lower() or "none",
+                evidence_score=int(debug.get("selected_product_page_score") or 0),
+                evidence_summary=_str_val(debug.get("Product Resolution Evidence")) or _str_val(debug.get("web_lookup_error")),
+            )
         updated["manufacturer_page_exact_sku"] = False
         return _stamp_debug_fields(updated), None, debug
 
     if not _str_val(updated.get("Product URL")):
         updated["Product URL"] = page_url
 
-    html = selected_html or _fetch_page_html(page_url)
+    html = selected_html
+    if not html:
+        if budget is not None and hasattr(budget, "can_fetch") and not budget.can_fetch():
+            debug["web_lookup_error"] = getattr(budget, "stopped_reason", "") or "page_fetch_budget_exhausted"
+            _merge_budget_debug(debug, budget)
+        else:
+            if budget is not None and hasattr(budget, "consume_fetch"):
+                budget.consume_fetch()
+            html = _fetch_page_html(page_url)
     if not html:
         extracted_fields = getattr(selected_resolution_candidate, "extracted_fields", {}) or {}
         if not extracted_fields:
@@ -1605,9 +1694,10 @@ def _apply_manufacturer_page_fields(
 
 def enrich_row(
     row: dict,
-    enrichment_mode: str = "standard",
+    enrichment_mode: str = "fast",
     session_cache: "_SessionCache | None" = None,
     use_web_enrichment: bool = True,
+    run_budget=None,
 ) -> tuple[dict, str | None, _DimensionResult | None]:
     """
     Enrich a single row using Brave Search + httpx + Claude.
@@ -1634,15 +1724,20 @@ def enrich_row(
             updated["API Budget Fetch Usage"] = "Used 0/0 page fetches"
             updated["API Budget AI Usage"] = "Used 0/0 AI calls"
             updated["API Budget Stopped Reason"] = "Skipped expensive enrichment: row already has required fields"
+            updated["API Budget Cost Usage"] = (
+                f"${run_budget.estimated_cost_usd:.4f}/${run_budget.hard_budget_usd:.2f}"
+                if run_budget is not None else "$0.0000/$0.00"
+            )
             if local_metrics.get("local_category_filled"):
                 updated["Search Diagnostics"] = "local_category_heuristic"
             return updated, None, None
 
         mode = _normalize_mode(enrichment_mode)
-        budget = _budget_for_mode(mode)
         brand = _str_val(row.get("Brand"))
         model_sku = _str_val(row.get("Model/SKU"))
         cache_key = _normalize_key(brand, model_sku) if brand and model_sku else ""
+        item_key = cache_key or "|".join([brand, model_sku, _str_val(row.get("Product Name"))])
+        budget = _budget_for_mode(mode, run_budget=run_budget, item_key=item_key)
         force_refresh = session_cache.force_refresh if session_cache else False
 
         # ── Cache check ────────────────────────────────────────────────────────
@@ -1669,6 +1764,10 @@ def enrich_row(
                     updated["API Budget Fetch Usage"] = "Used 0/0 page fetches"
                     updated["API Budget AI Usage"] = "Used 0/0 AI calls"
                     updated["API Budget Stopped Reason"] = "Used cached result: no API cost"
+                    updated["API Budget Cost Usage"] = (
+                        f"${run_budget.estimated_cost_usd:.4f}/${run_budget.hard_budget_usd:.2f}"
+                        if run_budget is not None else "$0.0000/$0.00"
+                    )
                     return updated, None, None
                 else:
                     product_cache_hit = "partial"
@@ -1846,9 +1945,29 @@ def _metrics_from_updated_row(updated: dict) -> dict:
     }
 
 
+def _budget_reason(value: object) -> bool:
+    text = _str_val(value).lower()
+    return any(token in text for token in ("budget", "exhausted", "limit reached", "hard budget"))
+
+
+def _stamp_budget_skipped(row: dict, reason: str = "Skipped enrichment due to budget cap") -> dict:
+    updated = row.copy()
+    updated["Review Required"] = True
+    updated["Status"] = _str_val(updated.get("Status")) or "Needs Review"
+    updated["Suggested Action"] = reason
+    updated["Enrichment Stage"] = _str_val(updated.get("Enrichment Stage")) or "budget_skipped"
+    updated["AI Extraction Status"] = _str_val(updated.get("AI Extraction Status")) or "Skipped AI: budget limit"
+    updated["API Budget Stopped Reason"] = _str_val(updated.get("API Budget Stopped Reason")) or reason
+    existing = _str_val(updated.get("Notes"))
+    note = "[Enrichment skipped: budget limit]"
+    if note not in existing:
+        updated["Notes"] = f"{existing} {note}".strip() if existing else note
+    return updated
+
+
 def enrich_dataframe(
     df: pd.DataFrame,
-    enrichment_mode: str = "standard",
+    enrichment_mode: str = "fast",
     force_refresh: bool = False,
     use_web_enrichment: bool = True,
 ) -> tuple[pd.DataFrame, list[str], list[dict]]:
@@ -1860,6 +1979,7 @@ def enrich_dataframe(
     errors: list[str] = []
     dimension_diagnostics: list[dict] = []
     started_at = time.perf_counter()
+    run_budget = _run_budget_for_mode(_normalize_mode(enrichment_mode))
     metrics = {
         "report_type": "enrichment_metrics",
         "summary": {
@@ -1875,7 +1995,20 @@ def enrich_dataframe(
             "page_fetches": 0,
             "ai_calls": 0,
             "ai_calls_avoided": 0,
+            "external_lookups": 0,
+            "image_searches": 0,
+            "skipped_calls_due_budget": 0,
+            "fields_skipped_due_budget": 0,
+            "target_budget_usd": run_budget.target_budget_usd,
+            "hard_budget_usd": run_budget.hard_budget_usd,
             "estimated_cost_usd": 0.0,
+            "cost_by_stage": {},
+            "cost_by_item": {},
+            "most_expensive_item": "",
+            "most_expensive_item_cost_usd": 0.0,
+            "paid_call_reasons": [],
+            "budget_skipped_calls": [],
+            "budget_skipped_fields": [],
             "cache_hit_rate": 0.0,
             "duration_ms": 0,
         },
@@ -1909,6 +2042,7 @@ def enrich_dataframe(
             r["API Budget Fetch Usage"] = "Used 0/0 page fetches"
             r["API Budget AI Usage"] = "Used 0/0 AI calls"
             r["API Budget Stopped Reason"] = "Skipped expensive enrichment: row already has required fields"
+            r["API Budget Cost Usage"] = f"${run_budget.estimated_cost_usd:.4f}/${run_budget.hard_budget_usd:.2f}"
             _write_updated_row(df, idx, r)
             continue
 
@@ -1928,11 +2062,15 @@ def enrich_dataframe(
                 r,
                 enrichment_mode=enrichment_mode,
                 session_cache=_session,
+                run_budget=run_budget,
             )
             if error:
                 errors.append(error)
             else:
                 _write_updated_row(df, idx, updated)
+                if _budget_reason(updated.get("API Budget Stopped Reason")):
+                    updated = _stamp_budget_skipped(updated, "Skipped enrichment due to budget cap")
+                    _write_updated_row(df, idx, updated)
                 if dup_key:
                     duplicate_results[dup_key] = updated
                 row_metrics = _metrics_from_updated_row(updated)
@@ -1973,9 +2111,26 @@ def enrich_dataframe(
     eligible = max(1, int(metrics["summary"]["eligible_rows"]))
     metrics["summary"]["cache_hit_rate"] = round(metrics["summary"]["cache_hits"] / eligible, 3)
     metrics["summary"]["duration_ms"] = int((time.perf_counter() - started_at) * 1000)
-    # Coarse diagnostic estimate: Brave/web requests are negligible compared
-    # with AI; this helps debug spend without trying to mirror vendor billing.
-    metrics["summary"]["estimated_cost_usd"] = round(metrics["summary"]["ai_calls"] * 0.01, 4)
+    run_diag = run_budget.diagnostics()
+    metrics["summary"].update({
+        "estimated_cost_usd": run_diag["estimated_cost_usd"],
+        "remaining_budget_usd": run_diag["remaining_budget_usd"],
+        "external_lookups": run_diag["external_lookups"],
+        "external_lookups_limit": run_diag["external_lookups_limit"],
+        "image_searches": run_diag["image_searches"],
+        "image_searches_limit": run_diag["image_searches_limit"],
+        "ai_calls": run_diag["ai_calls"],
+        "ai_calls_limit": run_diag["ai_calls_limit"],
+        "skipped_calls_due_budget": run_diag["skipped_calls_due_budget"],
+        "fields_skipped_due_budget": len(run_diag["skipped_fields_due_budget"]),
+        "cost_by_stage": run_diag["cost_by_stage"],
+        "cost_by_item": run_diag["cost_by_item"],
+        "most_expensive_item": run_diag["most_expensive_item"],
+        "most_expensive_item_cost_usd": run_diag["most_expensive_item_cost_usd"],
+        "paid_call_reasons": run_diag["paid_call_reasons"],
+        "budget_skipped_calls": run_diag["skipped_calls"],
+        "budget_skipped_fields": run_diag["skipped_fields_due_budget"],
+    })
     dimension_diagnostics.insert(0, metrics)
     return df, errors, dimension_diagnostics
 

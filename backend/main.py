@@ -282,6 +282,12 @@ def _real_integrations_enabled() -> bool:
     return _env_flag("ENABLE_REAL_INTEGRATIONS", False) and not _env_flag("DEMO_MODE", True)
 
 
+def _admin_enrichment_modes_allowed() -> bool:
+    if _env_flag("ALLOW_ADMIN_ENRICHMENT_MODES", False):
+        return True
+    return os.getenv("ENVIRONMENT", "").strip().lower() != "production"
+
+
 def _demo_mode_response(action: str, rows: int = 0) -> dict:
     return {
         "status": "demo_mode",
@@ -669,6 +675,8 @@ def validate_intake(payload: RowsPayload) -> IntakeResponse:
 
 @app.post("/intake/enrich", response_model=IntakeResponse)
 def enrich_intake(payload: RowsPayload) -> IntakeResponse:
+    if payload.enrichment_mode not in {"", "fast"} and not _admin_enrichment_modes_allowed():
+        raise HTTPException(status_code=403, detail="Balanced and deep enrichment are admin-only.")
     df, errors, dimension_diagnostics = enrich_dataframe(
         pd.DataFrame(payload.rows),
         enrichment_mode=payload.enrichment_mode,

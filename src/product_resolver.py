@@ -27,6 +27,13 @@ from src.product_image_extraction import (
     extract_product_image_candidates,
     score_image_candidates,
 )
+from src.source_success_registry import (
+    preferred_source_domains_for_row,
+    record_source_failure,
+    record_source_success,
+    source_success_score,
+    successful_urls_for_row,
+)
 from src.spec_extraction import (
     DimensionExtractionResult,
     extract_dimensions_from_html,
@@ -120,6 +127,27 @@ def resolve_product_page(row: dict, session_cache=None, budget=None) -> ProductR
     seen_urls: set[str] = set()
     stop_all = False
 
+    for url in _direct_candidate_urls(row):
+        key = _normalised_url(url)
+        if not url or key in seen_urls:
+            continue
+        seen_urls.add(key)
+        if budget is not None and not _url_cached(session_cache, url) and not _can_fetch(budget):
+            budget.stop("page fetch budget exhausted")
+            break
+        candidate = _candidate_from_url(url, official_domains, title="existing verified product URL")
+        candidate.diagnostics["candidate_origin"] = "existing_product_url"
+        _fetch_candidate(candidate, session_cache, budget)
+        _score_candidate(candidate, row, official_domains)
+        _extract_candidate_assets(candidate, row)
+        candidates.append(candidate)
+        urls_checked.append(url)
+        if _candidate_has_complete_result(candidate):
+            if budget is not None:
+                budget.stop("Stopped early: existing product URL yielded dimensions/image")
+            stop_all = True
+            break
+
     for query in queries:
         if stop_all:
             break
@@ -133,11 +161,12 @@ def resolve_product_page(row: dict, session_cache=None, budget=None) -> ProductR
             if not url or key in seen_urls:
                 continue
             seen_urls.add(key)
-            if budget is not None and not _can_fetch(budget):
+            if budget is not None and not _url_cached(session_cache, url) and not _can_fetch(budget):
                 budget.stop("page fetch budget exhausted")
                 stop_all = True
                 break
             candidate = _candidate_from_search_result(result, official_domains)
+            candidate.diagnostics["candidate_origin"] = "search"
             _fetch_candidate(candidate, session_cache, budget)
             _score_candidate(candidate, row, official_domains)
             _extract_candidate_assets(candidate, row)
@@ -160,6 +189,7 @@ def resolve_product_page(row: dict, session_cache=None, budget=None) -> ProductR
                 break
 
     selected = _select_candidate(candidates)
+    _record_source_outcomes(row, candidates, selected)
     diagnostics = [_diagnostic_record(candidate) for candidate in candidates]
     if session_cache is not None:
         setattr(session_cache, "product_resolution_diagnostics", diagnostics)
@@ -200,7 +230,7 @@ def build_resolver_queries(row: dict, mode: str = "standard") -> tuple[list[str]
 
     primary_domain = official_domains[0] if official_domains else ""
     if primary_domain and sku:
-        add(f'site:{primary_domain} "{sku}"')
+        add(f'site:{primary_domain} "{sku}" dimensions')
     if brand and sku:
         add(f'"{brand}" "{sku}" official product page')
     if primary_domain and sku:
@@ -209,8 +239,10 @@ def build_resolver_queries(row: dict, mode: str = "standard") -> tuple[list[str]
     if mode in {"deep", "manual_retry"}:
         for domain in official_domains:
             if sku:
-                add(f'site:{domain} "{sku}" specifications')
                 add(f'site:{domain} "{sku}" dimensions')
+                add(f'site:{domain} "{sku}" spec sheet dimensions')
+                add(f'site:{domain} "{sku}" installation guide dimensions')
+                add(f'site:{domain} "{sku}" specifications')
                 add(f'site:{domain} "{sku}" product')
                 add(f'site:{domain} "{sku}" filetype:pdf')
         if brand and sku:
@@ -259,6 +291,29 @@ def _candidate_from_search_result(result, official_domains: list[str]) -> Produc
         domain=domain,
         title=_text(getattr(result, "title", "")),
         snippet=_text(getattr(result, "description", "")),
+        source_type=source_type,
+        is_official_domain=official,
+    )
+
+
+def _candidate_from_url(url: str, official_domains: list[str], *, title: str = "") -> ProductCandidate:
+    domain = _domain(url)
+    official = any(_domain_matches(domain, official_domain) for official_domain in official_domains)
+    is_pdf = _is_pdf_url(url)
+    if official and is_pdf:
+        source_type = "manufacturer_pdf"
+    elif official:
+        source_type = "manufacturer_page"
+    elif _is_retailer_domain(domain) and is_pdf:
+        source_type = "retailer_pdf"
+    elif _is_retailer_domain(domain):
+        source_type = "retailer_page"
+    else:
+        source_type = "unknown"
+    return ProductCandidate(
+        url=url,
+        domain=domain,
+        title=title,
         source_type=source_type,
         is_official_domain=official,
     )
@@ -343,6 +398,10 @@ def _score_candidate(candidate: ProductCandidate, row: dict, official_domains: l
         score += 10
     if candidate.source_type == "manufacturer_pdf":
         score += 20
+    learned_boost = source_success_score(row, candidate.domain)
+    if learned_boost:
+        score += learned_boost
+        candidate.diagnostics["source_success_boost"] = learned_boost
 
     if sku_norm and not candidate.matched_sku:
         candidate.confidence = "low" if score > 0 else "none"
@@ -398,8 +457,10 @@ def _extract_candidate_assets(candidate: ProductCandidate, row: dict) -> None:
     candidate.diagnostics.update({
         "dimension_confidence": dim_result.confidence,
         "dimension_evidence": dim_result.evidence_text,
+        "dimension_method": dim_result.source_type if dim_result.dimensions else "not_found",
         "image_candidates_found": len(image_candidates),
         "image_candidates": [image.__dict__ for image in image_candidates],
+        "image_method": fields.get("image_source", "not_found"),
     })
 
 
@@ -443,6 +504,10 @@ def _diagnostic_record(candidate: ProductCandidate) -> dict[str, Any]:
         "extracted_dimensions": candidate.extracted_dimensions,
         "extracted_image_url": candidate.extracted_image_url,
         "image_candidates_found": candidate.diagnostics.get("image_candidates_found", 0),
+        "candidate_origin": candidate.diagnostics.get("candidate_origin", ""),
+        "source_success_boost": candidate.diagnostics.get("source_success_boost", 0),
+        "dimension_method": candidate.diagnostics.get("dimension_method", ""),
+        "image_method": candidate.diagnostics.get("image_method", ""),
     }
 
 
@@ -450,6 +515,11 @@ def _official_domains(row: dict) -> list[str]:
     brand = _text(row.get("Brand"))
     domains: list[str] = []
     direct = get_domain_for_brand(brand)
+    if direct and direct[1] == "user" and direct[0] not in domains:
+        domains.append(direct[0])
+    for domain in preferred_source_domains_for_row(row):
+        if domain not in domains:
+            domains.append(domain)
     if direct and direct[0] not in domains:
         domains.append(direct[0])
     for domain in registry_domains_for_brand(brand):
@@ -458,13 +528,67 @@ def _official_domains(row: dict) -> list[str]:
     return domains
 
 
+def _direct_candidate_urls(row: dict) -> list[str]:
+    urls: list[str] = []
+    product_url = _text(row.get("Product URL") or row.get("Product Resolution URL"))
+    if product_url:
+        urls.append(product_url)
+    for url in successful_urls_for_row(row):
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _candidate_has_complete_result(candidate: ProductCandidate) -> bool:
+    return (
+        candidate.confidence in {"high", "medium"}
+        and bool(candidate.url)
+        and bool(candidate.extracted_dimensions)
+        and bool(candidate.extracted_image_url)
+    )
+
+
+def _record_source_outcomes(
+    row: dict,
+    candidates: list[ProductCandidate],
+    selected: ProductCandidate | None,
+) -> None:
+    for candidate in candidates:
+        if not candidate.domain:
+            continue
+        fields_found = {
+            "dimensions": bool(candidate.extracted_dimensions),
+            "image": bool(candidate.extracted_image_url),
+            "spec_sheet": candidate.source_type.endswith("_pdf"),
+            "product_url": bool(candidate.url),
+        }
+        if candidate is selected and candidate.confidence in {"high", "medium"}:
+            entry = record_source_success(
+                row,
+                domain=candidate.domain,
+                url=candidate.url,
+                fields_found=fields_found,
+                confidence=candidate.confidence,
+            )
+            candidate.diagnostics["source_registry_status"] = "success_stored" if entry else "success_not_stored"
+            continue
+        if candidate.confidence not in {"high", "medium"}:
+            reason = candidate.rejection_reason or "no_dimensions_or_image"
+            entry = record_source_failure(row, domain=candidate.domain, url=candidate.url, reason=reason)
+            candidate.diagnostics["source_registry_status"] = "failure_stored" if entry else "failure_not_stored"
+
+
 def _can_fetch(budget) -> bool:
     return budget is None or budget.can_fetch()
 
 
 def _budget_mode(budget) -> str:
     mode = str(getattr(budget, "mode", "standard") or "standard")
-    return mode if mode in {"fast", "standard", "deep", "manual_retry"} else "standard"
+    return mode if mode in {"fast", "standard", "balanced", "deep", "manual_retry"} else "standard"
+
+
+def _url_cached(session_cache, url: str) -> bool:
+    return bool(session_cache is not None and url in getattr(session_cache, "urls", {}))
 
 
 def _domain(url: str) -> str:

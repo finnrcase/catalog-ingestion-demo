@@ -4,9 +4,14 @@ import pytest
 
 from src.brave_search import SearchResult
 from src.enrichment_cache import budget_for_mode
-from src.product_lookup_budget import ProductLookupBudget
+from src.product_lookup_budget import EnrichmentRunBudget, ProductLookupBudget, run_budget_for_mode
 from src.product_lookup_cache import ProductLookupCache
 from src.product_resolver import ProductCandidate, ProductResolutionResult, resolve_product_page
+
+
+@pytest.fixture(autouse=True)
+def _isolate_source_registry(monkeypatch, tmp_path):
+    monkeypatch.setenv("SOURCE_SUCCESS_REGISTRY_PATH", str(tmp_path / "source_success_registry.json"))
 
 
 def _row() -> dict:
@@ -83,10 +88,51 @@ def test_budget_for_modes_match_phase_9_limits():
     deep = budget_for_mode("deep")
     manual = budget_for_mode("manual_retry")
 
-    assert (fast.brave_searches_limit, fast.page_fetches_limit, fast.ai_calls_limit) == (1, 2, 0)
+    assert (fast.brave_searches_limit, fast.page_fetches_limit, fast.ai_calls_limit) == (1, 1, 0)
     assert (standard.brave_searches_limit, standard.page_fetches_limit, standard.ai_calls_limit) == (3, 6, 1)
     assert (deep.brave_searches_limit, deep.page_fetches_limit, deep.ai_calls_limit) == (6, 12, 2)
     assert (manual.brave_searches_limit, manual.page_fetches_limit, manual.ai_calls_limit) == (10, 20, 3)
+
+
+def test_fast_run_budget_defaults_target_and_hard_cap(monkeypatch):
+    for name in (
+        "ENRICHMENT_TARGET_BUDGET_USD",
+        "ENRICHMENT_HARD_BUDGET_USD",
+        "ENRICHMENT_MAX_AI_CALLS_PER_UPLOAD",
+        "ENRICHMENT_MAX_EXTERNAL_LOOKUPS_PER_UPLOAD",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    budget = run_budget_for_mode("fast")
+
+    assert budget.target_budget_usd == 0.10
+    assert budget.hard_budget_usd == 0.25
+    assert budget.max_ai_calls == 3
+    assert budget.max_external_lookups == 25
+
+
+def test_run_budget_blocks_paid_call_over_hard_cap():
+    budget = EnrichmentRunBudget(
+        hard_budget_usd=0.005,
+        max_ai_calls=3,
+        ai_call_cost_usd=0.03,
+    )
+
+    assert not budget.consume("ai", budget.ai_call_cost_usd, item_key="wolf_mdd30ts", field="Dimensions")
+    assert budget.ai_calls_used == 0
+    assert budget.estimated_cost_usd == 0
+    assert budget.skipped_calls[-1]["reason"] == "hard budget exceeded"
+
+
+def test_fast_budget_env_does_not_reduce_deep_mode(monkeypatch):
+    monkeypatch.setenv("ENRICHMENT_TARGET_BUDGET_USD", "0.10")
+    monkeypatch.setenv("ENRICHMENT_HARD_BUDGET_USD", "0.25")
+
+    fast = run_budget_for_mode("fast")
+    deep = run_budget_for_mode("deep")
+
+    assert fast.hard_budget_usd == 0.25
+    assert deep.hard_budget_usd == 2.00
 
 
 def test_standard_mode_never_exceeds_three_brave_calls(monkeypatch):

@@ -232,6 +232,11 @@ function formatFileSize(bytes: number) {
   return `${value >= 10 || exponent === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[exponent]}`;
 }
 
+function formatUsd(value: unknown) {
+  const numeric = Number(value ?? 0);
+  return `$${Number.isFinite(numeric) ? numeric.toFixed(4) : "0.0000"}`;
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
@@ -329,6 +334,26 @@ function missingFieldsForDebug(row: IntakeRow) {
   const explicit = rowText(row, "Missing Fields");
   if (explicit) return explicit.split(",").map((item) => item.trim()).filter(Boolean);
   return missingFieldsForRow(row);
+}
+
+function phoneCallFieldsForRow(row: IntakeRow) {
+  const fields = new Set(missingFieldsForDebug(row));
+  if (!hasComplete3dDimensions(row.Dimensions)) fields.add("Dimensions");
+  if (!isPublicHttpsImageUrl(rowText(row, "Image URL"))) fields.add("Image URL");
+  if (!rowText(row, "Product URL").trim()) fields.add("Product URL");
+  const confidence = rowText(row, "confidence").toUpperCase();
+  const needsReview =
+    row["Review Required"] === true ||
+    rowText(row, "Status").toLowerCase().includes("review") ||
+    rowText(row, "needs_image_review").toLowerCase() === "true";
+  if (needsReview || (confidence && confidence !== "HIGH")) fields.add("Spec confirmation");
+  return Array.from(fields).filter(Boolean);
+}
+
+function shouldEmphasizePhoneCall(row: IntakeRow) {
+  return phoneCallFieldsForRow(row).some((field) =>
+    ["Dimensions", "Image URL", "Product URL", "Spec confirmation"].includes(field),
+  );
 }
 
 function traceField(row: IntakeRow, field: string, parsed: Record<string, unknown>) {
@@ -439,6 +464,13 @@ function buildInternalDebugReport(
         query: rowText(row, "_enrichment_query_used") || [rowText(row, "Brand"), rowText(row, "Model/SKU"), rowText(row, "Product Name")].filter(Boolean).join(" "),
         attempted: Boolean(rowText(row, "Product URL") || rowText(row, "Dimension Lookup Status") || rowText(row, "image_source") || diagnostics.length),
         matchedUrl: rowText(row, "Product URL") || null,
+        sourceDomainsTried: rowText(row, "Source Domains Tried"),
+        selectedDomain: rowText(row, "Selected Source Domain"),
+        sourceSelectionReason: rowText(row, "Source Selection Reason"),
+        dimensionsExtractionMethod: rowText(row, "Dimensions Extraction Method"),
+        imageExtractionMethod: rowText(row, "Image Extraction Method"),
+        successfulSourceStored: rowText(row, "Successful Source Stored"),
+        rejectedUrlsAndReasons: rowText(row, "Rejected URLs and Reasons"),
         extractedFields: {
           dimensions: rowText(row, "Dimensions") || null,
           imageUrl: rowText(row, "Image URL") || null,
@@ -538,16 +570,29 @@ function formatDebugReportText(report: ReturnType<typeof buildInternalDebugRepor
       "",
       "Enrichment Metrics",
       `Mode: ${metrics.mode ?? "unknown"}`,
-      `Estimated Cost: $${metrics.estimated_cost_usd ?? "0"}`,
+      `Target Budget: ${formatUsd(metrics.target_budget_usd)}`,
+      `Hard Budget: ${formatUsd(metrics.hard_budget_usd)}`,
+      `Estimated Cost: ${formatUsd(metrics.estimated_cost_usd)}`,
+      `Remaining Budget: ${formatUsd(metrics.remaining_budget_usd)}`,
       `Search Calls: ${metrics.search_calls ?? 0}`,
       `Page Fetches: ${metrics.page_fetches ?? 0}`,
+      `External Lookups: ${metrics.external_lookups ?? 0}/${metrics.external_lookups_limit ?? "?"}`,
+      `Image Searches: ${metrics.image_searches ?? 0}/${metrics.image_searches_limit ?? "?"}`,
       `AI Calls: ${metrics.ai_calls ?? 0}`,
+      `AI Call Limit: ${metrics.ai_calls_limit ?? "?"}`,
       `AI Calls Avoided: ${metrics.ai_calls_avoided ?? 0}`,
       `Cache Hit Rate: ${metrics.cache_hit_rate ?? 0}`,
       `Cache Hits: ${metrics.cache_hits ?? 0}`,
       `Duplicate Reuse: ${metrics.duplicate_reuse ?? 0}`,
       `Cheap Local Only: ${metrics.cheap_local_only ?? 0}`,
       `Skipped Enrichments: ${metrics.skipped_enrichments ?? 0}`,
+      `Budget-Skipped Calls: ${metrics.skipped_calls_due_budget ?? 0}`,
+      `Budget-Skipped Fields: ${metrics.fields_skipped_due_budget ?? 0}`,
+      `Most Expensive Item: ${metrics.most_expensive_item || "none"} (${formatUsd(metrics.most_expensive_item_cost_usd)})`,
+      `Cost By Stage: ${JSON.stringify(metrics.cost_by_stage || {})}`,
+      `Paid Call Reasons: ${JSON.stringify(metrics.paid_call_reasons || [])}`,
+      `Budget Skipped Calls: ${JSON.stringify(metrics.budget_skipped_calls || [])}`,
+      `Budget Skipped Fields: ${JSON.stringify(metrics.budget_skipped_fields || [])}`,
       `Duration: ${metrics.duration_ms ?? 0}ms`,
     );
   }
@@ -576,6 +621,13 @@ function formatDebugReportText(report: ReturnType<typeof buildInternalDebugRepor
       `- Query: ${product.enrichment.query || "(none)"}`,
       `- Attempted: ${product.enrichment.attempted ? "yes" : "no"}`,
       `- Matched URL: ${product.enrichment.matchedUrl || "none"}`,
+      `- Source Domains Tried: ${product.enrichment.sourceDomainsTried || "none"}`,
+      `- Selected Domain: ${product.enrichment.selectedDomain || "none"}`,
+      `- Source Selection Reason: ${product.enrichment.sourceSelectionReason || "none"}`,
+      `- Dimensions Method: ${product.enrichment.dimensionsExtractionMethod || "none"}`,
+      `- Image Method: ${product.enrichment.imageExtractionMethod || "none"}`,
+      `- Successful Source Stored: ${product.enrichment.successfulSourceStored || "none"}`,
+      `- Rejected URLs: ${product.enrichment.rejectedUrlsAndReasons || "none"}`,
       `- Failed Fields: ${product.enrichment.failedFields.join(", ") || "none"}`,
       `- Failure Reason: ${product.enrichment.failureReason || "none"}`,
       `- Retry Count: ${product.enrichment.retryCount}`,
@@ -1341,6 +1393,14 @@ export function IntakeWorkspace() {
   }
 
   async function handleValidate() {
+    if (["standard", "balanced", "deep", "manual_retry"].includes(enrichmentMode) && !INTERNAL_DEBUG_ENABLED) {
+      setMessage("Balanced and deep enrichment are internal/admin-only.");
+      return;
+    }
+    if (["deep", "manual_retry"].includes(enrichmentMode)) {
+      const confirmed = window.confirm("Deep enrichment can spend materially more API budget. Continue?");
+      if (!confirmed) return;
+    }
     setBusy("validate");
     setShowReviewItems(false);
     setShowMissingDetailItems(false);
@@ -1908,9 +1968,9 @@ export function IntakeWorkspace() {
                 disabled={!useWebEnrichment}
               >
                 <option value="fast">Fast - cheapest</option>
-                <option value="standard">Balanced</option>
-                <option value="deep">Deep enrichment</option>
-                <option value="manual_retry">Manual retry</option>
+                {INTERNAL_DEBUG_ENABLED ? <option value="standard">Balanced</option> : null}
+                {INTERNAL_DEBUG_ENABLED ? <option value="deep">Deep enrichment</option> : null}
+                {INTERNAL_DEBUG_ENABLED ? <option value="manual_retry">Manual retry</option> : null}
               </select>
             </Field>
 
@@ -2103,6 +2163,8 @@ export function IntakeWorkspace() {
                           .slice(0, 3);
                         const imageRejectedCandidates = rowText(row, "_image_rejected_candidates");
                         const imageDebugAvailable = Boolean(imageQueryUsed || imageCandidates.length || imageRejectedCandidates || rowText(row, "_selected_image_candidate"));
+                        const callFields = phoneCallFieldsForRow(row);
+                        const emphasizeCall = shouldEmphasizePhoneCall(row);
                         return (
                           <div key={index} className="grid gap-3 p-4 md:grid-cols-[1fr_1.2fr_auto] md:items-center">
                             <div className="min-w-0">
@@ -2185,6 +2247,18 @@ export function IntakeWorkspace() {
                                   }}
                                 />
                               </label>
+                              <button
+                                type="button"
+                                className={`btn-secondary inline-flex h-10 items-center justify-center gap-2 rounded-xl px-3 text-sm font-semibold ${
+                                  emphasizeCall ? "border-orangeBorder bg-orangeSoft/50 text-bronze hover:bg-orangeSoft" : ""
+                                }`}
+                                onClick={() => openVendorCall(row, callFields.length ? callFields : ["Spec confirmation"])}
+                                title="Call supplier/manufacturer to confirm specs or request product assets"
+                                aria-label="Phone call"
+                              >
+                                <Phone className="h-4 w-4" />
+                                <span>Phone Call</span>
+                              </button>
                               {imageUrl ? (
                                 <button
                                   className="btn-secondary inline-flex h-10 items-center justify-center rounded-xl px-3 text-sm font-semibold"
@@ -2398,20 +2472,47 @@ function InternalDebugPanel({
               <div className="rounded-xl border border-linen bg-ivory/40 p-3">
                 <div className="mb-2 font-semibold">Enrichment metrics</div>
                 <DebugLine label="Mode" value={report.enrichmentMetrics.mode || "unknown"} />
-                <DebugLine label="Est. cost" value={`$${report.enrichmentMetrics.estimated_cost_usd ?? "0"}`} />
+                <DebugLine label="Target" value={formatUsd(report.enrichmentMetrics.target_budget_usd)} />
+                <DebugLine label="Hard cap" value={formatUsd(report.enrichmentMetrics.hard_budget_usd)} />
+                <DebugLine label="Est. cost" value={formatUsd(report.enrichmentMetrics.estimated_cost_usd)} />
+                <DebugLine label="Remaining" value={formatUsd(report.enrichmentMetrics.remaining_budget_usd)} />
                 <DebugLine label="Search calls" value={report.enrichmentMetrics.search_calls ?? 0} />
                 <DebugLine label="Page fetches" value={report.enrichmentMetrics.page_fetches ?? 0} />
-                <DebugLine label="AI calls" value={report.enrichmentMetrics.ai_calls ?? 0} />
+                <DebugLine label="External lookups" value={`${report.enrichmentMetrics.external_lookups ?? 0}/${report.enrichmentMetrics.external_lookups_limit ?? "?"}`} />
+                <DebugLine label="Image searches" value={`${report.enrichmentMetrics.image_searches ?? 0}/${report.enrichmentMetrics.image_searches_limit ?? "?"}`} />
+                <DebugLine label="AI calls" value={`${report.enrichmentMetrics.ai_calls ?? 0}/${report.enrichmentMetrics.ai_calls_limit ?? "?"}`} />
                 <DebugLine label="AI avoided" value={report.enrichmentMetrics.ai_calls_avoided ?? 0} />
                 <DebugLine label="Cache hits" value={report.enrichmentMetrics.cache_hits ?? 0} />
                 <DebugLine label="Cache hit rate" value={report.enrichmentMetrics.cache_hit_rate ?? 0} />
                 <DebugLine label="Duplicates" value={report.enrichmentMetrics.duplicate_reuse ?? 0} />
                 <DebugLine label="Cheap only" value={report.enrichmentMetrics.cheap_local_only ?? 0} />
                 <DebugLine label="Skipped" value={report.enrichmentMetrics.skipped_enrichments ?? 0} />
+                <DebugLine label="Budget skips" value={report.enrichmentMetrics.skipped_calls_due_budget ?? 0} />
+                <DebugLine label="Fields skipped" value={report.enrichmentMetrics.fields_skipped_due_budget ?? 0} />
+                <DebugLine
+                  label="Most expensive"
+                  value={
+                    report.enrichmentMetrics.most_expensive_item
+                      ? `${report.enrichmentMetrics.most_expensive_item} (${formatUsd(report.enrichmentMetrics.most_expensive_item_cost_usd)})`
+                      : "none"
+                  }
+                />
                 <DebugLine label="Duration" value={`${report.enrichmentMetrics.duration_ms ?? 0}ms`} />
               </div>
             ) : null}
           </div>
+
+          {report.enrichmentMetrics ? (
+            <details className="rounded-xl border border-linen bg-white/70 p-3 text-xs">
+              <summary className="cursor-pointer font-semibold">Cost-control trace</summary>
+              <div className="mt-3 grid gap-2">
+                <DebugLine label="Cost by stage" value={JSON.stringify(report.enrichmentMetrics.cost_by_stage || {})} />
+                <DebugLine label="Paid call reasons" value={JSON.stringify(report.enrichmentMetrics.paid_call_reasons || [])} />
+                <DebugLine label="Budget skipped calls" value={JSON.stringify(report.enrichmentMetrics.budget_skipped_calls || [])} />
+                <DebugLine label="Budget skipped fields" value={JSON.stringify(report.enrichmentMetrics.budget_skipped_fields || [])} />
+              </div>
+            </details>
+          ) : null}
 
           <div className="grid gap-3">
             {report.products.length ? report.products.map((product) => (
@@ -2452,6 +2553,13 @@ function InternalDebugPanel({
                     <DebugLine label="Query" value={product.enrichment.query || "none"} />
                     <DebugLine label="Attempted" value={product.enrichment.attempted ? "yes" : "no"} />
                     <DebugLine label="Matched URL" value={product.enrichment.matchedUrl || "none"} />
+                    <DebugLine label="Source domains" value={product.enrichment.sourceDomainsTried || "none"} />
+                    <DebugLine label="Selected domain" value={product.enrichment.selectedDomain || "none"} />
+                    <DebugLine label="Selection reason" value={product.enrichment.sourceSelectionReason || "none"} />
+                    <DebugLine label="Dimensions method" value={product.enrichment.dimensionsExtractionMethod || "none"} />
+                    <DebugLine label="Image method" value={product.enrichment.imageExtractionMethod || "none"} />
+                    <DebugLine label="Source stored" value={product.enrichment.successfulSourceStored || "none"} />
+                    <DebugLine label="Rejected URLs" value={product.enrichment.rejectedUrlsAndReasons || "none"} />
                     <DebugLine label="Failed fields" value={product.enrichment.failedFields.join(", ") || "none"} />
                     <DebugLine label="Failure reason" value={product.enrichment.failureReason || "none"} />
                     <DebugLine label="Retry count" value={product.enrichment.retryCount} />
@@ -2579,8 +2687,12 @@ function VendorCallDialog({
     ["Location", rowText(state.row, "Room")],
     ["Supplier", rowText(state.row, "Supplier")],
     ["Category", rowText(state.row, "Product Category")],
+    ["Product URL", rowText(state.row, "Product URL")],
+    ["Image URL", rowText(state.row, "Image URL")],
     ["Dimensions", rowText(state.row, "Dimensions")],
     ["Finish", rowText(state.row, "Finish / Color")],
+    ["Confidence", rowText(state.row, "confidence") || rowText(state.row, "Product Resolution Confidence")],
+    ["Suggested Action", rowText(state.row, "Suggested Action")],
     ["Notes", cleanNotes(rowText(state.row, "Notes"))],
   ].filter(([, value]) => value.trim());
 

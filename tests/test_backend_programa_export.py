@@ -147,6 +147,19 @@ def test_intake_enrich_endpoint_passes_web_enrichment_flag(monkeypatch):
     assert captured["use_web_enrichment"] is False
 
 
+def test_intake_enrich_blocks_non_fast_modes_in_production(monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("ALLOW_ADMIN_ENRICHMENT_MODES", "false")
+    monkeypatch.setattr("backend.main.enrich_dataframe", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not run")))
+
+    response = client.post(
+        "/intake/enrich",
+        json={"rows": [{"Product Name": "Lamp"}], "enrichment_mode": "deep"},
+    )
+
+    assert response.status_code == 403
+
+
 def test_intake_enrich_endpoint_returns_photo_discovery_report(monkeypatch):
     rows = [{
         "Product Name": "Wolf Drawer",

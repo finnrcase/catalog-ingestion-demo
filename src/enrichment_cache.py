@@ -9,6 +9,7 @@ normalize_mode(mode) -> str
 budget_for_mode(mode) -> ProductLookupBudget
 confidence_ok(entry, field_name) -> bool
 ProductLookupBudget — per-product Brave/page/AI call counter
+EnrichmentRunBudget — per-upload cost/call limiter
 SearchBudget       — backwards-compatible alias
 SessionCache       — in-memory per-run query/URL dedup store
 ManufacturerDomainCache  — persistent data/manufacturer_domain_cache.json
@@ -23,7 +24,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from src.product_lookup_budget import ProductLookupBudget
+from src.product_lookup_budget import EnrichmentRunBudget, ProductLookupBudget, run_budget_for_mode
 
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 _MFR_CACHE_PATH = os.path.normpath(os.path.join(_DATA_DIR, "manufacturer_domain_cache.json"))
@@ -32,8 +33,9 @@ _PRODUCT_CACHE_PATH = os.path.normpath(os.path.join(_DATA_DIR, "product_enrichme
 _CACHE_ENABLED: bool = os.getenv("ENRICHMENT_CACHE_ENABLED", "true").lower() != "false"
 
 _MODE_LIMITS: dict[str, dict] = {
-    "fast": {"max_searches": 1, "max_urls": 2, "max_ai_calls": 0, "retailer": False, "general_fallback": False},
+    "fast": {"max_searches": 1, "max_urls": 1, "max_ai_calls": 0, "retailer": False, "general_fallback": False},
     "standard": {"max_searches": 3, "max_urls": 6, "max_ai_calls": 1, "retailer": False, "general_fallback": True},
+    "balanced": {"max_searches": 3, "max_urls": 6, "max_ai_calls": 1, "retailer": False, "general_fallback": True},
     "deep": {"max_searches": 6, "max_urls": 12, "max_ai_calls": 2, "retailer": True, "general_fallback": True},
     "manual_retry": {"max_searches": 10, "max_urls": 20, "max_ai_calls": 3, "retailer": True, "general_fallback": True},
 }
@@ -59,11 +61,16 @@ def normalize_key(brand: str, model: str) -> str:
 
 
 def normalize_mode(mode: str) -> str:
-    """Return mode unchanged if valid, else 'standard'."""
-    return mode if mode in VALID_MODES else "standard"
+    """Return mode unchanged if valid, else 'fast'."""
+    return mode if mode in VALID_MODES else "fast"
 
 
-def budget_for_mode(mode: str) -> ProductLookupBudget:
+def budget_for_mode(
+    mode: str,
+    *,
+    run_budget: EnrichmentRunBudget | None = None,
+    item_key: str = "",
+) -> ProductLookupBudget:
     """Create a ProductLookupBudget for the given enrichment mode, respecting env overrides."""
     limits = _MODE_LIMITS[normalize_mode(mode)]
     env_searches = os.getenv("BRAVE_MAX_SEARCHES_PER_PRODUCT")
@@ -76,6 +83,8 @@ def budget_for_mode(mode: str) -> ProductLookupBudget:
         mode=normalize_mode(mode),
         allows_retailer=limits["retailer"],
         allows_general_fallback=limits["general_fallback"],
+        run_budget=run_budget,
+        item_key=item_key,
     )
 
 

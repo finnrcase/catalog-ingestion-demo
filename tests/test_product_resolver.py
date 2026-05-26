@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import pytest
+
 from src.brave_search import SearchResult
 from src.product_resolver import build_resolver_queries, resolve_product_page
+from src.source_success_registry import record_source_success
+
+
+@pytest.fixture(autouse=True)
+def _isolate_source_registry(monkeypatch, tmp_path):
+    monkeypatch.setenv("SOURCE_SUCCESS_REGISTRY_PATH", str(tmp_path / "source_success_registry.json"))
 
 
 def _wolf_row() -> dict:
@@ -94,6 +102,35 @@ def test_build_resolver_queries_prioritizes_official_domain():
     assert "wolfappliance.com" in domains or "subzero-wolf.com" in domains
     assert any(query.startswith("site:") and '"MDD30TS"' in query for query in queries)
     assert '"Wolf" "MDD30TS" official product page' in queries
+
+
+def test_build_resolver_queries_uses_successful_source_registry_first():
+    row = {"Brand": "Acme", "Model/SKU": "AX100", "Product Category": "Appliances"}
+    record_source_success(row, domain="specs.acme.com", url="https://specs.acme.com/ax100", confidence="high")
+
+    queries, domains = build_resolver_queries(row)
+
+    assert domains[0] == "specs.acme.com"
+    assert queries[0] == 'site:specs.acme.com "AX100" dimensions'
+
+
+def test_existing_product_url_extracted_before_search(monkeypatch):
+    import src.product_resolver as pr
+
+    row = {
+        **_wolf_row(),
+        "Product URL": "https://wolfappliance.com/products/mdd30ts",
+    }
+    monkeypatch.setattr(pr, "search_product_candidates", lambda *a, **k: pytest.fail("search should not run"))
+    monkeypatch.setattr(pr.httpx, "get", lambda url, **kwargs: _resp(url, _wolf_html()))
+
+    result = resolve_product_page(row)
+
+    assert result.selected is not None
+    assert result.selected.url == row["Product URL"]
+    assert result.selected.diagnostics["candidate_origin"] == "existing_product_url"
+    assert result.selected.extracted_dimensions == '29.875"W x 23.5"D x 11.875"H'
+    assert result.selected.extracted_image_url == "https://cdn.wolfappliance.com/images/mdd30ts-product.jpg"
 
 
 def test_official_exact_sku_page_produces_high_dimensions_and_image(monkeypatch):

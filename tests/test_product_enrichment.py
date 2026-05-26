@@ -30,6 +30,7 @@ def _isolate_caches(monkeypatch, tmp_path):
     from src.enrichment_cache import ProductEnrichmentCache, ManufacturerDomainCache
     import src.product_enrichment as pe
     import src.dimension_enrichment as de
+    monkeypatch.setenv("SOURCE_SUCCESS_REGISTRY_PATH", str(tmp_path / "source_success_registry.json"))
     # Prevent manufacturer_domains.py from writing to real data/manufacturer_domain_cache.json
     monkeypatch.setattr("src.product_enrichment.get_domain_for_brand", lambda brand: None)
     monkeypatch.setattr("src.product_enrichment.record_discovered_domain", lambda brand, domain: None)
@@ -601,7 +602,7 @@ def test_enrich_row_full_cache_hit_with_missing_image_spends_zero_calls(monkeypa
 
     with patch("src.product_enrichment._fetch_page_html") as mock_fetch, \
          patch("src.product_enrichment._check_image_content_type") as mock_check:
-        updated, error, _ = enrich_row(_qualifying_row())
+        updated, error, _ = enrich_row(_qualifying_row(), enrichment_mode="standard")
 
     assert error is None
     assert not updated.get("Image URL")
@@ -632,7 +633,7 @@ def test_enrich_row_full_cache_hit_no_extra_search_when_image_already_cached(mon
     monkeypatch.setattr(pe, "_product_cache", cache)
 
     with patch("src.product_enrichment._fetch_page_html") as mock_fetch:
-        updated, error, _ = enrich_row(_qualifying_row())
+        updated, error, _ = enrich_row(_qualifying_row(), enrichment_mode="standard")
 
     mock_fetch.assert_not_called()
     assert updated.get("Image URL") == "https://wolfappliance.com/img/cached.jpg"
@@ -899,7 +900,7 @@ def test_enrich_row_fills_fields_on_success():
     with patch("src.product_resolver.search_product_candidates", return_value=[good_result]), \
          patch("src.product_resolver.httpx.get", return_value=_resolver_response(good_result.url, "Wolf MDD30TS official page content")), \
          patch("src.product_enrichment._extract_with_claude", return_value=extracted):
-        updated, error, _ = enrich_row(_qualifying_row())
+        updated, error, _ = enrich_row(_qualifying_row(), enrichment_mode="standard")
 
     assert error is None
     assert updated["Product Name"] == "Wolf 30\" Drawer Microwave"
@@ -950,7 +951,7 @@ def test_enrich_dataframe_isolates_exceptions():
     ]
     df = pd.DataFrame(rows)
 
-    def bad_enrich_row(row, enrichment_mode="standard", session_cache=None):
+    def bad_enrich_row(row, enrichment_mode="standard", session_cache=None, **kwargs):
         if row["Brand"] == "Wolf":
             raise RuntimeError("network error")
         return row, None, None
@@ -1286,9 +1287,9 @@ def test_enrich_dataframe_creates_session_cache_once(monkeypatch):
 
     created = []
     original_enrich_row = pe.enrich_row
-    def tracking_enrich_row(row, enrichment_mode="standard", session_cache=None):
+    def tracking_enrich_row(row, enrichment_mode="standard", session_cache=None, **kwargs):
         created.append(id(session_cache))
-        return original_enrich_row(row, enrichment_mode=enrichment_mode, session_cache=session_cache)
+        return original_enrich_row(row, enrichment_mode=enrichment_mode, session_cache=session_cache, **kwargs)
     monkeypatch.setattr(pe, "enrich_row", tracking_enrich_row)
 
     rows = [
