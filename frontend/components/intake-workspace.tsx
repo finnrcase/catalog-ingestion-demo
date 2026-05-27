@@ -90,9 +90,8 @@ const missingFieldKeys: Record<string, string> = {
 };
 
 const websiteThemeOptions = [
-  { id: "light", label: "Default Light", description: "Warm SCH white surfaces with orange accents." },
-  { id: "dark", label: "SCH Dark", description: "Dark version of the current card-based workflow." },
-  { id: "graphite", label: "Black / Gray", description: "High-contrast neutral black and gray workspace." },
+  { id: "light", label: "Light", description: "Bright, warm workspace for everyday use." },
+  { id: "dark", label: "Dark", description: "Low-light workspace with the same clean structure." },
 ] as const;
 
 const accentColorOptions = [
@@ -104,11 +103,12 @@ const accentColorOptions = [
 
 type WebsiteThemeId = (typeof websiteThemeOptions)[number]["id"];
 type AccentColorId = (typeof accentColorOptions)[number]["id"];
+type UiDensityId = "comfortable" | "compact";
+type AnimationPreferenceId = "smooth" | "reduced";
+type EnrichmentPriorityId = "balanced" | "images" | "dimensions" | "speed";
+type MeasurementUnitId = "imperial" | "metric";
 
-const themePreviewPalettes: Record<
-  WebsiteThemeId,
-  { background: string; surface: string; border: string; text: string; muted: string }
-> = {
+const themePreviewPalettes: Record<WebsiteThemeId, { background: string; surface: string; border: string; text: string; muted: string }> = {
   light: {
     background: "#fafaf8",
     surface: "#ffffff",
@@ -123,17 +123,32 @@ const themePreviewPalettes: Record<
     text: "#f2f4f7",
     muted: "#b5bcc6",
   },
-  graphite: {
-    background: "#09090a",
-    surface: "#19191b",
-    border: "#43454b",
-    text: "#f5f5f6",
-    muted: "#aeb0b5",
-  },
 };
 
 const websiteThemeStorageKey = "sch:websiteTheme";
 const accentColorStorageKey = "sch:accentColor";
+const uiDensityStorageKey = "sch:uiDensity";
+const animationPreferenceStorageKey = "sch:animationPreference";
+const enrichmentPriorityStorageKey = "sch:enrichmentPriority";
+const autoRetryStorageKey = "sch:autoRetryFailed";
+const measurementUnitStorageKey = "sch:measurementUnit";
+
+const uiDensityOptions: { id: UiDensityId; label: string; description: string }[] = [
+  { id: "comfortable", label: "Comfortable", description: "More breathing room for review work." },
+  { id: "compact", label: "Compact", description: "Tighter rows and controls for dense lists." },
+];
+
+const animationPreferenceOptions: { id: AnimationPreferenceId; label: string; description: string }[] = [
+  { id: "smooth", label: "Smooth", description: "Keep subtle interface motion." },
+  { id: "reduced", label: "Reduced", description: "Minimize transitions and motion." },
+];
+
+const enrichmentPriorityOptions: { id: EnrichmentPriorityId; label: string; description: string }[] = [
+  { id: "balanced", label: "Balanced", description: "Keep image, dimension, and speed needs even." },
+  { id: "images", label: "Prioritize images", description: "Put missing product images first during review." },
+  { id: "dimensions", label: "Prioritize dimensions", description: "Put missing measurements first during review." },
+  { id: "speed", label: "Prioritize speed", description: "Favor quicker passes and fewer deep checks." },
+];
 
 const missingFieldPlaceholders: Record<string, string> = {
   "Product Name": "Enter product name",
@@ -286,6 +301,10 @@ function formatFileSize(bytes: number) {
 function formatUsd(value: unknown) {
   const numeric = Number(value ?? 0);
   return `$${Number.isFinite(numeric) ? numeric.toFixed(4) : "0.0000"}`;
+}
+
+function formatPercent(value: number | null) {
+  return value === null ? "No data yet" : `${Math.round(value * 100)}%`;
 }
 
 function sleep(ms: number) {
@@ -863,6 +882,11 @@ export function IntakeWorkspace() {
   const [preferredWebsiteBusy, setPreferredWebsiteBusy] = useState(false);
   const [websiteTheme, setWebsiteTheme] = useState<WebsiteThemeId>("light");
   const [accentColor, setAccentColor] = useState<AccentColorId>("orange");
+  const [uiDensity, setUiDensity] = useState<UiDensityId>("comfortable");
+  const [animationPreference, setAnimationPreference] = useState<AnimationPreferenceId>("smooth");
+  const [enrichmentPriority, setEnrichmentPriority] = useState<EnrichmentPriorityId>("balanced");
+  const [autoRetryFailedItems, setAutoRetryFailedItems] = useState(false);
+  const [measurementUnit, setMeasurementUnit] = useState<MeasurementUnitId>("imperial");
   const [themeSettingsLoaded, setThemeSettingsLoaded] = useState(false);
   const [showReviewItems, setShowReviewItems] = useState(false);
   const [showMissingDetailItems, setShowMissingDetailItems] = useState(false);
@@ -910,11 +934,31 @@ export function IntakeWorkspace() {
   useEffect(() => {
     const storedTheme = window.localStorage.getItem(websiteThemeStorageKey);
     const storedAccent = window.localStorage.getItem(accentColorStorageKey);
+    const storedDensity = window.localStorage.getItem(uiDensityStorageKey);
+    const storedAnimationPreference = window.localStorage.getItem(animationPreferenceStorageKey);
+    const storedEnrichmentPriority = window.localStorage.getItem(enrichmentPriorityStorageKey);
+    const storedAutoRetry = window.localStorage.getItem(autoRetryStorageKey);
+    const storedMeasurementUnit = window.localStorage.getItem(measurementUnitStorageKey);
     if (websiteThemeOptions.some((option) => option.id === storedTheme)) {
       setWebsiteTheme(storedTheme as WebsiteThemeId);
     }
     if (accentColorOptions.some((option) => option.id === storedAccent)) {
       setAccentColor(storedAccent as AccentColorId);
+    }
+    if (uiDensityOptions.some((option) => option.id === storedDensity)) {
+      setUiDensity(storedDensity as UiDensityId);
+    }
+    if (animationPreferenceOptions.some((option) => option.id === storedAnimationPreference)) {
+      setAnimationPreference(storedAnimationPreference as AnimationPreferenceId);
+    }
+    if (enrichmentPriorityOptions.some((option) => option.id === storedEnrichmentPriority)) {
+      setEnrichmentPriority(storedEnrichmentPriority as EnrichmentPriorityId);
+    }
+    if (storedAutoRetry === "true" || storedAutoRetry === "false") {
+      setAutoRetryFailedItems(storedAutoRetry === "true");
+    }
+    if (storedMeasurementUnit === "imperial" || storedMeasurementUnit === "metric") {
+      setMeasurementUnit(storedMeasurementUnit);
     }
     setThemeSettingsLoaded(true);
   }, []);
@@ -923,9 +967,16 @@ export function IntakeWorkspace() {
     if (!themeSettingsLoaded) return;
     document.documentElement.dataset.theme = websiteTheme;
     document.documentElement.dataset.accent = accentColor;
+    document.documentElement.dataset.density = uiDensity;
+    document.documentElement.dataset.motion = animationPreference;
     window.localStorage.setItem(websiteThemeStorageKey, websiteTheme);
     window.localStorage.setItem(accentColorStorageKey, accentColor);
-  }, [accentColor, themeSettingsLoaded, websiteTheme]);
+    window.localStorage.setItem(uiDensityStorageKey, uiDensity);
+    window.localStorage.setItem(animationPreferenceStorageKey, animationPreference);
+    window.localStorage.setItem(enrichmentPriorityStorageKey, enrichmentPriority);
+    window.localStorage.setItem(autoRetryStorageKey, String(autoRetryFailedItems));
+    window.localStorage.setItem(measurementUnitStorageKey, measurementUnit);
+  }, [accentColor, animationPreference, autoRetryFailedItems, enrichmentPriority, measurementUnit, themeSettingsLoaded, uiDensity, websiteTheme]);
 
   useEffect(() => {
     fetchHealth().catch(() => {
@@ -985,6 +1036,32 @@ export function IntakeWorkspace() {
     [rows, debugUploads, errors, exportSummary, latestDiagnostics],
   );
   const enrichmentMetrics = internalDebugReport.enrichmentMetrics;
+  const settingsUsage = useMemo(() => {
+    const included = includedRows.length;
+    const ready = readyRows;
+    const dimensionsReady = includedRows.filter((row) => hasComplete3dDimensions(rowText(row, "Dimensions"))).length;
+    const imageReady = exportSummary.image_url_present;
+    const imageTotal = exportSummary.image_url_total || included;
+    const topWebsites = [...preferredWebsites]
+      .sort((a, b) => (Number(b.success_count || 0) - Number(a.success_count || 0)) || (Number(a.failure_count || 0) - Number(b.failure_count || 0)))
+      .slice(0, 3);
+    const providerCosts = enrichmentMetrics?.cost_by_provider && typeof enrichmentMetrics.cost_by_provider === "object"
+      ? Object.entries(enrichmentMetrics.cost_by_provider as Record<string, unknown>)
+          .map(([provider, cost]) => ({ provider, cost: Number(cost || 0) }))
+          .sort((a, b) => b.cost - a.cost)
+          .slice(0, 3)
+      : [];
+
+    return {
+      successRate: included ? ready / included : null,
+      imageSuccessRate: imageTotal ? imageReady / imageTotal : null,
+      dimensionSuccessRate: included ? dimensionsReady / included : null,
+      averageCostPerRun: Number(enrichmentMetrics?.estimated_cost_usd ?? 0),
+      averageCostPerItem: Number(enrichmentMetrics?.avg_cost_per_item_usd ?? 0),
+      topWebsites,
+      providerCosts,
+    };
+  }, [enrichmentMetrics, exportSummary.image_url_present, exportSummary.image_url_total, includedRows, preferredWebsites, readyRows]);
   const ignored = useMemo(() => rows.filter((row) => row.Include === false || row.Status === "Ignored").length, [rows]);
   const onlyPhotosSelected = bulkImages.length > 0 && files.length === 0 && !urls.trim();
   const uploadBusy = busy === "generate" || busy === "photoBulk";
@@ -1546,11 +1623,13 @@ export function IntakeWorkspace() {
   }
 
   async function handleValidate() {
-    if (["standard", "balanced", "deep", "manual_retry"].includes(enrichmentMode) && !INTERNAL_DEBUG_ENABLED) {
+    const effectiveEnrichmentMode =
+      autoRetryFailedItems && INTERNAL_DEBUG_ENABLED ? "manual_retry" : enrichmentMode;
+    if (["standard", "balanced", "deep", "manual_retry"].includes(effectiveEnrichmentMode) && !INTERNAL_DEBUG_ENABLED) {
       setMessage("Balanced and deep enrichment are internal/admin-only.");
       return;
     }
-    if (["deep", "manual_retry"].includes(enrichmentMode)) {
+    if (["deep", "manual_retry"].includes(effectiveEnrichmentMode)) {
       const confirmed = window.confirm("Deep enrichment can spend materially more API budget. Continue?");
       if (!confirmed) return;
     }
@@ -1563,7 +1642,7 @@ export function IntakeWorkspace() {
         rows,
         useWebEnrichment,
         sessionId: pdfSessionIdRef.current || undefined,
-        enrichmentMode,
+        enrichmentMode: effectiveEnrichmentMode,
       });
       setRows(response.rows);
       setErrors(response.errors);
@@ -1767,7 +1846,7 @@ export function IntakeWorkspace() {
     const url = preferredWebsiteForm.url.trim();
     const notes = preferredWebsiteForm.notes.trim();
     if (!keyword) {
-      setPreferredWebsiteStatus("Add a product name or keyword.");
+      setPreferredWebsiteStatus("Add a brand or keyword.");
       return;
     }
     if (!preferredWebsiteUrlIsValid(url)) {
@@ -1800,6 +1879,58 @@ export function IntakeWorkspace() {
       setPreferredWebsiteStatus("Preferred website deleted.");
     } catch (error) {
       setPreferredWebsiteStatus(error instanceof Error ? error.message : "Could not delete preferred website.");
+    } finally {
+      setPreferredWebsiteBusy(false);
+    }
+  }
+
+  function exportPreferredWebsitePreferences() {
+    const payload = {
+      exported_at: new Date().toISOString(),
+      entries: preferredWebsites.map((entry) => ({
+        keyword: entry.keyword,
+        url: entry.url,
+        notes: entry.notes || "",
+      })),
+    };
+    void downloadText("preferred-brand-websites.json", JSON.stringify(payload, null, 2));
+    setPreferredWebsiteStatus("Website preferences exported.");
+  }
+
+  async function importPreferredWebsitePreferences(file: File | null | undefined) {
+    if (!file) return;
+    setPreferredWebsiteBusy(true);
+    setPreferredWebsiteStatus("");
+    try {
+      const parsed = JSON.parse(await file.text()) as { entries?: unknown[] } | unknown[];
+      const entriesToImport = Array.isArray(parsed) ? parsed : Array.isArray(parsed.entries) ? parsed.entries : [];
+      if (!entriesToImport.length) {
+        setPreferredWebsiteStatus("No website preferences found in that file.");
+        return;
+      }
+      let saved = 0;
+      let skipped = 0;
+      for (const rawEntry of entriesToImport) {
+        const entry = rawEntry as Partial<PreferredWebsiteEntry>;
+        const keyword = String(entry.keyword || "").trim();
+        const url = String(entry.url || "").trim();
+        const notes = String(entry.notes || "").trim();
+        if (!keyword || !url) {
+          skipped += 1;
+          continue;
+        }
+        try {
+          await createPreferredWebsite({ keyword, url, notes });
+          saved += 1;
+        } catch {
+          skipped += 1;
+        }
+      }
+      const response = await fetchPreferredWebsites();
+      setPreferredWebsites(response.entries || []);
+      setPreferredWebsiteStatus(`Imported ${saved} website${saved === 1 ? "" : "s"}${skipped ? ` · ${skipped} skipped` : ""}.`);
+    } catch {
+      setPreferredWebsiteStatus("Could not import that website preferences file.");
     } finally {
       setPreferredWebsiteBusy(false);
     }
@@ -2203,35 +2334,32 @@ export function IntakeWorkspace() {
                 onChange={(event) => setUseWebEnrichment(event.target.checked)}
                 className="mt-1 h-4 w-4 accent-bronze"
               />
-              Use web search
+              Search websites for missing details
             </label>
 
-            <Field label="Enrichment mode">
+            <Field label="Search depth">
               <select
                 className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
                 value={enrichmentMode}
                 onChange={(event) => setEnrichmentMode(event.target.value as typeof enrichmentMode)}
                 disabled={!useWebEnrichment}
               >
-                <option value="fast">Fast - cheapest</option>
+                <option value="fast">Fast</option>
                 {INTERNAL_DEBUG_ENABLED ? <option value="standard">Balanced</option> : null}
-                {INTERNAL_DEBUG_ENABLED ? <option value="deep">Deep enrichment</option> : null}
-                {INTERNAL_DEBUG_ENABLED ? <option value="manual_retry">Manual retry</option> : null}
+                {INTERNAL_DEBUG_ENABLED ? <option value="deep">Deep</option> : null}
+                {INTERNAL_DEBUG_ENABLED ? <option value="manual_retry">Retry failed items</option> : null}
               </select>
             </Field>
 
             {useWebEnrichment ? (
               <div className="rounded-xl border border-orange/25 bg-orangeSoft/30 px-4 py-3 text-sm text-charcoal">
-                <div className="font-semibold">{budgetPreview.label} mode capped at {formatUsd(budgetPreview.hard)}</div>
+                <div className="font-semibold">{budgetPreview.label} search is ready.</div>
                 <div className="mt-1 text-xs text-taupe">
-                  {budgetPreview.itemCount} items · {budgetPreview.needsDimensions} need dimensions · {budgetPreview.needsProductUrl} need product URLs · {budgetPreview.imageOnly} image-only
-                </div>
-                <div className="mt-1 text-xs text-taupe">
-                  Max {budgetPreview.external} external lookups · {budgetPreview.images} image searches · {budgetPreview.ai} AI call{budgetPreview.ai === 1 ? "" : "s"}
+                  {budgetPreview.itemCount} items · {budgetPreview.needsDimensions} need dimensions · {budgetPreview.imageOnly} need images.
                 </div>
                 {busy === "validate" ? (
                   <div className="mt-2 rounded-lg border border-orange/20 bg-paper/50 px-3 py-2 text-xs text-bronze">
-                    Running estimate: capped at {formatUsd(budgetPreview.hard)}. Final Bravi API cost appears as calls complete.
+                    Searching trusted sources and filling missing details.
                   </div>
                 ) : null}
               </div>
@@ -2240,14 +2368,11 @@ export function IntakeWorkspace() {
             {enrichmentMetrics ? (
               <div className="rounded-xl border border-sage/20 bg-sage/10 px-4 py-3 text-sm text-charcoal">
                 <div className="font-semibold">
-                  Enrichment cost: {formatUsd(enrichmentMetrics.estimated_cost_usd)} · Bravi searches: {String(enrichmentMetrics.bravi_searches ?? 0)} · Cache hits: {String(enrichmentMetrics.cache_hits ?? 0)} · Avg/item: {formatUsd(enrichmentMetrics.avg_cost_per_item_usd)}
+                  Last run complete · Average cost per item {formatUsd(enrichmentMetrics.avg_cost_per_item_usd)}
                 </div>
                 <div className="mt-1 text-xs text-taupe">
-                  Bravi API cost {formatUsd(enrichmentMetrics.bravi_cost_usd)} · Paid calls {String(enrichmentMetrics.paid_calls ?? 0)} · Hard cap {formatUsd(enrichmentMetrics.hard_budget_usd)}
+                  Detailed cost, cache, and provider information is available in Settings → Advanced.
                 </div>
-                {Number(enrichmentMetrics.remaining_budget_usd ?? 0) <= Number(enrichmentMetrics.hard_budget_usd ?? 0) * 0.2 ? (
-                  <div className="mt-1 text-xs font-semibold text-bronze">Approaching budget cap.</div>
-                ) : null}
               </div>
             ) : null}
 
@@ -2310,7 +2435,7 @@ export function IntakeWorkspace() {
               onClick={handleValidate}
             >
               {busy === "validate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-              Run Enrichment
+              Fill Missing Details
             </button>
           </div>
         </Panel>
@@ -2594,14 +2719,40 @@ export function IntakeWorkspace() {
             busy={preferredWebsiteBusy}
             websiteTheme={websiteTheme}
             accentColor={accentColor}
+            uiDensity={uiDensity}
+            animationPreference={animationPreference}
+            useWebEnrichment={useWebEnrichment}
+            enrichmentMode={enrichmentMode}
+            enrichmentPriority={enrichmentPriority}
+            autoRetryFailedItems={autoRetryFailedItems}
+            measurementUnit={measurementUnit}
+            includeLowConfidenceImages={includeLowConfidenceImages}
+            budgetPreview={budgetPreview}
+            enrichmentMetrics={enrichmentMetrics}
+            usage={settingsUsage}
+            showInternalDebug={showInternalDebug}
+            debugCopyStatus={debugCopyStatus}
             onClose={() => setShowSettings(false)}
             onChangeTheme={setWebsiteTheme}
             onChangeAccent={setAccentColor}
+            onChangeDensity={setUiDensity}
+            onChangeAnimationPreference={setAnimationPreference}
+            onChangeUseWebEnrichment={setUseWebEnrichment}
+            onChangeEnrichmentMode={setEnrichmentMode}
+            onChangeEnrichmentPriority={setEnrichmentPriority}
+            onChangeAutoRetry={setAutoRetryFailedItems}
+            onChangeMeasurementUnit={setMeasurementUnit}
+            onChangeIncludeLowConfidenceImages={setIncludeLowConfidenceImages}
             onChangeForm={setPreferredWebsiteForm}
             onSave={savePreferredWebsite}
             onEdit={editPreferredWebsite}
             onDelete={removePreferredWebsite}
             onReset={resetPreferredWebsiteForm}
+            onImportWebsites={importPreferredWebsitePreferences}
+            onExportWebsites={exportPreferredWebsitePreferences}
+            onToggleInternalDebug={() => setShowInternalDebug((current) => !current)}
+            onCopyDebug={handleCopyInternalDebug}
+            onDownloadDebug={handleDownloadInternalDebug}
           />
         ) : null}
         {vendorCall ? (
@@ -2974,14 +3125,40 @@ function SettingsDialog({
   busy,
   websiteTheme,
   accentColor,
+  uiDensity,
+  animationPreference,
+  useWebEnrichment,
+  enrichmentMode,
+  enrichmentPriority,
+  autoRetryFailedItems,
+  measurementUnit,
+  includeLowConfidenceImages,
+  budgetPreview,
+  enrichmentMetrics,
+  usage,
+  showInternalDebug,
+  debugCopyStatus,
   onClose,
   onChangeTheme,
   onChangeAccent,
+  onChangeDensity,
+  onChangeAnimationPreference,
+  onChangeUseWebEnrichment,
+  onChangeEnrichmentMode,
+  onChangeEnrichmentPriority,
+  onChangeAutoRetry,
+  onChangeMeasurementUnit,
+  onChangeIncludeLowConfidenceImages,
   onChangeForm,
   onSave,
   onEdit,
   onDelete,
   onReset,
+  onImportWebsites,
+  onExportWebsites,
+  onToggleInternalDebug,
+  onCopyDebug,
+  onDownloadDebug,
 }: {
   entries: PreferredWebsiteEntry[];
   form: { keyword: string; url: string; notes: string; id: string };
@@ -2989,53 +3166,92 @@ function SettingsDialog({
   busy: boolean;
   websiteTheme: WebsiteThemeId;
   accentColor: AccentColorId;
+  uiDensity: UiDensityId;
+  animationPreference: AnimationPreferenceId;
+  useWebEnrichment: boolean;
+  enrichmentMode: "fast" | "standard" | "deep" | "manual_retry";
+  enrichmentPriority: EnrichmentPriorityId;
+  autoRetryFailedItems: boolean;
+  measurementUnit: MeasurementUnitId;
+  includeLowConfidenceImages: boolean;
+  budgetPreview: ReturnType<typeof enrichmentBudgetPreview>;
+  enrichmentMetrics: Record<string, unknown> | null;
+  usage: {
+    successRate: number | null;
+    imageSuccessRate: number | null;
+    dimensionSuccessRate: number | null;
+    averageCostPerRun: number;
+    averageCostPerItem: number;
+    topWebsites: PreferredWebsiteEntry[];
+    providerCosts: { provider: string; cost: number }[];
+  };
+  showInternalDebug: boolean;
+  debugCopyStatus: string;
   onClose: () => void;
   onChangeTheme: (theme: WebsiteThemeId) => void;
   onChangeAccent: (accent: AccentColorId) => void;
+  onChangeDensity: (density: UiDensityId) => void;
+  onChangeAnimationPreference: (preference: AnimationPreferenceId) => void;
+  onChangeUseWebEnrichment: (enabled: boolean) => void;
+  onChangeEnrichmentMode: (mode: "fast" | "standard" | "deep" | "manual_retry") => void;
+  onChangeEnrichmentPriority: (priority: EnrichmentPriorityId) => void;
+  onChangeAutoRetry: (enabled: boolean) => void;
+  onChangeMeasurementUnit: (unit: MeasurementUnitId) => void;
+  onChangeIncludeLowConfidenceImages: (enabled: boolean) => void;
   onChangeForm: (form: { keyword: string; url: string; notes: string; id: string }) => void;
   onSave: () => void;
   onEdit: (entry: PreferredWebsiteEntry) => void;
   onDelete: (entry: PreferredWebsiteEntry) => void;
   onReset: () => void;
+  onImportWebsites: (file: File | null | undefined) => void;
+  onExportWebsites: () => void;
+  onToggleInternalDebug: () => void;
+  onCopyDebug: () => void;
+  onDownloadDebug: (format: "json" | "txt") => void;
 }) {
-  const selectedTheme = websiteThemeOptions.find((option) => option.id === websiteTheme) || websiteThemeOptions[0];
+  const importInputRef = useRef<HTMLInputElement>(null);
+  const selectedPriority = enrichmentPriorityOptions.find((option) => option.id === enrichmentPriority) || enrichmentPriorityOptions[0];
+  const websiteSuccessTotal = entries.reduce((total, entry) => total + Number(entry.success_count || 0), 0);
+  const websiteFailureTotal = entries.reduce((total, entry) => total + Number(entry.failure_count || 0), 0);
+  const websiteSuccessRate =
+    websiteSuccessTotal + websiteFailureTotal > 0
+      ? websiteSuccessTotal / (websiteSuccessTotal + websiteFailureTotal)
+      : null;
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-black/35 px-4 py-6">
-      <div className="max-h-[90vh] w-full max-w-4xl overflow-auto rounded-2xl border border-linen bg-paper p-5 shadow-xl sm:p-6">
+      <div className="max-h-[90vh] w-full max-w-5xl overflow-auto rounded-2xl border border-linen bg-paper p-5 shadow-xl sm:p-6">
         <div className="flex items-start justify-between gap-4 border-b border-linen pb-4">
           <div>
             <div className="text-xl font-semibold text-charcoal">Settings</div>
-            <div className="mt-1 text-sm text-taupe">Preferred sources used before broad product search.</div>
+            <div className="mt-1 text-sm text-taupe">Simple preferences first. Advanced controls stay tucked away until you need them.</div>
           </div>
           <button type="button" className="btn-secondary inline-flex h-9 w-9 items-center justify-center rounded-xl" onClick={onClose} aria-label="Close settings">
             <X className="h-4 w-4" />
           </button>
         </div>
 
-        <div className="mt-5 grid gap-5">
-          <section className="grid gap-4 rounded-xl border border-linen bg-ivory/40 p-4">
-            <div>
-              <h3 className="text-base font-semibold text-charcoal">Website Theme</h3>
-              <p className="mt-1 text-sm text-taupe">Choose the workspace colors. This saves in your browser and applies across the app.</p>
-            </div>
-
-            <div className="grid gap-4 lg:grid-cols-[minmax(220px,0.8fr)_1.2fr]">
-              <div className="grid gap-3">
-                <Field label="Theme">
-                  <select
-                    className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
-                    value={websiteTheme}
-                    onChange={(event) => onChangeTheme(event.target.value as WebsiteThemeId)}
-                  >
+        <div className="mt-5 grid gap-4">
+          <SettingsSection
+            title="Appearance"
+            description="Keep the workspace comfortable without changing your data."
+          >
+            <div className="grid gap-4 lg:grid-cols-[1fr_1.1fr]">
+              <div className="grid gap-4 rounded-xl border border-linen bg-ivory/35 p-4">
+                <div>
+                  <div className="mb-2 text-xs font-semibold uppercase text-charcoal/55">Theme</div>
+                  <div className="grid gap-2 sm:grid-cols-2">
                     {websiteThemeOptions.map((option) => (
-                      <option key={option.id} value={option.id}>
-                        {option.label}
-                      </option>
+                      <ThemePreviewCard
+                        key={option.id}
+                        theme={option.id}
+                        label={option.label}
+                        active={websiteTheme === option.id}
+                        onSelect={() => onChangeTheme(option.id)}
+                      />
                     ))}
-                  </select>
-                </Field>
-                <div className="text-xs leading-5 text-taupe">{selectedTheme.description}</div>
+                  </div>
+                </div>
                 <div>
                   <div className="mb-2 text-xs font-semibold uppercase text-charcoal/55">Accent</div>
                   <div className="flex flex-wrap gap-2">
@@ -3056,35 +3272,34 @@ function SettingsDialog({
                 </div>
               </div>
 
-              <div className="grid gap-3 sm:grid-cols-3">
-                {websiteThemeOptions.map((option) => (
-                  <ThemePreviewCard
-                    key={option.id}
-                    theme={option.id}
-                    label={option.label}
-                    active={websiteTheme === option.id}
-                    onSelect={() => onChangeTheme(option.id)}
-                  />
-                ))}
+              <div className="grid gap-3">
+                <SettingChoiceGroup
+                  label="UI density"
+                  options={uiDensityOptions}
+                  value={uiDensity}
+                  onChange={(value) => onChangeDensity(value as UiDensityId)}
+                />
+                <SettingChoiceGroup
+                  label="Animation"
+                  options={animationPreferenceOptions}
+                  value={animationPreference}
+                  onChange={(value) => onChangeAnimationPreference(value as AnimationPreferenceId)}
+                />
               </div>
             </div>
-          </section>
+          </SettingsSection>
 
-          <section className="grid gap-4">
-            <div>
-              <h3 className="text-base font-semibold text-charcoal">Preferred Product Websites</h3>
-              <p className="mt-1 text-sm text-taupe">
-                Add product keywords and trusted sites. Matching rows try these sources first, then fall back to normal search.
-              </p>
-            </div>
-
+          <SettingsSection
+            title="Preferred Brands & Websites"
+            description="Trusted brand and vendor sources are checked before broad search."
+          >
             <div className="grid gap-3 rounded-xl border border-orangeBorder/40 bg-orangeSoft/15 p-4 md:grid-cols-[1fr_1.2fr]">
-              <Field label="Product name / keyword">
+              <Field label="Brand / keyword">
                 <input
                   className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
                   value={form.keyword}
                   onChange={(event) => onChangeForm({ ...form, keyword: event.target.value })}
-                  placeholder="Sub-Zero drawers"
+                  placeholder="Sub-Zero"
                 />
               </Field>
               <Field label="Preferred website URL">
@@ -3119,11 +3334,39 @@ function SettingsDialog({
               </div>
             </div>
 
+            <div className="grid gap-3 rounded-xl border border-linen bg-ivory/35 p-4 sm:grid-cols-[1fr_auto] sm:items-center">
+              <div>
+                <div className="text-sm font-semibold text-charcoal">Import / export preferences</div>
+                <div className="mt-1 text-xs leading-5 text-taupe">
+                  Move trusted website preferences between browsers or projects.
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" disabled={busy || entries.length === 0} onClick={onExportWebsites}>
+                  Export
+                </button>
+                <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" disabled={busy} onClick={() => importInputRef.current?.click()}>
+                  Import
+                </button>
+                <input
+                  ref={importInputRef}
+                  className="hidden"
+                  type="file"
+                  accept="application/json,.json"
+                  onChange={(event) => {
+                    onImportWebsites(event.target.files?.[0]);
+                    event.currentTarget.value = "";
+                  }}
+                />
+              </div>
+            </div>
+
             <div className="overflow-x-auto rounded-xl border border-linen bg-paper">
               <table className="w-full min-w-[760px] text-left text-sm">
                 <thead className="bg-ivory text-xs uppercase text-charcoal/60">
                   <tr>
-                    <th className="px-3 py-3">Keyword</th>
+                    <th className="px-3 py-3">Priority</th>
+                    <th className="px-3 py-3">Brand/Keyword</th>
                     <th className="px-3 py-3">Website</th>
                     <th className="px-3 py-3">Notes</th>
                     <th className="px-3 py-3">Results</th>
@@ -3133,6 +3376,9 @@ function SettingsDialog({
                 <tbody>
                   {entries.length ? entries.map((entry) => (
                     <tr key={entry.id} className="border-t border-linen align-top">
+                      <td className="px-3 py-3 text-xs font-semibold text-taupe">
+                        {Number(entry.success_count || 0) > 0 ? "High" : "Standard"}
+                      </td>
                       <td className="px-3 py-3 font-semibold text-charcoal">{entry.keyword}</td>
                       <td className="px-3 py-3">
                         <div className="text-charcoal">{entry.domain}</div>
@@ -3156,7 +3402,7 @@ function SettingsDialog({
                     </tr>
                   )) : (
                     <tr>
-                      <td className="px-3 py-6 text-center text-sm text-taupe" colSpan={5}>
+                      <td className="px-3 py-6 text-center text-sm text-taupe" colSpan={6}>
                         No preferred websites saved yet.
                       </td>
                     </tr>
@@ -3164,9 +3410,228 @@ function SettingsDialog({
                 </tbody>
               </table>
             </div>
-          </section>
+            <div className="text-xs text-taupe">
+              Brand priority is based on past successful matches. Websites with successful results are tried first.
+            </div>
+          </SettingsSection>
+
+          <SettingsSection
+            title="Enrichment Preferences"
+            description="Simple defaults for how missing product details are filled."
+          >
+            <div className="grid gap-4 lg:grid-cols-3">
+              <div className="grid gap-3 rounded-xl border border-linen bg-ivory/35 p-4">
+                <Field label="Search depth">
+                  <select
+                    className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
+                    value={enrichmentMode}
+                    onChange={(event) => onChangeEnrichmentMode(event.target.value as typeof enrichmentMode)}
+                    disabled={!useWebEnrichment}
+                  >
+                    <option value="fast">Fast</option>
+                    {INTERNAL_DEBUG_ENABLED ? <option value="standard">Balanced</option> : null}
+                    {INTERNAL_DEBUG_ENABLED ? <option value="deep">Deep</option> : null}
+                    {INTERNAL_DEBUG_ENABLED ? <option value="manual_retry">Retry failed items</option> : null}
+                  </select>
+                </Field>
+                <label className="flex items-center gap-2 text-sm text-taupe">
+                  <input
+                    type="checkbox"
+                    checked={useWebEnrichment}
+                    onChange={(event) => onChangeUseWebEnrichment(event.target.checked)}
+                    className="h-4 w-4 accent-bronze"
+                  />
+                  Search websites for missing details
+                </label>
+              </div>
+
+              <div className="grid gap-3 rounded-xl border border-linen bg-ivory/35 p-4">
+                <Field label="Priority">
+                  <select
+                    className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
+                    value={enrichmentPriority}
+                    onChange={(event) => onChangeEnrichmentPriority(event.target.value as EnrichmentPriorityId)}
+                  >
+                    {enrichmentPriorityOptions.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <div className="text-xs leading-5 text-taupe">{selectedPriority.description}</div>
+              </div>
+
+              <div className="grid gap-3 rounded-xl border border-linen bg-ivory/35 p-4">
+                <label className="flex items-start gap-2 text-sm text-taupe">
+                  <input
+                    type="checkbox"
+                    checked={autoRetryFailedItems}
+                    onChange={(event) => onChangeAutoRetry(event.target.checked)}
+                    className="mt-1 h-4 w-4 accent-bronze"
+                    disabled={!INTERNAL_DEBUG_ENABLED}
+                  />
+                  <span>
+                    <span className="block font-semibold text-charcoal">Auto-retry failed items</span>
+                    <span className="text-xs">{INTERNAL_DEBUG_ENABLED ? "Uses the retry pass when enrichment runs." : "Available for internal review mode."}</span>
+                  </span>
+                </label>
+                <Field label="Measurement unit">
+                  <select
+                    className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
+                    value={measurementUnit}
+                    onChange={(event) => onChangeMeasurementUnit(event.target.value as MeasurementUnitId)}
+                  >
+                    <option value="imperial">Inches</option>
+                    <option value="metric">Centimeters</option>
+                  </select>
+                </Field>
+              </div>
+            </div>
+          </SettingsSection>
+
+          <details className="rounded-xl border border-linen bg-ivory/25">
+            <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-charcoal">
+              Advanced Settings
+            </summary>
+            <div className="grid gap-4 border-t border-linen p-4">
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                <AdvancedSettingCard title="Cost controls" value={`${budgetPreview.label} · cap ${formatUsd(budgetPreview.hard)}`} />
+                <AdvancedSettingCard title="Cache behavior" value={`Cache hits ${String(enrichmentMetrics?.cache_hits ?? 0)} · paid calls ${String(enrichmentMetrics?.paid_calls ?? 0)}`} />
+                <AdvancedSettingCard title="Confidence thresholds" value="Review flags remain visible on product rows." />
+                <AdvancedSettingCard title="Provider controls" value={usage.providerCosts.length ? usage.providerCosts.map((item) => item.provider).join(", ") : "No provider usage yet"} />
+                <AdvancedSettingCard title="Extraction tracing" value={showInternalDebug ? "Debug panel visible" : "Debug panel hidden"} />
+                <AdvancedSettingCard title="Advanced export formatting" value={includeLowConfidenceImages ? "Low-confidence ZIP images included" : "Low-confidence ZIP images excluded"} />
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" onClick={onToggleInternalDebug} disabled={!INTERNAL_DEBUG_ENABLED}>
+                  {showInternalDebug ? "Hide Debug Panel" : "Show Debug Panel"}
+                </button>
+                <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" onClick={onCopyDebug} disabled={!INTERNAL_DEBUG_ENABLED}>
+                  Copy Debug Summary
+                </button>
+                <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" onClick={() => onDownloadDebug("json")} disabled={!INTERNAL_DEBUG_ENABLED}>
+                  Download JSON
+                </button>
+                <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" onClick={() => onDownloadDebug("txt")} disabled={!INTERNAL_DEBUG_ENABLED}>
+                  Download TXT
+                </button>
+                <label className="flex items-center gap-2 rounded-xl border border-linen bg-paper px-3 py-2 text-xs font-semibold text-taupe">
+                  <input
+                    type="checkbox"
+                    checked={includeLowConfidenceImages}
+                    onChange={(event) => onChangeIncludeLowConfidenceImages(event.target.checked)}
+                    className="h-4 w-4 accent-bronze"
+                  />
+                  Include low-confidence ZIP images
+                </label>
+                {debugCopyStatus ? <span className="self-center text-xs text-taupe">{debugCopyStatus}</span> : null}
+              </div>
+            </div>
+          </details>
+
+          <SettingsSection
+            title="Analytics & Usage"
+            description="A quick read on how enrichment has been performing in this browser session."
+          >
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+              <MetricCard label="Average success" value={formatPercent(usage.successRate)} />
+              <MetricCard label="Image success" value={formatPercent(usage.imageSuccessRate)} />
+              <MetricCard label="Dimension success" value={formatPercent(usage.dimensionSuccessRate)} />
+              <MetricCard label="Average cost/run" value={formatUsd(usage.averageCostPerRun)} />
+              <MetricCard label="Average cost/item" value={formatUsd(usage.averageCostPerItem)} />
+            </div>
+            <div className="grid gap-3 lg:grid-cols-2">
+              <div className="rounded-xl border border-linen bg-ivory/35 p-4">
+                <div className="text-sm font-semibold text-charcoal">Most successful websites</div>
+                <div className="mt-3 grid gap-2 text-sm text-taupe">
+                  {usage.topWebsites.length ? usage.topWebsites.map((entry) => (
+                    <div key={entry.id} className="flex items-center justify-between gap-3">
+                      <span className="truncate">{entry.domain || entry.url}</span>
+                      <span className="text-xs font-semibold text-charcoal">{entry.success_count || 0} success</span>
+                    </div>
+                  )) : <span>No website results yet.</span>}
+                </div>
+              </div>
+              <div className="rounded-xl border border-linen bg-ivory/35 p-4">
+                <div className="text-sm font-semibold text-charcoal">Provider usage</div>
+                <div className="mt-3 grid gap-2 text-sm text-taupe">
+                  {usage.providerCosts.length ? usage.providerCosts.map((item) => (
+                    <div key={item.provider} className="flex items-center justify-between gap-3">
+                      <span className="truncate">{item.provider}</span>
+                      <span className="text-xs font-semibold text-charcoal">{formatUsd(item.cost)}</span>
+                    </div>
+                  )) : <span>No provider usage yet.</span>}
+                </div>
+              </div>
+            </div>
+            <div className="text-xs text-taupe">
+              Preferred website success rate: {formatPercent(websiteSuccessRate)}
+            </div>
+          </SettingsSection>
         </div>
       </div>
+    </div>
+  );
+}
+
+function SettingsSection({ title, description, children }: { title: string; description: string; children: ReactNode }) {
+  return (
+    <section className="grid gap-4 rounded-xl border border-linen bg-paper p-4">
+      <div>
+        <h3 className="text-base font-semibold text-charcoal">{title}</h3>
+        <p className="mt-1 text-sm leading-6 text-taupe">{description}</p>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function SettingChoiceGroup({
+  label,
+  options,
+  value,
+  onChange,
+}: {
+  label: string;
+  options: { id: string; label: string; description: string }[];
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="rounded-xl border border-linen bg-ivory/35 p-4">
+      <div className="mb-2 text-xs font-semibold uppercase text-charcoal/55">{label}</div>
+      <div className="grid gap-2">
+        {options.map((option) => (
+          <button
+            key={option.id}
+            type="button"
+            className={`btn-secondary rounded-xl px-3 py-2 text-left text-sm ${value === option.id ? "border-orangeBorder bg-orangeSoft text-bronze" : ""}`}
+            onClick={() => onChange(option.id)}
+          >
+            <span className="block font-semibold">{option.label}</span>
+            <span className="mt-0.5 block text-xs font-normal text-taupe">{option.description}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function AdvancedSettingCard({ title, value }: { title: string; value: string }) {
+  return (
+    <div className="rounded-xl border border-linen bg-paper p-3">
+      <div className="text-xs font-semibold uppercase text-charcoal/55">{title}</div>
+      <div className="mt-2 text-sm leading-5 text-charcoal">{value}</div>
+    </div>
+  );
+}
+
+function MetricCard({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl border border-linen bg-ivory/35 p-4">
+      <div className="text-2xl font-semibold text-charcoal">{value}</div>
+      <div className="mt-1 text-xs font-semibold uppercase text-charcoal/55">{label}</div>
     </div>
   );
 }

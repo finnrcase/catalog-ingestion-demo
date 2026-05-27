@@ -15,13 +15,13 @@ from src.preferred_websites import (
 def test_preferred_website_crud_and_duplicate_validation(tmp_path):
     path = tmp_path / "preferred.json"
 
-    entry = add_preferred_website(keyword="Sub-Zero Drawers", url="subzero-wolf.com/products/id36r", notes="official", path=path)
+    entry = add_preferred_website(keyword="Sub-Zero", url="subzero-wolf.com/products/id36r", notes="official", path=path)
 
     assert entry["domain"] == "subzero-wolf.com"
     assert entry["url"] == "https://subzero-wolf.com/products/id36r"
-    assert list_preferred_websites(path)[0]["keyword"] == "Sub-Zero Drawers"
+    assert list_preferred_websites(path)[0]["keyword"] == "Sub-Zero"
     with pytest.raises(ValueError):
-        add_preferred_website(keyword="Sub-Zero Drawers", url="https://subzero-wolf.com/products/id36r", path=path)
+        add_preferred_website(keyword="Sub-Zero", url="https://subzero-wolf.com/products/id36r", path=path)
 
     updated = update_preferred_website(entry["id"], keyword="Sub-Zero Refrigerator Drawers", url=entry["url"], notes="updated", path=path)
     assert updated["notes"] == "updated"

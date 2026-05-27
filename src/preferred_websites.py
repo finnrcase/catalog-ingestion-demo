@@ -1,8 +1,8 @@
-"""User-managed preferred product websites for enrichment.
+"""User-managed preferred brand and vendor websites for enrichment.
 
 Entries are stored in a small persistent JSON database so users can teach the
-resolver which sites to try first for product keywords without changing export
-schemas or enrichment trust rules.
+resolver which sites to try first for brands, vendors, or keywords without
+changing export schemas or enrichment trust rules.
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ def add_preferred_website(
     keyword_clean = _clean_keyword(keyword)
     url_clean = normalise_preferred_url(url)
     if not keyword_clean:
-        raise ValueError("Product name / keyword is required.")
+        raise ValueError("Brand / keyword is required.")
     if not url_clean:
         raise ValueError("Preferred website URL must be a valid http or https URL.")
     entries = load_preferred_websites(path)
@@ -115,7 +115,7 @@ def update_preferred_website(
     keyword_clean = _clean_keyword(keyword)
     url_clean = normalise_preferred_url(url)
     if not keyword_clean:
-        raise ValueError("Product name / keyword is required.")
+        raise ValueError("Brand / keyword is required.")
     if not url_clean:
         raise ValueError("Preferred website URL must be a valid http or https URL.")
     duplicate_key = _duplicate_key(keyword_clean, url_clean)
