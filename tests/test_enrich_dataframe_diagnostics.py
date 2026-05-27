@@ -67,7 +67,10 @@ def _metric_diagnostic(diagnostics):
 
 
 def _dimension_diagnostics(diagnostics):
-    return [d for d in diagnostics if d.get("report_type") != "enrichment_metrics"]
+    return [
+        d for d in diagnostics
+        if d.get("report_type") not in {"enrichment_metrics", "targeted_missing_field_retry"}
+    ]
 
 
 def test_enrich_dataframe_returns_three_values():

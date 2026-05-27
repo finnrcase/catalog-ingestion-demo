@@ -26,7 +26,20 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     const theme = localStorage.getItem("sch:websiteTheme") || "light";
     const accent = localStorage.getItem("sch:accentColor") || "orange";
     const allowedThemes = new Set(["light", "dark", "graphite"]);
-    const allowedAccents = new Set(["orange", "sage", "blue", "plum"]);
+    const allowedAccents = new Set([
+      "orange",
+      "sage",
+      "blue",
+      "plum",
+      "mustard",
+      "terracotta",
+      "slate-blue",
+      "sand",
+      "forest",
+      "ocean",
+      "clay",
+      "rosewood",
+    ]);
     document.documentElement.dataset.theme = allowedThemes.has(theme) ? theme : "light";
     document.documentElement.dataset.accent = allowedAccents.has(accent) ? accent : "orange";
   } catch {

@@ -613,12 +613,19 @@ def test_export_xlsx_is_valid_xlsx():
     import openpyxl
     df = build_programa_import_dataframe(_make_rows([{}]))
     xlsx_bytes = export_programa_xlsx(df)
+    assert xlsx_bytes.startswith(b"PK")
+    assert not xlsx_bytes.startswith(b"Section,")
     wb = openpyxl.load_workbook(io.BytesIO(xlsx_bytes))
     assert len(wb.sheetnames) == 1
     ws = wb.active
     headers = [ws.cell(1, c).value for c in range(1, len(PROGRAMA_COLUMNS) + 1)]
     assert headers[0] == "Section"
     assert headers[1] == "Product Name"
+    assert "Image URL" in headers
+    assert ws.cell(row=2, column=headers.index("Image URL") + 1).value == "https://example.com/image.jpg"
+    assert ws.freeze_panes == "A2"
+    assert all(ws.cell(row=1, column=c).font.bold for c in range(1, len(PROGRAMA_COLUMNS) + 1))
+    assert ws.column_dimensions["A"].width >= 10
 
 
 def test_export_xlsx_no_merged_cells():

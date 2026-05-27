@@ -182,6 +182,10 @@ export async function enrichRows(input: {
   useWebEnrichment: boolean;
   sessionId?: string;
   enrichmentMode?: "fast" | "standard" | "deep" | "manual_retry";
+  targetedRetryMode?: "off" | "conservative" | "balanced" | "aggressive";
+  maxExtraRetriesPerItem?: number;
+  maxExtraCostPerRow?: number;
+  maxExtraCostPerRun?: number;
 }): Promise<IntakeResponse> {
   return parseJson<IntakeResponse>(
     await apiFetch(apiUrl("/intake/enrich"), {
@@ -192,6 +196,10 @@ export async function enrichRows(input: {
         use_web_enrichment: input.useWebEnrichment,
         session_id: input.sessionId,
         enrichment_mode: input.enrichmentMode || "fast",
+        targeted_retry_mode: input.targetedRetryMode || "conservative",
+        max_extra_retries_per_item: input.maxExtraRetriesPerItem,
+        max_extra_cost_per_row: input.maxExtraCostPerRow,
+        max_extra_cost_per_run: input.maxExtraCostPerRun,
       }),
     }),
   );
@@ -400,25 +408,40 @@ function filenameFromContentDisposition(header: string | null, fallback: string)
   return match?.[1]?.trim() || fallback;
 }
 
-async function exportProgramaFile(rows: IntakeRow[], path: string, fallbackMessage: string): Promise<ProgramaExportFile> {
+async function blobStartsWithZipSignature(blob: Blob) {
+  const bytes = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+  return bytes[0] === 0x50 && bytes[1] === 0x4b;
+}
+
+async function exportProgramaFile(
+  rows: IntakeRow[],
+  path: string,
+  fallbackMessage: string,
+  fallbackFilename: string,
+  expectedFormat: "csv" | "xlsx",
+): Promise<ProgramaExportFile> {
   const response = await apiFetch(apiUrl(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ rows }),
   });
   if (!response.ok) throw new Error(fallbackMessage);
+  const blob = await response.blob();
+  if (expectedFormat === "xlsx" && !(await blobStartsWithZipSignature(blob))) {
+    throw new Error("XLSX export returned a non-Excel file. Please use CSV export or retry.");
+  }
   return {
-    blob: await response.blob(),
-    filename: filenameFromContentDisposition(response.headers.get("content-disposition"), "programa_import.csv"),
+    blob,
+    filename: filenameFromContentDisposition(response.headers.get("content-disposition"), fallbackFilename),
   };
 }
 
 export async function exportProgramaCsv(rows: IntakeRow[]): Promise<ProgramaExportFile> {
-  return exportProgramaFile(rows, "/export/programa/csv", "Could not export Programa CSV.");
+  return exportProgramaFile(rows, "/export/programa/csv", "Could not export Programa CSV.", "programa_import.csv", "csv");
 }
 
 export async function exportProgramaXlsx(rows: IntakeRow[]): Promise<ProgramaExportFile> {
-  return exportProgramaFile(rows, "/export/programa/xlsx", "Could not export Programa XLSX.");
+  return exportProgramaFile(rows, "/export/programa/xlsx", "Could not export Programa XLSX.", "programa_import.xlsx", "xlsx");
 }
 
 export async function exportProgramaXlsxWithImages(rows: IntakeRow[]): Promise<ProgramaExportFile> {
@@ -426,6 +449,8 @@ export async function exportProgramaXlsxWithImages(rows: IntakeRow[]): Promise<P
     rows,
     "/export/programa/xlsx-with-images",
     "Could not export Programa Excel with Images.",
+    "programa_import_with_images.xlsx",
+    "xlsx",
   );
 }
 
@@ -446,5 +471,11 @@ export async function exportProgramaZip(rows: IntakeRow[], includeLowConfidenceI
 }
 
 export async function exportProgramaDebugCsv(rows: IntakeRow[]): Promise<Blob> {
-  return (await exportProgramaFile(rows, "/export/programa/debug-csv", "Could not export Debug CSV.")).blob;
+  return (await exportProgramaFile(
+    rows,
+    "/export/programa/debug-csv",
+    "Could not export Debug CSV.",
+    "programa_import_debug.csv",
+    "csv",
+  )).blob;
 }

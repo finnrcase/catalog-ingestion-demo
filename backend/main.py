@@ -168,6 +168,10 @@ class RowsPayload(BaseModel):
     use_web_enrichment: bool = True
     include_low_confidence_images: bool = False
     session_id: str | None = None
+    targeted_retry_mode: str = "conservative"
+    max_extra_retries_per_item: int | None = None
+    max_extra_cost_per_row: float | None = None
+    max_extra_cost_per_run: float | None = None
 
 
 class ProgramaPayload(RowsPayload):
@@ -276,6 +280,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "Content-Type"],
 )
 
 
@@ -721,6 +726,10 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
         enrichment_mode=payload.enrichment_mode,
         force_refresh=payload.force_refresh,
         use_web_enrichment=payload.use_web_enrichment,
+        targeted_retry_mode=payload.targeted_retry_mode,
+        max_extra_retries_per_item=payload.max_extra_retries_per_item,
+        max_extra_cost_per_row=payload.max_extra_cost_per_row,
+        max_extra_cost_per_run=payload.max_extra_cost_per_run,
     )
     if payload.use_web_enrichment:
         session_id = payload.session_id or "default"

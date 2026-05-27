@@ -1,5 +1,8 @@
 from fastapi.testclient import TestClient
 import datetime
+import io
+
+import openpyxl
 
 from backend.main import app
 from src.image_uploader import ImageUploadResult
@@ -186,7 +189,7 @@ def test_preferred_websites_endpoints_crud():
 def test_intake_enrich_endpoint_passes_web_enrichment_flag(monkeypatch):
     captured = {}
 
-    def fake_enrich_dataframe(df, enrichment_mode="standard", force_refresh=False, use_web_enrichment=True):
+    def fake_enrich_dataframe(df, enrichment_mode="standard", force_refresh=False, use_web_enrichment=True, **kwargs):
         captured["use_web_enrichment"] = use_web_enrichment
         return df, [], []
 
@@ -222,7 +225,7 @@ def test_intake_enrich_endpoint_returns_photo_discovery_report(monkeypatch):
         "Product URL": "https://www.subzero-wolf.com/products/mdd30ts",
     }]
 
-    def fake_enrich_dataframe(df, enrichment_mode="standard", force_refresh=False, use_web_enrichment=True):
+    def fake_enrich_dataframe(df, enrichment_mode="standard", force_refresh=False, use_web_enrichment=True, **kwargs):
         return df, [], []
 
     def fake_recover_images_for_dataframe(df, pdf_lookup=None, session_id=None, enable_screenshot=True, enable_web_lookup=True):
@@ -274,6 +277,25 @@ def test_programa_export_xlsx_endpoint_returns_workbook():
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
     assert response.content.startswith(b"PK")
+    assert not response.content.startswith(b"Section,")
+    workbook = openpyxl.load_workbook(io.BytesIO(response.content))
+    worksheet = workbook.active
+    assert worksheet.freeze_panes == "A2"
+    assert worksheet["A1"].font.bold is True
+    assert worksheet["O2"].value == "https://cdn.example.com/lamp.jpg"
+
+
+def test_programa_export_exposes_download_headers_for_browser():
+    response = client.post(
+        "/export/programa/xlsx",
+        json=_rows(),
+        headers={"Origin": "http://localhost:3000"},
+    )
+
+    assert response.status_code == 200
+    exposed = response.headers.get("access-control-expose-headers", "")
+    assert "Content-Disposition" in exposed
+    assert "Content-Type" in exposed
 
 
 def test_programa_export_debug_csv_endpoint_includes_debug_columns():

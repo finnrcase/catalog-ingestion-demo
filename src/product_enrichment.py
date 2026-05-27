@@ -45,7 +45,7 @@ from src.product_lookup_cache import (
 from src.product_page_specs import extract_product_page_specs
 from src.product_resolver import resolve_product_page
 from src.spec_extraction import DimensionExtractionResult, extract_dimensions_from_html
-from src.source_success_registry import record_source_success
+from src.source_success_registry import preferred_source_domains_for_row, record_source_success
 
 try:
     import html2text as _html2text
@@ -105,6 +105,49 @@ _EXTERNAL_ENRICHMENT_FIELDS: tuple[str, ...] = (
     "Image URL",
 )
 
+_TARGETED_RETRY_MODES: dict[str, dict[str, object]] = {
+    "off": {
+        "max_extra_retries_per_item": 0,
+        "max_extra_cost_per_row": 0.0,
+        "max_extra_cost_per_run": 0.0,
+        "max_searches_per_item": 0,
+        "max_fetches_per_item": 0,
+        "allow_search": False,
+        "allow_image_search": False,
+        "allow_unverified_product_url_fetch": False,
+    },
+    "conservative": {
+        "max_extra_retries_per_item": 1,
+        "max_extra_cost_per_row": 0.006,
+        "max_extra_cost_per_run": 0.04,
+        "max_searches_per_item": 1,
+        "max_fetches_per_item": 1,
+        "allow_search": True,
+        "allow_image_search": False,
+        "allow_unverified_product_url_fetch": False,
+    },
+    "balanced": {
+        "max_extra_retries_per_item": 2,
+        "max_extra_cost_per_row": 0.01,
+        "max_extra_cost_per_run": 0.08,
+        "max_searches_per_item": 1,
+        "max_fetches_per_item": 2,
+        "allow_search": True,
+        "allow_image_search": True,
+        "allow_unverified_product_url_fetch": True,
+    },
+    "aggressive": {
+        "max_extra_retries_per_item": 3,
+        "max_extra_cost_per_row": 0.02,
+        "max_extra_cost_per_run": 0.15,
+        "max_searches_per_item": 2,
+        "max_fetches_per_item": 3,
+        "allow_search": True,
+        "allow_image_search": True,
+        "allow_unverified_product_url_fetch": True,
+    },
+}
+
 _APPLIANCE_BRANDS: frozenset[str] = frozenset({
     "asko", "bertazzoni", "bosch", "dacor", "fisher paykel", "fisher & paykel",
     "frigidaire", "gaggenau", "ge", "ge appliances", "jennair", "kitchenaid",
@@ -146,11 +189,79 @@ class ProductPageCandidate:
     rejected_candidates: list[dict] = field(default_factory=list)
 
 
+@dataclass
+class TargetedRetryConfig:
+    mode: str = "conservative"
+    max_extra_retries_per_item: int = 1
+    max_extra_cost_per_row: float = 0.006
+    max_extra_cost_per_run: float = 0.04
+    max_searches_per_item: int = 1
+    max_fetches_per_item: int = 1
+    allow_search: bool = True
+    allow_image_search: bool = False
+    allow_unverified_product_url_fetch: bool = False
+    extra_cost_used: float = 0.0
+
+
 def _str_val(v) -> str:
     """Safely convert a row cell value to a stripped string, handling None."""
     if v is None:
         return ""
     return str(v).strip()
+
+
+def _float_env_value(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _int_env_value(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalise_retry_mode(mode: str | None) -> str:
+    value = _str_val(mode or os.getenv("TARGETED_MISSING_FIELD_RETRY_MODE", "conservative")).lower()
+    return value if value in _TARGETED_RETRY_MODES else "conservative"
+
+
+def _targeted_retry_config(
+    mode: str | None = None,
+    *,
+    max_extra_retries_per_item: int | None = None,
+    max_extra_cost_per_row: float | None = None,
+    max_extra_cost_per_run: float | None = None,
+) -> TargetedRetryConfig:
+    retry_mode = _normalise_retry_mode(mode)
+    raw = dict(_TARGETED_RETRY_MODES[retry_mode])
+    retries = int(raw["max_extra_retries_per_item"])
+    row_cost = float(raw["max_extra_cost_per_row"])
+    run_cost = float(raw["max_extra_cost_per_run"])
+    if retry_mode != "off":
+        retries = _int_env_value("TARGETED_RETRY_MAX_EXTRA_RETRIES_PER_ITEM", retries)
+        row_cost = _float_env_value("TARGETED_RETRY_MAX_EXTRA_COST_PER_ROW", row_cost)
+        run_cost = _float_env_value("TARGETED_RETRY_MAX_EXTRA_COST_PER_RUN", run_cost)
+    if max_extra_retries_per_item is not None:
+        retries = max(0, int(max_extra_retries_per_item))
+    if max_extra_cost_per_row is not None:
+        row_cost = max(0.0, float(max_extra_cost_per_row))
+    if max_extra_cost_per_run is not None:
+        run_cost = max(0.0, float(max_extra_cost_per_run))
+    return TargetedRetryConfig(
+        mode=retry_mode,
+        max_extra_retries_per_item=retries,
+        max_extra_cost_per_row=row_cost,
+        max_extra_cost_per_run=run_cost,
+        max_searches_per_item=int(raw["max_searches_per_item"]),
+        max_fetches_per_item=int(raw["max_fetches_per_item"]),
+        allow_search=bool(raw["allow_search"]),
+        allow_image_search=bool(raw["allow_image_search"]),
+        allow_unverified_product_url_fetch=bool(raw["allow_unverified_product_url_fetch"]),
+    )
 
 
 def _qualifies(row: dict) -> bool:
@@ -1242,6 +1353,587 @@ def _focused_dimension_pass_from_cached_pages(
         "Dimension Extra Cost": "$0.0000 (cached/selected pages only)",
     })
     return None
+
+
+_WEAK_IMAGE_HINTS = (
+    "logo",
+    "icon",
+    "favicon",
+    "placeholder",
+    "default-meta-image",
+    "default_image",
+    "missing-image",
+    "no-image",
+    "sprite",
+)
+
+
+def _row_has_weak_or_missing_image(row: dict) -> bool:
+    if not row_has_image(row):
+        return True
+    if _is_manual_image(row):
+        return False
+    confidence = _str_val(row.get("confidence") or row.get("Image Recovery Confidence")).upper()
+    source = _str_val(row.get("image_source") or row.get("Image Recovery Source")).lower()
+    image_url = _str_val(row.get("Image URL")).lower()
+    if confidence in {"LOW", "NONE"}:
+        return True
+    return any(hint in f"{source} {image_url}" for hint in _WEAK_IMAGE_HINTS)
+
+
+def _missing_critical_fields_for_retry(row: dict) -> list[str]:
+    missing: list[str] = []
+    if not _str_val(row.get("Brand")):
+        missing.append("manufacturer")
+    if not _str_val(row.get("Product URL")):
+        missing.append("product URL")
+    if not has_complete_3d_dimensions(_str_val(row.get("Dimensions"))):
+        missing.append("dimensions")
+    if _row_has_weak_or_missing_image(row):
+        missing.append("image")
+    if not (_str_val(row.get("Finish / Color")) or _str_val(row.get("Material"))):
+        missing.append("finish/material")
+    return missing
+
+
+def _same_url(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    try:
+        parsed_left = urllib.parse.urlparse(left)
+        parsed_right = urllib.parse.urlparse(right)
+        left_key = (parsed_left.hostname or "").lower(), re.sub(r"/+$", "", parsed_left.path or "/")
+        right_key = (parsed_right.hostname or "").lower(), re.sub(r"/+$", "", parsed_right.path or "/")
+        return left_key == right_key
+    except Exception:
+        return left == right
+
+
+def _existing_product_url_is_trusted(row: dict, url: str) -> bool:
+    if not url:
+        return False
+    if str(row.get("manufacturer_page_exact_sku")).lower() == "true":
+        return True
+    resolution_confidence = _str_val(row.get("Product Resolution Confidence")).lower()
+    resolution_url = _str_val(row.get("Product Resolution URL") or row.get("selected_product_page_url"))
+    if resolution_confidence in {"high", "medium"} and (not resolution_url or _same_url(url, resolution_url)):
+        return True
+    domain = urllib.parse.urlparse(url).hostname or ""
+    known_domains = set(_manufacturer_domains_for_search(row)) | set(preferred_source_domains_for_row(row)[:3])
+    return any(domain == known or domain.endswith("." + known) for known in known_domains if known)
+
+
+def _retry_item_key(row: dict) -> str:
+    return _duplicate_key(row) or "|".join([
+        _str_val(row.get("Brand")),
+        _str_val(row.get("Model/SKU")),
+        _str_val(row.get("Product Name")),
+    ])
+
+
+def _retry_can_consume(
+    config: TargetedRetryConfig,
+    state: dict,
+    run_budget,
+    kind: str,
+    cost_usd: float,
+    *,
+    item_key: str,
+    field: str,
+    reason: str,
+    query: str = "",
+) -> bool:
+    if config.mode == "off":
+        return False
+    if state.get("attempts", 0) >= config.max_extra_retries_per_item:
+        if run_budget is not None:
+            run_budget.record_skip(kind, cost_usd, item_key=item_key, field=field, reason="targeted retry per-item limit", query=query)
+        return False
+    if state.get("extra_cost_usd", 0.0) + cost_usd > config.max_extra_cost_per_row:
+        if run_budget is not None:
+            run_budget.record_skip(kind, cost_usd, item_key=item_key, field=field, reason="targeted retry per-row cost cap", query=query)
+        return False
+    if config.extra_cost_used + cost_usd > config.max_extra_cost_per_run:
+        if run_budget is not None:
+            run_budget.record_skip(kind, cost_usd, item_key=item_key, field=field, reason="targeted retry per-run cost cap", query=query)
+        return False
+    if run_budget is not None and not run_budget.can_spend(kind, cost_usd, item_key=item_key, field=field, reason=reason, query=query):
+        return False
+    return True
+
+
+def _retry_consume(
+    config: TargetedRetryConfig,
+    state: dict,
+    run_budget,
+    kind: str,
+    cost_usd: float,
+    *,
+    item_key: str,
+    field: str,
+    reason: str,
+    query: str = "",
+) -> bool:
+    if not _retry_can_consume(config, state, run_budget, kind, cost_usd, item_key=item_key, field=field, reason=reason, query=query):
+        return False
+    if run_budget is not None:
+        if not run_budget.consume(
+            kind,
+            cost_usd,
+            item_key=item_key,
+            field=field,
+            reason=reason,
+            stage="targeted_missing_field_retry",
+            query=query,
+        ):
+            return False
+    state["extra_cost_usd"] = round(float(state.get("extra_cost_usd", 0.0)) + cost_usd, 6)
+    config.extra_cost_used = round(config.extra_cost_used + cost_usd, 6)
+    return True
+
+
+def _fetch_retry_html(
+    url: str,
+    *,
+    session_cache: "_SessionCache | None",
+    config: TargetedRetryConfig,
+    state: dict,
+    run_budget,
+    item_key: str,
+    field: str,
+) -> tuple[str, str]:
+    if session_cache is not None and url in session_cache.urls:
+        cached = session_cache.urls[url]
+        return ("" if isinstance(cached, bytes) else str(cached or "")), "cached_page_html"
+    cost = getattr(run_budget, "fetch_cost_usd", 0.0005) if run_budget is not None else 0.0
+    if state.get("fetches", 0) >= config.max_fetches_per_item:
+        if run_budget is not None:
+            run_budget.record_skip("fetch", cost, item_key=item_key, field=field, reason="targeted retry fetch limit")
+        return "", "fetch_limit"
+    if not _retry_consume(
+        config,
+        state,
+        run_budget,
+        "fetch",
+        cost,
+        item_key=item_key,
+        field=field,
+        reason=f"targeted retry fetch product page for {field}",
+    ):
+        return "", "budget_skipped"
+    state["fetches"] = int(state.get("fetches", 0)) + 1
+    html = _fetch_page_html(url)
+    if html and session_cache is not None:
+        session_cache.urls[url] = html
+    return html, "fetched_product_page" if html else "fetch_failed"
+
+
+def _page_evidence_for_retry(row: dict, url: str, html: str) -> ProductEvidence:
+    confidence = _str_val(row.get("Product Resolution Confidence")).lower()
+    resolution_url = _str_val(row.get("Product Resolution URL") or row.get("selected_product_page_url"))
+    if confidence in {"high", "medium"} and (not resolution_url or _same_url(url, resolution_url)):
+        return ProductEvidence(
+            confidence=confidence,
+            score=90 if confidence == "high" else 70,
+            matched_sku=True,
+            matched_brand=True,
+            matched_product_name=bool(_str_val(row.get("Product Name"))),
+            official_domain=True,
+            domain=urllib.parse.urlparse(url).netloc.lower(),
+            evidence_summary="existing_verified_product_url",
+        )
+    return score_product_page(row, url, html)
+
+
+def _apply_retry_extraction_from_html(
+    updated: dict,
+    *,
+    url: str,
+    html: str,
+    page_evidence: ProductEvidence,
+    missing_fields: list[str],
+    debug: dict,
+    source_label: str,
+) -> list[str]:
+    filled: list[str] = []
+    if page_evidence.confidence not in {"high", "medium"}:
+        debug.setdefault("rejected_pages", []).append({
+            "url": url,
+            "reason": page_evidence.rejection_reason or page_evidence.confidence,
+            "score": page_evidence.score,
+        })
+        return filled
+
+    if "dimensions" in missing_fields and not has_complete_3d_dimensions(_str_val(updated.get("Dimensions"))):
+        specs = extract_product_page_specs(
+            html,
+            url,
+            updated,
+            official_domain=page_evidence.official_domain,
+            sku_match=page_evidence.matched_sku,
+            product_name_match=page_evidence.matched_product_name,
+        )
+        dim_conf = specs.confidence
+        if specs.dimensions and dim_conf in {"high", "medium"}:
+            updated["Dimensions"] = specs.dimensions
+            if specs.width:
+                updated["Width (in)"] = specs.width
+            if specs.height:
+                updated["Height (in)"] = specs.height
+            if specs.depth:
+                updated["Depth (in)"] = specs.depth
+            if specs.length:
+                updated["Length (in)"] = specs.length
+            updated["Dimension Source URL"] = url
+            updated["Dimension Confidence"] = dim_conf
+            updated["Dimension Source Type"] = f"targeted_retry_{source_label}"
+            updated["Dimension Lookup Status"] = "found"
+            updated["dimension_source_url"] = url
+            updated["dimension_confidence"] = dim_conf
+            updated["dimension_evidence"] = specs.evidence
+            updated["dimension_raw_text"] = specs.raw_text
+            updated["Dimensions Extraction Method"] = f"targeted_retry:{source_label}:{specs.debug.get('dimension_failure_reason') or specs.evidence or 'spec_extraction'}"
+            updated["Dimensions Source Pass"] = "targeted_retry"
+            filled.append("dimensions")
+            debug["dimension_method"] = updated["Dimensions Extraction Method"]
+        else:
+            debug.setdefault("failed_fields", {})["dimensions"] = specs.debug.get("dimension_failure_reason") or "complete_w_h_d_not_found"
+
+    if (
+        "image" in missing_fields
+        and _row_has_weak_or_missing_image(updated)
+        and not _is_manual_image(updated)
+    ):
+        image = extract_product_page_image(
+            html,
+            url,
+            updated,
+            page_evidence=page_evidence,
+            source_prefix=f"targeted_retry_{source_label}",
+        )
+        _stamp_image_debug_fields(updated, image, {
+            "selected_product_page_url": url,
+            "_enrichment_query_used": debug.get("query", ""),
+        })
+        if image.image_found and image.confidence in {"HIGH", "MEDIUM"}:
+            updated["Image URL"] = image.image_url
+            updated["image_source"] = image.image_source
+            updated["confidence"] = image.confidence
+            updated["evidence"] = ";".join(image.evidence)
+            updated["needs_image_review"] = str(image.confidence != "HIGH")
+            updated["Image Recovery Confidence"] = image.confidence
+            updated["Image Recovery Source"] = image.image_source
+            updated["Image Source Pass"] = "targeted_retry"
+            updated["Image Extraction Method"] = f"targeted_retry:{source_label}:{image.image_source}"
+            _maybe_upload_selected_image_to_cloudinary(
+                updated,
+                debug,
+                candidate_url=image.image_url,
+                source_type=image.image_source,
+            )
+            filled.append("image")
+        else:
+            debug.setdefault("failed_fields", {})["image"] = image.error or "no_high_or_medium_product_image"
+
+    for source, dest in (("finish", "Finish / Color"), ("material", "Material")):
+        if "finish/material" not in missing_fields or _str_val(updated.get(dest)):
+            continue
+        specs = extract_product_page_specs(
+            html,
+            url,
+            updated,
+            official_domain=page_evidence.official_domain,
+            sku_match=page_evidence.matched_sku,
+            product_name_match=page_evidence.matched_product_name,
+        )
+        value = _str_val(getattr(specs, source, ""))
+        if value:
+            updated[dest] = value
+            updated[f"{dest} Source Pass"] = "targeted_retry"
+            filled.append(dest)
+
+    if filled:
+        record_source_success(
+            updated,
+            domain=urllib.parse.urlparse(url).netloc,
+            url=url,
+            fields_found={
+                "dimensions": has_complete_3d_dimensions(_str_val(updated.get("Dimensions"))),
+                "image": row_has_image(updated),
+                "product_url": bool(_str_val(updated.get("Product URL"))),
+                "spec_sheet": url.lower().split("?", 1)[0].endswith(".pdf"),
+            },
+            confidence=page_evidence.confidence,
+        )
+    return filled
+
+
+def _targeted_retry_queries(row: dict, missing_fields: list[str], config: TargetedRetryConfig) -> list[str]:
+    brand = _str_val(row.get("Brand"))
+    model = _str_val(row.get("Model/SKU") or row.get("SKU"))
+    product_name = _str_val(row.get("Product Name"))
+    domains: list[str] = []
+    for domain in [*preferred_source_domains_for_row(row), *_manufacturer_domains_for_search(row)]:
+        if domain and domain not in domains:
+            domains.append(domain)
+    queries: list[str] = []
+
+    def add(query: str) -> None:
+        clean = " ".join(query.split()).strip()
+        if clean and clean not in queries:
+            queries.append(clean)
+
+    if "dimensions" in missing_fields:
+        for domain in domains[:2]:
+            add(f'site:{domain} "{model}" dimensions')
+            if config.mode in {"balanced", "aggressive"}:
+                add(f'site:{domain} "{model}" spec sheet')
+        if not domains and brand and model:
+            add(f'"{brand}" "{model}" dimensions')
+        if config.mode in {"balanced", "aggressive"} and brand and model:
+            add(f'"{brand}" "{model}" spec sheet')
+    if "product URL" in missing_fields and domains and model:
+        add(f'site:{domains[0]} "{model}" product')
+    if "image" in missing_fields and config.allow_image_search and brand and model:
+        if domains:
+            add(f'site:{domains[0]} "{model}" product image')
+        elif product_name:
+            add(f'"{brand}" "{model}" "{product_name}" product image')
+    return queries
+
+
+def _search_retry_candidates(
+    query: str,
+    row: dict,
+    *,
+    session_cache: "_SessionCache | None",
+    config: TargetedRetryConfig,
+    state: dict,
+    run_budget,
+    item_key: str,
+    field: str,
+) -> list:
+    if session_cache is not None and query in session_cache.queries:
+        return session_cache.queries[query]
+    if state.get("searches", 0) >= config.max_searches_per_item:
+        cost = getattr(run_budget, "search_cost_usd", 0.003) if run_budget is not None else 0.0
+        if run_budget is not None:
+            run_budget.record_skip("search", cost, item_key=item_key, field=field, reason="targeted retry search limit", query=query)
+        return []
+    cost = getattr(run_budget, "search_cost_usd", 0.003) if run_budget is not None else 0.0
+    if not _retry_consume(
+        config,
+        state,
+        run_budget,
+        "search",
+        cost,
+        item_key=item_key,
+        field=field,
+        reason=f"targeted retry search for {field}",
+        query=query,
+    ):
+        return []
+    state["searches"] = int(state.get("searches", 0)) + 1
+    try:
+        return search_product_candidates(query, _str_val(row.get("Brand")), session_cache=session_cache)
+    except Exception:
+        return []
+
+
+def _targeted_missing_field_retry(
+    row: dict,
+    *,
+    session_cache: "_SessionCache | None",
+    run_budget,
+    config: TargetedRetryConfig,
+) -> tuple[dict, dict | None]:
+    initial_missing = _missing_critical_fields_for_retry(row)
+    actionable_missing = [field for field in initial_missing if field in {"image", "dimensions", "product URL", "finish/material"}]
+    if config.mode == "off" or not actionable_missing:
+        return row, None
+    if not _str_val(row.get("Brand")) or not _str_val(row.get("Model/SKU")):
+        return row, None
+
+    updated = row.copy()
+    item_key = _retry_item_key(updated)
+    state = {"attempts": 0, "searches": 0, "fetches": 0, "extra_cost_usd": 0.0}
+    debug: dict = {
+        "report_type": "targeted_missing_field_retry",
+        "item_key": item_key,
+        "mode": config.mode,
+        "missing_after_first_pass": list(initial_missing),
+        "attempts": [],
+        "filled_fields": [],
+        "failed_fields": {},
+        "extra_cost_usd": 0.0,
+        "status": "not_attempted",
+    }
+
+    def record_attempt(**payload) -> None:
+        debug["attempts"].append(payload)
+
+    # Free or one-fetch retry from the already selected/verified product URL.
+    product_url = _str_val(updated.get("Product URL") or updated.get("Product Resolution URL"))
+    if product_url and (config.allow_unverified_product_url_fetch or _existing_product_url_is_trusted(updated, product_url)):
+        field_label = ", ".join(actionable_missing)
+        html, html_status = _fetch_retry_html(
+            product_url,
+            session_cache=session_cache,
+            config=config,
+            state=state,
+            run_budget=run_budget,
+            item_key=item_key,
+            field=field_label,
+        )
+        state["attempts"] += 1
+        if html:
+            evidence = _page_evidence_for_retry(updated, product_url, html)
+            filled = _apply_retry_extraction_from_html(
+                updated,
+                url=product_url,
+                html=html,
+                page_evidence=evidence,
+                missing_fields=actionable_missing,
+                debug=debug,
+                source_label="existing_product_page",
+            )
+            debug["filled_fields"].extend(field for field in filled if field not in debug["filled_fields"])
+            record_attempt(
+                source="existing_product_page",
+                url=product_url,
+                status="filled" if filled else "no_field_filled",
+                html_status=html_status,
+                page_confidence=evidence.confidence,
+                fields=filled,
+            )
+        else:
+            record_attempt(source="existing_product_page", url=product_url, status=html_status, fields=[])
+
+    remaining_missing = _missing_critical_fields_for_retry(updated)
+    remaining_actionable = [
+        field for field in remaining_missing
+        if field in {"dimensions", "product URL", "finish/material"} or (field == "image" and config.allow_image_search)
+    ]
+    if config.allow_search and remaining_actionable and state["attempts"] < config.max_extra_retries_per_item:
+        for query in _targeted_retry_queries(updated, remaining_actionable, config):
+            if state["attempts"] >= config.max_extra_retries_per_item:
+                break
+            results = _search_retry_candidates(
+                query,
+                updated,
+                session_cache=session_cache,
+                config=config,
+                state=state,
+                run_budget=run_budget,
+                item_key=item_key,
+                field=", ".join(remaining_actionable),
+            )
+            for rank, result in enumerate(results[:3], start=1):
+                url = _str_val(getattr(result, "url", ""))
+                if not url:
+                    continue
+                html, html_status = _fetch_retry_html(
+                    url,
+                    session_cache=session_cache,
+                    config=config,
+                    state=state,
+                    run_budget=run_budget,
+                    item_key=item_key,
+                    field=", ".join(remaining_actionable),
+                )
+                state["attempts"] += 1
+                if not html:
+                    record_attempt(source="targeted_search", query=query, url=url, rank=rank, status=html_status, fields=[])
+                    continue
+                evidence = score_product_page(
+                    updated,
+                    url,
+                    html,
+                    title=_str_val(getattr(result, "title", "")),
+                    description=_str_val(getattr(result, "description", "")),
+                )
+                if evidence.confidence in {"high", "medium"} and not _str_val(updated.get("Product URL")):
+                    updated["Product URL"] = url
+                    updated["Product Resolution URL"] = url
+                    updated["Product Resolution Confidence"] = evidence.confidence
+                    updated["Product Resolution Evidence"] = evidence.evidence_summary
+                    debug["filled_fields"].append("product URL")
+                filled = _apply_retry_extraction_from_html(
+                    updated,
+                    url=url,
+                    html=html,
+                    page_evidence=evidence,
+                    missing_fields=remaining_actionable,
+                    debug={**debug, "query": query},
+                    source_label="targeted_search",
+                )
+                debug["filled_fields"].extend(field for field in filled if field not in debug["filled_fields"])
+                record_attempt(
+                    source="targeted_search",
+                    query=query,
+                    url=url,
+                    rank=rank,
+                    status="filled" if filled else "no_field_filled",
+                    page_confidence=evidence.confidence,
+                    evidence_score=evidence.score,
+                    rejection_reason=evidence.rejection_reason,
+                    fields=filled,
+                )
+                if not any(field in _missing_critical_fields_for_retry(updated) for field in actionable_missing):
+                    break
+            if not any(field in _missing_critical_fields_for_retry(updated) for field in actionable_missing):
+                break
+
+    filled_fields = list(dict.fromkeys(str(field) for field in debug["filled_fields"] if str(field)))
+    debug["filled_fields"] = filled_fields
+    debug["extra_cost_usd"] = round(float(state.get("extra_cost_usd", 0.0)), 6)
+    debug["status"] = "filled" if filled_fields else "not_found"
+    if state["attempts"] == 0:
+        debug["status"] = "skipped"
+
+    updated["Targeted Retry Mode"] = config.mode
+    updated["Targeted Retry Missing Fields"] = ", ".join(initial_missing)
+    updated["Targeted Retry Attempted"] = "yes" if state["attempts"] else "no"
+    updated["Targeted Retry Status"] = debug["status"]
+    updated["Targeted Retry Filled Fields"] = ", ".join(filled_fields)
+    updated["Targeted Retry Extra Cost"] = f"${debug['extra_cost_usd']:.4f}"
+    updated["Targeted Retry Attempts"] = json.dumps(debug["attempts"][-8:])
+    updated["Targeted Retry Failure Reason"] = json.dumps(debug.get("failed_fields") or {})
+    try:
+        previous_retry_count = int(float(_str_val(updated.get("retry_count")) or 0))
+    except (TypeError, ValueError):
+        previous_retry_count = 0
+    updated["retry_count"] = previous_retry_count + int(state["attempts"])
+    if filled_fields:
+        updated["Enrichment Stage"] = "targeted_missing_field_retry"
+        brand_key = _str_val(updated.get("Brand"))
+        model_key = _str_val(updated.get("Model/SKU"))
+        if brand_key and model_key:
+            try:
+                cache_key = _normalize_key(brand_key, model_key)
+            except ValueError:
+                cache_key = ""
+            if cache_key:
+                cache_fields: dict = {"general_confidence": "medium"}
+                if _str_val(updated.get("Product URL")):
+                    cache_fields["product_url"] = _str_val(updated.get("Product URL"))
+                if has_complete_3d_dimensions(_str_val(updated.get("Dimensions"))):
+                    cache_fields.update({
+                        "dimensions": _str_val(updated.get("Dimensions")),
+                        "width_in": _str_val(updated.get("Width (in)")),
+                        "height_in": _str_val(updated.get("Height (in)")),
+                        "depth_in": _str_val(updated.get("Depth (in)")),
+                        "length_in": _str_val(updated.get("Length (in)")),
+                        "dimension_source_url": _str_val(updated.get("Dimension Source URL")),
+                        "dimension_confidence": _str_val(updated.get("Dimension Confidence")).lower() or "medium",
+                    })
+                image_conf = _str_val(updated.get("Image Recovery Confidence") or updated.get("confidence")).upper()
+                if row_has_image(updated) and image_conf in {"HIGH", "MEDIUM"}:
+                    cache_fields["image_url"] = _str_val(updated.get("Image URL"))
+                if _str_val(updated.get("Finish / Color")):
+                    cache_fields["finish"] = _str_val(updated.get("Finish / Color"))
+                _product_cache.update(cache_key, cache_fields)
+    return updated, debug
 
 
 def _apply_product_lookup_cache_entry(row: dict, cache_entry: dict, debug: dict) -> tuple[dict, _DimensionResult | None]:
@@ -2462,6 +3154,10 @@ def enrich_dataframe(
     enrichment_mode: str = "fast",
     force_refresh: bool = False,
     use_web_enrichment: bool = True,
+    targeted_retry_mode: str | None = None,
+    max_extra_retries_per_item: int | None = None,
+    max_extra_cost_per_row: float | None = None,
+    max_extra_cost_per_run: float | None = None,
 ) -> tuple[pd.DataFrame, list[str], list[dict]]:
     """
     Enrich all qualifying rows in df. Returns (updated_df, error_list, dimension_diagnostics).
@@ -2472,6 +3168,12 @@ def enrich_dataframe(
     dimension_diagnostics: list[dict] = []
     started_at = time.perf_counter()
     run_budget = _run_budget_for_mode(_normalize_mode(enrichment_mode))
+    retry_config = _targeted_retry_config(
+        targeted_retry_mode,
+        max_extra_retries_per_item=max_extra_retries_per_item,
+        max_extra_cost_per_row=max_extra_cost_per_row,
+        max_extra_cost_per_run=max_extra_cost_per_run,
+    )
     metrics = {
         "report_type": "enrichment_metrics",
         "summary": {
@@ -2495,6 +3197,15 @@ def enrich_dataframe(
             "paid_calls": 0,
             "broad_searches": 0,
             "retries": 0,
+            "targeted_retry_mode": retry_config.mode,
+            "targeted_retry_items": 0,
+            "targeted_retry_attempts": 0,
+            "targeted_retry_fields_filled": 0,
+            "targeted_retry_extra_cost_usd": 0.0,
+            "targeted_retry_skipped": 0,
+            "targeted_retry_max_extra_retries_per_item": retry_config.max_extra_retries_per_item,
+            "targeted_retry_max_extra_cost_per_row": retry_config.max_extra_cost_per_row,
+            "targeted_retry_max_extra_cost_per_run": retry_config.max_extra_cost_per_run,
             "skipped_calls_due_budget": 0,
             "fields_skipped_due_budget": 0,
             "target_budget_usd": run_budget.target_budget_usd,
@@ -2616,6 +3327,57 @@ def enrich_dataframe(
             errors.append(f"Row '{label}': {exc}")
 
         time.sleep(0.05 if _normalize_mode(enrichment_mode) == "fast" else 0.2)
+
+    if retry_config.mode != "off":
+        for idx in row_indices:
+            current = df.loc[idx].to_dict()
+            if _str_val(current.get("Source Type")) == "URL":
+                continue
+            missing = _missing_critical_fields_for_retry(current)
+            actionable = [field for field in missing if field in {"image", "dimensions", "product URL", "finish/material"}]
+            if not actionable:
+                continue
+            if not _str_val(current.get("Brand")) or not _str_val(current.get("Model/SKU")):
+                continue
+            try:
+                retried, retry_debug = _targeted_missing_field_retry(
+                    current,
+                    session_cache=_session,
+                    run_budget=run_budget,
+                    config=retry_config,
+                )
+                if retry_debug is None:
+                    continue
+                item_key = _retry_item_key(retried)
+                retried = _stamp_bravi_cost_debug(
+                    retried,
+                    current,
+                    run_budget,
+                    item_key,
+                    fallback_status=f"targeted_retry_{retry_debug.get('status', 'not_used')}",
+                )
+                _write_updated_row(df, idx, retried)
+                fields_filled = list(retry_debug.get("filled_fields") or [])
+                attempts = list(retry_debug.get("attempts") or [])
+                metrics["summary"]["targeted_retry_items"] += 1
+                metrics["summary"]["targeted_retry_attempts"] += len(attempts)
+                metrics["summary"]["targeted_retry_fields_filled"] += len(fields_filled)
+                metrics["summary"]["targeted_retry_extra_cost_usd"] = round(
+                    float(metrics["summary"]["targeted_retry_extra_cost_usd"]) + float(retry_debug.get("extra_cost_usd") or 0.0),
+                    6,
+                )
+                if retry_debug.get("status") == "skipped":
+                    metrics["summary"]["targeted_retry_skipped"] += 1
+                dimension_diagnostics.append({
+                    **retry_debug,
+                    "row_index": int(idx),
+                    "product_name": _str_val(retried.get("Product Name")),
+                    "model_searched": _str_val(retried.get("Model/SKU")),
+                    "missing_after_retry": _missing_critical_fields_for_retry(retried),
+                })
+            except Exception as exc:
+                label = _str_val(current.get("Product Name")) or _str_val(current.get("Brand")) or _str_val(current.get("Model/SKU")) or str(idx)
+                errors.append(f"Targeted retry for row '{label}': {exc}")
 
     eligible = max(1, int(metrics["summary"]["eligible_rows"]))
     metrics["summary"]["cache_hit_rate"] = round(metrics["summary"]["cache_hits"] / eligible, 3)

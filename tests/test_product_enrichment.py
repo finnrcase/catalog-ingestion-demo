@@ -1702,3 +1702,167 @@ def test_cloudinary_upload_failure_keeps_original_candidate_image_url(monkeypatc
     assert row["image_upload_status"] == "failed"
     assert row["image_upload_failure_reason"] == "fetch_failed:403"
     assert debug["image_upload_failure_reason"] == "fetch_failed:403"
+
+
+# ── targeted missing-field retry ──────────────────────────────────────────────
+
+def _targeted_retry_html() -> str:
+    return """
+    <html>
+      <head>
+        <meta property="og:image" content="https://www.subzero-wolf.com/images/mdd30ts-product.jpg">
+        <script type="application/ld+json">
+        {
+          "@type": "Product",
+          "name": "Wolf MDD30TS Drawer Microwave",
+          "brand": {"name": "Wolf"},
+          "sku": "MDD30TS",
+          "image": "https://www.subzero-wolf.com/images/mdd30ts-jsonld.jpg",
+          "additionalProperty": [
+            {"name": "Dimensions", "value": "Width: 29.875 in, Depth: 23.5 in, Height: 11.875 in"}
+          ]
+        }
+        </script>
+      </head>
+      <body>
+        <h1>Wolf MDD30TS Drawer Microwave</h1>
+        <table><tr><th>Overall Dimensions</th><td>Width: 29.875 in, Depth: 23.5 in, Height: 11.875 in</td></tr></table>
+      </body>
+    </html>
+    """
+
+
+def test_targeted_retry_fills_missing_image_from_existing_product_url_without_brave(monkeypatch):
+    import src.product_enrichment as pe
+
+    fetches = []
+    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: fetches.append(url) or _targeted_retry_html())
+    monkeypatch.setattr(pe, "_maybe_upload_selected_image_to_cloudinary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pe, "search_product_candidates", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("broad search should not run")))
+
+    df = pd.DataFrame([{
+        "Source Type": "PDF",
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product Name": "Drawer Microwave",
+        "Dimensions": '29.875"W x 23.5"D x 11.875"H',
+        "Product Category": "Appliances",
+        "Product URL": "https://www.subzero-wolf.com/products/mdd30ts",
+        "Image URL": "",
+        "Confidence Score": 90,
+    }])
+
+    updated_df, errors, diagnostics = enrich_dataframe(df, targeted_retry_mode="conservative")
+
+    assert errors == []
+    row = updated_df.iloc[0].to_dict()
+    assert row["Image URL"] in {
+        "https://www.subzero-wolf.com/images/mdd30ts-product.jpg",
+        "https://www.subzero-wolf.com/images/mdd30ts-jsonld.jpg",
+    }
+    assert row["Targeted Retry Status"] == "filled"
+    assert "image" in row["Targeted Retry Filled Fields"]
+    assert fetches == ["https://www.subzero-wolf.com/products/mdd30ts"]
+    metrics = diagnostics[0]["summary"]
+    assert metrics["targeted_retry_items"] == 1
+    assert metrics["targeted_retry_fields_filled"] >= 1
+
+
+def test_targeted_retry_extracts_dimensions_from_existing_verified_page(monkeypatch):
+    import src.product_enrichment as pe
+
+    monkeypatch.setattr(pe, "enrich_row", lambda row, **kwargs: (row, None, None))
+    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: _targeted_retry_html())
+    monkeypatch.setattr(pe, "_maybe_upload_selected_image_to_cloudinary", lambda *args, **kwargs: None)
+
+    df = pd.DataFrame([{
+        "Source Type": "PDF",
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product Name": "Drawer Microwave",
+        "Dimensions": "",
+        "Product Category": "Appliances",
+        "Product URL": "https://www.subzero-wolf.com/products/mdd30ts",
+        "Image URL": "https://res.cloudinary.com/demo/image/upload/manual.jpg",
+        "image_source": "manual_upload",
+        "Confidence Score": 90,
+    }])
+
+    updated_df, errors, diagnostics = enrich_dataframe(df, targeted_retry_mode="conservative")
+
+    assert errors == []
+    row = updated_df.iloc[0].to_dict()
+    assert row["Dimensions"] == '29.875"W x 23.5"D x 11.875"H'
+    assert row["Dimension Source URL"] == "https://www.subzero-wolf.com/products/mdd30ts"
+    assert row["Dimension Source Type"] == "targeted_retry_existing_product_page"
+    assert row["Targeted Retry Status"] == "filled"
+    assert "dimensions" in row["Targeted Retry Filled Fields"]
+    assert any(d.get("report_type") == "targeted_missing_field_retry" for d in diagnostics)
+
+
+def test_targeted_retry_off_does_not_fetch_missing_image(monkeypatch):
+    import src.product_enrichment as pe
+
+    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: (_ for _ in ()).throw(AssertionError("retry fetch should not run")))
+
+    df = pd.DataFrame([{
+        "Source Type": "PDF",
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product Name": "Drawer Microwave",
+        "Dimensions": '29.875"W x 23.5"D x 11.875"H',
+        "Product Category": "Appliances",
+        "Product URL": "https://www.subzero-wolf.com/products/mdd30ts",
+        "Image URL": "",
+        "Confidence Score": 90,
+    }])
+
+    updated_df, errors, diagnostics = enrich_dataframe(df, targeted_retry_mode="off")
+
+    assert errors == []
+    assert updated_df.iloc[0]["Image URL"] == ""
+    assert diagnostics[0]["summary"]["targeted_retry_mode"] == "off"
+    assert diagnostics[0]["summary"]["targeted_retry_items"] == 0
+
+
+def test_targeted_retry_uses_narrow_dimension_search_when_no_product_url(monkeypatch):
+    from src.brave_search import SearchResult
+    import src.product_enrichment as pe
+
+    queries = []
+    monkeypatch.setattr(pe, "enrich_row", lambda row, **kwargs: (row, None, None))
+    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: _targeted_retry_html())
+    monkeypatch.setattr(pe, "_maybe_upload_selected_image_to_cloudinary", lambda *args, **kwargs: None)
+
+    def fake_search(query, brand="", session_cache=None):
+        queries.append(query)
+        return [SearchResult(
+            title="Wolf MDD30TS Drawer Microwave",
+            url="https://www.subzero-wolf.com/products/mdd30ts",
+            description="MDD30TS dimensions",
+            domain_score=80,
+        )]
+
+    monkeypatch.setattr(pe, "search_product_candidates", fake_search)
+
+    df = pd.DataFrame([{
+        "Source Type": "PDF",
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product Name": "Drawer Microwave",
+        "Dimensions": "",
+        "Product Category": "Appliances",
+        "Product URL": "",
+        "Image URL": "",
+        "Confidence Score": 90,
+    }])
+
+    updated_df, errors, diagnostics = enrich_dataframe(df, targeted_retry_mode="conservative")
+
+    assert errors == []
+    row = updated_df.iloc[0].to_dict()
+    assert row["Product URL"] == "https://www.subzero-wolf.com/products/mdd30ts"
+    assert row["Dimensions"] == '29.875"W x 23.5"D x 11.875"H'
+    assert queries
+    assert all("dimensions" in query.lower() or "product" in query.lower() for query in queries)
+    assert diagnostics[0]["summary"]["targeted_retry_extra_cost_usd"] <= 0.006

@@ -8,6 +8,7 @@ import {
   Download,
   FileText,
   ImageIcon,
+  Maximize2,
   Loader2,
   Phone,
   RefreshCw,
@@ -99,6 +100,14 @@ const accentColorOptions = [
   { id: "sage", label: "Sage", color: "rgb(95 122 101)" },
   { id: "blue", label: "Blue", color: "rgb(37 99 235)" },
   { id: "plum", label: "Plum", color: "rgb(147 51 120)" },
+  { id: "mustard", label: "Mustard", color: "rgb(161 125 35)" },
+  { id: "terracotta", label: "Terracotta", color: "rgb(183 101 73)" },
+  { id: "slate-blue", label: "Slate Blue", color: "rgb(93 111 140)" },
+  { id: "sand", label: "Sand", color: "rgb(182 154 114)" },
+  { id: "forest", label: "Forest", color: "rgb(66 97 79)" },
+  { id: "ocean", label: "Ocean", color: "rgb(47 111 128)" },
+  { id: "clay", label: "Clay", color: "rgb(166 83 58)" },
+  { id: "rosewood", label: "Rosewood", color: "rgb(138 79 94)" },
 ] as const;
 
 type WebsiteThemeId = (typeof websiteThemeOptions)[number]["id"];
@@ -106,6 +115,7 @@ type AccentColorId = (typeof accentColorOptions)[number]["id"];
 type UiDensityId = "comfortable" | "compact";
 type AnimationPreferenceId = "smooth" | "reduced";
 type EnrichmentPriorityId = "balanced" | "images" | "dimensions" | "speed";
+type MissingFieldRetryModeId = "off" | "conservative" | "balanced" | "aggressive";
 type MeasurementUnitId = "imperial" | "metric";
 
 const themePreviewPalettes: Record<WebsiteThemeId, { background: string; surface: string; border: string; text: string; muted: string }> = {
@@ -130,8 +140,10 @@ const accentColorStorageKey = "sch:accentColor";
 const uiDensityStorageKey = "sch:uiDensity";
 const animationPreferenceStorageKey = "sch:animationPreference";
 const enrichmentPriorityStorageKey = "sch:enrichmentPriority";
+const missingFieldRetryModeStorageKey = "sch:missingFieldRetryMode";
 const autoRetryStorageKey = "sch:autoRetryFailed";
 const measurementUnitStorageKey = "sch:measurementUnit";
+const itemDebugModeStorageKey = "sch:itemDebugMode";
 
 const uiDensityOptions: { id: UiDensityId; label: string; description: string }[] = [
   { id: "comfortable", label: "Comfortable", description: "More breathing room for review work." },
@@ -148,6 +160,13 @@ const enrichmentPriorityOptions: { id: EnrichmentPriorityId; label: string; desc
   { id: "images", label: "Prioritize images", description: "Put missing product images first during review." },
   { id: "dimensions", label: "Prioritize dimensions", description: "Put missing measurements first during review." },
   { id: "speed", label: "Prioritize speed", description: "Favor quicker passes and fewer deep checks." },
+];
+
+const missingFieldRetryModeOptions: { id: MissingFieldRetryModeId; label: string; description: string }[] = [
+  { id: "off", label: "Off", description: "Run only the first cheap enrichment pass." },
+  { id: "conservative", label: "Conservative", description: "Reuse verified pages first, with one tiny targeted retry when budget allows." },
+  { id: "balanced", label: "Balanced", description: "Allow a little more targeted work for missing dimensions and images." },
+  { id: "aggressive", label: "Aggressive", description: "Internal/manual mode for stubborn rows; still budget capped." },
 ];
 
 const missingFieldPlaceholders: Record<string, string> = {
@@ -190,6 +209,15 @@ function isPhotoOnlyRow(row: IntakeRow) {
 
 function isPublicHttpsImageUrl(value: string) {
   return value.trim().toLowerCase().startsWith("https://");
+}
+
+function domainFromUrl(value: string) {
+  if (!value) return "";
+  try {
+    return new URL(value).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
 }
 
 function photoReportFromDiagnostics(diagnostics?: Record<string, unknown>[]): PhotoDiscoveryReport | null {
@@ -244,6 +272,15 @@ type DebugUploadSnapshot = {
   finalProductEntries: number;
   logs?: Record<string, unknown>[] | null;
   telemetry?: Record<string, unknown>;
+};
+
+type ImagePreviewState = {
+  url: string;
+  productName: string;
+  sourcePage: string;
+  sourceDomain: string;
+  sourceLabel: string;
+  resolution: string;
 };
 
 const UPLOAD_TIMEOUT_MS = 90_000;
@@ -400,6 +437,79 @@ function candidateImageUrl(candidate: Record<string, unknown>) {
   return String(candidate.url || candidate.image_url || "").trim();
 }
 
+function itemSearchAttemptCount(row: IntakeRow) {
+  const explicit = Number(row["Search Attempts"] || row["search_attempts"] || row["attempt_count"] || 0);
+  if (Number.isFinite(explicit) && explicit > 0) return explicit;
+  return (
+    safeParseArray(rowText(row, "_bravi_calls")).length +
+    safeParseArray(rowText(row, "_image_candidates")).length +
+    (rowText(row, "_enrichment_query_used") ? 1 : 0)
+  );
+}
+
+function itemEstimatedCost(row: IntakeRow) {
+  const label = rowText(row, "Bravi Cost");
+  if (label) return label;
+  return formatUsd(row["Bravi Cost USD"]);
+}
+
+function imageResolutionForRow(row: IntakeRow) {
+  const width = Number(
+    row["cloudinary_width"] ||
+      row["image_width"] ||
+      row["Image Width"] ||
+      row["_image_width"] ||
+      0,
+  );
+  const height = Number(
+    row["cloudinary_height"] ||
+      row["image_height"] ||
+      row["Image Height"] ||
+      row["_image_height"] ||
+      0,
+  );
+  return Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0
+    ? `${Math.round(width)} x ${Math.round(height)} px`
+    : "";
+}
+
+function imagePreviewStateForRow(row: IntakeRow): ImagePreviewState | null {
+  const url = rowText(row, "Image URL");
+  if (!isPublicHttpsImageUrl(url)) return null;
+  const sourcePage = rowText(row, "Product URL") || rowText(row, "Original Image URL");
+  const sourceDomain =
+    rowText(row, "Selected Source Domain") ||
+    domainFromUrl(sourcePage) ||
+    domainFromUrl(rowText(row, "Original Image URL")) ||
+    domainFromUrl(url);
+  const sourceLabel = rowText(row, "image_source") || rowText(row, "_image_source_type") || "Product image";
+  return {
+    url,
+    productName: rowText(row, "Product Name") || "Product image",
+    sourcePage,
+    sourceDomain,
+    sourceLabel,
+    resolution: imageResolutionForRow(row),
+  };
+}
+
+function itemDebugRows(row: IntakeRow) {
+  const productUrl = rowText(row, "Product URL");
+  const dimensionSourceUrl = rowText(row, "Dimension Source URL") || productUrl;
+  const specSourceUrl = rowText(row, "Successful Source Stored") || productUrl;
+  const missing = missingFieldsForDebug(row);
+  return [
+    ["Search source", rowText(row, "Selected Source Domain") || domainFromUrl(productUrl) || rowText(row, "Source Domains Tried") || "none"],
+    ["Extraction confidence", rowText(row, "Product Resolution Confidence") || rowText(row, "confidence") || rowText(row, "Confidence Score") || "none"],
+    ["Image supplied by", rowText(row, "image_source") || rowText(row, "_image_source_type") || domainFromUrl(rowText(row, "Image URL")) || "none"],
+    ["Dimensions supplied by", [rowText(row, "Dimension Source Type"), domainFromUrl(dimensionSourceUrl)].filter(Boolean).join(" · ") || "none"],
+    ["Specs supplied by", rowText(row, "Source Selection Reason") || domainFromUrl(specSourceUrl) || "none"],
+    ["Search attempts", itemSearchAttemptCount(row)],
+    ["Estimated cost", itemEstimatedCost(row)],
+    ["Failure reason", rowText(row, "Suggested Action") || (missing.length ? `Missing ${missing.join(", ")}` : "none")],
+  ] as const;
+}
+
 function missingFieldsForDebug(row: IntakeRow) {
   const explicit = rowText(row, "Missing Fields");
   if (explicit) return explicit.split(",").map((item) => item.trim()).filter(Boolean);
@@ -547,6 +657,13 @@ function buildInternalDebugReport(
         sourceSelectionReason: rowText(row, "Source Selection Reason"),
         dimensionsExtractionMethod: rowText(row, "Dimensions Extraction Method"),
         imageExtractionMethod: rowText(row, "Image Extraction Method"),
+        targetedRetryMode: rowText(row, "Targeted Retry Mode"),
+        targetedRetryMissingFields: rowText(row, "Targeted Retry Missing Fields"),
+        targetedRetryStatus: rowText(row, "Targeted Retry Status"),
+        targetedRetryFilledFields: rowText(row, "Targeted Retry Filled Fields"),
+        targetedRetryExtraCost: rowText(row, "Targeted Retry Extra Cost"),
+        targetedRetryAttempts: safeParseArray(rowText(row, "Targeted Retry Attempts")),
+        targetedRetryFailureReason: rowText(row, "Targeted Retry Failure Reason"),
         successfulSourceStored: rowText(row, "Successful Source Stored"),
         rejectedUrlsAndReasons: rowText(row, "Rejected URLs and Reasons"),
         extractedFields: {
@@ -675,6 +792,11 @@ function formatDebugReportText(report: ReturnType<typeof buildInternalDebugRepor
       `Cache Hits: ${metrics.cache_hits ?? 0}`,
       `Duplicate Reuse: ${metrics.duplicate_reuse ?? 0}`,
       `Cheap Local Only: ${metrics.cheap_local_only ?? 0}`,
+      `Targeted Retry Mode: ${metrics.targeted_retry_mode ?? "conservative"}`,
+      `Targeted Retry Items: ${metrics.targeted_retry_items ?? 0}`,
+      `Targeted Retry Attempts: ${metrics.targeted_retry_attempts ?? 0}`,
+      `Targeted Retry Fields Filled: ${metrics.targeted_retry_fields_filled ?? 0}`,
+      `Targeted Retry Extra Cost: ${formatUsd(metrics.targeted_retry_extra_cost_usd)}`,
       `Skipped Enrichments: ${metrics.skipped_enrichments ?? 0}`,
       `Budget-Skipped Calls: ${metrics.skipped_calls_due_budget ?? 0}`,
       `Budget-Skipped Fields: ${metrics.fields_skipped_due_budget ?? 0}`,
@@ -719,6 +841,11 @@ function formatDebugReportText(report: ReturnType<typeof buildInternalDebugRepor
       `- Source Selection Reason: ${product.enrichment.sourceSelectionReason || "none"}`,
       `- Dimensions Method: ${product.enrichment.dimensionsExtractionMethod || "none"}`,
       `- Image Method: ${product.enrichment.imageExtractionMethod || "none"}`,
+      `- Targeted Retry: ${product.enrichment.targetedRetryStatus || "none"}`,
+      `- Retry Missing Fields: ${product.enrichment.targetedRetryMissingFields || "none"}`,
+      `- Retry Filled Fields: ${product.enrichment.targetedRetryFilledFields || "none"}`,
+      `- Retry Extra Cost: ${product.enrichment.targetedRetryExtraCost || "$0.0000"}`,
+      `- Retry Attempts: ${JSON.stringify(product.enrichment.targetedRetryAttempts || [])}`,
       `- Successful Source Stored: ${product.enrichment.successfulSourceStored || "none"}`,
       `- Rejected URLs: ${product.enrichment.rejectedUrlsAndReasons || "none"}`,
       `- Failed Fields: ${product.enrichment.failedFields.join(", ") || "none"}`,
@@ -873,9 +1000,9 @@ export function IntakeWorkspace() {
   const [activePdfParseJobId, setActivePdfParseJobId] = useState("");
   const [debugUploads, setDebugUploads] = useState<DebugUploadSnapshot[]>([]);
   const [latestDiagnostics, setLatestDiagnostics] = useState<Record<string, unknown>[]>([]);
-  const [showInternalDebug, setShowInternalDebug] = useState(false);
   const [debugCopyStatus, setDebugCopyStatus] = useState("");
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsClosing, setSettingsClosing] = useState(false);
   const [preferredWebsites, setPreferredWebsites] = useState<PreferredWebsiteEntry[]>([]);
   const [preferredWebsiteForm, setPreferredWebsiteForm] = useState({ keyword: "", url: "", notes: "", id: "" });
   const [preferredWebsiteStatus, setPreferredWebsiteStatus] = useState("");
@@ -885,8 +1012,11 @@ export function IntakeWorkspace() {
   const [uiDensity, setUiDensity] = useState<UiDensityId>("comfortable");
   const [animationPreference, setAnimationPreference] = useState<AnimationPreferenceId>("smooth");
   const [enrichmentPriority, setEnrichmentPriority] = useState<EnrichmentPriorityId>("balanced");
+  const [missingFieldRetryMode, setMissingFieldRetryMode] = useState<MissingFieldRetryModeId>("conservative");
   const [autoRetryFailedItems, setAutoRetryFailedItems] = useState(false);
   const [measurementUnit, setMeasurementUnit] = useState<MeasurementUnitId>("imperial");
+  const [itemDebugMode, setItemDebugMode] = useState(false);
+  const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null);
   const [themeSettingsLoaded, setThemeSettingsLoaded] = useState(false);
   const [showReviewItems, setShowReviewItems] = useState(false);
   const [showMissingDetailItems, setShowMissingDetailItems] = useState(false);
@@ -928,6 +1058,7 @@ export function IntakeWorkspace() {
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const bulkImageInputRef = useRef<HTMLInputElement>(null);
+  const settingsCloseTimeoutRef = useRef<number | null>(null);
   const pdfSessionIdRef = useRef<string>("");
   const downloadedExportFilenamesRef = useRef<Set<string>>(new Set());
 
@@ -937,8 +1068,10 @@ export function IntakeWorkspace() {
     const storedDensity = window.localStorage.getItem(uiDensityStorageKey);
     const storedAnimationPreference = window.localStorage.getItem(animationPreferenceStorageKey);
     const storedEnrichmentPriority = window.localStorage.getItem(enrichmentPriorityStorageKey);
+    const storedMissingFieldRetryMode = window.localStorage.getItem(missingFieldRetryModeStorageKey);
     const storedAutoRetry = window.localStorage.getItem(autoRetryStorageKey);
     const storedMeasurementUnit = window.localStorage.getItem(measurementUnitStorageKey);
+    const storedItemDebugMode = window.localStorage.getItem(itemDebugModeStorageKey);
     if (websiteThemeOptions.some((option) => option.id === storedTheme)) {
       setWebsiteTheme(storedTheme as WebsiteThemeId);
     }
@@ -954,14 +1087,37 @@ export function IntakeWorkspace() {
     if (enrichmentPriorityOptions.some((option) => option.id === storedEnrichmentPriority)) {
       setEnrichmentPriority(storedEnrichmentPriority as EnrichmentPriorityId);
     }
+    if (missingFieldRetryModeOptions.some((option) => option.id === storedMissingFieldRetryMode)) {
+      setMissingFieldRetryMode(storedMissingFieldRetryMode as MissingFieldRetryModeId);
+    }
     if (storedAutoRetry === "true" || storedAutoRetry === "false") {
       setAutoRetryFailedItems(storedAutoRetry === "true");
     }
     if (storedMeasurementUnit === "imperial" || storedMeasurementUnit === "metric") {
       setMeasurementUnit(storedMeasurementUnit);
     }
+    if (storedItemDebugMode === "true" || storedItemDebugMode === "false") {
+      setItemDebugMode(storedItemDebugMode === "true");
+    }
     setThemeSettingsLoaded(true);
   }, []);
+
+  useEffect(() => {
+    return () => {
+      if (settingsCloseTimeoutRef.current) {
+        window.clearTimeout(settingsCloseTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!imagePreview) return;
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") setImagePreview(null);
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [imagePreview]);
 
   useEffect(() => {
     if (!themeSettingsLoaded) return;
@@ -974,9 +1130,11 @@ export function IntakeWorkspace() {
     window.localStorage.setItem(uiDensityStorageKey, uiDensity);
     window.localStorage.setItem(animationPreferenceStorageKey, animationPreference);
     window.localStorage.setItem(enrichmentPriorityStorageKey, enrichmentPriority);
+    window.localStorage.setItem(missingFieldRetryModeStorageKey, missingFieldRetryMode);
     window.localStorage.setItem(autoRetryStorageKey, String(autoRetryFailedItems));
     window.localStorage.setItem(measurementUnitStorageKey, measurementUnit);
-  }, [accentColor, animationPreference, autoRetryFailedItems, enrichmentPriority, measurementUnit, themeSettingsLoaded, uiDensity, websiteTheme]);
+    window.localStorage.setItem(itemDebugModeStorageKey, String(itemDebugMode));
+  }, [accentColor, animationPreference, autoRetryFailedItems, enrichmentPriority, itemDebugMode, measurementUnit, missingFieldRetryMode, themeSettingsLoaded, uiDensity, websiteTheme]);
 
   useEffect(() => {
     fetchHealth().catch(() => {
@@ -1062,6 +1220,34 @@ export function IntakeWorkspace() {
       providerCosts,
     };
   }, [enrichmentMetrics, exportSummary.image_url_present, exportSummary.image_url_total, includedRows, preferredWebsites, readyRows]);
+
+  function openSettings() {
+    if (settingsCloseTimeoutRef.current) {
+      window.clearTimeout(settingsCloseTimeoutRef.current);
+      settingsCloseTimeoutRef.current = null;
+    }
+    setSettingsClosing(false);
+    setShowSettings(true);
+  }
+
+  function closeSettings() {
+    if (settingsCloseTimeoutRef.current) {
+      window.clearTimeout(settingsCloseTimeoutRef.current);
+    }
+    if (animationPreference === "reduced") {
+      setSettingsClosing(false);
+      setShowSettings(false);
+      settingsCloseTimeoutRef.current = null;
+      return;
+    }
+    setSettingsClosing(true);
+    settingsCloseTimeoutRef.current = window.setTimeout(() => {
+      setShowSettings(false);
+      setSettingsClosing(false);
+      settingsCloseTimeoutRef.current = null;
+    }, 180);
+  }
+
   const ignored = useMemo(() => rows.filter((row) => row.Include === false || row.Status === "Ignored").length, [rows]);
   const onlyPhotosSelected = bulkImages.length > 0 && files.length === 0 && !urls.trim();
   const uploadBusy = busy === "generate" || busy === "photoBulk";
@@ -1643,6 +1829,7 @@ export function IntakeWorkspace() {
         useWebEnrichment,
         sessionId: pdfSessionIdRef.current || undefined,
         enrichmentMode: effectiveEnrichmentMode,
+        targetedRetryMode: missingFieldRetryMode,
       });
       setRows(response.rows);
       setErrors(response.errors);
@@ -1952,7 +2139,7 @@ export function IntakeWorkspace() {
             <button
               type="button"
               className="btn-secondary inline-flex h-10 w-10 items-center justify-center rounded-xl"
-              onClick={() => setShowSettings(true)}
+              onClick={openSettings}
               aria-label="Open settings"
               title="Settings"
             >
@@ -2564,9 +2751,10 @@ export function IntakeWorkspace() {
                           .filter((candidate) => isPublicHttpsImageUrl(candidateImageUrl(candidate)))
                           .slice(0, 3);
                         const imageRejectedCandidates = rowText(row, "_image_rejected_candidates");
-                        const imageDebugAvailable = Boolean(imageQueryUsed || imageCandidates.length || imageRejectedCandidates || rowText(row, "_selected_image_candidate"));
                         const callFields = phoneCallFieldsForRow(row);
                         const emphasizeCall = shouldEmphasizePhoneCall(row);
+                        const imagePreviewState = imagePreviewStateForRow(row);
+                        const itemDebugAvailable = itemDebugMode;
                         return (
                           <div key={index} className="grid gap-3 p-4 md:grid-cols-[1fr_1.2fr_auto] md:items-center">
                             <div className="min-w-0">
@@ -2586,10 +2774,19 @@ export function IntakeWorkspace() {
                               <div className="sm:col-span-2">
                                 Image:{" "}
                                 {imageUrl ? (
-                                  <span className="inline-flex max-w-full items-center gap-2 align-middle">
-                                    <img src={imageUrl} alt={productName || "Product image"} className="h-8 w-8 rounded-lg object-cover" />
+                                  <button
+                                    type="button"
+                                    className="inline-flex max-w-full items-center gap-2 rounded-lg align-middle text-left hover:bg-orangeSoft/35"
+                                    onClick={() => imagePreviewState ? setImagePreview(imagePreviewState) : null}
+                                  >
+                                    <span className="relative h-8 w-8 shrink-0 overflow-hidden rounded-lg">
+                                      <img src={imageUrl} alt={productName || "Product image"} className="h-8 w-8 object-cover" />
+                                      <span className="absolute inset-0 grid place-items-center bg-black/0 text-white opacity-0 transition hover:bg-black/25 hover:opacity-100">
+                                        <Maximize2 className="h-3.5 w-3.5" />
+                                      </span>
+                                    </span>
                                     <span className="truncate text-charcoal">{imageUrl}</span>
-                                  </span>
+                                  </button>
                                 ) : (
                                   <span className="font-semibold text-clay">Missing</span>
                                 )}
@@ -2599,7 +2796,7 @@ export function IntakeWorkspace() {
                                   {uploadStatus}
                                 </div>
                               ) : null}
-                              {evidence ? <div className="sm:col-span-2 truncate">Evidence: {evidence}</div> : null}
+                              {itemDebugMode && evidence ? <div className="sm:col-span-2 truncate">Evidence: {evidence}</div> : null}
                               {imageCandidates.length ? (
                                 <div className="sm:col-span-2 mt-1 flex flex-wrap gap-2">
                                   {imageCandidates.map((candidate, candidateIndex) => {
@@ -2618,10 +2815,18 @@ export function IntakeWorkspace() {
                                   })}
                                 </div>
                               ) : null}
-                              {rawGroupedText || parsedFields || enrichmentQuery || confidenceReason || missingInitial || imageDebugAvailable ? (
+                              {itemDebugAvailable ? (
                                 <details className="sm:col-span-2 rounded-lg border border-linen bg-ivory/40 p-2">
-                                  <summary className="cursor-pointer text-xs font-semibold text-charcoal">Item debug</summary>
-                                  <div className="mt-2 grid gap-1 text-xs text-taupe">
+                                  <summary className="cursor-pointer text-xs font-semibold text-charcoal">Item debug metadata</summary>
+                                  <div className="mt-2 grid gap-2 text-xs text-taupe">
+                                    <div className="grid gap-1 rounded-md border border-linen bg-paper/70 p-2 sm:grid-cols-2">
+                                      {itemDebugRows(row).map(([label, value]) => (
+                                        <div key={label} className="min-w-0">
+                                          <span className="font-semibold text-charcoal">{label}:</span>{" "}
+                                          <span className="break-words">{String(value || "none")}</span>
+                                        </div>
+                                      ))}
+                                    </div>
                                     {rawGroupedText ? (
                                       <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-md bg-paper p-2 text-charcoal">{rawGroupedText}</pre>
                                     ) : null}
@@ -2701,16 +2906,6 @@ export function IntakeWorkspace() {
             </div>
           </div>
         </Panel>
-        {INTERNAL_DEBUG_ENABLED ? (
-          <InternalDebugPanel
-            report={internalDebugReport}
-            expanded={showInternalDebug}
-            copyStatus={debugCopyStatus}
-            onToggle={() => setShowInternalDebug((current) => !current)}
-            onCopy={handleCopyInternalDebug}
-            onDownload={handleDownloadInternalDebug}
-          />
-        ) : null}
         {showSettings ? (
           <SettingsDialog
             entries={preferredWebsites}
@@ -2724,15 +2919,17 @@ export function IntakeWorkspace() {
             useWebEnrichment={useWebEnrichment}
             enrichmentMode={enrichmentMode}
             enrichmentPriority={enrichmentPriority}
+            missingFieldRetryMode={missingFieldRetryMode}
             autoRetryFailedItems={autoRetryFailedItems}
             measurementUnit={measurementUnit}
+            itemDebugMode={itemDebugMode}
             includeLowConfidenceImages={includeLowConfidenceImages}
             budgetPreview={budgetPreview}
             enrichmentMetrics={enrichmentMetrics}
             usage={settingsUsage}
-            showInternalDebug={showInternalDebug}
             debugCopyStatus={debugCopyStatus}
-            onClose={() => setShowSettings(false)}
+            isClosing={settingsClosing}
+            onClose={closeSettings}
             onChangeTheme={setWebsiteTheme}
             onChangeAccent={setAccentColor}
             onChangeDensity={setUiDensity}
@@ -2740,8 +2937,10 @@ export function IntakeWorkspace() {
             onChangeUseWebEnrichment={setUseWebEnrichment}
             onChangeEnrichmentMode={setEnrichmentMode}
             onChangeEnrichmentPriority={setEnrichmentPriority}
+            onChangeMissingFieldRetryMode={setMissingFieldRetryMode}
             onChangeAutoRetry={setAutoRetryFailedItems}
             onChangeMeasurementUnit={setMeasurementUnit}
+            onChangeItemDebugMode={setItemDebugMode}
             onChangeIncludeLowConfidenceImages={setIncludeLowConfidenceImages}
             onChangeForm={setPreferredWebsiteForm}
             onSave={savePreferredWebsite}
@@ -2750,7 +2949,6 @@ export function IntakeWorkspace() {
             onReset={resetPreferredWebsiteForm}
             onImportWebsites={importPreferredWebsitePreferences}
             onExportWebsites={exportPreferredWebsitePreferences}
-            onToggleInternalDebug={() => setShowInternalDebug((current) => !current)}
             onCopyDebug={handleCopyInternalDebug}
             onDownloadDebug={handleDownloadInternalDebug}
           />
@@ -2762,6 +2960,12 @@ export function IntakeWorkspace() {
             onChange={setVendorCall}
             onClose={() => setVendorCall(null)}
             onGenerateScript={handleGenerateCallScript}
+          />
+        ) : null}
+        {imagePreview ? (
+          <ProductImageLightbox
+            preview={imagePreview}
+            onClose={() => setImagePreview(null)}
           />
         ) : null}
       </div>
@@ -3020,6 +3224,11 @@ function InternalDebugPanel({
                     <DebugLine label="Selection reason" value={product.enrichment.sourceSelectionReason || "none"} />
                     <DebugLine label="Dimensions method" value={product.enrichment.dimensionsExtractionMethod || "none"} />
                     <DebugLine label="Image method" value={product.enrichment.imageExtractionMethod || "none"} />
+                    <DebugLine label="Targeted retry" value={product.enrichment.targetedRetryStatus || "none"} />
+                    <DebugLine label="Retry missing fields" value={product.enrichment.targetedRetryMissingFields || "none"} />
+                    <DebugLine label="Retry filled fields" value={product.enrichment.targetedRetryFilledFields || "none"} />
+                    <DebugLine label="Retry extra cost" value={product.enrichment.targetedRetryExtraCost || "$0.0000"} />
+                    <DebugLine label="Retry attempts" value={JSON.stringify(product.enrichment.targetedRetryAttempts || [])} />
                     <DebugLine label="Source stored" value={product.enrichment.successfulSourceStored || "none"} />
                     <DebugLine label="Rejected URLs" value={product.enrichment.rejectedUrlsAndReasons || "none"} />
                     <DebugLine label="Failed fields" value={product.enrichment.failedFields.join(", ") || "none"} />
@@ -3130,14 +3339,16 @@ function SettingsDialog({
   useWebEnrichment,
   enrichmentMode,
   enrichmentPriority,
+  missingFieldRetryMode,
   autoRetryFailedItems,
   measurementUnit,
+  itemDebugMode,
   includeLowConfidenceImages,
   budgetPreview,
   enrichmentMetrics,
   usage,
-  showInternalDebug,
   debugCopyStatus,
+  isClosing,
   onClose,
   onChangeTheme,
   onChangeAccent,
@@ -3146,8 +3357,10 @@ function SettingsDialog({
   onChangeUseWebEnrichment,
   onChangeEnrichmentMode,
   onChangeEnrichmentPriority,
+  onChangeMissingFieldRetryMode,
   onChangeAutoRetry,
   onChangeMeasurementUnit,
+  onChangeItemDebugMode,
   onChangeIncludeLowConfidenceImages,
   onChangeForm,
   onSave,
@@ -3156,7 +3369,6 @@ function SettingsDialog({
   onReset,
   onImportWebsites,
   onExportWebsites,
-  onToggleInternalDebug,
   onCopyDebug,
   onDownloadDebug,
 }: {
@@ -3171,8 +3383,10 @@ function SettingsDialog({
   useWebEnrichment: boolean;
   enrichmentMode: "fast" | "standard" | "deep" | "manual_retry";
   enrichmentPriority: EnrichmentPriorityId;
+  missingFieldRetryMode: MissingFieldRetryModeId;
   autoRetryFailedItems: boolean;
   measurementUnit: MeasurementUnitId;
+  itemDebugMode: boolean;
   includeLowConfidenceImages: boolean;
   budgetPreview: ReturnType<typeof enrichmentBudgetPreview>;
   enrichmentMetrics: Record<string, unknown> | null;
@@ -3185,8 +3399,8 @@ function SettingsDialog({
     topWebsites: PreferredWebsiteEntry[];
     providerCosts: { provider: string; cost: number }[];
   };
-  showInternalDebug: boolean;
   debugCopyStatus: string;
+  isClosing: boolean;
   onClose: () => void;
   onChangeTheme: (theme: WebsiteThemeId) => void;
   onChangeAccent: (accent: AccentColorId) => void;
@@ -3195,8 +3409,10 @@ function SettingsDialog({
   onChangeUseWebEnrichment: (enabled: boolean) => void;
   onChangeEnrichmentMode: (mode: "fast" | "standard" | "deep" | "manual_retry") => void;
   onChangeEnrichmentPriority: (priority: EnrichmentPriorityId) => void;
+  onChangeMissingFieldRetryMode: (mode: MissingFieldRetryModeId) => void;
   onChangeAutoRetry: (enabled: boolean) => void;
   onChangeMeasurementUnit: (unit: MeasurementUnitId) => void;
+  onChangeItemDebugMode: (enabled: boolean) => void;
   onChangeIncludeLowConfidenceImages: (enabled: boolean) => void;
   onChangeForm: (form: { keyword: string; url: string; notes: string; id: string }) => void;
   onSave: () => void;
@@ -3205,12 +3421,12 @@ function SettingsDialog({
   onReset: () => void;
   onImportWebsites: (file: File | null | undefined) => void;
   onExportWebsites: () => void;
-  onToggleInternalDebug: () => void;
   onCopyDebug: () => void;
   onDownloadDebug: (format: "json" | "txt") => void;
 }) {
   const importInputRef = useRef<HTMLInputElement>(null);
   const selectedPriority = enrichmentPriorityOptions.find((option) => option.id === enrichmentPriority) || enrichmentPriorityOptions[0];
+  const selectedRetryMode = missingFieldRetryModeOptions.find((option) => option.id === missingFieldRetryMode) || missingFieldRetryModeOptions[1];
   const websiteSuccessTotal = entries.reduce((total, entry) => total + Number(entry.success_count || 0), 0);
   const websiteFailureTotal = entries.reduce((total, entry) => total + Number(entry.failure_count || 0), 0);
   const websiteSuccessRate =
@@ -3219,8 +3435,8 @@ function SettingsDialog({
       : null;
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/35 px-4 py-6">
-      <div className="max-h-[90vh] w-full max-w-5xl overflow-auto rounded-2xl border border-linen bg-paper p-5 shadow-xl sm:p-6">
+    <div className={`settings-overlay fixed inset-0 z-50 grid place-items-center bg-black/35 px-4 py-6${isClosing ? " settings-overlay-closing" : ""}`}>
+      <div className={`settings-dialog max-h-[90vh] w-full max-w-5xl overflow-auto rounded-2xl border border-linen bg-paper p-5 shadow-xl sm:p-6${isClosing ? " settings-dialog-closing" : ""}`}>
         <div className="flex items-start justify-between gap-4 border-b border-linen pb-4">
           <div>
             <div className="text-xl font-semibold text-charcoal">Settings</div>
@@ -3460,6 +3676,21 @@ function SettingsDialog({
                   </select>
                 </Field>
                 <div className="text-xs leading-5 text-taupe">{selectedPriority.description}</div>
+                <Field label="Missing-field retry">
+                  <select
+                    className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
+                    value={missingFieldRetryMode}
+                    onChange={(event) => onChangeMissingFieldRetryMode(event.target.value as MissingFieldRetryModeId)}
+                    disabled={!useWebEnrichment}
+                  >
+                    {missingFieldRetryModeOptions.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <div className="text-xs leading-5 text-taupe">{selectedRetryMode.description}</div>
               </div>
 
               <div className="grid gap-3 rounded-xl border border-linen bg-ivory/35 p-4">
@@ -3500,22 +3731,44 @@ function SettingsDialog({
                 <AdvancedSettingCard title="Cache behavior" value={`Cache hits ${String(enrichmentMetrics?.cache_hits ?? 0)} · paid calls ${String(enrichmentMetrics?.paid_calls ?? 0)}`} />
                 <AdvancedSettingCard title="Confidence thresholds" value="Review flags remain visible on product rows." />
                 <AdvancedSettingCard title="Provider controls" value={usage.providerCosts.length ? usage.providerCosts.map((item) => item.provider).join(", ") : "No provider usage yet"} />
-                <AdvancedSettingCard title="Extraction tracing" value={showInternalDebug ? "Debug panel visible" : "Debug panel hidden"} />
+                <AdvancedSettingCard title="Debug & Diagnostics" value={itemDebugMode ? "Item metadata visible on rows" : "Off for everyday review"} />
+                <AdvancedSettingCard title="Extraction tracing" value={itemDebugMode ? "Available in item rows and report export" : "Hidden"} />
                 <AdvancedSettingCard title="Advanced export formatting" value={includeLowConfidenceImages ? "Low-confidence ZIP images included" : "Low-confidence ZIP images excluded"} />
               </div>
+              <div className="rounded-xl border border-linen bg-paper p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-charcoal">Debug &amp; Diagnostics</div>
+                    <div className="mt-1 text-xs leading-5 text-taupe">
+                      Optional row-level metadata for troubleshooting source quality, confidence, cost, and incomplete enrichment.
+                    </div>
+                  </div>
+                  <label className="flex items-center gap-2 rounded-xl border border-linen bg-ivory/45 px-3 py-2 text-xs font-semibold text-charcoal">
+                    <input
+                      type="checkbox"
+                      checked={itemDebugMode}
+                      onChange={(event) => onChangeItemDebugMode(event.target.checked)}
+                      className="h-4 w-4 accent-bronze"
+                    />
+                    Enable Item Debug Mode
+                  </label>
+                </div>
+                {itemDebugMode ? (
+                  <div className="mt-3 flex flex-wrap gap-2 border-t border-linen pt-3">
+                    <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" onClick={onCopyDebug}>
+                      Copy Debug Summary
+                    </button>
+                    <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" onClick={() => onDownloadDebug("json")}>
+                      Download JSON
+                    </button>
+                    <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" onClick={() => onDownloadDebug("txt")}>
+                      Download TXT
+                    </button>
+                    {debugCopyStatus ? <span className="self-center text-xs text-taupe">{debugCopyStatus}</span> : null}
+                  </div>
+                ) : null}
+              </div>
               <div className="flex flex-wrap gap-2">
-                <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" onClick={onToggleInternalDebug} disabled={!INTERNAL_DEBUG_ENABLED}>
-                  {showInternalDebug ? "Hide Debug Panel" : "Show Debug Panel"}
-                </button>
-                <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" onClick={onCopyDebug} disabled={!INTERNAL_DEBUG_ENABLED}>
-                  Copy Debug Summary
-                </button>
-                <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" onClick={() => onDownloadDebug("json")} disabled={!INTERNAL_DEBUG_ENABLED}>
-                  Download JSON
-                </button>
-                <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" onClick={() => onDownloadDebug("txt")} disabled={!INTERNAL_DEBUG_ENABLED}>
-                  Download TXT
-                </button>
                 <label className="flex items-center gap-2 rounded-xl border border-linen bg-paper px-3 py-2 text-xs font-semibold text-taupe">
                   <input
                     type="checkbox"
@@ -3525,7 +3778,6 @@ function SettingsDialog({
                   />
                   Include low-confidence ZIP images
                 </label>
-                {debugCopyStatus ? <span className="self-center text-xs text-taupe">{debugCopyStatus}</span> : null}
               </div>
             </div>
           </details>
@@ -3669,6 +3921,81 @@ function ThemePreviewCard({
       </div>
       <div className="mt-2 text-xs font-semibold text-charcoal">{label}</div>
     </button>
+  );
+}
+
+function ProductImageLightbox({ preview, onClose }: { preview: ImagePreviewState; onClose: () => void }) {
+  const [zoomed, setZoomed] = useState(false);
+  const [detectedResolution, setDetectedResolution] = useState(preview.resolution);
+  const resolution = detectedResolution || preview.resolution || "Resolution unavailable";
+
+  return (
+    <div className="image-lightbox-overlay fixed inset-0 z-50 grid place-items-center bg-black/70 px-4 py-6" onClick={onClose}>
+      <div className="image-lightbox-panel max-h-[90vh] w-full max-w-5xl overflow-hidden rounded-2xl border border-linen bg-paper shadow-xl" onClick={(event) => event.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4 border-b border-linen p-4">
+          <div className="min-w-0">
+            <div className="truncate text-sm font-semibold text-charcoal">{preview.productName}</div>
+            <div className="mt-1 truncate text-xs text-taupe">
+              {[preview.sourceLabel, preview.sourceDomain, resolution].filter(Boolean).join(" · ") || "Product image"}
+            </div>
+          </div>
+          <button type="button" className="btn-secondary inline-flex h-9 w-9 items-center justify-center rounded-xl" onClick={onClose} aria-label="Close image preview">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="grid gap-4 p-4">
+          <button
+            type="button"
+            className={`grid max-h-[65vh] place-items-center overflow-auto rounded-xl bg-ivory ${zoomed ? "cursor-zoom-out" : "cursor-zoom-in"}`}
+            onClick={() => setZoomed((current) => !current)}
+            aria-label={zoomed ? "Zoom out product image" : "Zoom in product image"}
+          >
+            <img
+              src={preview.url}
+              alt={preview.productName}
+              className={`transition-transform duration-200 ${zoomed ? "max-h-none w-auto max-w-none scale-125" : "max-h-[65vh] w-full object-contain"}`}
+              onLoad={(event) => {
+                const image = event.currentTarget;
+                if (image.naturalWidth && image.naturalHeight) {
+                  setDetectedResolution(`${image.naturalWidth} x ${image.naturalHeight} px`);
+                }
+              }}
+            />
+          </button>
+          <div className="grid gap-3 rounded-xl border border-linen bg-ivory/35 p-3 text-xs text-taupe sm:grid-cols-3">
+            <div className="min-w-0">
+              <div className="font-semibold uppercase text-charcoal/55">Website</div>
+              <div className="mt-1 truncate text-charcoal">{preview.sourceDomain || domainFromUrl(preview.url) || "Unknown"}</div>
+            </div>
+            <div className="min-w-0">
+              <div className="font-semibold uppercase text-charcoal/55">Source</div>
+              <div className="mt-1 truncate text-charcoal">{preview.sourceLabel || "Product image"}</div>
+            </div>
+            <div className="min-w-0">
+              <div className="font-semibold uppercase text-charcoal/55">Resolution</div>
+              <div className="mt-1 truncate text-charcoal">{resolution}</div>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-taupe">
+            <span className="min-w-0 flex-1 truncate">{preview.url}</span>
+            <div className="flex flex-wrap gap-2">
+              <button type="button" className="btn-secondary inline-flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold" onClick={() => setZoomed((current) => !current)}>
+                <Maximize2 className="h-3.5 w-3.5" />
+                {zoomed ? "Fit image" : "Zoom image"}
+              </button>
+              <a className="btn-secondary inline-flex h-9 items-center rounded-xl px-3 text-xs font-semibold" href={preview.url} target="_blank" rel="noreferrer">
+                Open image in new tab
+              </a>
+            {preview.sourcePage ? (
+              <a className="btn-secondary inline-flex h-9 items-center rounded-xl px-3 text-xs font-semibold" href={preview.sourcePage} target="_blank" rel="noreferrer">
+                Open source page
+              </a>
+            ) : null}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

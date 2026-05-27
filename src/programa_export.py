@@ -41,7 +41,8 @@ import pandas as pd
 from PIL import Image, ImageOps
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as OpenPyXLImage
-from openpyxl.styles import Alignment
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 from src.dimensions import extract_labeled_dimensions, has_complete_3d_dimensions
 from src.image_presence import image_filename, local_image_path, row_has_image
@@ -729,10 +730,31 @@ def _dedupe_export_filename(
 
 
 def export_programa_xlsx(df: pd.DataFrame) -> bytes:
-    """Serialize a Programa import DataFrame to XLSX bytes."""
+    """Serialize a Programa import DataFrame to native XLSX workbook bytes."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Programa Import")
+        ws = writer.book["Programa Import"]
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
+        header_fill = PatternFill(fill_type="solid", fgColor="F7F4EF")
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+        # Keep the export lightweight while making it comfortable to review in Excel.
+        for idx, column_name in enumerate(df.columns, start=1):
+            values = [_str_val(column_name)]
+            if not df.empty:
+                values.extend(_str_val(value) for value in df.iloc[:, idx - 1].tolist()[:200])
+            max_len = max((len(value) for value in values), default=10)
+            ws.column_dimensions[get_column_letter(idx)].width = min(60, max(10, max_len + 2))
     return buf.getvalue()
 
 
