@@ -72,15 +72,23 @@ def budget_for_mode(
     item_key: str = "",
 ) -> ProductLookupBudget:
     """Create a ProductLookupBudget for the given enrichment mode, respecting env overrides."""
-    limits = _MODE_LIMITS[normalize_mode(mode)]
+    mode_name = normalize_mode(mode)
+    limits = _MODE_LIMITS[mode_name]
     env_searches = os.getenv("BRAVE_MAX_SEARCHES_PER_PRODUCT")
     env_urls = os.getenv("ENRICHMENT_MAX_URLS_PER_PRODUCT")
     env_ai_calls = os.getenv("ENRICHMENT_MAX_AI_CALLS_PER_PRODUCT")
+    max_searches = int(env_searches) if env_searches else limits["max_searches"]
+    max_urls = int(env_urls) if env_urls else limits["max_urls"]
+    max_ai_calls = int(env_ai_calls) if env_ai_calls else limits["max_ai_calls"]
+    if mode_name == "fast":
+        max_searches = min(max_searches, limits["max_searches"])
+        max_urls = min(max_urls, limits["max_urls"])
+        max_ai_calls = min(max_ai_calls, limits["max_ai_calls"])
     return ProductLookupBudget(
-        max_searches=int(env_searches) if env_searches else limits["max_searches"],
-        max_urls=int(env_urls) if env_urls else limits["max_urls"],
-        max_ai_calls=int(env_ai_calls) if env_ai_calls else limits["max_ai_calls"],
-        mode=normalize_mode(mode),
+        max_searches=max_searches,
+        max_urls=max_urls,
+        max_ai_calls=max_ai_calls,
+        mode=mode_name,
         allows_retailer=limits["retailer"],
         allows_general_fallback=limits["general_fallback"],
         run_budget=run_budget,

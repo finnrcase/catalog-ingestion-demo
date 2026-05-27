@@ -7,6 +7,7 @@ from src.spec_extraction import (
     extract_dimensions_from_pdf_bytes,
     extract_specs_from_verified_candidate,
 )
+from src.product_page_specs import extract_product_page_specs
 
 
 def test_extract_dimensions_from_jsonld_product_fields():
@@ -27,6 +28,33 @@ def test_extract_dimensions_from_jsonld_product_fields():
 
     assert result.dimensions == '29.875"W x 23.5"D x 11.875"H'
     assert result.confidence == "high"
+
+
+def test_extract_dimensions_from_jsonld_quantitative_values():
+    html = """
+    <script type="application/ld+json">
+    {
+      "@type": "Product",
+      "name": "Sub-Zero ID36R",
+      "sku": "ID36R",
+      "width": {"@type": "QuantitativeValue", "value": "36", "unitCode": "INH"},
+      "height": {"@type": "QuantitativeValue", "value": "84", "unitText": "in"},
+      "depth": {"@type": "QuantitativeValue", "value": "24", "unitText": "in"}
+    }
+    </script>
+    """
+
+    result = extract_dimensions_from_html(html, {"Brand": "Sub-Zero", "Model/SKU": "ID36R"})
+    specs = extract_product_page_specs(
+        html,
+        "https://subzero-wolf.com/products/id36r",
+        {"Brand": "Sub-Zero", "Model/SKU": "ID36R"},
+        official_domain=True,
+        sku_match=True,
+    )
+
+    assert result.dimensions == '36"W x 24"D x 84"H'
+    assert specs.dimensions == '36"W x 24"D x 84"H'
 
 
 def test_extract_separate_width_height_depth_rows_from_table():

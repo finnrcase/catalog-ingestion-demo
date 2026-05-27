@@ -199,6 +199,34 @@ def test_quote_item_grouping_multiple_appliance_items_no_header_rows():
     assert rows[0]["_quote_date"] == "05/20/2026"
 
 
+def test_quote_item_cleanup_model_name_and_warranty_price():
+    lines = [
+        "PC RICHARD APPLIANCE SELECTION",
+        "Project: 1 Lily Pond Lane",
+        "ITEM",
+        "MANUFACTURER",
+        "MODEL",
+        "DESCRIPTION",
+        "COLOR",
+        "QTY",
+        "1",
+        "SUB ZERO",
+        "ID36R",
+        '" FRIDGE DRAWS BAR',
+        "PNL",
+        "1",
+        "5 Years Warranty $129.99",
+    ]
+
+    rows = build_quote_item_rows(lines)
+
+    assert len(rows) == 1
+    assert rows[0]["Product Name"] == "Sub-Zero Refrigerator Drawers"
+    assert rows[0]["Room"] == "Bar"
+    assert rows[0]["Model"] == "ID36R"
+    assert rows[0]["Price"] == ""
+
+
 def test_quote_context_extracts_global_fields_without_items():
     context = extract_quote_context([
         "PC RICHARD APPLIANCE SELECTION",

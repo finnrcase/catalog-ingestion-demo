@@ -24,6 +24,8 @@ _MODEL_LABEL_RE = re.compile(
 )
 _MODEL_TOKEN_RE = re.compile(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9][A-Za-z0-9./_-]{3,}")
 _PRICE_RE = re.compile(r"\$[\d,]+(?:\.\d{2})?|\b\d{1,6}\.\d{2}\b")
+_PRICE_SKIP_RE = re.compile(r"\b(?:warranty|protection|service\s*plan|extended\s*service|years?)\b", re.IGNORECASE)
+_PRICE_LABEL_RE = re.compile(r"\b(?:price|unit\s*price|ext(?:ended)?\s*price|amount|subtotal|total)\b", re.IGNORECASE)
 _DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}")
 _PHONE_RE = re.compile(r"(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}")
@@ -265,7 +267,7 @@ def _row_from_group(group: ItemGroup, context: QuoteContext, *, fallback_room: s
     if not model and not _strong_description(description):
         return None
 
-    product_name = _product_name(brand, description, model)
+    product_name = _clean_product_name(_product_name(brand, description, model), brand=brand, model=model, room=inferred_room)
     row = make_base_row(
         project=context.project,
         room=inferred_room,
@@ -277,6 +279,7 @@ def _row_from_group(group: ItemGroup, context: QuoteContext, *, fallback_room: s
             "Product Name": product_name,
             "Brand": brand,
             "Model/SKU": model,
+            "Model": model,
             "Finish / Color": finish,
             "Color": finish,
             "Product Category": context.category or ("Appliances" if brand else ""),
@@ -396,8 +399,27 @@ def _extract_finish(lines: list[str]) -> str:
 
 
 def _extract_price(text: str) -> str:
-    match = _PRICE_RE.search(text)
-    return match.group(0) if match else ""
+    candidates: list[tuple[bool, float, str]] = []
+    for line in str(text or "").splitlines():
+        cleaned = _tidy_text(line)
+        if not cleaned or _PRICE_SKIP_RE.search(cleaned):
+            continue
+        labelled = bool(_PRICE_LABEL_RE.search(cleaned))
+        for match in _PRICE_RE.finditer(cleaned):
+            raw = match.group(0)
+            candidates.append((labelled, _price_amount(raw), raw))
+    if not candidates:
+        return ""
+    labelled_candidates = [candidate for candidate in candidates if candidate[0]]
+    pool = labelled_candidates or candidates
+    return max(pool, key=lambda candidate: candidate[1])[2]
+
+
+def _price_amount(raw: str) -> float:
+    try:
+        return float(re.sub(r"[^0-9.]", "", raw))
+    except ValueError:
+        return 0.0
 
 
 def _extract_quantity_from_group(lines: list[str], item_number: str) -> int:
@@ -478,12 +500,33 @@ def _product_name(brand: str, description: str, model: str) -> str:
     return model
 
 
+def _clean_product_name(name: str, *, brand: str, model: str, room: str) -> str:
+    cleaned = _tidy_text(str(name or "").replace('"', " "))
+    if brand and not re.search(rf"\b{re.escape(brand)}\b", cleaned, re.IGNORECASE):
+        cleaned = f"{brand} {cleaned}".strip()
+    cleaned = re.sub(r"\bfridge\b", "Refrigerator", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bdraws\b", "Drawers", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bdraw\b", "Drawer", cleaned, flags=re.IGNORECASE)
+    if room:
+        room_token = re.escape(room.split("'")[0])
+        cleaned = re.sub(rf"\s+\b{room_token}\b$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = _tidy_text(cleaned.strip(" -,:;"))
+    return _title(cleaned)
+
+
 def _title(text: str) -> str:
     keep_upper = {"GE", "LED", "SS"}
+    keep_case = {
+        "sub-zero": "Sub-Zero",
+        "jennair": "JennAir",
+        "kitchenaid": "KitchenAid",
+    }
     words = []
     for word in _tidy_text(text).split():
         stripped = word.strip()
-        if stripped.upper() in keep_upper or (re.fullmatch(r"[A-Z0-9./_-]{4,}", stripped) and re.search(r"\d", stripped)):
+        if stripped.lower() in keep_case:
+            words.append(keep_case[stripped.lower()])
+        elif stripped.upper() in keep_upper or (re.fullmatch(r"[A-Z0-9./_-]{4,}", stripped) and re.search(r"\d", stripped)):
             words.append(stripped.upper())
         else:
             words.append(stripped[:1].upper() + stripped[1:].lower())

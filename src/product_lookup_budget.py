@@ -10,10 +10,10 @@ _RUN_MODE_LIMITS = {
     "fast": {
         "target_budget_usd": 0.10,
         "hard_budget_usd": 0.25,
-        "max_ai_calls": 3,
-        "max_external_lookups": 25,
-        "max_image_searches": 5,
-        "max_retries": 5,
+        "max_ai_calls": 1,
+        "max_external_lookups": 12,
+        "max_image_searches": 3,
+        "max_retries": 3,
     },
     "standard": {
         "target_budget_usd": 0.25,
@@ -84,15 +84,32 @@ def _normalise_mode(mode: str) -> str:
     return mode if mode in _RUN_MODE_LIMITS else "fast"
 
 
+def _provider_for_kind(kind: str) -> str:
+    if kind in {"search", "image_search"}:
+        return "brave"
+    if kind == "ai":
+        return "ai"
+    if kind in {"fetch", "external_lookup"}:
+        return "page_fetch"
+    return kind or "unknown"
+
+
+def _is_broad_query(query: str) -> bool:
+    text = str(query or "").lower()
+    if not text:
+        return False
+    return "site:" not in text and "official product page" not in text
+
+
 @dataclass
 class EnrichmentRunBudget:
     mode: str = "fast"
     target_budget_usd: float = 0.10
     hard_budget_usd: float = 0.25
-    max_ai_calls: int = 3
-    max_external_lookups: int = 25
-    max_image_searches: int = 5
-    max_retries: int = 5
+    max_ai_calls: int = 1
+    max_external_lookups: int = 12
+    max_image_searches: int = 3
+    max_retries: int = 3
     search_cost_usd: float = 0.003
     fetch_cost_usd: float = 0.0005
     ai_call_cost_usd: float = 0.03
@@ -108,9 +125,31 @@ class EnrichmentRunBudget:
     paid_call_reasons: list[dict] = field(default_factory=list)
     stage_costs: dict[str, float] = field(default_factory=dict)
     item_costs: dict[str, float] = field(default_factory=dict)
+    provider_costs: dict[str, float] = field(default_factory=dict)
+    field_costs: dict[str, float] = field(default_factory=dict)
+    broad_searches_used: int = 0
+    brave_calls: list[dict] = field(default_factory=list)
 
     def remaining_budget_usd(self) -> float:
         return max(0.0, self.hard_budget_usd - self.estimated_cost_usd)
+
+    def can_start_paid_lookup(
+        self,
+        *,
+        item_key: str = "",
+        field: str = "",
+        reason: str = "",
+        cost_usd: float | None = None,
+    ) -> bool:
+        """Cheap pre-flight for an item before starting live lookup work."""
+        return self.can_spend(
+            "external_lookup",
+            self.search_cost_usd if cost_usd is None else cost_usd,
+            item_key=item_key,
+            field=field,
+            reason=reason or "pre-flight paid lookup budget check",
+            record_skip=False,
+        )
 
     def _limit_reached(self, kind: str) -> str:
         if kind in {"search", "fetch", "external_lookup"} and self.external_lookups_used >= self.max_external_lookups:
@@ -132,15 +171,16 @@ class EnrichmentRunBudget:
         field: str = "",
         reason: str = "",
         record_skip: bool = True,
+        query: str = "",
     ) -> bool:
         limit_reason = self._limit_reached(kind)
         if limit_reason:
             if record_skip:
-                self.record_skip(kind, cost_usd, item_key=item_key, field=field, reason=limit_reason)
+                self.record_skip(kind, cost_usd, item_key=item_key, field=field, reason=limit_reason, query=query)
             return False
         if self.estimated_cost_usd + cost_usd > self.hard_budget_usd:
             if record_skip:
-                self.record_skip(kind, cost_usd, item_key=item_key, field=field, reason="hard budget exceeded")
+                self.record_skip(kind, cost_usd, item_key=item_key, field=field, reason="hard budget exceeded", query=query)
             return False
         return True
 
@@ -152,17 +192,23 @@ class EnrichmentRunBudget:
         item_key: str = "",
         field: str = "",
         reason: str = "",
+        query: str = "",
     ) -> None:
         record = {
             "kind": kind,
+            "provider": _provider_for_kind(kind),
             "estimated_cost_usd": round(float(cost_usd), 6),
             "item_key": item_key,
             "field": field,
+            "query": query,
             "reason": reason or "budget limit",
+            "status": "skipped",
         }
         self.skipped_calls.append(record)
         if field:
             self.skipped_fields.append(record)
+        if record["provider"] == "brave":
+            self.brave_calls.append(record)
 
     def consume(
         self,
@@ -173,8 +219,9 @@ class EnrichmentRunBudget:
         field: str = "",
         reason: str = "",
         stage: str = "",
+        query: str = "",
     ) -> bool:
-        if not self.can_spend(kind, cost_usd, item_key=item_key, field=field, reason=reason):
+        if not self.can_spend(kind, cost_usd, item_key=item_key, field=field, reason=reason, query=query):
             return False
         self.estimated_cost_usd += cost_usd
         if kind in {"search", "fetch", "external_lookup"}:
@@ -186,17 +233,38 @@ class EnrichmentRunBudget:
         elif kind == "retry":
             self.retries_used += 1
         stage_key = stage or kind
+        if stage_key == "broad_search":
+            self.broad_searches_used += 1
         self.stage_costs[stage_key] = round(self.stage_costs.get(stage_key, 0.0) + cost_usd, 6)
         if item_key:
             self.item_costs[item_key] = round(self.item_costs.get(item_key, 0.0) + cost_usd, 6)
+        provider = _provider_for_kind(kind)
+        self.provider_costs[provider] = round(self.provider_costs.get(provider, 0.0) + cost_usd, 6)
+        if field:
+            self.field_costs[field] = round(self.field_costs.get(field, 0.0) + cost_usd, 6)
         self.paid_call_reasons.append({
             "kind": kind,
             "stage": stage_key,
+            "provider": provider,
             "item_key": item_key,
             "field": field,
+            "query": query,
             "reason": reason,
             "estimated_cost_usd": round(cost_usd, 6),
+            "status": "called",
         })
+        if provider == "brave":
+            self.brave_calls.append({
+                "kind": kind,
+                "stage": stage_key,
+                "provider": provider,
+                "item_key": item_key,
+                "field": field,
+                "query": query,
+                "reason": reason,
+                "estimated_cost_usd": round(cost_usd, 6),
+                "status": "called",
+            })
         return True
 
     def diagnostics(self) -> dict:
@@ -214,6 +282,7 @@ class EnrichmentRunBudget:
             "external_lookups_limit": self.max_external_lookups,
             "image_searches": self.image_searches_used,
             "image_searches_limit": self.max_image_searches,
+            "broad_searches": self.broad_searches_used,
             "ai_calls": self.ai_calls_used,
             "ai_calls_limit": self.max_ai_calls,
             "retries": self.retries_used,
@@ -222,6 +291,11 @@ class EnrichmentRunBudget:
             "skipped_calls": self.skipped_calls[-25:],
             "skipped_fields_due_budget": self.skipped_fields[-25:],
             "cost_by_stage": self.stage_costs,
+            "cost_by_provider": self.provider_costs,
+            "cost_by_field": self.field_costs,
+            "brave_cost_usd": round(self.provider_costs.get("brave", 0.0), 4),
+            "brave_searches": sum(1 for call in self.brave_calls if call.get("status") == "called"),
+            "brave_calls": self.brave_calls[-50:],
             "cost_by_item": self.item_costs,
             "most_expensive_item": most_expensive_item,
             "most_expensive_item_cost_usd": round(most_expensive_item_cost, 4),
@@ -232,10 +306,15 @@ class EnrichmentRunBudget:
 def run_budget_for_mode(mode: str) -> EnrichmentRunBudget:
     mode = _normalise_mode(mode)
     limits = dict(_RUN_MODE_LIMITS[mode])
+    target_budget = _mode_float_env(mode, "TARGET_BUDGET_USD", limits["target_budget_usd"])
+    hard_budget = _mode_float_env(mode, "HARD_BUDGET_USD", limits["hard_budget_usd"])
+    if mode == "fast":
+        target_budget = min(target_budget, 0.10)
+        hard_budget = min(hard_budget, 0.25)
     return EnrichmentRunBudget(
         mode=mode,
-        target_budget_usd=_mode_float_env(mode, "TARGET_BUDGET_USD", limits["target_budget_usd"]),
-        hard_budget_usd=_mode_float_env(mode, "HARD_BUDGET_USD", limits["hard_budget_usd"]),
+        target_budget_usd=target_budget,
+        hard_budget_usd=hard_budget,
         max_ai_calls=_mode_int_env(mode, "MAX_AI_CALLS_PER_UPLOAD", limits["max_ai_calls"]),
         max_external_lookups=_mode_int_env(mode, "MAX_EXTERNAL_LOOKUPS_PER_UPLOAD", limits["max_external_lookups"]),
         max_image_searches=_mode_int_env(mode, "MAX_IMAGE_SEARCHES_PER_UPLOAD", limits["max_image_searches"]),
@@ -336,7 +415,7 @@ class ProductLookupBudget:
     def urls_used(self, value: int) -> None:
         self.page_fetches_used = int(value)
 
-    def can_search(self) -> bool:
+    def can_search(self, *, query: str = "", field: str = "Product URL", reason: str = "product search") -> bool:
         allowed = self.brave_searches_used < self.brave_searches_limit
         if not allowed and not self.stopped_reason:
             self.stopped_reason = "search budget exhausted"
@@ -345,11 +424,21 @@ class ProductLookupBudget:
                 "search",
                 self.run_budget.search_cost_usd,
                 item_key=self.item_key,
-                field="Product URL",
-                reason="product search",
+                field=field,
+                reason=reason,
+                query=query,
             )
             if not allowed and not self.stopped_reason:
                 self.stopped_reason = "run budget exhausted"
+        elif not allowed and self.run_budget is not None:
+            self.run_budget.record_skip(
+                "search",
+                self.run_budget.search_cost_usd,
+                item_key=self.item_key,
+                field=field,
+                query=query,
+                reason=self.stopped_reason or "search budget exhausted",
+            )
         return allowed
 
     def can_fetch(self) -> bool:
@@ -384,18 +473,21 @@ class ProductLookupBudget:
                 self.stopped_reason = "run budget exhausted"
         return allowed
 
-    def consume_search(self) -> None:
-        if not self.can_search():
+    def consume_search(self, *, query: str = "", field: str = "Product URL", reason: str = "product search") -> None:
+        if not self.can_search(query=query, field=field, reason=reason):
             return
         self.brave_searches_used += 1
         if self.run_budget is not None:
+            stage = "broad_search" if _is_broad_query(query) else "search"
+            call_reason = f"{reason}: {query}" if query else reason
             self.run_budget.consume(
                 "search",
                 self.run_budget.search_cost_usd,
                 item_key=self.item_key,
-                field="Product URL",
-                reason="product search",
-                stage="search",
+                field=field,
+                reason=call_reason,
+                stage=stage,
+                query=query,
             )
 
     def consume_fetch(self) -> None:
@@ -448,6 +540,8 @@ class ProductLookupBudget:
                 "run_estimated_cost_usd": round(self.run_budget.estimated_cost_usd, 4),
                 "run_target_budget_usd": round(self.run_budget.target_budget_usd, 4),
                 "run_hard_budget_usd": round(self.run_budget.hard_budget_usd, 4),
+                "run_brave_cost_usd": round(self.run_budget.provider_costs.get("brave", 0.0), 4),
+                "run_brave_searches": sum(1 for call in self.run_budget.brave_calls if call.get("status") == "called"),
                 "run_external_lookups": self.run_budget.external_lookups_used,
                 "run_ai_calls": self.run_budget.ai_calls_used,
             })

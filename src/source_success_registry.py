@@ -20,18 +20,178 @@ from src.product_evidence import normalize_brand, normalize_sku
 DATA_DIR = Path("data")
 DEFAULT_REGISTRY_PATH = DATA_DIR / "source_success_registry.json"
 
+APPLIANCE_SOURCE_DOMAINS = [
+    "subzero-wolf.com",
+    "ca.subzero-wolf.com",
+    "scotsman-ice.com",
+    "mieleusa.com",
+    "miele.com",
+    "bosch-home.com",
+    "geappliances.com",
+    "fisherpaykel.com",
+    "lynxgrills.com",
+    "thermador.com",
+    "jennair.com",
+    "kitchenaid.com",
+    "monogram.com",
+    "vikingrange.com",
+    "dacor.com",
+    "samsung.com",
+    "lg.com",
+    "whirlpool.com",
+    "frigidaire.com",
+    "electrolux.com",
+    "sharpusa.com",
+    "zephyronline.com",
+    "broan-nutone.com",
+    "bestrangehoods.com",
+    "faberspa.com",
+    "home.hestan.com",
+]
+LIGHTING_SOURCE_DOMAINS = [
+    "visualcomfort.com",
+    "circalighting.com",
+    "arteriorshome.com",
+    "lumens.com",
+    "rejuvenation.com",
+    "shadesoflight.com",
+    "schoolhouse.com",
+    "hudsonvalleylighting.com",
+    "techlighting.com",
+]
+PLUMBING_BATH_SOURCE_DOMAINS = [
+    "kohler.com",
+    "waterworks.com",
+    "rohlhome.com",
+    "houseofrohl.com",
+    "brizo.com",
+    "deltafaucet.com",
+    "moen.com",
+    "hansgrohe-usa.com",
+    "grohe.us",
+    "toto.com",
+    "duravit.us",
+    "build.com",
+    "ferguson.com",
+]
+FURNITURE_DECOR_SOURCE_DOMAINS = [
+    "rh.com",
+    "potterybarn.com",
+    "westelm.com",
+    "crateandbarrel.com",
+    "cb2.com",
+    "perigold.com",
+    "wayfair.com",
+    "serenaandlily.com",
+    "mcgeeandco.com",
+    "rejuvenation.com",
+    "anthropologie.com",
+    "arhaus.com",
+    "fourhands.com",
+    "bernhardt.com",
+    "visualcomfort.com",
+]
+TILE_SURFACES_HARDWARE_SOURCE_DOMAINS = [
+    "annesacks.com",
+    "fireclaytile.com",
+    "bedrosians.com",
+    "daltile.com",
+    "cletile.com",
+    "waterworks.com",
+    "emtek.com",
+    "baldwinhardware.com",
+    "topknobs.com",
+    "rejuvenation.com",
+]
+
+CATEGORY_SOURCE_HINTS: dict[str, list[str]] = {
+    "appliances": APPLIANCE_SOURCE_DOMAINS,
+    "appliance": APPLIANCE_SOURCE_DOMAINS,
+    "lighting": LIGHTING_SOURCE_DOMAINS,
+    "plumbing": PLUMBING_BATH_SOURCE_DOMAINS,
+    "bath": PLUMBING_BATH_SOURCE_DOMAINS,
+    "bathroom": PLUMBING_BATH_SOURCE_DOMAINS,
+    "furniture": FURNITURE_DECOR_SOURCE_DOMAINS,
+    "decor": FURNITURE_DECOR_SOURCE_DOMAINS,
+    "accessories": FURNITURE_DECOR_SOURCE_DOMAINS,
+    "tile": TILE_SURFACES_HARDWARE_SOURCE_DOMAINS,
+    "stone tile": TILE_SURFACES_HARDWARE_SOURCE_DOMAINS,
+    "surfaces": TILE_SURFACES_HARDWARE_SOURCE_DOMAINS,
+    "hardware": TILE_SURFACES_HARDWARE_SOURCE_DOMAINS,
+}
+
 BRAND_SOURCE_HINTS: dict[str, list[str]] = {
-    "sub zero": ["subzero-wolf.com"],
-    "subzero": ["subzero-wolf.com"],
-    "wolf": ["subzero-wolf.com", "wolfappliance.com"],
+    "sub zero": ["subzero-wolf.com", "ca.subzero-wolf.com"],
+    "subzero": ["subzero-wolf.com", "ca.subzero-wolf.com"],
+    "wolf": ["subzero-wolf.com", "ca.subzero-wolf.com"],
+    "scotsman": ["scotsman-ice.com"],
     "miele": ["mieleusa.com", "miele.com"],
-    "bosch": ["bosch-home.com/us", "bosch-home.com"],
+    "bosch": ["bosch-home.com", "bosch-home.com/us"],
     "ge": ["geappliances.com"],
     "ge appliances": ["geappliances.com"],
-    "scotsman": ["scotsman-ice.com"],
     "fisher paykel": ["fisherpaykel.com"],
     "fisher & paykel": ["fisherpaykel.com"],
     "lynx": ["lynxgrills.com"],
+    "thermador": ["thermador.com"],
+    "jennair": ["jennair.com"],
+    "kitchenaid": ["kitchenaid.com"],
+    "monogram": ["monogram.com"],
+    "viking": ["vikingrange.com"],
+    "viking range": ["vikingrange.com"],
+    "dacor": ["dacor.com"],
+    "samsung": ["samsung.com"],
+    "lg": ["lg.com"],
+    "whirlpool": ["whirlpool.com"],
+    "frigidaire": ["frigidaire.com"],
+    "electrolux": ["electrolux.com"],
+    "sharp": ["sharpusa.com"],
+    "zephyr": ["zephyronline.com"],
+    "broan": ["broan-nutone.com"],
+    "broan nutone": ["broan-nutone.com"],
+    "best": ["bestrangehoods.com"],
+    "faber": ["faberspa.com"],
+    "hestan": ["home.hestan.com"],
+    "visual comfort": ["visualcomfort.com"],
+    "circa lighting": ["circalighting.com", "visualcomfort.com"],
+    "arteriors": ["arteriorshome.com"],
+    "hudson valley": ["hudsonvalleylighting.com"],
+    "tech lighting": ["techlighting.com"],
+    "kohler": ["kohler.com"],
+    "waterworks": ["waterworks.com"],
+    "rohl": ["rohlhome.com", "houseofrohl.com"],
+    "brizo": ["brizo.com"],
+    "delta": ["deltafaucet.com"],
+    "moen": ["moen.com"],
+    "hansgrohe": ["hansgrohe-usa.com"],
+    "grohe": ["grohe.us"],
+    "toto": ["toto.com"],
+    "duravit": ["duravit.us"],
+    "rh": ["rh.com"],
+    "restoration hardware": ["rh.com"],
+    "pottery barn": ["potterybarn.com"],
+    "west elm": ["westelm.com"],
+    "crate and barrel": ["crateandbarrel.com"],
+    "crate barrel": ["crateandbarrel.com"],
+    "cb2": ["cb2.com"],
+    "perigold": ["perigold.com"],
+    "wayfair": ["wayfair.com"],
+    "serena and lily": ["serenaandlily.com"],
+    "mcgee": ["mcgeeandco.com"],
+    "mcgee co": ["mcgeeandco.com"],
+    "anthropologie": ["anthropologie.com"],
+    "arhaus": ["arhaus.com"],
+    "four hands": ["fourhands.com"],
+    "bernhardt": ["bernhardt.com"],
+    "annsacks": ["annesacks.com"],
+    "ann sacks": ["annesacks.com"],
+    "fireclay": ["fireclaytile.com"],
+    "bedrosians": ["bedrosians.com"],
+    "daltile": ["daltile.com"],
+    "cle tile": ["cletile.com"],
+    "cletile": ["cletile.com"],
+    "emtek": ["emtek.com"],
+    "baldwin": ["baldwinhardware.com"],
+    "top knobs": ["topknobs.com"],
 }
 
 _MARKETPLACE_OR_SOCIAL = (
@@ -95,6 +255,8 @@ def preferred_source_domains_for_row(row: dict, path: str | Path | None = None) 
 
     for domain in brand_source_hints(row.get("Brand")):
         scored.setdefault(domain, 3)
+    for domain in category_source_hints(row.get("Product Category") or row.get("Section")):
+        scored.setdefault(domain, 1)
 
     return [
         domain
@@ -112,6 +274,19 @@ def brand_source_hints(brand: object) -> list[str]:
         compact = brand_key.replace(" ", "")
         for key, value in BRAND_SOURCE_HINTS.items():
             if key.replace(" ", "") == compact:
+                hints = value
+                break
+    return _dedupe_domains(hints or [])
+
+
+def category_source_hints(category: object) -> list[str]:
+    category_key = _normalise_category_text(category)
+    if not category_key:
+        return []
+    hints = CATEGORY_SOURCE_HINTS.get(category_key)
+    if not hints:
+        for key, value in CATEGORY_SOURCE_HINTS.items():
+            if key in category_key or category_key in key:
                 hints = value
                 break
     return _dedupe_domains(hints or [])
@@ -259,7 +434,11 @@ def _sku_key(row: dict) -> str:
 
 
 def _category_key(row: dict) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", str(row.get("Product Category") or "").lower()).strip()
+    return _normalise_category_text(row.get("Product Category") or row.get("Section"))
+
+
+def _normalise_category_text(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
 
 
 def _domain_from_url(url: str) -> str:

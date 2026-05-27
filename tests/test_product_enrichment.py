@@ -1602,3 +1602,69 @@ def test_manufacturer_page_does_not_overwrite_pdf_values_without_exact_sku(monke
     assert updated["Model/SKU"] == "TOB 1234"
     assert updated["Finish / Color"] == "PDF Bronze"
     assert updated["manufacturer_page_exact_sku"] is False
+
+
+def test_cloudinary_upload_replaces_verified_candidate_image_url(monkeypatch):
+    import src.product_enrichment as pe
+    from src.image_uploader import ImageUploadResult
+
+    monkeypatch.setattr(
+        pe,
+        "fetch_convert_upload_remote_image",
+        lambda url, source_type="": ImageUploadResult(
+            secure_url="https://res.cloudinary.com/demo/image/upload/wolf.jpg",
+            public_id="sch/wolf",
+            width=900,
+            height=700,
+            format="jpg",
+            bytes=12345,
+            status="uploaded",
+            debug={"candidate_url": url, "source_type": source_type, "final_saved_image_url": "https://res.cloudinary.com/demo/image/upload/wolf.jpg"},
+        ),
+    )
+    row = {
+        "Image URL": "https://subzero-wolf.com/images/mdd30ts.webp",
+        "image_source": "official_site_json_ld",
+    }
+    debug = {}
+
+    pe._maybe_upload_selected_image_to_cloudinary(
+        row,
+        debug,
+        candidate_url="https://subzero-wolf.com/images/mdd30ts.webp",
+        source_type="official_site_json_ld",
+    )
+
+    assert row["Image URL"] == "https://res.cloudinary.com/demo/image/upload/wolf.jpg"
+    assert row["Original Image URL"] == "https://subzero-wolf.com/images/mdd30ts.webp"
+    assert row["cloudinary_public_id"] == "sch/wolf"
+    assert row["image_upload_status"] == "uploaded"
+    assert debug["selected_image_url"] == "https://res.cloudinary.com/demo/image/upload/wolf.jpg"
+
+
+def test_cloudinary_upload_failure_keeps_original_candidate_image_url(monkeypatch):
+    import src.product_enrichment as pe
+    from src.image_uploader import ImageUploadResult
+
+    monkeypatch.setattr(
+        pe,
+        "fetch_convert_upload_remote_image",
+        lambda url, source_type="": ImageUploadResult(status="failed", error="fetch_failed:403", debug={"candidate_url": url}),
+    )
+    row = {
+        "Image URL": "https://subzero-wolf.com/images/mdd30ts.webp",
+        "image_source": "official_site_json_ld",
+    }
+    debug = {}
+
+    pe._maybe_upload_selected_image_to_cloudinary(
+        row,
+        debug,
+        candidate_url="https://subzero-wolf.com/images/mdd30ts.webp",
+        source_type="official_site_json_ld",
+    )
+
+    assert row["Image URL"] == "https://subzero-wolf.com/images/mdd30ts.webp"
+    assert row["image_upload_status"] == "failed"
+    assert row["image_upload_failure_reason"] == "fetch_failed:403"
+    assert debug["image_upload_failure_reason"] == "fetch_failed:403"

@@ -53,12 +53,20 @@ def _brave_search_urls(
     if session_cache is not None and query in session_cache.queries:
         return [r.url for r in session_cache.queries[query][:limit]]
     # Budget check before real API call
-    if budget is not None and not budget.can_search():
-        return []
+    if budget is not None:
+        try:
+            can_search = budget.can_search(query=query, field="Dimensions", reason="dimension lookup search")
+        except TypeError:
+            can_search = budget.can_search()
+        if not can_search:
+            return []
     try:
         results = _brave_candidates(query, brand, session_cache=session_cache)
         if budget is not None:
-            budget.consume_search()
+            try:
+                budget.consume_search(query=query, field="Dimensions", reason="dimension lookup search")
+            except TypeError:
+                budget.consume_search()
         return [r.url for r in results[:limit]]
     except Exception:
         return []

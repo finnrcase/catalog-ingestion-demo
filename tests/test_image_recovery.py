@@ -779,6 +779,27 @@ def test_dataframe_recovery_skips_high_confidence_rows(tmp_path):
     assert m.call_count == 1
 
 
+def test_dataframe_recovery_limits_product_page_image_fetches_in_fast_mode(tmp_path):
+    df = pd.DataFrame([
+        {"Product Name": "One", "Brand": "Wolf", "Model/SKU": "A1", "Image URL": "", "Product URL": "https://wolf.example/a1"},
+        {"Product Name": "Two", "Brand": "Wolf", "Model/SKU": "A2", "Image URL": "", "Product URL": "https://wolf.example/a2"},
+        {"Product Name": "Three", "Brand": "Wolf", "Model/SKU": "A3", "Image URL": "", "Product URL": "https://wolf.example/a3"},
+    ])
+
+    with patch("src.image_recovery.recover_image_for_row") as m:
+        m.return_value = ImageRecoveryResult(confidence="NONE", image_source="none", error="missing")
+        recover_images_for_dataframe(
+            df,
+            pdf_lookup=None,
+            session_id="testsess",
+            enable_screenshot=False,
+            enable_web_lookup=False,
+            max_product_page_fetches=1,
+        )
+
+    assert [call.kwargs["enable_product_page"] for call in m.call_args_list] == [True, False, False]
+
+
 def test_dataframe_recovery_skips_manual_uploaded_image_rows(tmp_path):
     df = pd.DataFrame([
         {

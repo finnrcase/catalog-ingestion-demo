@@ -460,6 +460,7 @@ from src.programa_export import (
     build_programa_debug_dataframe,
     export_programa_csv,
     export_programa_xlsx,
+    generate_programa_export_filename,
     PROGRAMA_COLUMNS,
     CANONICAL_SECTIONS,
     _DEBUG_EXTRA_COLUMNS,
@@ -512,6 +513,36 @@ def test_section_normalization_maps_legacy_categories_to_canonical_sections():
     assert normalize_section("Stone/Tile") == "Flooring"
     assert normalize_section("Accessories") == "Decor"
     assert normalize_section("Totally Custom One-Off") == "General"
+
+
+def test_generate_programa_export_filename_uses_project_supplier_category_and_date():
+    rows = _make_rows([
+        {
+            "Project": "1 Lily Pond Lane",
+            "Supplier": "PC Richard",
+            "Product Category": "Appliances",
+        }
+    ])
+
+    filename = generate_programa_export_filename(rows, today="2026-05-26")
+
+    assert filename == "1_Lily_Pond_Lane_PC_Richard_Appliances_Programa_Import_2026-05-26.csv"
+
+
+def test_generate_programa_export_filename_dedupes_and_trims():
+    rows = _make_rows([
+        {
+            "Project": "A" * 140,
+            "Supplier": "PC Richard",
+            "Product Category": "Appliances",
+        }
+    ])
+    first = generate_programa_export_filename(rows, today="2026-05-26", max_length=120)
+    second = generate_programa_export_filename(rows, today="2026-05-26", existing_filenames={first}, max_length=120)
+
+    assert len(first) <= 120
+    assert second.endswith("_v2.csv")
+    assert len(second) <= 120
 
 
 def test_export_contains_only_canonical_sections():
@@ -652,6 +683,25 @@ def test_internal_source_columns_excluded_from_standard_export():
     df = build_programa_import_dataframe(rows)
     assert list(df.columns) == PROGRAMA_COLUMNS
     assert "_source_pdf_id" not in df.columns
+
+
+def test_model_column_uses_canonical_model_without_changing_columns():
+    from src.programa_export import build_programa_import_dataframe, PROGRAMA_COLUMNS
+
+    rows = [{
+        "Include": True,
+        "Product Name": "Refrigerator Drawers",
+        "Brand": "Sub-Zero",
+        "Model/SKU": "RAW-ID36R",
+        "Model": "ID36R",
+        "Quantity": 1,
+    }]
+
+    df = build_programa_import_dataframe(rows)
+
+    assert list(df.columns) == PROGRAMA_COLUMNS
+    assert df.loc[0, "SKU"] == "RAW-ID36R"
+    assert df.loc[0, "Model"] == "ID36R"
 
 
 def test_internal_source_columns_present_in_debug_export():

@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 import datetime
 
 from backend.main import app
+from src.image_uploader import ImageUploadResult
 
 
 client = TestClient(app)
@@ -75,8 +76,16 @@ def test_programa_xlsx_with_images_endpoint_returns_xlsx():
 
 def test_upload_image_endpoint_returns_secure_url(monkeypatch):
     monkeypatch.setattr(
-        "backend.main.upload_image",
-        lambda file: "https://res.cloudinary.com/demo/image/upload/handmade-doll.jpg",
+        "backend.main.upload_image_with_metadata",
+        lambda file: ImageUploadResult(
+            secure_url="https://res.cloudinary.com/demo/image/upload/handmade-doll.jpg",
+            public_id="handmade-doll",
+            width=800,
+            height=600,
+            format="jpg",
+            bytes=1234,
+            status="uploaded",
+        ),
     )
 
     response = client.post(
@@ -85,11 +94,15 @@ def test_upload_image_endpoint_returns_secure_url(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert response.json() == {"secure_url": "https://res.cloudinary.com/demo/image/upload/handmade-doll.jpg"}
+    body = response.json()
+    assert body["secure_url"] == "https://res.cloudinary.com/demo/image/upload/handmade-doll.jpg"
+    assert body["public_id"] == "handmade-doll"
+    assert body["width"] == 800
+    assert body["image_upload_status"] == "uploaded"
 
 
 def test_upload_image_endpoint_rejects_missing_secure_url(monkeypatch):
-    monkeypatch.setattr("backend.main.upload_image", lambda file: None)
+    monkeypatch.setattr("backend.main.upload_image_with_metadata", lambda file: ImageUploadResult(status="failed"))
 
     response = client.post(
         "/api/upload-image",
@@ -101,8 +114,8 @@ def test_upload_image_endpoint_rejects_missing_secure_url(monkeypatch):
 
 def test_upload_image_endpoint_rejects_non_image(monkeypatch):
     monkeypatch.setattr(
-        "backend.main.upload_image",
-        lambda file: "https://res.cloudinary.com/demo/image/upload/not-used.jpg",
+        "backend.main.upload_image_with_metadata",
+        lambda file: ImageUploadResult(secure_url="https://res.cloudinary.com/demo/image/upload/not-used.jpg"),
     )
 
     response = client.post(
@@ -202,7 +215,7 @@ def test_programa_export_csv_endpoint_uses_programa_columns():
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/csv")
-    assert f'filename="programa_import_{today}.csv"' in response.headers["content-disposition"]
+    assert f'filename="Untitled_Project_Decor_Programa_Import_{today}.csv"' in response.headers["content-disposition"]
     text = response.content.decode("utf-8")
     assert "Section,Product Name,Brand,SKU,Model" in text
     assert "Decor,Lamp" in text
@@ -215,7 +228,7 @@ def test_programa_export_xlsx_endpoint_returns_workbook():
     today = datetime.date.today().isoformat()
 
     assert response.status_code == 200
-    assert f'filename="programa_import_{today}.xlsx"' in response.headers["content-disposition"]
+    assert f'filename="Untitled_Project_Decor_Programa_Import_{today}.xlsx"' in response.headers["content-disposition"]
     assert response.headers["content-type"].startswith(
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )

@@ -463,6 +463,14 @@ function buildInternalDebugReport(
       enrichment: {
         query: rowText(row, "_enrichment_query_used") || [rowText(row, "Brand"), rowText(row, "Model/SKU"), rowText(row, "Product Name")].filter(Boolean).join(" "),
         attempted: Boolean(rowText(row, "Product URL") || rowText(row, "Dimension Lookup Status") || rowText(row, "image_source") || diagnostics.length),
+        braviUsed: rowText(row, "Bravi Used") || "no",
+        braviQuery: rowText(row, "Bravi Query"),
+        braviCost: rowText(row, "Bravi Cost") || formatUsd(row["Bravi Cost USD"]),
+        braviResultStatus: rowText(row, "Bravi Result Status"),
+        braviFieldsFilled: rowText(row, "Bravi Fields Filled"),
+        braviSkippedReason: rowText(row, "Bravi Skipped Reason"),
+        braviCacheStatus: rowText(row, "Bravi Cache Status"),
+        braviCalls: safeParseArray(rowText(row, "_bravi_calls")),
         matchedUrl: rowText(row, "Product URL") || null,
         sourceDomainsTried: rowText(row, "Source Domains Tried"),
         selectedDomain: rowText(row, "Selected Source Domain"),
@@ -490,6 +498,12 @@ function buildInternalDebugReport(
         rejectedCandidates: rejectedImageCandidates.length ? rejectedImageCandidates : rejectedImageText,
         sourceType: rowText(row, "_image_source_type") || rowText(row, "image_source"),
         finalConfidence: rowText(row, "_image_final_confidence") || rowText(row, "confidence"),
+        uploadStatus: rowText(row, "image_upload_status") || rowText(row, "Image Upload Status"),
+        uploadFailureReason: rowText(row, "image_upload_failure_reason"),
+        uploadDebug: safeParseRecord(rowText(row, "_image_upload_debug")),
+        cloudinaryUrl: rowText(row, "cloudinary_secure_url"),
+        cloudinaryPublicId: rowText(row, "cloudinary_public_id"),
+        originalImageUrl: rowText(row, "Original Image URL"),
       },
       finalStatus: rowText(row, "Status"),
       missingFields,
@@ -573,11 +587,17 @@ function formatDebugReportText(report: ReturnType<typeof buildInternalDebugRepor
       `Target Budget: ${formatUsd(metrics.target_budget_usd)}`,
       `Hard Budget: ${formatUsd(metrics.hard_budget_usd)}`,
       `Estimated Cost: ${formatUsd(metrics.estimated_cost_usd)}`,
+      `Bravi API Cost: ${formatUsd(metrics.bravi_cost_usd)}`,
+      `Bravi Searches: ${metrics.bravi_searches ?? 0}`,
+      `Average Cost Per Item: ${formatUsd(metrics.avg_cost_per_item_usd)}`,
+      `Cache Hits vs Paid Calls: ${metrics.cache_hits ?? 0}/${metrics.paid_calls ?? 0}`,
       `Remaining Budget: ${formatUsd(metrics.remaining_budget_usd)}`,
       `Search Calls: ${metrics.search_calls ?? 0}`,
       `Page Fetches: ${metrics.page_fetches ?? 0}`,
       `External Lookups: ${metrics.external_lookups ?? 0}/${metrics.external_lookups_limit ?? "?"}`,
       `Image Searches: ${metrics.image_searches ?? 0}/${metrics.image_searches_limit ?? "?"}`,
+      `Broad Searches: ${metrics.broad_searches ?? 0}`,
+      `Retries: ${metrics.retries ?? 0}/${metrics.retries_limit ?? "?"}`,
       `AI Calls: ${metrics.ai_calls ?? 0}`,
       `AI Call Limit: ${metrics.ai_calls_limit ?? "?"}`,
       `AI Calls Avoided: ${metrics.ai_calls_avoided ?? 0}`,
@@ -590,6 +610,9 @@ function formatDebugReportText(report: ReturnType<typeof buildInternalDebugRepor
       `Budget-Skipped Fields: ${metrics.fields_skipped_due_budget ?? 0}`,
       `Most Expensive Item: ${metrics.most_expensive_item || "none"} (${formatUsd(metrics.most_expensive_item_cost_usd)})`,
       `Cost By Stage: ${JSON.stringify(metrics.cost_by_stage || {})}`,
+      `Cost By Provider: ${JSON.stringify(metrics.cost_by_provider || {})}`,
+      `Cost By Field: ${JSON.stringify(metrics.cost_by_field || {})}`,
+      `Bravi Calls: ${JSON.stringify(metrics.bravi_calls || [])}`,
       `Paid Call Reasons: ${JSON.stringify(metrics.paid_call_reasons || [])}`,
       `Budget Skipped Calls: ${JSON.stringify(metrics.budget_skipped_calls || [])}`,
       `Budget Skipped Fields: ${JSON.stringify(metrics.budget_skipped_fields || [])}`,
@@ -634,11 +657,25 @@ function formatDebugReportText(report: ReturnType<typeof buildInternalDebugRepor
       `- Final Status: ${product.finalStatus}`,
       `- Confidence: ${product.confidenceScore}`,
       `- Confidence Reason: ${product.confidenceReasons || "none"}`,
+      "Bravi API Trace:",
+      `- Used: ${product.enrichment.braviUsed || "no"}`,
+      `- Query: ${product.enrichment.braviQuery || "none"}`,
+      `- Cost: ${product.enrichment.braviCost || "$0.0000"}`,
+      `- Status: ${product.enrichment.braviResultStatus || "none"}`,
+      `- Fields Filled: ${product.enrichment.braviFieldsFilled || "none"}`,
+      `- Cache/Budget: ${product.enrichment.braviCacheStatus || "none"} ${product.enrichment.braviSkippedReason || ""}`.trim(),
+      `- Calls: ${JSON.stringify(product.enrichment.braviCalls || [])}`,
       "Image Trace:",
       `- Query Used: ${product.imageTrace.queryUsed || "none"}`,
       `- Selected: ${product.imageTrace.selectedCandidate || "none"}`,
       `- Source: ${product.imageTrace.sourceType || "none"}`,
       `- Confidence: ${product.imageTrace.finalConfidence || "none"}`,
+      `- Upload Status: ${product.imageTrace.uploadStatus || "none"}`,
+      `- Upload Failure: ${product.imageTrace.uploadFailureReason || "none"}`,
+      `- Cloudinary URL: ${product.imageTrace.cloudinaryUrl || "none"}`,
+      `- Cloudinary Public ID: ${product.imageTrace.cloudinaryPublicId || "none"}`,
+      `- Original Image URL: ${product.imageTrace.originalImageUrl || "none"}`,
+      `- Upload Debug: ${JSON.stringify(product.imageTrace.uploadDebug)}`,
       `- Candidates: ${JSON.stringify(product.imageTrace.candidatesFound)}`,
       `- Rejected: ${typeof product.imageTrace.rejectedCandidates === "string" ? product.imageTrace.rejectedCandidates || "none" : JSON.stringify(product.imageTrace.rejectedCandidates)}`,
     );
@@ -687,6 +724,32 @@ function missingFieldsForRow(row: IntakeRow) {
   if (!rowText(row, "Room").trim()) missing.push("Location");
   if (!rowText(row, "Product Category").trim()) missing.push("Category");
   return missing;
+}
+
+function enrichmentBudgetPreview(rows: IntakeRow[], mode: "fast" | "standard" | "deep" | "manual_retry") {
+  const included = rows.filter((row) => row.Include !== false);
+  const needsDimensions = included.filter((row) => rowText(row, "Brand") && rowText(row, "Model/SKU") && !hasComplete3dDimensions(row.Dimensions));
+  const needsProductUrl = included.filter((row) => rowText(row, "Brand") && rowText(row, "Model/SKU") && !rowText(row, "Product URL").trim());
+  const imageOnly = included.filter((row) =>
+    rowText(row, "Brand") &&
+    rowText(row, "Model/SKU") &&
+    hasComplete3dDimensions(row.Dimensions) &&
+    rowText(row, "Product URL").trim() &&
+    !isPublicHttpsImageUrl(rowText(row, "Image URL")),
+  );
+  const caps = {
+    fast: { target: 0.10, hard: 0.25, external: 12, images: 3, ai: 1, label: "Fast" },
+    standard: { target: 0.25, hard: 0.50, external: 50, images: 10, ai: 6, label: "Balanced" },
+    deep: { target: 1.00, hard: 2.00, external: 200, images: 50, ai: 20, label: "Deep" },
+    manual_retry: { target: 1.00, hard: 2.00, external: 200, images: 50, ai: 20, label: "Manual retry" },
+  }[mode];
+  return {
+    itemCount: included.length,
+    needsDimensions: needsDimensions.length,
+    needsProductUrl: needsProductUrl.length,
+    imageOnly: imageOnly.length,
+    ...caps,
+  };
 }
 
 function isColumnMissing(row: IntakeRow, column: string) {
@@ -783,6 +846,7 @@ export function IntakeWorkspace() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const bulkImageInputRef = useRef<HTMLInputElement>(null);
   const pdfSessionIdRef = useRef<string>("");
+  const downloadedExportFilenamesRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     fetchHealth().catch(() => {
@@ -828,10 +892,15 @@ export function IntakeWorkspace() {
     () => includedRows.filter((row) => row["Review Required"] === true).length,
     [includedRows],
   );
+  const budgetPreview = useMemo(
+    () => enrichmentBudgetPreview(rows, enrichmentMode),
+    [rows, enrichmentMode],
+  );
   const internalDebugReport = useMemo(
     () => buildInternalDebugReport(rows, debugUploads, errors, exportSummary, latestDiagnostics),
     [rows, debugUploads, errors, exportSummary, latestDiagnostics],
   );
+  const enrichmentMetrics = internalDebugReport.enrichmentMetrics;
   const ignored = useMemo(() => rows.filter((row) => row.Include === false || row.Status === "Ignored").length, [rows]);
   const onlyPhotosSelected = bulkImages.length > 0 && files.length === 0 && !urls.trim();
   const uploadBusy = busy === "generate" || busy === "photoBulk";
@@ -1416,7 +1485,11 @@ export function IntakeWorkspace() {
       setErrors(response.errors);
       setLatestDiagnostics(response.dimension_diagnostics || []);
       setPhotoDiscoveryReport(photoReportFromDiagnostics(response.dimension_diagnostics));
-      setMessage(useWebEnrichment ? "Missing info search complete." : "Input updates saved without web search.");
+      const metricSummary = response.dimension_diagnostics?.find((entry) => entry.report_type === "enrichment_metrics")?.summary as Record<string, unknown> | undefined;
+      const costText = metricSummary
+        ? ` Enrichment cost: ${formatUsd(metricSummary.estimated_cost_usd)} · Bravi searches: ${metricSummary.bravi_searches ?? 0} · Cache hits: ${metricSummary.cache_hits ?? 0} · Avg/item: ${formatUsd(metricSummary.avg_cost_per_item_usd)}`
+        : "";
+      setMessage(useWebEnrichment ? `Missing info search complete.${costText}` : "Input updates saved without web search.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not save input updates.");
     } finally {
@@ -1513,10 +1586,27 @@ export function IntakeWorkspace() {
     URL.revokeObjectURL(url);
   }
 
+  function dedupeDownloadFilename(filename: string) {
+    const seen = downloadedExportFilenamesRef.current;
+    const lower = filename.toLowerCase();
+    if (!seen.has(lower)) {
+      seen.add(lower);
+      return filename;
+    }
+    const dot = filename.lastIndexOf(".");
+    const stem = dot > 0 ? filename.slice(0, dot) : filename;
+    const ext = dot > 0 ? filename.slice(dot) : "";
+    let version = 2;
+    while (seen.has(`${stem}_v${version}${ext}`.toLowerCase())) version += 1;
+    const next = `${stem}_v${version}${ext}`;
+    seen.add(next.toLowerCase());
+    return next;
+  }
+
   async function handleProgramaExport(format: "csv" | "xlsx" | "xlsx-images" | "zip") {
     setBusy("export");
     try {
-      const blob =
+      const exported =
         format === "zip"
           ? await exportProgramaZip(includedRows, includeLowConfidenceImages)
           : format === "xlsx-images"
@@ -1524,15 +1614,9 @@ export function IntakeWorkspace() {
           : format === "xlsx"
           ? await exportProgramaXlsx(includedRows)
           : await exportProgramaCsv(includedRows);
-      const today = new Date().toISOString().slice(0, 10);
-      const filename =
-        format === "zip"
-          ? `programa_export_${today}.zip`
-          : format === "xlsx-images"
-          ? `programa_import_with_images_${today}.xlsx`
-          : `programa_import_${today}.${format}`;
-      downloadBlob(blob, filename);
-      setMessage("Use this file for Programa Import Products.");
+      const filename = dedupeDownloadFilename(exported.filename);
+      downloadBlob(exported.blob, filename);
+      setMessage(`Use ${filename} for Programa Import Products.`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not export Programa import file.");
     } finally {
@@ -1973,6 +2057,37 @@ export function IntakeWorkspace() {
                 {INTERNAL_DEBUG_ENABLED ? <option value="manual_retry">Manual retry</option> : null}
               </select>
             </Field>
+
+            {useWebEnrichment ? (
+              <div className="rounded-xl border border-orange/25 bg-orangeSoft/30 px-4 py-3 text-sm text-charcoal">
+                <div className="font-semibold">{budgetPreview.label} mode capped at {formatUsd(budgetPreview.hard)}</div>
+                <div className="mt-1 text-xs text-taupe">
+                  {budgetPreview.itemCount} items · {budgetPreview.needsDimensions} need dimensions · {budgetPreview.needsProductUrl} need product URLs · {budgetPreview.imageOnly} image-only
+                </div>
+                <div className="mt-1 text-xs text-taupe">
+                  Max {budgetPreview.external} external lookups · {budgetPreview.images} image searches · {budgetPreview.ai} AI call{budgetPreview.ai === 1 ? "" : "s"}
+                </div>
+                {busy === "validate" ? (
+                  <div className="mt-2 rounded-lg border border-orange/20 bg-white/50 px-3 py-2 text-xs text-bronze">
+                    Running estimate: capped at {formatUsd(budgetPreview.hard)}. Final Bravi API cost appears as calls complete.
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            {enrichmentMetrics ? (
+              <div className="rounded-xl border border-sage/20 bg-sage/10 px-4 py-3 text-sm text-charcoal">
+                <div className="font-semibold">
+                  Enrichment cost: {formatUsd(enrichmentMetrics.estimated_cost_usd)} · Bravi searches: {String(enrichmentMetrics.bravi_searches ?? 0)} · Cache hits: {String(enrichmentMetrics.cache_hits ?? 0)} · Avg/item: {formatUsd(enrichmentMetrics.avg_cost_per_item_usd)}
+                </div>
+                <div className="mt-1 text-xs text-taupe">
+                  Bravi API cost {formatUsd(enrichmentMetrics.bravi_cost_usd)} · Paid calls {String(enrichmentMetrics.paid_calls ?? 0)} · Hard cap {formatUsd(enrichmentMetrics.hard_budget_usd)}
+                </div>
+                {Number(enrichmentMetrics.remaining_budget_usd ?? 0) <= Number(enrichmentMetrics.hard_budget_usd ?? 0) * 0.2 ? (
+                  <div className="mt-1 text-xs font-semibold text-bronze">Approaching budget cap.</div>
+                ) : null}
+              </div>
+            ) : null}
 
             {rows.length > 0 && missingInputRows.length ? (
               <ProductListDisclosure
@@ -2475,11 +2590,17 @@ function InternalDebugPanel({
                 <DebugLine label="Target" value={formatUsd(report.enrichmentMetrics.target_budget_usd)} />
                 <DebugLine label="Hard cap" value={formatUsd(report.enrichmentMetrics.hard_budget_usd)} />
                 <DebugLine label="Est. cost" value={formatUsd(report.enrichmentMetrics.estimated_cost_usd)} />
+                <DebugLine label="Bravi API cost" value={formatUsd(report.enrichmentMetrics.bravi_cost_usd)} />
+                <DebugLine label="Bravi searches" value={report.enrichmentMetrics.bravi_searches ?? 0} />
+                <DebugLine label="Avg/item" value={formatUsd(report.enrichmentMetrics.avg_cost_per_item_usd)} />
+                <DebugLine label="Paid calls" value={report.enrichmentMetrics.paid_calls ?? 0} />
                 <DebugLine label="Remaining" value={formatUsd(report.enrichmentMetrics.remaining_budget_usd)} />
                 <DebugLine label="Search calls" value={report.enrichmentMetrics.search_calls ?? 0} />
                 <DebugLine label="Page fetches" value={report.enrichmentMetrics.page_fetches ?? 0} />
                 <DebugLine label="External lookups" value={`${report.enrichmentMetrics.external_lookups ?? 0}/${report.enrichmentMetrics.external_lookups_limit ?? "?"}`} />
                 <DebugLine label="Image searches" value={`${report.enrichmentMetrics.image_searches ?? 0}/${report.enrichmentMetrics.image_searches_limit ?? "?"}`} />
+                <DebugLine label="Broad searches" value={report.enrichmentMetrics.broad_searches ?? 0} />
+                <DebugLine label="Retries" value={`${report.enrichmentMetrics.retries ?? 0}/${report.enrichmentMetrics.retries_limit ?? "?"}`} />
                 <DebugLine label="AI calls" value={`${report.enrichmentMetrics.ai_calls ?? 0}/${report.enrichmentMetrics.ai_calls_limit ?? "?"}`} />
                 <DebugLine label="AI avoided" value={report.enrichmentMetrics.ai_calls_avoided ?? 0} />
                 <DebugLine label="Cache hits" value={report.enrichmentMetrics.cache_hits ?? 0} />
@@ -2507,6 +2628,9 @@ function InternalDebugPanel({
               <summary className="cursor-pointer font-semibold">Cost-control trace</summary>
               <div className="mt-3 grid gap-2">
                 <DebugLine label="Cost by stage" value={JSON.stringify(report.enrichmentMetrics.cost_by_stage || {})} />
+                <DebugLine label="Cost by provider" value={JSON.stringify(report.enrichmentMetrics.cost_by_provider || {})} />
+                <DebugLine label="Cost by field" value={JSON.stringify(report.enrichmentMetrics.cost_by_field || {})} />
+                <DebugLine label="Bravi calls" value={JSON.stringify(report.enrichmentMetrics.bravi_calls || [])} />
                 <DebugLine label="Paid call reasons" value={JSON.stringify(report.enrichmentMetrics.paid_call_reasons || [])} />
                 <DebugLine label="Budget skipped calls" value={JSON.stringify(report.enrichmentMetrics.budget_skipped_calls || [])} />
                 <DebugLine label="Budget skipped fields" value={JSON.stringify(report.enrichmentMetrics.budget_skipped_fields || [])} />
@@ -2552,6 +2676,13 @@ function InternalDebugPanel({
                     <div className="font-semibold text-charcoal">Enrichment trace</div>
                     <DebugLine label="Query" value={product.enrichment.query || "none"} />
                     <DebugLine label="Attempted" value={product.enrichment.attempted ? "yes" : "no"} />
+                    <DebugLine label="Bravi used" value={product.enrichment.braviUsed || "no"} />
+                    <DebugLine label="Bravi query" value={product.enrichment.braviQuery || "none"} />
+                    <DebugLine label="Bravi cost" value={product.enrichment.braviCost || "$0.0000"} />
+                    <DebugLine label="Bravi status" value={product.enrichment.braviResultStatus || "none"} />
+                    <DebugLine label="Bravi fields" value={product.enrichment.braviFieldsFilled || "none"} />
+                    <DebugLine label="Bravi skipped" value={product.enrichment.braviSkippedReason || "none"} />
+                    <DebugLine label="Bravi calls" value={JSON.stringify(product.enrichment.braviCalls || [])} />
                     <DebugLine label="Matched URL" value={product.enrichment.matchedUrl || "none"} />
                     <DebugLine label="Source domains" value={product.enrichment.sourceDomainsTried || "none"} />
                     <DebugLine label="Selected domain" value={product.enrichment.selectedDomain || "none"} />
@@ -2571,6 +2702,12 @@ function InternalDebugPanel({
                     <DebugLine label="Selected" value={product.imageTrace.selectedCandidate || "none"} />
                     <DebugLine label="Source" value={product.imageTrace.sourceType || "none"} />
                     <DebugLine label="Confidence" value={product.imageTrace.finalConfidence || "none"} />
+                    <DebugLine label="Upload status" value={product.imageTrace.uploadStatus || "none"} />
+                    <DebugLine label="Upload failure" value={product.imageTrace.uploadFailureReason || "none"} />
+                    <DebugLine label="Cloudinary URL" value={product.imageTrace.cloudinaryUrl || "none"} />
+                    <DebugLine label="Cloudinary public ID" value={product.imageTrace.cloudinaryPublicId || "none"} />
+                    <DebugLine label="Original URL" value={product.imageTrace.originalImageUrl || "none"} />
+                    <DebugLine label="Upload debug" value={JSON.stringify(product.imageTrace.uploadDebug)} />
                     <DebugLine label="Candidates" value={JSON.stringify(product.imageTrace.candidatesFound)} />
                     <DebugLine
                       label="Rejected"

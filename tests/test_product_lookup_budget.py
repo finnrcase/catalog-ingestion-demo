@@ -107,8 +107,10 @@ def test_fast_run_budget_defaults_target_and_hard_cap(monkeypatch):
 
     assert budget.target_budget_usd == 0.10
     assert budget.hard_budget_usd == 0.25
-    assert budget.max_ai_calls == 3
-    assert budget.max_external_lookups == 25
+    assert budget.max_ai_calls == 1
+    assert budget.max_external_lookups == 12
+    assert budget.max_image_searches == 3
+    assert budget.max_retries == 3
 
 
 def test_run_budget_blocks_paid_call_over_hard_cap():
@@ -126,13 +128,34 @@ def test_run_budget_blocks_paid_call_over_hard_cap():
 
 def test_fast_budget_env_does_not_reduce_deep_mode(monkeypatch):
     monkeypatch.setenv("ENRICHMENT_TARGET_BUDGET_USD", "0.10")
-    monkeypatch.setenv("ENRICHMENT_HARD_BUDGET_USD", "0.25")
+    monkeypatch.setenv("ENRICHMENT_HARD_BUDGET_USD", "0.75")
 
     fast = run_budget_for_mode("fast")
     deep = run_budget_for_mode("deep")
 
     assert fast.hard_budget_usd == 0.25
     assert deep.hard_budget_usd == 2.00
+
+
+def test_run_budget_tracks_provider_field_and_broad_search_costs():
+    budget = run_budget_for_mode("fast")
+
+    assert budget.consume(
+        "search",
+        budget.search_cost_usd,
+        field="Dimensions",
+        reason="brand model dimensions",
+        stage="broad_search",
+        query='"Wolf" "MDD30TS" dimensions',
+    )
+
+    diag = budget.diagnostics()
+    assert diag["broad_searches"] == 1
+    assert diag["cost_by_provider"]["brave"] == budget.search_cost_usd
+    assert diag["cost_by_field"]["Dimensions"] == budget.search_cost_usd
+    assert diag["brave_cost_usd"] == budget.search_cost_usd
+    assert diag["brave_searches"] == 1
+    assert diag["brave_calls"][0]["query"] == '"Wolf" "MDD30TS" dimensions'
 
 
 def test_standard_mode_never_exceeds_three_brave_calls(monkeypatch):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from src.source_success_registry import (
     brand_source_hints,
+    category_source_hints,
     load_source_registry,
     preferred_source_domains_for_row,
     record_source_failure,
@@ -21,9 +22,34 @@ def _row(brand="Wolf", model="MDD30TS", category="Appliances") -> dict:
 
 
 def test_brand_source_hints_include_required_appliance_sources():
-    assert brand_source_hints("Sub-Zero") == ["subzero-wolf.com"]
+    assert brand_source_hints("Sub-Zero")[:2] == ["subzero-wolf.com", "ca.subzero-wolf.com"]
     assert "mieleusa.com" in brand_source_hints("Miele")
     assert brand_source_hints("Fisher Paykel") == ["fisherpaykel.com"]
+
+
+def test_category_source_hints_seed_design_product_sources():
+    appliances = category_source_hints("Appliances")
+    lighting = category_source_hints("Lighting")
+    plumbing = category_source_hints("Plumbing / Bath")
+    furniture = category_source_hints("Furniture / Decor")
+    tile = category_source_hints("Stone/Tile")
+
+    assert "thermador.com" in appliances
+    assert "home.hestan.com" in appliances
+    assert "visualcomfort.com" in lighting
+    assert "kohler.com" in plumbing
+    assert "ferguson.com" in plumbing
+    assert "rh.com" in furniture
+    assert "annesacks.com" in tile
+
+
+def test_preferred_sources_use_brand_before_category_hints(tmp_path):
+    row = _row("Wolf", "MDD30TS", "Appliances")
+
+    preferred = preferred_source_domains_for_row(row, tmp_path / "empty.json")
+
+    assert preferred.index("subzero-wolf.com") < preferred.index("thermador.com")
+    assert "scotsman-ice.com" in preferred
 
 
 def test_source_success_registry_saves_and_prefers_successful_domain(tmp_path):

@@ -237,3 +237,27 @@ def test_wrong_product_same_brand_rejected(monkeypatch):
     assert result.selected is None
     assert result.diagnostics[0]["rejection_reason"] == "sku_not_found"
     assert result.diagnostics[0]["confidence"] in {"low", "none"}
+
+
+def test_official_sitemap_with_sku_is_not_selected(monkeypatch):
+    import src.product_resolver as pr
+
+    sitemap = SearchResult(
+        "Wolf Sitemap",
+        "https://wolfappliance.com/sitemap.xml",
+        "Wolf MDD30TS product sitemap entry",
+        90,
+    )
+    sitemap_html = """
+    <urlset>
+      <url><loc>https://wolfappliance.com/products/mdd30ts</loc></url>
+      <url><loc>https://wolfappliance.com/products/other</loc></url>
+    </urlset>
+    """
+    monkeypatch.setattr(pr, "search_product_candidates", lambda *a, **k: [sitemap])
+    monkeypatch.setattr(pr.httpx, "get", lambda url, **kwargs: _resp(url, sitemap_html))
+
+    result = resolve_product_page(_wolf_row())
+
+    assert result.selected is None
+    assert result.diagnostics[0]["rejection_reason"] in {"non_product_page", "sitemap_page"}

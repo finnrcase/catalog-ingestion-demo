@@ -27,8 +27,10 @@ from src.brave_search import BRAVE_API_KEY, search_product_candidates
 from src.category_ai import _normalise_category
 from src.dimension_enrichment import DimensionResult as _DimensionResult, find_dimensions as _find_dimensions
 from src.dimensions import has_complete_3d_dimensions
+from src.enrichment_cost_history import append_cost_history
 from src.image_presence import row_has_image
 from src.image_evidence import sku_appears_in_text
+from src.image_uploader import fetch_convert_upload_remote_image, is_public_https_image_url
 from src.measurement_parser import normalize_dimension_fields
 from src.manufacturer_domains import get_domain_for_brand, record_discovered_domain, record_verified_domain
 from src.official_product_lookup import lookup_official_product_page
@@ -257,6 +259,25 @@ def _needs_external_enrichment(row: dict) -> bool:
     return False
 
 
+def _enrichment_priority(row: dict) -> tuple[int, int, str]:
+    """Lower values get the first share of the Fast-mode budget."""
+    if not _str_val(row.get("Brand")) or not _str_val(row.get("Model/SKU")):
+        return (9, 0, "")
+    missing_dims = not has_complete_3d_dimensions(_str_val(row.get("Dimensions")))
+    missing_url = not _str_val(row.get("Product URL"))
+    if missing_dims and missing_url:
+        priority = 0
+    elif missing_dims:
+        priority = 1
+    elif missing_url:
+        priority = 2
+    elif not row_has_image(row):
+        priority = 4
+    else:
+        priority = 5
+    return (priority, 0 if _confidence_fraction(row) >= 0.85 else 1, _duplicate_key(row))
+
+
 def _build_search_query(row: dict) -> str:
     """Build a Brave Search query; prioritise spec sheets when dimensions are needed."""
     dims = _str_val(row.get("Dimensions"))
@@ -394,9 +415,16 @@ def _search_results_for_query(
 ) -> list:
     cached = bool(session_cache is not None and query in session_cache.queries)
     if budget is not None and not cached:
-        if not budget.can_search():
+        try:
+            can_search = budget.can_search(query=query, field="Product URL", reason="product page candidate search")
+        except TypeError:
+            can_search = budget.can_search()
+        if not can_search:
             return []
-        budget.consume_search()
+        try:
+            budget.consume_search(query=query, field="Product URL", reason="product page candidate search")
+        except TypeError:
+            budget.consume_search()
     return search_product_candidates(query, brand, session_cache=session_cache)
 
 
@@ -914,6 +942,11 @@ def _budget_diagnostics(budget) -> dict:
                 f"${data.get('run_estimated_cost_usd', 0):.4f}/${data.get('run_hard_budget_usd', 0):.2f}"
                 if "run_estimated_cost_usd" in data else ""
             ),
+            "Bravi Run Cost": (
+                f"${data.get('run_brave_cost_usd', 0):.4f}"
+                if "run_brave_cost_usd" in data else ""
+            ),
+            "Bravi Search Calls": data.get("run_brave_searches", ""),
         }
     return {
         "API Budget Search Usage": f"Used {getattr(budget, 'searches_used', 0)}/{getattr(budget, 'max_searches', 0)} search calls",
@@ -976,6 +1009,68 @@ def _stamp_image_debug_fields(updated: dict, image, debug: dict) -> None:
     updated["_selected_image_candidate"] = getattr(image, "image_url", "") or _str_val(debug.get("selected_image_url"))
     updated["_image_source_type"] = getattr(image, "image_source", "")
     updated["_image_final_confidence"] = getattr(image, "confidence", "")
+
+
+def _maybe_upload_selected_image_to_cloudinary(
+    updated: dict,
+    debug: dict,
+    *,
+    candidate_url: str,
+    source_type: str = "",
+) -> None:
+    candidate = _str_val(candidate_url)
+    if not candidate or _is_manual_image(updated):
+        return
+    if "res.cloudinary.com/" in candidate.lower():
+        updated["image_upload_status"] = "uploaded"
+        updated["Image Upload Status"] = "Uploaded"
+        debug["image_upload_status"] = "uploaded"
+        debug["image_upload_debug"] = {
+            "candidate_url": candidate,
+            "source_type": source_type,
+            "cloudinary_upload_attempted": False,
+            "final_saved_image_url": candidate,
+            "status": "already_cloudinary",
+        }
+        return
+    if not is_public_https_image_url(candidate):
+        updated["image_upload_status"] = "failed"
+        updated["Image Upload Status"] = "Upload failed"
+        updated["image_upload_failure_reason"] = "non_https_candidate_url"
+        debug["image_upload_status"] = "failed"
+        debug["image_upload_failure_reason"] = "non_https_candidate_url"
+        return
+
+    result = fetch_convert_upload_remote_image(candidate, source_type=source_type)
+    upload_debug = result.debug or {}
+    debug["image_upload_status"] = result.status
+    debug["image_upload_debug"] = upload_debug
+    debug["image_upload_failure_reason"] = result.error
+    updated["_image_upload_debug"] = json.dumps(upload_debug)
+    updated["image_upload_status"] = result.status
+    updated["image_upload_failure_reason"] = result.error
+    if result.secure_url:
+        updated["Original Image URL"] = candidate
+        updated["Image URL"] = result.secure_url
+        updated["cloudinary_secure_url"] = result.secure_url
+        updated["cloudinary_public_id"] = result.public_id
+        updated["cloudinary_width"] = result.width
+        updated["cloudinary_height"] = result.height
+        updated["cloudinary_format"] = result.format
+        updated["cloudinary_bytes"] = result.bytes
+        updated["Image Upload Status"] = "Uploaded"
+        debug["original_selected_image_url"] = candidate
+        debug["selected_image_url"] = result.secure_url
+        debug["cloudinary_secure_url"] = result.secure_url
+        debug["cloudinary_public_id"] = result.public_id
+        debug["cloudinary_width"] = result.width
+        debug["cloudinary_height"] = result.height
+        debug["cloudinary_format"] = result.format
+        debug["cloudinary_bytes"] = result.bytes
+    elif result.status == "skipped":
+        updated["Image Upload Status"] = "Upload skipped"
+    else:
+        updated["Image Upload Status"] = "Upload failed"
 
 
 def _apply_product_lookup_cache_entry(row: dict, cache_entry: dict, debug: dict) -> tuple[dict, _DimensionResult | None]:
@@ -1063,6 +1158,12 @@ def _apply_product_lookup_cache_entry(row: dict, cache_entry: dict, debug: dict)
             updated["confidence"] = image_confidence
             updated["evidence"] = evidence
             updated["needs_image_review"] = str(image_confidence != "HIGH" or confidence == "medium")
+            _maybe_upload_selected_image_to_cloudinary(
+                updated,
+                debug,
+                candidate_url=image_url,
+                source_type="product_lookup_cache",
+            )
 
     if confidence == "medium":
         updated["Review Required"] = True
@@ -1315,6 +1416,12 @@ def _apply_official_product_lookup(
         updated["manufacturer_page_exact_sku"] = bool(getattr(selected_resolution_candidate, "matched_sku", False))
         if extracted_fields.get("Image URL") and not row_has_image(updated) and extracted_fields.get("image_confidence") in {"HIGH", "MEDIUM"}:
             updated["Image URL"] = extracted_fields["Image URL"]
+            _maybe_upload_selected_image_to_cloudinary(
+                updated,
+                debug,
+                candidate_url=extracted_fields["Image URL"],
+                source_type=_str_val(extracted_fields.get("image_source")) or "verified_product_page",
+            )
         _merge_budget_debug(debug, budget)
         return _stamp_debug_fields(updated), None, debug
 
@@ -1450,6 +1557,12 @@ def _apply_official_product_lookup(
             updated["confidence"] = image.confidence
             updated["evidence"] = ";".join(image.evidence)
             updated["needs_image_review"] = str(image.confidence != "HIGH")
+            _maybe_upload_selected_image_to_cloudinary(
+                updated,
+                debug,
+                candidate_url=image.image_url,
+                source_type=image.image_source,
+            )
     if (
         not image.image_found
         and
@@ -1467,6 +1580,12 @@ def _apply_official_product_lookup(
         updated["confidence"] = resolver_fields.get("image_confidence", "")
         updated["evidence"] = resolver_fields.get("image_evidence", "")
         updated["needs_image_review"] = str(resolver_fields.get("image_confidence") != "HIGH")
+        _maybe_upload_selected_image_to_cloudinary(
+            updated,
+            debug,
+            candidate_url=resolver_fields["Image URL"],
+            source_type=_str_val(resolver_fields.get("image_source")) or "verified_product_page",
+        )
 
     product_cache_key = ""
     brand_key = _str_val(updated.get("Brand"))
@@ -1635,6 +1754,39 @@ def _apply_cache_to_row(
     return updated, filled, missing
 
 
+def _fuzzy_product_cache_entry(brand: str, model: str, exact_key: str) -> tuple[str, dict | None]:
+    """Find a conservative same-brand cache hit for model variants."""
+    brand_clean = re.sub(r"[^a-z0-9]+", "", brand.lower())
+    model_clean = re.sub(r"[^a-z0-9]+", "", model.lower())
+    if not brand_clean or len(model_clean) < 5:
+        return "", None
+    try:
+        _product_cache._load()
+        data = getattr(_product_cache, "_data", {}) or {}
+    except Exception:
+        return "", None
+    for key, entry in data.items():
+        if key == exact_key or not isinstance(entry, dict):
+            continue
+        if not str(key).startswith(f"{brand_clean}_"):
+            continue
+        cached_model = str(key).split("_", 1)[-1]
+        if len(cached_model) < 5:
+            continue
+        same_model = cached_model == model_clean
+        close_variant = (
+            len(model_clean) >= 8
+            and len(cached_model) >= 8
+            and (cached_model.startswith(model_clean) or model_clean.startswith(cached_model))
+        )
+        if not (same_model or close_variant):
+            continue
+        confidence = _str_val(entry.get("general_confidence") or entry.get("dimension_confidence")).lower()
+        if confidence in {"high", "medium"}:
+            return str(key), entry
+    return "", None
+
+
 def _should_write_manufacturer_value(updated: dict, field: str, allow_overwrite: bool = False) -> bool:
     existing = _str_val(updated.get(field))
     if not existing:
@@ -1774,8 +1926,41 @@ def enrich_row(
                     fields_searched.extend(still_missing)
                     _log.info("[CACHE HIT: partial] key=%s still_missing=%s", cache_key, still_missing)
             else:
-                fields_searched.extend(_ESSENTIAL_CACHE_FIELDS)
-                _log.info("[CACHE MISS] key=%s", cache_key)
+                fuzzy_key, fuzzy_entry = _fuzzy_product_cache_entry(brand, model_sku, cache_key)
+                if fuzzy_entry is not None and not force_refresh:
+                    row, cache_fields_filled, still_missing = _apply_cache_to_row(
+                        row,
+                        fuzzy_entry,
+                        force_refresh,
+                    )
+                    if cache_fields_filled:
+                        row["Cache Match Type"] = "fuzzy_model"
+                        row["Cache Match Key"] = fuzzy_key
+                    if not still_missing:
+                        _log.info("[CACHE HIT: fuzzy full] key=%s fuzzy_key=%s", cache_key, fuzzy_key)
+                        product_cache_hit = "fuzzy_full"
+                        updated = row.copy()
+                        original = _str_val(updated.get("Source Type", ""))
+                        if not original.endswith("_Enriched"):
+                            updated["Source Type"] = f"{original}_Enriched" if original else "Enriched"
+                        updated["Enrichment Stage"] = "persistent_cache"
+                        updated["product_lookup_cache_status"] = "fuzzy_hit"
+                        updated["AI Extraction Status"] = "Skipped AI: fuzzy product enrichment cache hit"
+                        updated["API Budget Search Usage"] = "Used 0/0 search calls"
+                        updated["API Budget Fetch Usage"] = "Used 0/0 page fetches"
+                        updated["API Budget AI Usage"] = "Used 0/0 AI calls"
+                        updated["API Budget Stopped Reason"] = "Used fuzzy cached result: no API cost"
+                        updated["API Budget Cost Usage"] = (
+                            f"${run_budget.estimated_cost_usd:.4f}/${run_budget.hard_budget_usd:.2f}"
+                            if run_budget is not None else "$0.0000/$0.00"
+                        )
+                        return updated, None, None
+                    product_cache_hit = "fuzzy_partial"
+                    fields_searched.extend(still_missing)
+                    _log.info("[CACHE HIT: fuzzy partial] key=%s fuzzy_key=%s still_missing=%s", cache_key, fuzzy_key, still_missing)
+                else:
+                    fields_searched.extend(_ESSENTIAL_CACHE_FIELDS)
+                    _log.info("[CACHE MISS] key=%s", cache_key)
 
         if not has_enough_search_identity(row):
             updated = row.copy()
@@ -1783,6 +1968,12 @@ def enrich_row(
             note = "[Enrichment: skipped web search; not enough identifying info]"
             if note not in existing:
                 updated["Notes"] = f"{existing} {note}".strip() if existing else note
+            updated, _debug = normalize_dimension_fields(updated)
+            return updated, None, None
+
+        if _live_lookup_blocked_by_budget(budget, row, item_key=item_key, field=", ".join(fields_searched or _ESSENTIAL_CACHE_FIELDS)):
+            updated = _stamp_budget_skipped(row, "Skipped enrichment due to budget cap")
+            updated.update(_budget_diagnostics(budget))
             updated, _debug = normalize_dimension_fields(updated)
             return updated, None, None
 
@@ -1817,7 +2008,7 @@ def enrich_row(
         dim_result: _DimensionResult | None = None
         if brand_val and model_val and not has_complete_3d_dimensions(dims_val):
             dim_result = _find_dimensions(updated, session_cache=session_cache, budget=budget)
-            if dim_result.status == "found" and dim_result.confidence in ("high", "medium"):
+            if dim_result and dim_result.status == "found" and dim_result.confidence in ("high", "medium"):
                 updated["Dimensions"] = dim_result.dimensions
                 if dim_result.width:
                     updated["Width (in)"] = dim_result.width
@@ -1850,10 +2041,11 @@ def enrich_row(
                         tag = f"[Cutout Dimensions: {cutout_part}]"
                         if tag not in existing_notes:
                             updated["Notes"] = f"{existing_notes} {tag}".strip() if existing_notes else tag
-            updated["Dimension Source URL"] = dim_result.source_url
-            updated["Dimension Confidence"] = dim_result.confidence if dim_result.confidence not in ("", "none", None) else ""
-            updated["Dimension Source Type"] = dim_result.source_type if dim_result.source_type not in ("", "none", None) else ""
-            updated["Dimension Lookup Status"] = dim_result.status
+            if dim_result:
+                updated["Dimension Source URL"] = dim_result.source_url
+                updated["Dimension Confidence"] = dim_result.confidence if dim_result.confidence not in ("", "none", None) else ""
+                updated["Dimension Source Type"] = dim_result.source_type if dim_result.source_type not in ("", "none", None) else ""
+                updated["Dimension Lookup Status"] = dim_result.status
 
         updated, _debug = normalize_dimension_fields(updated)
         return updated, None, dim_result
@@ -1945,15 +2137,111 @@ def _metrics_from_updated_row(updated: dict) -> dict:
     }
 
 
+def _stamp_bravi_cost_debug(
+    updated: dict,
+    before: dict,
+    run_budget,
+    item_key: str,
+    *,
+    fallback_status: str = "",
+) -> dict:
+    """Attach per-item Bravi/Brave cost trace for debug visibility."""
+    out = updated.copy()
+    calls = []
+    if run_budget is not None:
+        calls = [
+            dict(call)
+            for call in getattr(run_budget, "brave_calls", [])
+            if not item_key or _str_val(call.get("item_key")) == item_key
+        ]
+    called = [call for call in calls if call.get("status") == "called"]
+    skipped = [call for call in calls if call.get("status") == "skipped"]
+    cost = round(sum(float(call.get("estimated_cost_usd") or 0.0) for call in called), 6)
+    queries = []
+    for call in called:
+        query = _str_val(call.get("query"))
+        if query and query not in queries:
+            queries.append(query)
+
+    fields_filled: list[str] = []
+    for field in (
+        "Product URL",
+        "Dimensions",
+        "Image URL",
+        "Product Category",
+        "Finish / Color",
+        "Material",
+        "Brand",
+        "Model/SKU",
+    ):
+        before_value = _str_val(before.get(field))
+        after_value = _str_val(out.get(field))
+        if after_value and after_value != before_value:
+            fields_filled.append(field)
+
+    cache_hit = _str_val(out.get("product_lookup_cache_status")) in {"hit", "searched_no_result"} or _str_val(out.get("Enrichment Stage")) in {
+        "persistent_cache",
+        "duplicate_reuse",
+    }
+    if called:
+        status = "called"
+    elif skipped:
+        status = "skipped_due_to_budget"
+    elif cache_hit:
+        status = "cache_hit"
+    else:
+        status = fallback_status or "not_used"
+
+    out["Bravi Used"] = "yes" if called else "no"
+    out["Bravi Query"] = " | ".join(queries)
+    out["Bravi Cost"] = f"${cost:.4f}"
+    out["Bravi Cost USD"] = cost
+    out["Bravi Result Status"] = status
+    out["Bravi Fields Filled"] = ", ".join(fields_filled if called else [])
+    out["Bravi Skipped Reason"] = "; ".join(_str_val(call.get("reason")) for call in skipped if _str_val(call.get("reason")))
+    out["Bravi Cache Status"] = "cache_hit" if cache_hit else "cache_miss"
+    out["_bravi_calls"] = json.dumps(calls[-10:])
+    return out
+
+
 def _budget_reason(value: object) -> bool:
     text = _str_val(value).lower()
     return any(token in text for token in ("budget", "exhausted", "limit reached", "hard budget"))
 
 
+def _live_lookup_blocked_by_budget(budget, row: dict, *, item_key: str, field: str) -> bool:
+    if budget is None:
+        return False
+    run_budget = getattr(budget, "run_budget", None)
+    projected_cost = (
+        getattr(run_budget, "fetch_cost_usd", 0.0)
+        if run_budget is not None and _str_val(row.get("Product URL"))
+        else getattr(run_budget, "search_cost_usd", 0.0)
+    )
+    projected_kind = "fetch" if _str_val(row.get("Product URL")) else "search"
+    if run_budget is not None and not run_budget.can_start_paid_lookup(
+        item_key=item_key,
+        field=field,
+        reason="skip live lookup before starting item",
+        cost_usd=projected_cost,
+    ):
+        run_budget.record_skip(
+            projected_kind,
+            projected_cost,
+            item_key=item_key,
+            field=field,
+            reason="hard budget exhausted before item lookup",
+        )
+        budget.stop("Skipped enrichment due to budget cap")
+        return True
+    return False
+
+
 def _stamp_budget_skipped(row: dict, reason: str = "Skipped enrichment due to budget cap") -> dict:
     updated = row.copy()
     updated["Review Required"] = True
-    updated["Status"] = _str_val(updated.get("Status")) or "Needs Review"
+    if _str_val(updated.get("Status")).lower() not in {"ready", "complete", "completed"}:
+        updated["Status"] = "Needs Review"
     updated["Suggested Action"] = reason
     updated["Enrichment Stage"] = _str_val(updated.get("Enrichment Stage")) or "budget_skipped"
     updated["AI Extraction Status"] = _str_val(updated.get("AI Extraction Status")) or "Skipped AI: budget limit"
@@ -1997,12 +2285,20 @@ def enrich_dataframe(
             "ai_calls_avoided": 0,
             "external_lookups": 0,
             "image_searches": 0,
+            "bravi_searches": 0,
+            "bravi_cost_usd": 0.0,
+            "avg_cost_per_item_usd": 0.0,
+            "paid_calls": 0,
+            "broad_searches": 0,
+            "retries": 0,
             "skipped_calls_due_budget": 0,
             "fields_skipped_due_budget": 0,
             "target_budget_usd": run_budget.target_budget_usd,
             "hard_budget_usd": run_budget.hard_budget_usd,
             "estimated_cost_usd": 0.0,
             "cost_by_stage": {},
+            "cost_by_provider": {},
+            "cost_by_field": {},
             "cost_by_item": {},
             "most_expensive_item": "",
             "most_expensive_item_cost_usd": 0.0,
@@ -2021,7 +2317,10 @@ def enrich_dataframe(
     _session = _SC(force_refresh=force_refresh)
     duplicate_results: dict[str, dict] = {}
 
-    for idx, row in df.iterrows():
+    row_indices = sorted(list(df.index), key=lambda row_idx: _enrichment_priority(df.loc[row_idx].to_dict()))
+
+    for idx in row_indices:
+        row = df.loc[idx]
         raw = row.to_dict()
         r, local_metrics = _apply_cheap_local_enrichment(raw)
         if r != raw:
@@ -2029,6 +2328,8 @@ def enrich_dataframe(
 
         if not _str_val(r.get("Brand")) or not _str_val(r.get("Model/SKU")):
             metrics["summary"]["skipped_enrichments"] += 1
+            r = _stamp_bravi_cost_debug(r, raw, run_budget, _duplicate_key(r), fallback_status="skipped_missing_brand_model")
+            _write_updated_row(df, idx, r)
             continue
 
         metrics["summary"]["eligible_rows"] += 1
@@ -2043,12 +2344,14 @@ def enrich_dataframe(
             r["API Budget AI Usage"] = "Used 0/0 AI calls"
             r["API Budget Stopped Reason"] = "Skipped expensive enrichment: row already has required fields"
             r["API Budget Cost Usage"] = f"${run_budget.estimated_cost_usd:.4f}/${run_budget.hard_budget_usd:.2f}"
+            r = _stamp_bravi_cost_debug(r, raw, run_budget, _duplicate_key(r), fallback_status="local_confidence_sufficient")
             _write_updated_row(df, idx, r)
             continue
 
         dup_key = _duplicate_key(r)
         if dup_key and not force_refresh and dup_key in duplicate_results:
             updated = _apply_duplicate_enrichment_result(r, duplicate_results[dup_key])
+            updated = _stamp_bravi_cost_debug(updated, r, run_budget, dup_key, fallback_status="duplicate_reuse")
             _write_updated_row(df, idx, updated)
             metrics["summary"]["duplicate_reuse"] += 1
             metrics["summary"]["skipped_enrichments"] += 1
@@ -2067,9 +2370,11 @@ def enrich_dataframe(
             if error:
                 errors.append(error)
             else:
+                updated = _stamp_bravi_cost_debug(updated, r, run_budget, dup_key, fallback_status="not_used")
                 _write_updated_row(df, idx, updated)
                 if _budget_reason(updated.get("API Budget Stopped Reason")):
                     updated = _stamp_budget_skipped(updated, "Skipped enrichment due to budget cap")
+                    updated = _stamp_bravi_cost_debug(updated, r, run_budget, dup_key, fallback_status="skipped_due_to_budget")
                     _write_updated_row(df, idx, updated)
                 if dup_key:
                     duplicate_results[dup_key] = updated
@@ -2119,11 +2424,21 @@ def enrich_dataframe(
         "external_lookups_limit": run_diag["external_lookups_limit"],
         "image_searches": run_diag["image_searches"],
         "image_searches_limit": run_diag["image_searches_limit"],
+        "bravi_searches": run_diag.get("brave_searches", 0),
+        "bravi_cost_usd": run_diag.get("brave_cost_usd", 0.0),
+        "avg_cost_per_item_usd": round(run_diag["estimated_cost_usd"] / max(1, int(metrics["summary"]["total_rows"])), 6),
+        "paid_calls": len([call for call in getattr(run_budget, "paid_call_reasons", []) if call.get("status", "called") == "called"]),
+        "broad_searches": run_diag.get("broad_searches", 0),
+        "retries": run_diag.get("retries", 0),
+        "retries_limit": run_diag.get("retries_limit", 0),
         "ai_calls": run_diag["ai_calls"],
         "ai_calls_limit": run_diag["ai_calls_limit"],
         "skipped_calls_due_budget": run_diag["skipped_calls_due_budget"],
         "fields_skipped_due_budget": len(run_diag["skipped_fields_due_budget"]),
         "cost_by_stage": run_diag["cost_by_stage"],
+        "cost_by_provider": run_diag.get("cost_by_provider", {}),
+        "cost_by_field": run_diag.get("cost_by_field", {}),
+        "bravi_calls": run_diag.get("brave_calls", []),
         "cost_by_item": run_diag["cost_by_item"],
         "most_expensive_item": run_diag["most_expensive_item"],
         "most_expensive_item_cost_usd": run_diag["most_expensive_item_cost_usd"],
@@ -2131,6 +2446,11 @@ def enrich_dataframe(
         "budget_skipped_calls": run_diag["skipped_calls"],
         "budget_skipped_fields": run_diag["skipped_fields_due_budget"],
     })
+    try:
+        cost_history_entry = append_cost_history(metrics["summary"], df.to_dict(orient="records"))
+        metrics["summary"]["cost_history_entry"] = cost_history_entry
+    except Exception as exc:
+        metrics["summary"]["cost_history_error"] = str(exc)
     dimension_diagnostics.insert(0, metrics)
     return df, errors, dimension_diagnostics
 

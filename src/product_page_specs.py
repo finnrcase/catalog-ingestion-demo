@@ -69,16 +69,17 @@ def _jsonld_product_text(soup: BeautifulSoup) -> str:
             types = type_value if isinstance(type_value, list) else [type_value]
             if not any(str(t).lower() == "product" for t in types):
                 continue
-            for key in ("name", "description", "sku", "mpn", "model", "color", "material"):
-                if item.get(key):
-                    chunks.append(f"{key}: {item[key]}")
+            for key in ("name", "description", "sku", "mpn", "model", "color", "material", "width", "height", "depth"):
+                value = _json_value_text(item.get(key))
+                if value:
+                    chunks.append(f"{key}: {value}")
             props = item.get("additionalProperty") or item.get("additionalProperties") or []
             if isinstance(props, dict):
                 props = [props]
             for prop in props:
                 if isinstance(prop, dict):
                     name = prop.get("name") or prop.get("propertyID") or ""
-                    value = prop.get("value") or prop.get("description") or ""
+                    value = _json_value_text(prop.get("value") or prop.get("description") or "")
                     if name or value:
                         chunks.append(f"{name}: {value}")
     return "\n".join(chunks)
@@ -110,13 +111,13 @@ def _jsonld_product_metadata(soup: BeautifulSoup) -> dict[str, str]:
             if isinstance(brand, dict):
                 brand = brand.get("name", "")
             metadata = {
-                "product_name": _text(item.get("name")),
-                "brand": _text(brand),
-                "sku": _text(item.get("sku") or item.get("mpn") or item.get("model")),
-                "category": _text(item.get("category") or item.get("productType")),
-                "color": _text(item.get("color")),
-                "material": _text(item.get("material")),
-                "description": _text(item.get("description")),
+                "product_name": _json_value_text(item.get("name")),
+                "brand": _json_value_text(brand),
+                "sku": _json_value_text(item.get("sku") or item.get("mpn") or item.get("model")),
+                "category": _json_value_text(item.get("category") or item.get("productType")),
+                "color": _json_value_text(item.get("color")),
+                "material": _json_value_text(item.get("material")),
+                "description": _json_value_text(item.get("description")),
             }
             return {k: v for k, v in metadata.items() if v}
     return {}
@@ -125,6 +126,9 @@ def _jsonld_product_metadata(soup: BeautifulSoup) -> dict[str, str]:
 def _spec_table_text(soup: BeautifulSoup) -> str:
     chunks: list[str] = []
     spec_hint = re.compile(r"dimension|width|height|depth|length|diameter|finish|color|material|lead|weight|spec", re.I)
+    itemprop = _itemprop_dimension_text(soup)
+    if itemprop:
+        chunks.append(itemprop)
     for table in soup.find_all("table"):
         text = table.get_text(" ", strip=True)
         if spec_hint.search(text):
@@ -136,7 +140,61 @@ def _spec_table_text(soup: BeautifulSoup) -> str:
             text = node.get_text(" ", strip=True)
             if spec_hint.search(text):
                 chunks.append(text[:2000])
+    adjacent = _adjacent_label_value_dimension_text(soup)
+    if adjacent:
+        chunks.append(adjacent)
     return "\n".join(chunks)
+
+
+def _json_value_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        for key in ("value", "name", "text", "description", "content", "unitText"):
+            if value.get(key):
+                unit = _normalise_unit(value.get("unitText") or value.get("unitCode") or "")
+                text = _json_value_text(value.get(key))
+                if key == "value" and unit and unit not in text.lower():
+                    text = f"{text} {unit}"
+                return text
+        return " ".join(_json_value_text(v) for v in value.values() if _json_value_text(v))
+    if isinstance(value, list):
+        return " ".join(_json_value_text(item) for item in value if _json_value_text(item))
+    return _text(value)
+
+
+def _normalise_unit(value: object) -> str:
+    unit = str(value or "").strip().lower()
+    return {"inh": "in", "cmt": "cm", "mmt": "mm"}.get(unit, unit)
+
+
+def _itemprop_dimension_text(soup: BeautifulSoup) -> str:
+    parts: list[str] = []
+    for prop in ("width", "height", "depth"):
+        tag = soup.select_one(f'[itemprop="{prop}"]')
+        if not tag:
+            continue
+        value = tag.get("content") or tag.get("value") or tag.get_text(" ", strip=True)
+        if value:
+            parts.append(f"{prop}: {value}")
+    return " ".join(parts)
+
+
+def _adjacent_label_value_dimension_text(soup: BeautifulSoup) -> str:
+    parts: list[str] = []
+    label_re = re.compile(r"^(?:overall |product |appliance )?(?:dimensions?|width|height|depth)$", re.I)
+    for node in soup.find_all(["div", "span", "li", "p"]):
+        label = node.get_text(" ", strip=True)
+        if not label or not label_re.fullmatch(label.strip(": ")):
+            continue
+        sibling = node.find_next_sibling()
+        while sibling is not None:
+            value = sibling.get_text(" ", strip=True) if hasattr(sibling, "get_text") else str(sibling).strip()
+            if value:
+                parts.append(f"{label}: {value}")
+                break
+            sibling = sibling.find_next_sibling() if hasattr(sibling, "find_next_sibling") else None
+    return "\n".join(parts)
 
 
 def _first_labeled_value(text: str, labels: tuple[str, ...]) -> str:

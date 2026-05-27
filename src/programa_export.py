@@ -27,6 +27,7 @@ export_programa_xlsx(df) -> bytes
 
 from __future__ import annotations
 
+import datetime
 import io
 import re
 import hashlib
@@ -477,13 +478,14 @@ def _row_to_programa_dict(row: dict, *, validate_image_urls: bool = False) -> di
     finish_color = _str_val(row.get("Finish / Color"))
     color = _str_val(row.get("Color"))
     material = _str_val(row.get("Material")) or _extract_material_from_notes(_str_val(row.get("Notes")))
+    canonical_model = _str_val(row.get("Model"))
 
     return {
         "Section": normalize_section(row.get("Product Category") or row.get("Section")),
         "Product Name": _str_val(row.get("Product Name")),
         "Brand": _str_val(row.get("Brand")),
         "SKU": _str_val(row.get("Model/SKU")),
-        "Model": "",
+        "Model": canonical_model,
         "Dimensions": dimensions,
         "Width (in)": _str_val(parts.get("width")),
         "Height (in)": _str_val(parts.get("height")),
@@ -614,6 +616,116 @@ def export_programa_csv(df: pd.DataFrame) -> bytes:
     buf = io.StringIO()
     df.to_csv(buf, index=False)
     return buf.getvalue().encode("utf-8")
+
+
+def generate_programa_export_filename(
+    rows,
+    *,
+    extension: str = "csv",
+    today: str | None = None,
+    kind: str = "import",
+    existing_filenames: set[str] | list[str] | tuple[str, ...] | None = None,
+    max_length: int = 120,
+) -> str:
+    """Build a descriptive, filesystem-safe Programa export filename.
+
+    The export data shape stays unchanged; this only improves the attachment
+    filename used by API responses and browser downloads.
+    """
+    row_list = _to_row_list(rows)
+    date_str = today or datetime.date.today().isoformat()
+    ext = extension.lower().lstrip(".") or "csv"
+    project = _first_non_empty(row_list, ("Project", "Project Name", "project", "project_name"))
+    room = _first_non_empty(row_list, ("Room", "Location", "room", "location"))
+    supplier = _first_non_empty(row_list, ("Supplier", "Vendor", "supplier", "vendor"))
+    category = _dominant_value(row_list, ("Product Category", "Section", "Category", "product_category", "section"))
+
+    if not project and room:
+        project = f"SCH {room}"
+    if not project:
+        project = "Untitled Project"
+
+    parts = [project]
+    if supplier:
+        parts.append(supplier)
+    if category:
+        parts.append(category)
+    label = "Programa Export" if kind == "zip" else "Programa Import"
+    parts.append(label)
+
+    stem_parts = [part for part in (_filename_part(part) for part in parts) if part]
+    clean_date = re.sub(r"[^0-9-]+", "", date_str) or datetime.date.today().isoformat()
+    stem_parts.append(clean_date)
+    stem = "_".join(stem_parts)
+    filename = _trim_filename(f"{stem}.{ext}", max_length=max_length)
+    return _dedupe_export_filename(filename, existing_filenames or set(), max_length=max_length)
+
+
+def _first_non_empty(rows: list[dict], fields: tuple[str, ...]) -> str:
+    for row in rows:
+        for field in fields:
+            value = _str_val(row.get(field))
+            if value:
+                return value
+    return ""
+
+
+def _dominant_value(rows: list[dict], fields: tuple[str, ...]) -> str:
+    counts: dict[str, tuple[str, int]] = {}
+    for row in rows:
+        for field in fields:
+            value = _str_val(row.get(field))
+            if not value:
+                continue
+            key = re.sub(r"\s+", " ", value.lower()).strip()
+            if key:
+                counts[key] = (value, counts.get(key, (value, 0))[1] + 1)
+                break
+    if not counts:
+        return ""
+    return sorted(counts.values(), key=lambda item: (-item[1], item[0].lower()))[0][0]
+
+
+def _filename_part(value: object) -> str:
+    text = _str_val(value)
+    text = re.sub(r"[^\w\s-]+", "", text, flags=re.UNICODE)
+    text = re.sub(r"[-\s]+", "_", text).strip("_")
+    return text or ""
+
+
+def _trim_filename(filename: str, *, max_length: int = 120) -> str:
+    if len(filename) <= max_length:
+        return filename
+    stem, dot, ext = filename.rpartition(".")
+    if not dot:
+        return filename[:max_length].rstrip("_")
+    keep = max(1, max_length - len(ext) - 1)
+    return f"{stem[:keep].rstrip('_')}.{ext}"
+
+
+def _dedupe_export_filename(
+    filename: str,
+    existing_filenames: set[str] | list[str] | tuple[str, ...],
+    *,
+    max_length: int = 120,
+) -> str:
+    existing = {str(name).lower() for name in existing_filenames}
+    if filename.lower() not in existing:
+        return filename
+    stem, dot, ext = filename.rpartition(".")
+    if not dot:
+        stem, ext = filename, ""
+    version = 2
+    while True:
+        suffix = f"_v{version}"
+        candidate_stem = stem
+        if len(candidate_stem) + len(suffix) + (1 + len(ext) if ext else 0) > max_length:
+            trim_to = max_length - len(suffix) - (1 + len(ext) if ext else 0)
+            candidate_stem = candidate_stem[:trim_to].rstrip("_")
+        candidate = f"{candidate_stem}{suffix}.{ext}" if ext else f"{candidate_stem}{suffix}"
+        if candidate.lower() not in existing:
+            return candidate
+        version += 1
 
 
 def export_programa_xlsx(df: pd.DataFrame) -> bytes:

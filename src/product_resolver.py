@@ -117,6 +117,19 @@ _KNOWN_BRANDS = {
     "visual comfort",
     "wolf",
 }
+_HARD_NON_PRODUCT_PATH_RE = re.compile(
+    r"(^|/)(?:sitemap(?:\.xml)?|search|search-results|find-a-dealer|where-to-buy|"
+    r"store-locator|privacy|terms|contact|support|blog|news|press)(?:/|$|[._-])",
+    re.IGNORECASE,
+)
+_SOFT_GENERIC_PATH_RE = re.compile(
+    r"(^|/)(?:category|categories|collection|collections|catalog|sitemap)(?:/|$|[._-])",
+    re.IGNORECASE,
+)
+_PRODUCT_PATH_RE = re.compile(
+    r"/(?:product|products|pdp|appliance|spec|specification|resources?)/",
+    re.IGNORECASE,
+)
 
 
 def resolve_product_page(row: dict, session_cache=None, budget=None) -> ProductResolutionResult:
@@ -151,9 +164,14 @@ def resolve_product_page(row: dict, session_cache=None, budget=None) -> ProductR
     for query in queries:
         if stop_all:
             break
-        if budget is not None and not budget.can_search() and not (session_cache is not None and query in session_cache.queries):
-            budget.stop("search budget exhausted")
-            break
+        if budget is not None and not (session_cache is not None and query in session_cache.queries):
+            try:
+                can_search = budget.can_search(query=query, field="Product URL", reason="product resolver search")
+            except TypeError:
+                can_search = budget.can_search()
+            if not can_search:
+                budget.stop("search budget exhausted")
+                break
         results = _search(query, row, session_cache, budget)
         for result in results[:5]:
             url = _text(getattr(result, "url", ""))
@@ -266,9 +284,16 @@ def _search(query: str, row: dict, session_cache, budget) -> list:
     if session_cache is not None and query in session_cache.queries:
         return session_cache.queries[query]
     if budget is not None:
-        if not budget.can_search():
+        try:
+            can_search = budget.can_search(query=query, field="Product URL", reason="product resolver search")
+        except TypeError:
+            can_search = budget.can_search()
+        if not can_search:
             return []
-        budget.consume_search()
+        try:
+            budget.consume_search(query=query, field="Product URL", reason="product resolver search")
+        except TypeError:
+            budget.consume_search()
     return search_product_candidates(query, _text(row.get("Brand")), session_cache=session_cache)
 
 
@@ -409,6 +434,25 @@ def _score_candidate(candidate: ProductCandidate, row: dict, official_domains: l
         candidate.evidence_score = min(score, 59)
         return
 
+    non_product_reason = _non_product_page_reason(candidate, sku_norm, product_name)
+    if non_product_reason:
+        candidate.confidence = "none"
+        candidate.rejection_reason = non_product_reason
+        candidate.evidence_score = min(score, 59)
+        candidate.diagnostics["exact_page_signal"] = False
+        return
+
+    if (
+        sku_norm
+        and candidate.matched_sku
+        and not _has_exact_product_page_signal(candidate, sku_norm, product_name)
+    ):
+        candidate.confidence = "low"
+        candidate.rejection_reason = "generic_page_without_product_signal"
+        candidate.evidence_score = min(score, 59)
+        candidate.diagnostics["exact_page_signal"] = False
+        return
+
     if candidate.is_official_domain and candidate.matched_sku and score >= 80:
         confidence = "high"
     elif candidate.matched_sku and score >= 60:
@@ -422,6 +466,7 @@ def _score_candidate(candidate: ProductCandidate, row: dict, official_domains: l
         confidence = "medium"
     candidate.confidence = confidence
     candidate.evidence_score = max(0, min(100, score))
+    candidate.diagnostics["exact_page_signal"] = _has_exact_product_page_signal(candidate, sku_norm, product_name)
     if confidence == "none":
         candidate.rejection_reason = "insufficient_evidence"
 
@@ -508,6 +553,7 @@ def _diagnostic_record(candidate: ProductCandidate) -> dict[str, Any]:
         "source_success_boost": candidate.diagnostics.get("source_success_boost", 0),
         "dimension_method": candidate.diagnostics.get("dimension_method", ""),
         "image_method": candidate.diagnostics.get("image_method", ""),
+        "exact_page_signal": candidate.diagnostics.get("exact_page_signal", ""),
     }
 
 
@@ -621,6 +667,47 @@ def _is_retailer_domain(domain: str) -> bool:
     return any(_domain_matches(domain, root) for root in _RETAILER_DOMAINS)
 
 
+def _non_product_page_reason(candidate: ProductCandidate, sku_norm: str, product_name: str) -> str:
+    if candidate.source_type.endswith("_pdf"):
+        return ""
+    parsed = urllib.parse.urlparse(candidate.url)
+    path = parsed.path.lower() or "/"
+    title_text = _norm(" ".join([candidate.title, _html_title(candidate.html), _h1_text(candidate.html)]))
+    if _HARD_NON_PRODUCT_PATH_RE.search(path):
+        return "non_product_page"
+    if "sitemap" in title_text and not (_has_product_jsonld(candidate.html) or _has_spec_table(candidate.html)):
+        return "sitemap_page"
+    if _SOFT_GENERIC_PATH_RE.search(path) and not _has_exact_product_page_signal(candidate, sku_norm, product_name):
+        return "generic_listing_page"
+    return ""
+
+
+def _has_exact_product_page_signal(candidate: ProductCandidate, sku_norm: str, product_name: str) -> bool:
+    if candidate.source_type.endswith("_pdf"):
+        return bool(sku_norm and candidate.matched_sku)
+    path_compact = re.sub(r"[^a-z0-9]", "", urllib.parse.urlparse(candidate.url).path.lower())
+    if sku_norm and sku_norm in path_compact:
+        return True
+    if _has_product_jsonld(candidate.html) or _has_spec_table(candidate.html):
+        return True
+    title_h1 = " ".join([candidate.title, _html_title(candidate.html), _h1_text(candidate.html)])
+    if sku_norm and sku_norm in re.sub(r"[^a-z0-9]", "", title_h1.lower()):
+        return True
+    if product_name and product_name_similarity(product_name, title_h1) >= 0.55 and _PRODUCT_PATH_RE.search(candidate.url):
+        return True
+    return False
+
+
+def _html_title(html: str) -> str:
+    match = re.search(r"<title[^>]*>(.*?)</title>", html or "", re.I | re.S)
+    return _html_to_text(match.group(1)) if match else ""
+
+
+def _h1_text(html: str) -> str:
+    match = re.search(r"<h1[^>]*>(.*?)</h1>", html or "", re.I | re.S)
+    return _html_to_text(match.group(1)) if match else ""
+
+
 def _brand_matches(brand_norm: str, domain: str, haystack_norm: str) -> bool:
     if not brand_norm:
         return False
@@ -649,7 +736,14 @@ def _has_product_jsonld(html: str) -> bool:
 
 
 def _has_spec_table(html: str) -> bool:
-    return bool(re.search(r"<table|<dl|dimension|width|height|depth", html or "", re.I))
+    return bool(re.search(
+        r"<table|<dl|class=[\"'][^\"']*(?:spec|dimension|detail)|"
+        r"id=[\"'][^\"']*(?:spec|dimension|detail)|"
+        r"product dimensions?|overall dimensions?|appliance dimensions?|"
+        r"\b(?:width|height|depth)\s*:",
+        html or "",
+        re.I,
+    ))
 
 
 def _has_image_candidates(html: str) -> bool:

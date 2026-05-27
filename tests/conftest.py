@@ -7,3 +7,4 @@ import pytest
 def _isolate_source_success_registry(monkeypatch, tmp_path):
     """Keep resolver source-learning tests from writing to real project data."""
     monkeypatch.setenv("SOURCE_SUCCESS_REGISTRY_PATH", str(tmp_path / "source_success_registry.json"))
+    monkeypatch.setenv("ENRICHMENT_COST_HISTORY_PATH", str(tmp_path / "enrichment_cost_history.json"))

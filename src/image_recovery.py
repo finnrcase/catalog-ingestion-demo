@@ -62,6 +62,7 @@ from src.manufacturer_domains import get_domain_for_brand
 from src.image_presence import row_has_image, row_image_status
 from src.product_page_images import extract_image_from_url
 from src.web_product_lookup import lookup_official_product_image
+from src.image_uploader import upload_image_with_metadata
 
 
 _log = logging.getLogger(__name__)
@@ -1153,6 +1154,7 @@ def recover_image_for_row(
     session_id: str | None = None,  # forward-plumbing for recover_images_for_dataframe (Task 7) — not used here
     enable_screenshot: bool = True,
     enable_web_lookup: bool = True,
+    enable_product_page: bool = True,
     debug: dict | None = None,
 ) -> ImageRecoveryResult:
     """
@@ -1218,26 +1220,29 @@ def recover_image_for_row(
         debug.setdefault("screenshot_rejection_reasons", [])
 
     # 1) Product/Supplier/Source URL page extraction.
-    for page_key in ("Product URL", "Supplier URL", "Source URL"):
-        page_url = _str_val(row.get(page_key))
-        if not page_url:
-            continue
-        page_result = recover_from_product_page(row, page_url, debug=debug)
-        if page_result.confidence == "HIGH":
-            if debug is not None:
-                _record_final_debug(debug, page_result)
-            return page_result
-        if page_result.confidence in ("MEDIUM", "LOW"):
-            held = page_result
-        if enable_screenshot:
-            shot_result = recover_from_screenshot(row, page_url, debug=debug)
-            if shot_result.confidence == "HIGH":
+    if enable_product_page:
+        for page_key in ("Product URL", "Supplier URL", "Source URL"):
+            page_url = _str_val(row.get(page_key))
+            if not page_url:
+                continue
+            page_result = recover_from_product_page(row, page_url, debug=debug)
+            if page_result.confidence == "HIGH":
                 if debug is not None:
-                    _record_final_debug(debug, shot_result)
-                return shot_result
-            if shot_result.confidence in ("MEDIUM", "LOW"):
-                held = _better(held, shot_result)
-        break
+                    _record_final_debug(debug, page_result)
+                return page_result
+            if page_result.confidence in ("MEDIUM", "LOW"):
+                held = page_result
+            if enable_screenshot:
+                shot_result = recover_from_screenshot(row, page_url, debug=debug)
+                if shot_result.confidence == "HIGH":
+                    if debug is not None:
+                        _record_final_debug(debug, shot_result)
+                    return shot_result
+                if shot_result.confidence in ("MEDIUM", "LOW"):
+                    held = _better(held, shot_result)
+            break
+    elif debug is not None:
+        debug["product_url_rejection_reasons"] = ["product_page_image_lookup_skipped_by_budget"]
 
     # 2) Official manufacturer/supplier web lookup.
     if enable_web_lookup:
@@ -1414,6 +1419,7 @@ def recover_images_for_dataframe(
     session_id: str | None = None,
     enable_screenshot: bool = True,
     enable_web_lookup: bool = True,
+    max_product_page_fetches: int | None = None,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """
     Run the recovery pipeline on rows that don't already carry a HIGH-confidence
@@ -1430,6 +1436,7 @@ def recover_images_for_dataframe(
     if not session_id:
         session_id = "default"
     images_dir = _session_image_dir(session_id)
+    product_page_fetches = 0
 
     for idx, row in df.iterrows():
         if _row_already_high(row):
@@ -1437,12 +1444,19 @@ def recover_images_for_dataframe(
 
         row_dict = row.to_dict()
         debug: dict = {}
+        has_page_url = any(_str_val(row_dict.get(key)) for key in ("Product URL", "Supplier URL", "Source URL"))
+        enable_product_page_for_row = True
+        if max_product_page_fetches is not None and has_page_url:
+            enable_product_page_for_row = product_page_fetches < max_product_page_fetches
+            if enable_product_page_for_row:
+                product_page_fetches += 1
         result = recover_image_for_row(
             row_dict,
             pdf_lookup=pdf_lookup,
             session_id=session_id,
             enable_screenshot=enable_screenshot,
             enable_web_lookup=enable_web_lookup,
+            enable_product_page=enable_product_page_for_row,
             debug=debug,
         )
 
@@ -1468,6 +1482,32 @@ def recover_images_for_dataframe(
             df.at[idx, "Image URL"] = result.image_url
         elif result.image_url:
             df.at[idx, "Review Image URL"] = result.image_url
+
+        if result.confidence in {"HIGH", "MEDIUM"} and result.jpeg_bytes:
+            upload_result = upload_image_with_metadata(io.BytesIO(result.jpeg_bytes), source_url=result.image_url)
+            upload_debug = upload_result.debug or {}
+            if upload_result.secure_url:
+                if result.confidence == "HIGH":
+                    original_url = result.image_url
+                    df.at[idx, "Original Image URL"] = original_url
+                    df.at[idx, "Image URL"] = upload_result.secure_url
+                    result.image_url = upload_result.secure_url
+                else:
+                    df.at[idx, "Review Image URL"] = upload_result.secure_url
+                df.at[idx, "cloudinary_secure_url"] = upload_result.secure_url
+                df.at[idx, "cloudinary_public_id"] = upload_result.public_id
+                df.at[idx, "cloudinary_width"] = upload_result.width
+                df.at[idx, "cloudinary_height"] = upload_result.height
+                df.at[idx, "cloudinary_format"] = upload_result.format
+                df.at[idx, "cloudinary_bytes"] = upload_result.bytes
+                df.at[idx, "image_upload_status"] = "uploaded"
+                df.at[idx, "Image Upload Status"] = "Uploaded"
+                upload_debug["final_saved_image_url"] = upload_result.secure_url
+            else:
+                df.at[idx, "image_upload_status"] = upload_result.status
+                df.at[idx, "image_upload_failure_reason"] = upload_result.error
+                df.at[idx, "Image Upload Status"] = "Upload skipped" if upload_result.status == "skipped" else "Upload failed"
+            df.at[idx, "_image_upload_debug"] = json.dumps(upload_debug)
 
         # Only HIGH images feed the Excel-with-images export path. MEDIUM
         # screenshots are saved as review candidates, and LOW stays diagnostic

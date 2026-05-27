@@ -200,6 +200,29 @@ def test_default_meta_image_rejected_in_favor_of_gallery():
     assert any("default-meta-image" in reason for reason in result.debug["rejection_reasons"])
 
 
+def test_verified_product_gallery_allows_generic_non_brand_alt_text():
+    html = """
+    <html><body>
+      <div class="product-media hero">
+        <img alt="Stainless steel appliance front view"
+             src="https://cdn.wolfappliance.com/products/warming-drawer-front.jpg"
+             width="1000"
+             height="800">
+      </div>
+    </body></html>
+    """
+
+    result = extract_product_page_image(
+        html,
+        "https://wolfappliance.com/products/mdd30ts",
+        _row(),
+        page_evidence=_high_page_evidence(),
+    )
+
+    assert result.image_found is True
+    assert result.image_url.endswith("warming-drawer-front.jpg")
+
+
 def test_low_confidence_page_image_not_assigned(monkeypatch, isolated_product_enrichment_caches):
     import src.product_enrichment as pe
 

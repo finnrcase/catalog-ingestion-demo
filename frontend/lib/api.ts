@@ -323,25 +323,47 @@ export async function validateProgramaExport(rows: IntakeRow[]): Promise<Program
   );
 }
 
-async function exportProgramaFile(rows: IntakeRow[], path: string, fallbackMessage: string): Promise<Blob> {
+export type ProgramaExportFile = {
+  blob: Blob;
+  filename: string;
+};
+
+function filenameFromContentDisposition(header: string | null, fallback: string) {
+  if (!header) return fallback;
+  const utf8Match = header.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1].replace(/"/g, ""));
+    } catch {
+      return utf8Match[1].replace(/"/g, "");
+    }
+  }
+  const match = header.match(/filename="?([^";]+)"?/i);
+  return match?.[1]?.trim() || fallback;
+}
+
+async function exportProgramaFile(rows: IntakeRow[], path: string, fallbackMessage: string): Promise<ProgramaExportFile> {
   const response = await apiFetch(apiUrl(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ rows }),
   });
   if (!response.ok) throw new Error(fallbackMessage);
-  return response.blob();
+  return {
+    blob: await response.blob(),
+    filename: filenameFromContentDisposition(response.headers.get("content-disposition"), "programa_import.csv"),
+  };
 }
 
-export async function exportProgramaCsv(rows: IntakeRow[]): Promise<Blob> {
+export async function exportProgramaCsv(rows: IntakeRow[]): Promise<ProgramaExportFile> {
   return exportProgramaFile(rows, "/export/programa/csv", "Could not export Programa CSV.");
 }
 
-export async function exportProgramaXlsx(rows: IntakeRow[]): Promise<Blob> {
+export async function exportProgramaXlsx(rows: IntakeRow[]): Promise<ProgramaExportFile> {
   return exportProgramaFile(rows, "/export/programa/xlsx", "Could not export Programa XLSX.");
 }
 
-export async function exportProgramaXlsxWithImages(rows: IntakeRow[]): Promise<Blob> {
+export async function exportProgramaXlsxWithImages(rows: IntakeRow[]): Promise<ProgramaExportFile> {
   return exportProgramaFile(
     rows,
     "/export/programa/xlsx-with-images",
@@ -349,7 +371,7 @@ export async function exportProgramaXlsxWithImages(rows: IntakeRow[]): Promise<B
   );
 }
 
-export async function exportProgramaZip(rows: IntakeRow[], includeLowConfidenceImages = false): Promise<Blob> {
+export async function exportProgramaZip(rows: IntakeRow[], includeLowConfidenceImages = false): Promise<ProgramaExportFile> {
   const response = await apiFetch(apiUrl("/export/programa/zip"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -359,9 +381,12 @@ export async function exportProgramaZip(rows: IntakeRow[], includeLowConfidenceI
     }),
   });
   if (!response.ok) throw new Error("Could not export Programa ZIP.");
-  return response.blob();
+  return {
+    blob: await response.blob(),
+    filename: filenameFromContentDisposition(response.headers.get("content-disposition"), "programa_export.zip"),
+  };
 }
 
 export async function exportProgramaDebugCsv(rows: IntakeRow[]): Promise<Blob> {
-  return exportProgramaFile(rows, "/export/programa/debug-csv", "Could not export Debug CSV.");
+  return (await exportProgramaFile(rows, "/export/programa/debug-csv", "Could not export Debug CSV.")).blob;
 }

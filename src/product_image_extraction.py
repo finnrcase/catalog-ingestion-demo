@@ -27,7 +27,7 @@ class ImageCandidate:
     rejection_reason: str = ""
 
 
-_BAD_HINTS = (
+_HARD_BAD_HINTS = (
     "logo",
     "icon",
     "sprite",
@@ -48,13 +48,35 @@ _BAD_HINTS = (
     "no-image",
     "noimage",
     "badge",
+)
+_SOFT_BAD_HINTS = (
     "lifestyle",
     "roomscene",
     "room-scene",
     "inspiration",
 )
+_BAD_HINTS = _HARD_BAD_HINTS + _SOFT_BAD_HINTS
 _GENERIC_ALT = {"product", "image", "photo", "view", "front", "side", "back", "detail", "gallery", "main"}
 _CONF_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
+_KNOWN_BRAND_ALT_TOKENS = {
+    "asko",
+    "bosch",
+    "cove",
+    "fisher",
+    "ge",
+    "jenn",
+    "jennair",
+    "kallista",
+    "kohler",
+    "lynx",
+    "miele",
+    "monogram",
+    "scotsman",
+    "subzero",
+    "thermador",
+    "viking",
+    "wolf",
+}
 
 
 def extract_product_image_candidates(html: str, page_url: str, row: dict) -> list[ImageCandidate]:
@@ -93,8 +115,18 @@ def extract_product_image_candidates(html: str, page_url: str, row: dict) -> lis
         for img in soup.select(selector):
             raw = ""
             source = "html_image"
-            width = _parse_int(img.get("width"))
-            height = _parse_int(img.get("height"))
+            width = _parse_int(
+                img.get("width")
+                or img.get("data-width")
+                or img.get("data-image-width")
+                or img.get("naturalWidth")
+            )
+            height = _parse_int(
+                img.get("height")
+                or img.get("data-height")
+                or img.get("data-image-height")
+                or img.get("naturalHeight")
+            )
             if img.get("srcset"):
                 raw, srcset_width = _best_srcset(str(img.get("srcset") or ""))
                 width = width or srcset_width
@@ -179,13 +211,17 @@ def _score(candidate: ImageCandidate, row: dict, page_verified: bool, page_confi
         candidate.rejection_reason = "svg_without_product_signal"
         candidate.evidence = evidence
         return
-    alt_ok, alt_reason = _valid_alt(candidate, row)
+    alt_ok, alt_reason = _valid_alt(candidate, row, page_verified=page_verified)
     if not alt_ok:
         candidate.rejection_reason = alt_reason
         candidate.evidence = evidence
         return
 
     score = _source_score(candidate.source)
+    soft_hint = _soft_bad_hint(f"{candidate.url} {candidate.alt} {candidate.title} {candidate.context}")
+    if soft_hint:
+        score -= 20
+        evidence.append(f"soft_image_hint_penalty:{soft_hint}")
     sku = normalize_sku(row.get("Model/SKU") or row.get("SKU"))
     compact_url = re.sub(r"[^a-z0-9]", "", candidate.url.lower())
     if sku and sku in compact_url:
@@ -256,25 +292,57 @@ def _valid_url(url: str) -> tuple[bool, str]:
     if parsed.scheme != "https":
         return False, "not_https"
     lowered = url.lower()
-    for hint in _BAD_HINTS:
+    for hint in _HARD_BAD_HINTS:
         if hint in lowered:
             return False, f"bad_image_hint:{hint}"
     return True, ""
 
 
-def _valid_alt(candidate: ImageCandidate, row: dict) -> tuple[bool, str]:
+def _valid_alt(candidate: ImageCandidate, row: dict, *, page_verified: bool = False) -> tuple[bool, str]:
     alt = _norm(f"{candidate.alt} {candidate.title}")
     if not alt:
         return True, ""
-    for hint in _BAD_HINTS:
+    for hint in _HARD_BAD_HINTS:
         if hint in alt:
             return False, f"bad_alt_hint:{hint}"
+    if _mentions_other_known_brand(alt, row):
+        return False, "unrelated_alt_text"
     if _identity_in_text(alt, row, require_sku=False):
         return True, ""
     remaining = [token for token in alt.split() if token not in _GENERIC_ALT]
+    if page_verified and re.search(
+        r"gallery|product|media|carousel|pdp|picture|hero|primary|main|zoom",
+        candidate.context,
+        re.I,
+    ):
+        return True, ""
     if len(remaining) >= 2:
         return False, "unrelated_alt_text"
     return True, ""
+
+
+def _mentions_other_known_brand(alt_norm: str, row: dict) -> bool:
+    row_brand = _norm(str(row.get("Brand") or "")).replace(" ", "")
+    compact_alt = alt_norm.replace(" ", "")
+    alt_tokens = set(alt_norm.split())
+    for token in _KNOWN_BRAND_ALT_TOKENS:
+        if token and token in row_brand:
+            continue
+        if token == "ge":
+            if "ge" in alt_tokens:
+                return True
+            continue
+        if token in compact_alt:
+            return True
+    return False
+
+
+def _soft_bad_hint(value: str) -> str:
+    lowered = str(value or "").lower()
+    for hint in _SOFT_BAD_HINTS:
+        if hint in lowered:
+            return hint
+    return ""
 
 
 def _identity_in_text(text: str, row: dict, *, require_sku: bool) -> bool:

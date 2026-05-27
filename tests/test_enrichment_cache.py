@@ -77,6 +77,18 @@ def test_budget_for_mode_fast():
     assert not b.allows_general_fallback
 
 
+def test_budget_for_mode_fast_clamps_generic_env(monkeypatch):
+    from src.enrichment_cache import budget_for_mode
+
+    monkeypatch.setenv("BRAVE_MAX_SEARCHES_PER_PRODUCT", "5")
+    monkeypatch.setenv("ENRICHMENT_MAX_URLS_PER_PRODUCT", "5")
+    monkeypatch.setenv("ENRICHMENT_MAX_AI_CALLS_PER_PRODUCT", "2")
+
+    b = budget_for_mode("fast")
+
+    assert (b.max_searches, b.max_urls, b.max_ai_calls) == (1, 1, 0)
+
+
 def test_budget_for_mode_deep():
     from src.enrichment_cache import budget_for_mode
     b = budget_for_mode("deep")

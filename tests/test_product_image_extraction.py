@@ -94,3 +94,19 @@ def test_select_best_requires_page_evidence_for_high_medium():
 
     scored_high_page = score_image_candidates(candidates, _row(), _evidence("high"))
     assert select_best_product_image(scored_high_page, _evidence("high")).confidence in {"HIGH", "MEDIUM"}
+
+
+def test_verified_gallery_candidate_allows_generic_non_brand_alt_text():
+    html = """
+    <section class="product-media hero">
+      <img src="https://cdn.wolfappliance.com/products/warming-drawer-front.jpg"
+           alt="Stainless steel appliance front view"
+           width="1000"
+           height="800">
+    </section>
+    """
+    candidates = extract_product_image_candidates(html, "https://wolfappliance.com/products/mdd30ts", _row())
+    scored = score_image_candidates(candidates, _row(), _evidence("high"))
+
+    assert scored[0].rejection_reason == ""
+    assert scored[0].confidence in {"HIGH", "MEDIUM"}

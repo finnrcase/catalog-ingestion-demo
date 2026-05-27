@@ -40,7 +40,7 @@ from src.eligibility import split_eligible_rows
 from src.export import get_csv_bytes
 from src.intake import build_intake_dataframe, create_pdf_rows, create_photo_rows, create_url_rows
 from src.intake_schema import CATEGORIES, STATUSES
-from src.image_uploader import is_public_https_image_url, upload_image
+from src.image_uploader import is_public_https_image_url, upload_image_with_metadata
 from src.manufacturer_domains import save_manufacturer_override
 from src.notes import remove_notes_row_prefix
 from src.image_recovery import cleanup_old_sessions
@@ -69,6 +69,7 @@ from src.programa_export import (
     export_programa_xlsx,
     export_programa_xlsx_with_images,
     export_programa_zip,
+    generate_programa_export_filename,
     validate_for_export,
 )
 from src.programa_automation import open_programa_login_window, run_programa_automation
@@ -230,6 +231,13 @@ class PdfParseJobResponse(BaseModel):
 
 class ImageUploadResponse(BaseModel):
     secure_url: str
+    public_id: str = ""
+    width: int = 0
+    height: int = 0
+    format: str = ""
+    bytes: int = 0
+    image_upload_status: str = ""
+    debug: dict = Field(default_factory=dict)
 
 
 class ManufacturerOverridePayload(BaseModel):
@@ -652,14 +660,24 @@ async def generate_intake(
 async def upload_image_endpoint(file: UploadFile = File(...)) -> ImageUploadResponse:
     content_type = (file.content_type or "").lower()
     filename = (file.filename or "").lower()
-    if not (content_type.startswith("image/") or filename.endswith((".jpg", ".jpeg", ".png", ".webp"))):
+    if not (content_type.startswith("image/") or filename.endswith((".jpg", ".jpeg", ".png", ".webp", ".avif"))):
         raise HTTPException(status_code=400, detail="Only image files can be uploaded.")
 
     content = await _read_upload_with_limit(file, max_bytes=min(_MAX_UPLOAD_BYTES, 25 * 1024 * 1024))
-    secure_url = upload_image(io.BytesIO(content))
+    result = upload_image_with_metadata(io.BytesIO(content))
+    secure_url = result.secure_url
     if not secure_url or not is_public_https_image_url(secure_url):
         raise HTTPException(status_code=502, detail="Cloudinary upload failed or did not return a secure HTTPS URL.")
-    return ImageUploadResponse(secure_url=secure_url)
+    return ImageUploadResponse(
+        secure_url=secure_url,
+        public_id=result.public_id,
+        width=result.width,
+        height=result.height,
+        format=result.format,
+        bytes=result.bytes,
+        image_upload_status=result.status,
+        debug=result.debug,
+    )
 
 
 @app.post("/upload-image", response_model=ImageUploadResponse)
@@ -687,13 +705,20 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
         session_id = payload.session_id or "default"
         pdfs_dir = _TMP_UPLOADS / session_id / "pdfs"
         pdf_lookup = {f.stem: str(f) for f in pdfs_dir.glob("*.pdf")} if pdfs_dir.exists() else {}
-        df, image_diagnostics = recover_images_for_dataframe(
-            df,
-            pdf_lookup=pdf_lookup,
-            session_id=session_id,
-            enable_screenshot=payload.enrichment_mode != "fast",
-            enable_web_lookup=payload.enrichment_mode != "fast",
-        )
+        image_recovery_kwargs = {
+            "pdf_lookup": pdf_lookup,
+            "session_id": session_id,
+            "enable_screenshot": payload.enrichment_mode != "fast",
+            "enable_web_lookup": payload.enrichment_mode != "fast",
+            "max_product_page_fetches": 3 if payload.enrichment_mode == "fast" else None,
+        }
+        try:
+            df, image_diagnostics = recover_images_for_dataframe(df, **image_recovery_kwargs)
+        except TypeError as exc:
+            if "max_product_page_fetches" not in str(exc):
+                raise
+            image_recovery_kwargs.pop("max_product_page_fetches", None)
+            df, image_diagnostics = recover_images_for_dataframe(df, **image_recovery_kwargs)
         if image_diagnostics:
             dimension_diagnostics = [
                 *dimension_diagnostics,
@@ -1083,29 +1108,29 @@ def export_programa_validate(payload: RowsPayload) -> dict:
 @app.post("/export/programa/csv")
 def export_programa_import_csv(payload: RowsPayload) -> Response:
     df = build_programa_import_dataframe(payload.rows)
-    today = datetime.date.today().isoformat()
+    filename = generate_programa_export_filename(payload.rows, extension="csv")
     return Response(
         content=export_programa_csv(df),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="programa_import_{today}.csv"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
 @app.post("/export/programa/xlsx")
 def export_programa_import_xlsx(payload: RowsPayload) -> Response:
     df = build_programa_import_dataframe(payload.rows)
-    today = datetime.date.today().isoformat()
+    filename = generate_programa_export_filename(payload.rows, extension="xlsx")
     return Response(
         content=export_programa_xlsx(df),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="programa_import_{today}.xlsx"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
 @app.post("/export/programa/xlsx-with-images")
 def export_programa_import_xlsx_with_images(payload: RowsPayload) -> Response:
     """XLSX with same-row embedded product images for Programa's custom importer."""
-    today = datetime.date.today().isoformat()
+    filename = generate_programa_export_filename(payload.rows, extension="xlsx")
     xlsx_bytes = export_programa_xlsx_with_images(
         payload.rows,
         session_id=payload.session_id,
@@ -1114,14 +1139,14 @@ def export_programa_import_xlsx_with_images(payload: RowsPayload) -> Response:
     return Response(
         content=xlsx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="programa_import_with_images_{today}.xlsx"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
 @app.post("/export/programa/zip")
 def export_programa_import_zip(payload: RowsPayload) -> Response:
     """ZIP archive: programa_import.csv + images/ folder + manifest.csv."""
-    today = datetime.date.today().isoformat()
+    filename = generate_programa_export_filename(payload.rows, extension="zip", kind="zip")
     zip_bytes = export_programa_zip(
         payload.rows,
         include_low_confidence_images=payload.include_low_confidence_images,
@@ -1130,7 +1155,7 @@ def export_programa_import_zip(payload: RowsPayload) -> Response:
     return Response(
         content=zip_bytes,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="programa_export_{today}.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
