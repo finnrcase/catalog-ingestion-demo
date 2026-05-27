@@ -55,6 +55,12 @@ from src.pdf_parsing_pipeline import (
     PdfParseCancelledError,
     parse_pdf_file_resilient,
 )
+from src.preferred_websites import (
+    add_preferred_website,
+    delete_preferred_website,
+    list_preferred_websites,
+    update_preferred_website,
+)
 from src.persistent_storage import (
     persistent_upload_storage_enabled,
     require_persistent_upload_storage,
@@ -243,6 +249,12 @@ class ImageUploadResponse(BaseModel):
 class ManufacturerOverridePayload(BaseModel):
     brand: str = ""
     website: str = ""
+
+
+class PreferredWebsitePayload(BaseModel):
+    keyword: str = ""
+    url: str = ""
+    notes: str = ""
 
 
 app = FastAPI(
@@ -667,7 +679,16 @@ async def upload_image_endpoint(file: UploadFile = File(...)) -> ImageUploadResp
     result = upload_image_with_metadata(io.BytesIO(content))
     secure_url = result.secure_url
     if not secure_url or not is_public_https_image_url(secure_url):
-        raise HTTPException(status_code=502, detail="Cloudinary upload failed or did not return a secure HTTPS URL.")
+        if result.error == "cloudinary_not_configured":
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Cloudinary image upload is not configured. Set CLOUDINARY_CLOUD_NAME, "
+                    "CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET, or set CLOUDINARY_URL."
+                ),
+            )
+        detail = result.error or "Cloudinary upload failed or did not return a secure HTTPS URL."
+        raise HTTPException(status_code=502, detail=detail)
     return ImageUploadResponse(
         secure_url=secure_url,
         public_id=result.public_id,
@@ -878,6 +899,39 @@ def manufacturer_override(payload: ManufacturerOverridePayload) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "saved", "override": entry}
+
+
+@app.get("/settings/preferred-websites")
+def preferred_websites_list() -> dict:
+    return {"entries": list_preferred_websites()}
+
+
+@app.post("/settings/preferred-websites")
+def preferred_websites_create(payload: PreferredWebsitePayload) -> dict:
+    try:
+        entry = add_preferred_website(keyword=payload.keyword, url=payload.url, notes=payload.notes)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "saved", "entry": entry, "entries": list_preferred_websites()}
+
+
+@app.put("/settings/preferred-websites/{entry_id}")
+def preferred_websites_update(entry_id: str, payload: PreferredWebsitePayload) -> dict:
+    try:
+        entry = update_preferred_website(entry_id, keyword=payload.keyword, url=payload.url, notes=payload.notes)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "saved", "entry": entry, "entries": list_preferred_websites()}
+
+
+@app.delete("/settings/preferred-websites/{entry_id}")
+def preferred_websites_delete(entry_id: str) -> dict:
+    deleted = delete_preferred_website(entry_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Preferred website was not found.")
+    return {"status": "deleted", "entries": list_preferred_websites()}
 
 
 @app.post("/programa/eligible")

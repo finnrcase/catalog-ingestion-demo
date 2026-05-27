@@ -29,7 +29,7 @@ from src.dimension_enrichment import DimensionResult as _DimensionResult, find_d
 from src.dimensions import has_complete_3d_dimensions
 from src.enrichment_cost_history import append_cost_history
 from src.image_presence import row_has_image
-from src.image_evidence import sku_appears_in_text
+from src.image_evidence import product_name_appears_in_text, sku_appears_in_text
 from src.image_uploader import fetch_convert_upload_remote_image, is_public_https_image_url
 from src.measurement_parser import normalize_dimension_fields
 from src.manufacturer_domains import get_domain_for_brand, record_discovered_domain, record_verified_domain
@@ -44,6 +44,8 @@ from src.product_lookup_cache import (
 )
 from src.product_page_specs import extract_product_page_specs
 from src.product_resolver import resolve_product_page
+from src.spec_extraction import DimensionExtractionResult, extract_dimensions_from_html
+from src.source_success_registry import record_source_success
 
 try:
     import html2text as _html2text
@@ -1073,6 +1075,175 @@ def _maybe_upload_selected_image_to_cloudinary(
         updated["Image Upload Status"] = "Upload failed"
 
 
+def _dimension_result_from_extraction(
+    extraction: DimensionExtractionResult,
+    *,
+    source_url: str,
+    confidence: str,
+    source_type: str,
+    queries_tried: list[str] | None = None,
+    urls_checked: list[str] | None = None,
+) -> _DimensionResult:
+    return _DimensionResult(
+        dimensions=extraction.dimensions,
+        width=extraction.width,
+        height=extraction.height,
+        depth=extraction.depth,
+        length=extraction.length,
+        source_url=source_url,
+        confidence=confidence,
+        source_type=source_type,
+        status="found",
+        queries_tried=queries_tried or [],
+        urls_checked=urls_checked or [source_url],
+        evidence_text=extraction.evidence_text or extraction.raw_dimensions_text,
+    )
+
+
+def _cached_dimension_sources(
+    row: dict,
+    *,
+    session_cache: "_SessionCache | None",
+    primary_url: str,
+    primary_html: str,
+) -> list[tuple[str, str, str]]:
+    sources: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+
+    def add(url: str, html: str, origin: str) -> None:
+        clean_url = _str_val(url)
+        clean_html = str(html or "")
+        if not clean_url or not clean_html or clean_url in seen:
+            return
+        seen.add(clean_url)
+        sources.append((clean_url, clean_html, origin))
+
+    add(primary_url, primary_html, "selected_product_page")
+    if session_cache is None:
+        return sources
+
+    sku = _str_val(row.get("Model/SKU") or row.get("SKU"))
+    product_name = _str_val(row.get("Product Name"))
+    for url, html in getattr(session_cache, "urls", {}).items():
+        text = f"{url} {html[:12000]}"
+        relevant = bool(
+            (sku and sku_appears_in_text(sku, text))
+            or (product_name and product_name_appears_in_text(product_name, text))
+            or url == primary_url
+        )
+        if relevant:
+            add(url, html, "cached_visited_page")
+    return sources
+
+
+def _focused_dimension_pass_from_cached_pages(
+    updated: dict,
+    *,
+    session_cache: "_SessionCache | None",
+    primary_url: str,
+    primary_html: str,
+    selected_evidence: ProductEvidence | None,
+    debug: dict,
+) -> _DimensionResult | None:
+    """Try dimensions from pages already visited for product/image work.
+
+    This pass never performs Brave searches and never fetches a new URL. It only
+    reads HTML already in hand or in the per-run session cache.
+    """
+    if has_complete_3d_dimensions(_str_val(updated.get("Dimensions"))):
+        return None
+
+    checked: list[dict] = []
+    sources = _cached_dimension_sources(
+        updated,
+        session_cache=session_cache,
+        primary_url=primary_url,
+        primary_html=primary_html,
+    )
+    for url, html, origin in sources:
+        page_evidence = selected_evidence if url == primary_url and selected_evidence else None
+        if page_evidence is None:
+            page_evidence = score_product_page(updated, url, html)
+        if page_evidence.confidence not in {"high", "medium"}:
+            checked.append({
+                "url": url,
+                "origin": origin,
+                "status": "rejected_page",
+                "reason": page_evidence.rejection_reason or page_evidence.confidence,
+            })
+            continue
+
+        extraction = extract_dimensions_from_html(html, updated)
+        confidence = "high" if page_evidence.confidence == "high" and extraction.confidence == "high" else "medium"
+        if extraction.dimensions and extraction.confidence in {"high", "medium"}:
+            updated["Dimensions"] = extraction.dimensions
+            updated["Width (in)"] = extraction.width
+            updated["Height (in)"] = extraction.height
+            updated["Depth (in)"] = extraction.depth
+            if extraction.length:
+                updated["Length (in)"] = extraction.length
+            updated["dimension_width"] = extraction.width
+            updated["dimension_height"] = extraction.height
+            updated["dimension_depth"] = extraction.depth
+            updated["dimension_unit"] = extraction.unit or "in"
+            updated["raw_dimensions_text"] = extraction.raw_dimensions_text or extraction.evidence_text
+            updated["dimensions_source_url"] = url
+            updated["dimension_confidence_score"] = extraction.confidence_score
+            updated["Dimension Source URL"] = url
+            updated["Dimension Confidence"] = confidence
+            updated["Dimension Source Type"] = "cached_verified_product_page"
+            updated["Dimension Lookup Status"] = "found"
+            updated["dimension_source_url"] = url
+            updated["dimension_confidence"] = confidence
+            updated["dimension_evidence"] = extraction.evidence_text or extraction.raw_dimensions_text
+            updated["dimension_raw_text"] = extraction.raw_dimensions_text or extraction.evidence_text
+
+            debug.update({
+                "dimensions_found": True,
+                "dimension_source_url": url,
+                "dimension_confidence": confidence,
+                "dimension_evidence": extraction.evidence_text or extraction.raw_dimensions_text,
+                "Dimensions Extraction Method": f"focused_cached_page:{extraction.diagnostics.get('method', extraction.source_type)}",
+                "Dimension Search Sources": json.dumps([source[0] for source in sources]),
+                "Dimension Failure Reason": "",
+                "Dimension Extra Cost": "$0.0000 (reused cached/selected page HTML)",
+            })
+            record_source_success(
+                updated,
+                domain=urllib.parse.urlparse(url).netloc,
+                url=url,
+                fields_found={
+                    "dimensions": True,
+                    "image": row_has_image(updated),
+                    "product_url": True,
+                    "spec_sheet": False,
+                },
+                confidence=confidence,
+            )
+            return _dimension_result_from_extraction(
+                extraction,
+                source_url=url,
+                confidence=confidence,
+                source_type="cached_verified_product_page",
+                queries_tried=list(debug.get("brand_search_queries_used") or []),
+                urls_checked=[item[0] for item in sources],
+            )
+
+        checked.append({
+            "url": url,
+            "origin": origin,
+            "status": "not_found",
+            "reason": extraction.diagnostics.get("failure_reason", "complete_w_h_d_not_found"),
+        })
+
+    debug.update({
+        "Dimension Search Sources": json.dumps([source[0] for source in sources]),
+        "Dimension Failure Reason": json.dumps(checked[-8:]) if checked else "no_cached_pages_available",
+        "Dimension Extra Cost": "$0.0000 (cached/selected pages only)",
+    })
+    return None
+
+
 def _apply_product_lookup_cache_entry(row: dict, cache_entry: dict, debug: dict) -> tuple[dict, _DimensionResult | None]:
     """Fill blank row fields from a HIGH/MEDIUM verified product lookup cache entry."""
     updated = row.copy()
@@ -1209,6 +1380,9 @@ def _apply_official_product_lookup(
         "Selected Source Domain": "",
         "Source Selection Reason": "",
         "Dimensions Extraction Method": "",
+        "Dimension Search Sources": "",
+        "Dimension Failure Reason": "",
+        "Dimension Extra Cost": "$0.0000",
         "Image Extraction Method": "",
         "Successful Source Stored": "",
         "Rejected URLs and Reasons": "",
@@ -1249,6 +1423,9 @@ def _apply_official_product_lookup(
                 "Selected Source Domain",
                 "Source Selection Reason",
                 "Dimensions Extraction Method",
+                "Dimension Search Sources",
+                "Dimension Failure Reason",
+                "Dimension Extra Cost",
                 "Image Extraction Method",
                 "Successful Source Stored",
                 "Rejected URLs and Reasons",
@@ -1587,6 +1764,24 @@ def _apply_official_product_lookup(
             source_type=_str_val(resolver_fields.get("image_source")) or "verified_product_page",
         )
 
+    focused_dim_result = _focused_dimension_pass_from_cached_pages(
+        updated,
+        session_cache=session_cache,
+        primary_url=page_url,
+        primary_html=html,
+        selected_evidence=selected_evidence,
+        debug=debug,
+    )
+    if focused_dim_result is not None:
+        dim_result = focused_dim_result
+        resolved_dimensions = focused_dim_result.dimensions
+        resolved_dim_confidence = focused_dim_result.confidence
+        specs.width = focused_dim_result.width or specs.width
+        specs.height = focused_dim_result.height or specs.height
+        specs.depth = focused_dim_result.depth or specs.depth
+    elif not has_complete_3d_dimensions(_str_val(updated.get("Dimensions"))):
+        debug.setdefault("Dimension Extra Cost", "$0.0000 (cached/selected pages only)")
+
     product_cache_key = ""
     brand_key = _str_val(updated.get("Brand"))
     model_key = _str_val(updated.get("Model/SKU"))
@@ -1602,6 +1797,15 @@ def _apply_official_product_lookup(
         existing_entry = _product_cache.get(product_cache_key) or {}
         if image.image_found and image.confidence in {"HIGH", "MEDIUM"} and not existing_entry.get("image_url"):
             cache_fields["image_url"] = image.image_url
+        if resolved_dimensions and resolved_dim_confidence in {"high", "medium"}:
+            cache_fields.update({
+                "dimensions": resolved_dimensions,
+                "width_in": specs.width or "",
+                "height_in": specs.height or "",
+                "depth_in": specs.depth or "",
+                "dimension_source_url": _str_val(updated.get("Dimension Source URL")) or page_url,
+                "dimension_confidence": resolved_dim_confidence,
+            })
         _product_cache.update(product_cache_key, cache_fields)
 
     image_conf_for_cache = _str_val(debug.get("Image Recovery Confidence")).upper()

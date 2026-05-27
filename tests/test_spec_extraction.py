@@ -82,6 +82,46 @@ def test_extract_w_h_d_axis_first_format():
     assert result.dimensions == '29.875"W x 23.5"D x 11.875"H'
 
 
+def test_extract_h_w_d_ordered_measurements():
+    html = """
+    <section class="measurements">
+      <h2>Measurements</h2>
+      <p>H x W x D: 12 x 30 x 18 in</p>
+    </section>
+    """
+
+    result = extract_dimensions_from_html(html, {"Brand": "Visual Comfort", "Model/SKU": "KW123"})
+
+    assert result.dimensions == '30"W x 18"D x 12"H'
+    assert result.width == "30"
+    assert result.depth == "18"
+    assert result.height == "12"
+    assert result.unit == "in"
+    assert result.confidence_score == 90
+
+
+def test_extract_dimensions_from_meta_product_schema():
+    html = """
+    <meta itemprop="width" content="762 mm">
+    <meta itemprop="depth" content="457.2 mm">
+    <meta itemprop="height" content="304.8 mm">
+    """
+
+    result = extract_dimensions_from_html(html, {"Brand": "Wolf", "Model/SKU": "MDD30TS"})
+
+    assert result.dimensions == '30"W x 18"D x 12"H'
+
+
+def test_impossible_dimensions_are_rejected():
+    html = "<table><tr><th>Dimensions</th><td>Width: 9999 in Height: 12 in Depth: 24 in</td></tr></table>"
+
+    result = extract_dimensions_from_html(html, {"Brand": "Acme", "Model/SKU": "BAD999"})
+
+    assert result.dimensions == ""
+    assert result.confidence == "none"
+    assert result.diagnostics["failure_reason"] == "complete_w_h_d_not_found"
+
+
 def test_shipping_dimensions_are_medium_fallback_only():
     html = """
     <dl>

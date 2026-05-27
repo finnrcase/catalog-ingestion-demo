@@ -11,6 +11,7 @@ import {
   Loader2,
   Phone,
   RefreshCw,
+  Settings,
   Trash2,
   Upload,
   X,
@@ -19,6 +20,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import {
+  createPreferredWebsite,
+  deletePreferredWebsite,
   exportProgramaCsv,
   exportProgramaXlsx,
   exportProgramaXlsxWithImages,
@@ -27,6 +30,7 @@ import {
   fetchHealth,
   fetchPdfParseJob,
   fetchPdfParseLogs,
+  fetchPreferredWebsites,
   fetchSchema,
   fetchVendorCallStatus,
   enrichRows,
@@ -36,13 +40,14 @@ import {
   refreshVendorCall,
   retryPdfParseJob,
   startVendorCall,
+  updatePreferredWebsite,
   uploadPdfForParsing,
   uploadImage,
   validateProgramaExport,
   validateRows,
 } from "@/lib/api";
 import { hasComplete3dDimensions } from "@/lib/dimensions";
-import type { IntakeResponse, IntakeRow, PdfParseJob, PhotoDiscoveryReport } from "@/lib/types";
+import type { IntakeResponse, IntakeRow, PdfParseJob, PhotoDiscoveryReport, PreferredWebsiteEntry } from "@/lib/types";
 
 const reviewColumns = [
   "Include",
@@ -83,6 +88,52 @@ const missingFieldKeys: Record<string, string> = {
   Location: "Room",
   Category: "Product Category",
 };
+
+const websiteThemeOptions = [
+  { id: "light", label: "Default Light", description: "Warm SCH white surfaces with orange accents." },
+  { id: "dark", label: "SCH Dark", description: "Dark version of the current card-based workflow." },
+  { id: "graphite", label: "Black / Gray", description: "High-contrast neutral black and gray workspace." },
+] as const;
+
+const accentColorOptions = [
+  { id: "orange", label: "Orange", color: "rgb(249 115 22)" },
+  { id: "sage", label: "Sage", color: "rgb(95 122 101)" },
+  { id: "blue", label: "Blue", color: "rgb(37 99 235)" },
+  { id: "plum", label: "Plum", color: "rgb(147 51 120)" },
+] as const;
+
+type WebsiteThemeId = (typeof websiteThemeOptions)[number]["id"];
+type AccentColorId = (typeof accentColorOptions)[number]["id"];
+
+const themePreviewPalettes: Record<
+  WebsiteThemeId,
+  { background: string; surface: string; border: string; text: string; muted: string }
+> = {
+  light: {
+    background: "#fafaf8",
+    surface: "#ffffff",
+    border: "#e5e7eb",
+    text: "#1f2933",
+    muted: "#6b7280",
+  },
+  dark: {
+    background: "#151619",
+    surface: "#202225",
+    border: "#4c525b",
+    text: "#f2f4f7",
+    muted: "#b5bcc6",
+  },
+  graphite: {
+    background: "#09090a",
+    surface: "#19191b",
+    border: "#43454b",
+    text: "#f5f5f6",
+    muted: "#aeb0b5",
+  },
+};
+
+const websiteThemeStorageKey = "sch:websiteTheme";
+const accentColorStorageKey = "sch:accentColor";
 
 const missingFieldPlaceholders: Record<string, string> = {
   "Product Name": "Enter product name",
@@ -805,6 +856,14 @@ export function IntakeWorkspace() {
   const [latestDiagnostics, setLatestDiagnostics] = useState<Record<string, unknown>[]>([]);
   const [showInternalDebug, setShowInternalDebug] = useState(false);
   const [debugCopyStatus, setDebugCopyStatus] = useState("");
+  const [showSettings, setShowSettings] = useState(false);
+  const [preferredWebsites, setPreferredWebsites] = useState<PreferredWebsiteEntry[]>([]);
+  const [preferredWebsiteForm, setPreferredWebsiteForm] = useState({ keyword: "", url: "", notes: "", id: "" });
+  const [preferredWebsiteStatus, setPreferredWebsiteStatus] = useState("");
+  const [preferredWebsiteBusy, setPreferredWebsiteBusy] = useState(false);
+  const [websiteTheme, setWebsiteTheme] = useState<WebsiteThemeId>("light");
+  const [accentColor, setAccentColor] = useState<AccentColorId>("orange");
+  const [themeSettingsLoaded, setThemeSettingsLoaded] = useState(false);
   const [showReviewItems, setShowReviewItems] = useState(false);
   const [showMissingDetailItems, setShowMissingDetailItems] = useState(false);
   const [showEnrichedItems, setShowEnrichedItems] = useState(false);
@@ -849,6 +908,26 @@ export function IntakeWorkspace() {
   const downloadedExportFilenamesRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
+    const storedTheme = window.localStorage.getItem(websiteThemeStorageKey);
+    const storedAccent = window.localStorage.getItem(accentColorStorageKey);
+    if (websiteThemeOptions.some((option) => option.id === storedTheme)) {
+      setWebsiteTheme(storedTheme as WebsiteThemeId);
+    }
+    if (accentColorOptions.some((option) => option.id === storedAccent)) {
+      setAccentColor(storedAccent as AccentColorId);
+    }
+    setThemeSettingsLoaded(true);
+  }, []);
+
+  useEffect(() => {
+    if (!themeSettingsLoaded) return;
+    document.documentElement.dataset.theme = websiteTheme;
+    document.documentElement.dataset.accent = accentColor;
+    window.localStorage.setItem(websiteThemeStorageKey, websiteTheme);
+    window.localStorage.setItem(accentColorStorageKey, accentColor);
+  }, [accentColor, themeSettingsLoaded, websiteTheme]);
+
+  useEffect(() => {
     fetchHealth().catch(() => {
       setMessage("Backend is offline or not configured.");
     });
@@ -863,6 +942,11 @@ export function IntakeWorkspace() {
         setSections(fallbackSections);
         setPhotoBulkSection("Decor");
         setMessage("Backend is offline or not configured.");
+      });
+    fetchPreferredWebsites()
+      .then((payload) => setPreferredWebsites(payload.entries || []))
+      .catch(() => {
+        setPreferredWebsites([]);
       });
   }, []);
 
@@ -1652,6 +1736,75 @@ export function IntakeWorkspace() {
     }
   }
 
+  function resetPreferredWebsiteForm() {
+    setPreferredWebsiteForm({ keyword: "", url: "", notes: "", id: "" });
+    setPreferredWebsiteStatus("");
+  }
+
+  function editPreferredWebsite(entry: PreferredWebsiteEntry) {
+    setPreferredWebsiteForm({
+      keyword: entry.keyword || "",
+      url: entry.url || "",
+      notes: entry.notes || "",
+      id: entry.id,
+    });
+    setPreferredWebsiteStatus("");
+  }
+
+  function preferredWebsiteUrlIsValid(value: string) {
+    const raw = value.trim();
+    if (!raw) return false;
+    try {
+      const parsed = new URL(raw.includes("://") ? raw : `https://${raw}`);
+      return ["http:", "https:"].includes(parsed.protocol) && Boolean(parsed.hostname);
+    } catch {
+      return false;
+    }
+  }
+
+  async function savePreferredWebsite() {
+    const keyword = preferredWebsiteForm.keyword.trim();
+    const url = preferredWebsiteForm.url.trim();
+    const notes = preferredWebsiteForm.notes.trim();
+    if (!keyword) {
+      setPreferredWebsiteStatus("Add a product name or keyword.");
+      return;
+    }
+    if (!preferredWebsiteUrlIsValid(url)) {
+      setPreferredWebsiteStatus("Enter a valid website URL.");
+      return;
+    }
+    setPreferredWebsiteBusy(true);
+    setPreferredWebsiteStatus("");
+    try {
+      const response = preferredWebsiteForm.id
+        ? await updatePreferredWebsite(preferredWebsiteForm.id, { keyword, url, notes })
+        : await createPreferredWebsite({ keyword, url, notes });
+      setPreferredWebsites(response.entries || []);
+      resetPreferredWebsiteForm();
+      setPreferredWebsiteStatus("Preferred website saved.");
+    } catch (error) {
+      setPreferredWebsiteStatus(error instanceof Error ? error.message : "Could not save preferred website.");
+    } finally {
+      setPreferredWebsiteBusy(false);
+    }
+  }
+
+  async function removePreferredWebsite(entry: PreferredWebsiteEntry) {
+    setPreferredWebsiteBusy(true);
+    setPreferredWebsiteStatus("");
+    try {
+      const response = await deletePreferredWebsite(entry.id);
+      setPreferredWebsites(response.entries || []);
+      if (preferredWebsiteForm.id === entry.id) resetPreferredWebsiteForm();
+      setPreferredWebsiteStatus("Preferred website deleted.");
+    } catch (error) {
+      setPreferredWebsiteStatus(error instanceof Error ? error.message : "Could not delete preferred website.");
+    } finally {
+      setPreferredWebsiteBusy(false);
+    }
+  }
+
   return (
     <main className="min-h-screen px-4 py-6 sm:px-7 lg:px-10">
       <div className="mx-auto flex max-w-[1180px] flex-col gap-7">
@@ -1662,9 +1815,18 @@ export function IntakeWorkspace() {
               Internal
             </span>
           </div>
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <StatusBadge value={`${readyRows} Ready`} />
             <StatusBadge value={`${needsReview} Needs Review`} />
+            <button
+              type="button"
+              className="btn-secondary inline-flex h-10 w-10 items-center justify-center rounded-xl"
+              onClick={() => setShowSettings(true)}
+              aria-label="Open settings"
+              title="Settings"
+            >
+              <Settings className="h-4 w-4" />
+            </button>
           </div>
         </header>
 
@@ -1697,7 +1859,7 @@ export function IntakeWorkspace() {
             />
 
             <div className="grid gap-3 md:grid-cols-2">
-              <label className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed border-linen bg-white/70 px-4 py-4 transition hover:border-orangeBorder hover:bg-orangeSoft/40">
+              <label className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed border-linen bg-paper/70 px-4 py-4 transition hover:border-orangeBorder hover:bg-orangeSoft/40">
                 <span className="flex items-center gap-3">
                   <Upload className="h-5 w-5 text-bronze" />
                   <span>
@@ -1717,7 +1879,7 @@ export function IntakeWorkspace() {
 
               <label
                 className={`flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed px-4 py-4 transition ${
-                  isImageDragActive ? "border-orangeBorder bg-orangeSoft" : "border-linen bg-white/70 hover:border-orangeBorder hover:bg-orangeSoft/40"
+                  isImageDragActive ? "border-orangeBorder bg-orangeSoft" : "border-linen bg-paper/70 hover:border-orangeBorder hover:bg-orangeSoft/40"
                 }`}
                 onDragEnter={(event) => {
                   event.preventDefault();
@@ -1770,7 +1932,7 @@ export function IntakeWorkspace() {
                   ) : null}
                 </div>
                 {uploadDebug && showUploadDebug ? (
-                  <div className="mt-2 grid gap-1 rounded-lg border border-clay/20 bg-white/70 p-2 text-xs text-charcoal">
+                  <div className="mt-2 grid gap-1 rounded-lg border border-clay/20 bg-paper/70 p-2 text-xs text-charcoal">
                     <div><span className="font-semibold">File:</span> {uploadDebug.fileName}</div>
                     <div><span className="font-semibold">Type:</span> {uploadDebug.fileType}</div>
                     <div><span className="font-semibold">Size:</span> {uploadDebug.fileSize}</div>
@@ -1833,7 +1995,7 @@ export function IntakeWorkspace() {
                   <button
                     key={`${file.name}-${file.size}-${file.lastModified}`}
                     type="button"
-                    className="rounded-full border border-linen bg-white px-3 py-1 hover:border-orangeBorder"
+                    className="rounded-full border border-linen bg-paper px-3 py-1 hover:border-orangeBorder"
                     onClick={() => removeFile(index)}
                     title={`Remove ${file.name}`}
                   >
@@ -1976,7 +2138,7 @@ export function IntakeWorkspace() {
                 ready={readyRows}
                 needsReview={productListNeedsReview}
               >
-                <div className="overflow-x-auto rounded-xl border border-linen bg-white">
+                <div className="overflow-x-auto rounded-xl border border-linen bg-paper">
                   <table className="min-w-[1180px] w-full border-separate border-spacing-0 text-left text-sm">
                     <thead>
                       <tr>
@@ -2026,7 +2188,7 @@ export function IntakeWorkspace() {
               </ProductListDisclosure>
             </>
           ) : (
-            <div className="rounded-xl border border-dashed border-linen bg-white/60 px-5 py-10 text-center">
+            <div className="rounded-xl border border-dashed border-linen bg-paper/60 px-5 py-10 text-center">
               <p className="text-sm text-taupe">Uploaded products will appear here.</p>
             </div>
           )}
@@ -2068,7 +2230,7 @@ export function IntakeWorkspace() {
                   Max {budgetPreview.external} external lookups · {budgetPreview.images} image searches · {budgetPreview.ai} AI call{budgetPreview.ai === 1 ? "" : "s"}
                 </div>
                 {busy === "validate" ? (
-                  <div className="mt-2 rounded-lg border border-orange/20 bg-white/50 px-3 py-2 text-xs text-bronze">
+                  <div className="mt-2 rounded-lg border border-orange/20 bg-paper/50 px-3 py-2 text-xs text-bronze">
                     Running estimate: capped at {formatUsd(budgetPreview.hard)}. Final Bravi API cost appears as calls complete.
                   </div>
                 ) : null}
@@ -2099,7 +2261,7 @@ export function IntakeWorkspace() {
                 ready={readyRows}
                 needsReview={productListNeedsReview}
               >
-                <div className="divide-y divide-linen rounded-xl border border-linen bg-white">
+                <div className="divide-y divide-linen rounded-xl border border-linen bg-paper">
                   {rows.map((row, index) => {
                     const missingFields = row.Include !== false ? missingFieldsForRow(row) : [];
                     return missingFields.length > 0 ? (
@@ -2231,7 +2393,7 @@ export function IntakeWorkspace() {
                   {photoDiscoveryReport.failed_rows.length ? (
                     <div className="mt-3 space-y-2">
                       {photoDiscoveryReport.failed_rows.slice(0, 3).map((failed, failedIndex) => (
-                        <div key={`${failed.model_sku}-${failedIndex}`} className="rounded-lg border border-linen bg-white p-2 text-xs text-taupe">
+                        <div key={`${failed.model_sku}-${failedIndex}`} className="rounded-lg border border-linen bg-paper p-2 text-xs text-taupe">
                           <div className="font-semibold text-charcoal">
                             {failed.product_name || "Unnamed product"} {failed.brand || failed.model_sku ? <span className="font-normal text-taupe">· {[failed.brand, failed.model_sku].filter(Boolean).join(" ")}</span> : null}
                           </div>
@@ -2254,7 +2416,7 @@ export function IntakeWorkspace() {
                     ready={readyRows}
                     needsReview={productListNeedsReview}
                   >
-                    <div className="divide-y divide-linen rounded-xl border border-linen bg-white">
+                    <div className="divide-y divide-linen rounded-xl border border-linen bg-paper">
                       {rows.map((row, index) => {
                         if (row.Include === false) return null;
                         const productName = rowText(row, "Product Name");
@@ -2336,7 +2498,7 @@ export function IntakeWorkspace() {
                                   <summary className="cursor-pointer text-xs font-semibold text-charcoal">Item debug</summary>
                                   <div className="mt-2 grid gap-1 text-xs text-taupe">
                                     {rawGroupedText ? (
-                                      <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-md bg-white p-2 text-charcoal">{rawGroupedText}</pre>
+                                      <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-md bg-paper p-2 text-charcoal">{rawGroupedText}</pre>
                                     ) : null}
                                     {parsedFields ? <div><span className="font-semibold text-charcoal">Parsed:</span> {parsedFields}</div> : null}
                                     {enrichmentQuery ? <div><span className="font-semibold text-charcoal">Query:</span> {enrichmentQuery}</div> : null}
@@ -2424,6 +2586,24 @@ export function IntakeWorkspace() {
             onDownload={handleDownloadInternalDebug}
           />
         ) : null}
+        {showSettings ? (
+          <SettingsDialog
+            entries={preferredWebsites}
+            form={preferredWebsiteForm}
+            status={preferredWebsiteStatus}
+            busy={preferredWebsiteBusy}
+            websiteTheme={websiteTheme}
+            accentColor={accentColor}
+            onClose={() => setShowSettings(false)}
+            onChangeTheme={setWebsiteTheme}
+            onChangeAccent={setAccentColor}
+            onChangeForm={setPreferredWebsiteForm}
+            onSave={savePreferredWebsite}
+            onEdit={editPreferredWebsite}
+            onDelete={removePreferredWebsite}
+            onReset={resetPreferredWebsiteForm}
+          />
+        ) : null}
         {vendorCall ? (
           <VendorCallDialog
             state={vendorCall}
@@ -2442,14 +2622,14 @@ function StatusBadge({ value }: { value: string }) {
   const normal = value.toLowerCase();
   const tone =
     normal.startsWith("0 failed")
-      ? "border-linen bg-white/70 text-taupe"
+      ? "border-linen bg-paper/70 text-taupe"
       : normal.includes("ready") || normal.includes("uploaded")
       ? "border-sage/20 bg-sage/10 text-sage"
       : normal.includes("missing") || normal.includes("failed")
         ? "border-clay/20 bg-clay/10 text-clay"
         : normal.includes("review")
           ? "border-orangeBorder bg-orangeSoft text-bronze"
-          : "border-linen bg-white/70 text-taupe";
+          : "border-linen bg-paper/70 text-taupe";
   return (
     <span className={`inline-flex min-h-6 items-center rounded-full border px-2.5 py-1 text-xs font-semibold ${tone}`}>
       {value}
@@ -2482,7 +2662,7 @@ function ProductListDisclosure({
 }) {
   const summary = `${total} item${total === 1 ? "" : "s"} found · ${ready} ready · ${needsReview} ${needsReview === 1 ? "needs" : "need"} review`;
   return (
-    <div className="rounded-xl border border-linen bg-white/70">
+    <div className="rounded-xl border border-linen bg-paper/70">
       <button
         type="button"
         aria-expanded={expanded}
@@ -2525,7 +2705,7 @@ function InternalDebugPanel({
 }) {
   const upload = report.upload;
   return (
-    <section className="rounded-2xl border border-linen bg-white/60 p-4 text-sm text-charcoal">
+    <section className="rounded-2xl border border-linen bg-paper/60 p-4 text-sm text-charcoal">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="text-xs font-semibold uppercase tracking-[0.08em] text-taupe">Internal</div>
@@ -2624,7 +2804,7 @@ function InternalDebugPanel({
           </div>
 
           {report.enrichmentMetrics ? (
-            <details className="rounded-xl border border-linen bg-white/70 p-3 text-xs">
+            <details className="rounded-xl border border-linen bg-paper/70 p-3 text-xs">
               <summary className="cursor-pointer font-semibold">Cost-control trace</summary>
               <div className="mt-3 grid gap-2">
                 <DebugLine label="Cost by stage" value={JSON.stringify(report.enrichmentMetrics.cost_by_stage || {})} />
@@ -2640,7 +2820,7 @@ function InternalDebugPanel({
 
           <div className="grid gap-3">
             {report.products.length ? report.products.map((product) => (
-              <details key={`${product.index}-${product.id}`} className="rounded-xl border border-linen bg-white/70 p-3">
+              <details key={`${product.index}-${product.id}`} className="rounded-xl border border-linen bg-paper/70 p-3">
                 <summary className="cursor-pointer font-semibold">
                   #{product.index} {product.parsedFields["Product Name"].value || "Unnamed Item"} · {product.finalStatus || "No status"}
                 </summary>
@@ -2756,7 +2936,7 @@ function Panel({
 }) {
   return (
     <section
-      className={`rounded-2xl border bg-white/72 p-5 transition-colors sm:p-6 ${
+      className={`rounded-2xl border bg-paper/72 p-5 transition-colors sm:p-6 ${
         accent ? "border-orangeBorder/70 hover:bg-orangeSoft/10" : "border-linen"
       }`}
     >
@@ -2784,6 +2964,246 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
       <span className="mb-2 block text-xs font-semibold uppercase text-charcoal/55">{label}</span>
       {children}
     </label>
+  );
+}
+
+function SettingsDialog({
+  entries,
+  form,
+  status,
+  busy,
+  websiteTheme,
+  accentColor,
+  onClose,
+  onChangeTheme,
+  onChangeAccent,
+  onChangeForm,
+  onSave,
+  onEdit,
+  onDelete,
+  onReset,
+}: {
+  entries: PreferredWebsiteEntry[];
+  form: { keyword: string; url: string; notes: string; id: string };
+  status: string;
+  busy: boolean;
+  websiteTheme: WebsiteThemeId;
+  accentColor: AccentColorId;
+  onClose: () => void;
+  onChangeTheme: (theme: WebsiteThemeId) => void;
+  onChangeAccent: (accent: AccentColorId) => void;
+  onChangeForm: (form: { keyword: string; url: string; notes: string; id: string }) => void;
+  onSave: () => void;
+  onEdit: (entry: PreferredWebsiteEntry) => void;
+  onDelete: (entry: PreferredWebsiteEntry) => void;
+  onReset: () => void;
+}) {
+  const selectedTheme = websiteThemeOptions.find((option) => option.id === websiteTheme) || websiteThemeOptions[0];
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/35 px-4 py-6">
+      <div className="max-h-[90vh] w-full max-w-4xl overflow-auto rounded-2xl border border-linen bg-paper p-5 shadow-xl sm:p-6">
+        <div className="flex items-start justify-between gap-4 border-b border-linen pb-4">
+          <div>
+            <div className="text-xl font-semibold text-charcoal">Settings</div>
+            <div className="mt-1 text-sm text-taupe">Preferred sources used before broad product search.</div>
+          </div>
+          <button type="button" className="btn-secondary inline-flex h-9 w-9 items-center justify-center rounded-xl" onClick={onClose} aria-label="Close settings">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="mt-5 grid gap-5">
+          <section className="grid gap-4 rounded-xl border border-linen bg-ivory/40 p-4">
+            <div>
+              <h3 className="text-base font-semibold text-charcoal">Website Theme</h3>
+              <p className="mt-1 text-sm text-taupe">Choose the workspace colors. This saves in your browser and applies across the app.</p>
+            </div>
+
+            <div className="grid gap-4 lg:grid-cols-[minmax(220px,0.8fr)_1.2fr]">
+              <div className="grid gap-3">
+                <Field label="Theme">
+                  <select
+                    className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
+                    value={websiteTheme}
+                    onChange={(event) => onChangeTheme(event.target.value as WebsiteThemeId)}
+                  >
+                    {websiteThemeOptions.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <div className="text-xs leading-5 text-taupe">{selectedTheme.description}</div>
+                <div>
+                  <div className="mb-2 text-xs font-semibold uppercase text-charcoal/55">Accent</div>
+                  <div className="flex flex-wrap gap-2">
+                    {accentColorOptions.map((option) => (
+                      <button
+                        key={option.id}
+                        type="button"
+                        className={`btn-secondary inline-flex h-9 items-center gap-2 rounded-xl px-3 text-xs font-semibold ${
+                          accentColor === option.id ? "border-orangeBorder bg-orangeSoft text-bronze" : ""
+                        }`}
+                        onClick={() => onChangeAccent(option.id)}
+                      >
+                        <span className="h-3 w-3 rounded-full border border-linen" style={{ backgroundColor: option.color }} />
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-3">
+                {websiteThemeOptions.map((option) => (
+                  <ThemePreviewCard
+                    key={option.id}
+                    theme={option.id}
+                    label={option.label}
+                    active={websiteTheme === option.id}
+                    onSelect={() => onChangeTheme(option.id)}
+                  />
+                ))}
+              </div>
+            </div>
+          </section>
+
+          <section className="grid gap-4">
+            <div>
+              <h3 className="text-base font-semibold text-charcoal">Preferred Product Websites</h3>
+              <p className="mt-1 text-sm text-taupe">
+                Add product keywords and trusted sites. Matching rows try these sources first, then fall back to normal search.
+              </p>
+            </div>
+
+            <div className="grid gap-3 rounded-xl border border-orangeBorder/40 bg-orangeSoft/15 p-4 md:grid-cols-[1fr_1.2fr]">
+              <Field label="Product name / keyword">
+                <input
+                  className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
+                  value={form.keyword}
+                  onChange={(event) => onChangeForm({ ...form, keyword: event.target.value })}
+                  placeholder="Sub-Zero drawers"
+                />
+              </Field>
+              <Field label="Preferred website URL">
+                <input
+                  className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
+                  value={form.url}
+                  onChange={(event) => onChangeForm({ ...form, url: event.target.value })}
+                  placeholder="https://www.subzero-wolf.com/"
+                />
+              </Field>
+              <div className="md:col-span-2">
+                <Field label="Notes">
+                  <textarea
+                    className="input-surface min-h-20 w-full resize-none rounded-xl p-3 text-sm text-charcoal"
+                    value={form.notes}
+                    onChange={(event) => onChangeForm({ ...form, notes: event.target.value })}
+                    placeholder="Optional notes for internal use"
+                  />
+                </Field>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 md:col-span-2">
+                <button type="button" className="btn-primary inline-flex h-10 items-center justify-center rounded-xl px-4 text-sm font-semibold" disabled={busy} onClick={onSave}>
+                  {busy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                  {form.id ? "Save Changes" : "Add Website"}
+                </button>
+                {form.id ? (
+                  <button type="button" className="btn-secondary inline-flex h-10 items-center justify-center rounded-xl px-4 text-sm font-semibold" disabled={busy} onClick={onReset}>
+                    Cancel Edit
+                  </button>
+                ) : null}
+                {status ? <span className="text-sm text-taupe">{status}</span> : null}
+              </div>
+            </div>
+
+            <div className="overflow-x-auto rounded-xl border border-linen bg-paper">
+              <table className="w-full min-w-[760px] text-left text-sm">
+                <thead className="bg-ivory text-xs uppercase text-charcoal/60">
+                  <tr>
+                    <th className="px-3 py-3">Keyword</th>
+                    <th className="px-3 py-3">Website</th>
+                    <th className="px-3 py-3">Notes</th>
+                    <th className="px-3 py-3">Results</th>
+                    <th className="px-3 py-3">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {entries.length ? entries.map((entry) => (
+                    <tr key={entry.id} className="border-t border-linen align-top">
+                      <td className="px-3 py-3 font-semibold text-charcoal">{entry.keyword}</td>
+                      <td className="px-3 py-3">
+                        <div className="text-charcoal">{entry.domain}</div>
+                        <div className="max-w-[260px] truncate text-xs text-taupe">{entry.url}</div>
+                      </td>
+                      <td className="px-3 py-3 text-taupe">{entry.notes || ""}</td>
+                      <td className="px-3 py-3 text-xs text-taupe">
+                        <div>{entry.success_count || 0} success · {entry.failure_count || 0} failed</div>
+                        <div>{entry.last_status || "not used yet"}</div>
+                      </td>
+                      <td className="px-3 py-3">
+                        <div className="flex flex-wrap gap-2">
+                          <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold" disabled={busy} onClick={() => onEdit(entry)}>
+                            Edit
+                          </button>
+                          <button type="button" className="btn-secondary h-9 rounded-xl px-3 text-xs font-semibold text-clay" disabled={busy} onClick={() => onDelete(entry)}>
+                            Delete
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  )) : (
+                    <tr>
+                      <td className="px-3 py-6 text-center text-sm text-taupe" colSpan={5}>
+                        No preferred websites saved yet.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ThemePreviewCard({
+  theme,
+  label,
+  active,
+  onSelect,
+}: {
+  theme: WebsiteThemeId;
+  label: string;
+  active: boolean;
+  onSelect: () => void;
+}) {
+  const palette = themePreviewPalettes[theme];
+  return (
+    <button
+      type="button"
+      className={`rounded-xl border p-3 text-left transition ${
+        active ? "border-orangeBorder bg-orangeSoft/35" : "border-linen bg-paper/70 hover:border-orangeBorder"
+      }`}
+      onClick={onSelect}
+      aria-pressed={active}
+    >
+      <div className="overflow-hidden rounded-lg border" style={{ backgroundColor: palette.background, borderColor: palette.border }}>
+        <div className="space-y-2 p-3">
+          <div className="h-3 w-16 rounded-full" style={{ backgroundColor: palette.text }} />
+          <div className="rounded-md border p-2" style={{ backgroundColor: palette.surface, borderColor: palette.border }}>
+            <div className="h-2 w-20 rounded-full" style={{ backgroundColor: palette.text }} />
+            <div className="mt-2 h-2 w-14 rounded-full" style={{ backgroundColor: palette.muted }} />
+          </div>
+          <div className="h-2 w-full rounded-full bg-bronze" />
+        </div>
+      </div>
+      <div className="mt-2 text-xs font-semibold text-charcoal">{label}</div>
+    </button>
   );
 }
 
@@ -2898,7 +3318,7 @@ function VendorCallDialog({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-charcoal/25 px-4 py-6">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 px-4 py-6">
       <div className="glass-panel w-full max-w-xl rounded-lg p-5">
         <div className="flex items-start justify-between gap-4">
           <div>
@@ -2974,7 +3394,7 @@ function VendorCallDialog({
               type="button"
               disabled={!providerEnabled || !state.phoneNumber.trim() || !state.script || startingCall}
               onClick={handleStartCall}
-              className="btn-secondary inline-flex h-10 items-center justify-center rounded-xl px-4 text-sm font-semibold text-taupe hover:bg-white disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/65"
+              className="btn-secondary inline-flex h-10 items-center justify-center rounded-xl px-4 text-sm font-semibold text-taupe hover:bg-paper disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/65"
               title={
                 providerEnabled
                   ? state.script
@@ -3007,7 +3427,7 @@ function VendorCallDialog({
                 type="button"
                 onClick={handleRefreshCall}
                 disabled={refreshingCall}
-                className="mt-3 inline-flex h-8 items-center justify-center rounded-lg border border-linen bg-white px-3 text-xs font-semibold text-taupe hover:bg-ivory disabled:cursor-not-allowed disabled:text-taupe/60"
+                className="mt-3 inline-flex h-8 items-center justify-center rounded-lg border border-linen bg-paper px-3 text-xs font-semibold text-taupe hover:bg-ivory disabled:cursor-not-allowed disabled:text-taupe/60"
               >
                 {refreshingCall ? "Refreshing..." : "Refresh Status"}
               </button>

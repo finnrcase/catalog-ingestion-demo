@@ -112,6 +112,21 @@ def test_upload_image_endpoint_rejects_missing_secure_url(monkeypatch):
     assert response.status_code == 502
 
 
+def test_upload_image_endpoint_reports_missing_cloudinary_config(monkeypatch):
+    monkeypatch.setattr(
+        "backend.main.upload_image_with_metadata",
+        lambda file: ImageUploadResult(status="skipped", error="cloudinary_not_configured"),
+    )
+
+    response = client.post(
+        "/api/upload-image",
+        files={"file": ("doll.jpg", b"fake image", "image/jpeg")},
+    )
+
+    assert response.status_code == 503
+    assert "CLOUDINARY_CLOUD_NAME" in response.json()["detail"]
+
+
 def test_upload_image_endpoint_rejects_non_image(monkeypatch):
     monkeypatch.setattr(
         "backend.main.upload_image_with_metadata",
@@ -140,6 +155,32 @@ def test_manufacturer_override_endpoint_saves_mapping(monkeypatch, tmp_path):
     assert data["override"]["brand"] == "scotsman"
     assert data["override"]["domain"] == "scotsman-ice.com"
     assert data["override"]["source"] == "user"
+
+
+def test_preferred_websites_endpoints_crud():
+    create = client.post(
+        "/settings/preferred-websites",
+        json={"keyword": "Wolf drawer", "url": "https://subzero-wolf.com/products/mdd30ts", "notes": "official"},
+    )
+    assert create.status_code == 200
+    created = create.json()["entry"]
+    assert created["keyword"] == "Wolf drawer"
+    assert created["domain"] == "subzero-wolf.com"
+
+    listed = client.get("/settings/preferred-websites")
+    assert listed.status_code == 200
+    assert listed.json()["entries"][0]["id"] == created["id"]
+
+    update = client.put(
+        f"/settings/preferred-websites/{created['id']}",
+        json={"keyword": "Wolf microwave drawer", "url": created["url"], "notes": "updated"},
+    )
+    assert update.status_code == 200
+    assert update.json()["entry"]["notes"] == "updated"
+
+    delete = client.delete(f"/settings/preferred-websites/{created['id']}")
+    assert delete.status_code == 200
+    assert delete.json()["entries"] == []
 
 
 def test_intake_enrich_endpoint_passes_web_enrichment_flag(monkeypatch):

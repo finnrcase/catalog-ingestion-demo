@@ -128,3 +128,19 @@ export type VendorCallRefreshResponse = {
   confidence?: number;
   review_required?: boolean;
 };
+
+export type PreferredWebsiteEntry = {
+  id: string;
+  keyword: string;
+  url: string;
+  domain: string;
+  notes?: string;
+  created_at?: string;
+  updated_at?: string;
+  success_count?: number;
+  failure_count?: number;
+  last_checked?: string;
+  last_status?: string;
+  last_fields_found?: Record<string, boolean>;
+  field_success_counts?: Record<string, number>;
+};

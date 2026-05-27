@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from bs4 import BeautifulSoup
 
 from src.measurement_parser import combined_dimensions, parse_dimensions
+from src.spec_extraction import extract_dimensions_from_html
 
 
 @dataclass
@@ -221,8 +222,19 @@ def extract_product_page_specs(
     table_text = _spec_table_text(soup)
     body_text = soup.get_text(" ", strip=True)
     candidate_text = "\n".join(part for part in (jsonld_text, table_text, body_text[:4000]) if part)
-    parts = parse_dimensions(candidate_text)
-    dims = combined_dimensions(parts)
+    dim_result = extract_dimensions_from_html(html, row)
+    if dim_result.dimensions:
+        parts = {
+            "width": dim_result.width,
+            "height": dim_result.height,
+            "depth": dim_result.depth,
+            "length": dim_result.length,
+            "diameter": "",
+        }
+        dims = dim_result.dimensions
+    else:
+        parts = parse_dimensions(candidate_text)
+        dims = combined_dimensions(parts)
 
     evidence_bits: list[str] = []
     if jsonld_text:
@@ -244,6 +256,8 @@ def extract_product_page_specs(
             confidence = "medium"
         else:
             confidence = "low"
+        if dim_result.dimensions and dim_result.confidence in {"high", "medium"} and confidence == "low":
+            confidence = "medium"
 
     return ProductPageSpecResult(
         product_name=metadata.get("product_name", "") or _text(soup.select_one("h1").get_text(" ", strip=True) if soup.select_one("h1") else ""),
@@ -264,7 +278,12 @@ def extract_product_page_specs(
         weight=_first_labeled_value(candidate_text, ("Weight",)),
         source_url=page_url,
         confidence=confidence,
-        evidence=";".join(evidence_bits),
-        raw_text=candidate_text[:1000],
-        debug={"jsonld_found": bool(jsonld_text), "spec_text_found": bool(table_text)},
+        evidence=";".join([*evidence_bits, dim_result.diagnostics.get("method", "")]).strip(";"),
+        raw_text=dim_result.raw_dimensions_text or candidate_text[:1000],
+        debug={
+            "jsonld_found": bool(jsonld_text),
+            "spec_text_found": bool(table_text),
+            "dimension_failure_reason": dim_result.diagnostics.get("failure_reason", ""),
+            "dimension_confidence_score": dim_result.confidence_score,
+        },
     )

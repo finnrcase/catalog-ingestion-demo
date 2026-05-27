@@ -908,6 +908,40 @@ def test_enrich_row_fills_fields_on_success():
     assert updated["Dimensions"] == '29 7/8"W x 23 1/2"D x 11 7/8"H'
 
 
+def test_enrich_row_reuses_verified_page_for_focused_dimensions_without_extra_search():
+    good_result = SearchResult(
+        "Wolf MDD30TS Product",
+        "https://subzero-wolf.com/wolf/products/mdd30ts",
+        "Wolf MDD30TS",
+        90,
+    )
+    html = """
+    <html>
+      <body>
+        <h1>Wolf MDD30TS Warming Drawer</h1>
+        <script type="application/ld+json">
+          {"@type":"Product","name":"Wolf MDD30TS Warming Drawer","brand":{"name":"Wolf"},"sku":"MDD30TS","category":"Appliances"}
+        </script>
+        <section class="measurements">Measurements H x W x D: 11.875 x 29.875 x 23.5 in</section>
+      </body>
+    </html>
+    """
+    row = {**_qualifying_row(), "Product Name": "Warming Drawer", "Product Category": "Appliances", "Image URL": "https://cdn.example.com/mdd30ts.jpg"}
+
+    with patch("src.product_resolver.search_product_candidates", return_value=[good_result]), \
+         patch("src.product_resolver.httpx.get", return_value=_resolver_response(good_result.url, html)), \
+         patch("src.product_enrichment._find_dimensions") as mock_find_dimensions:
+        updated, error, dim_result = enrich_row(row, enrichment_mode="fast")
+
+    assert error is None
+    assert updated["Dimensions"] == '29.875"W x 23.5"D x 11.875"H'
+    assert updated["Dimension Source URL"] == good_result.url
+    assert updated["Dimension Lookup Status"] == "found"
+    assert updated["Dimension Extra Cost"].startswith("$0.0000")
+    assert dim_result is not None
+    mock_find_dimensions.assert_not_called()
+
+
 def test_enrich_row_web_enrichment_disabled_skips_search_domain_and_dimension_lookup():
     with patch("src.product_enrichment.search_product_candidates") as mock_search, \
          patch("src.product_enrichment.get_domain_for_brand") as mock_domain, \

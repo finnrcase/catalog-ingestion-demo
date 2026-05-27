@@ -22,6 +22,11 @@ from src.product_evidence import (
     normalize_sku,
     product_name_similarity,
 )
+from src.preferred_websites import (
+    preferred_direct_urls_for_row,
+    preferred_domains_for_row,
+    record_preferred_website_result,
+)
 from src.product_image_extraction import (
     ImageCandidate,
     extract_product_image_candidates,
@@ -140,7 +145,8 @@ def resolve_product_page(row: dict, session_cache=None, budget=None) -> ProductR
     seen_urls: set[str] = set()
     stop_all = False
 
-    for url in _direct_candidate_urls(row):
+    for direct in _direct_candidate_urls(row):
+        url = direct["url"]
         key = _normalised_url(url)
         if not url or key in seen_urls:
             continue
@@ -148,8 +154,11 @@ def resolve_product_page(row: dict, session_cache=None, budget=None) -> ProductR
         if budget is not None and not _url_cached(session_cache, url) and not _can_fetch(budget):
             budget.stop("page fetch budget exhausted")
             break
-        candidate = _candidate_from_url(url, official_domains, title="existing verified product URL")
-        candidate.diagnostics["candidate_origin"] = "existing_product_url"
+        candidate = _candidate_from_url(url, official_domains, title=direct.get("title", "existing verified product URL"))
+        candidate.diagnostics["candidate_origin"] = direct.get("origin", "existing_product_url")
+        if direct.get("preferred_entry_id"):
+            candidate.diagnostics["preferred_entry_id"] = direct["preferred_entry_id"]
+            candidate.diagnostics["preferred_keyword"] = direct.get("preferred_keyword", "")
         _fetch_candidate(candidate, session_cache, budget)
         _score_candidate(candidate, row, official_domains)
         _extract_candidate_assets(candidate, row)
@@ -247,6 +256,12 @@ def build_resolver_queries(row: dict, mode: str = "standard") -> tuple[list[str]
             queries.append(cleaned)
 
     primary_domain = official_domains[0] if official_domains else ""
+    for domain in preferred_domains_for_row(row):
+        if sku:
+            add(f'site:{domain} "{sku}" dimensions')
+            add(f'site:{domain} "{sku}" product')
+        elif product_name:
+            add(f'site:{domain} "{product_name}"')
     if primary_domain and sku:
         add(f'site:{primary_domain} "{sku}" dimensions')
     if brand and sku:
@@ -554,6 +569,9 @@ def _diagnostic_record(candidate: ProductCandidate) -> dict[str, Any]:
         "dimension_method": candidate.diagnostics.get("dimension_method", ""),
         "image_method": candidate.diagnostics.get("image_method", ""),
         "exact_page_signal": candidate.diagnostics.get("exact_page_signal", ""),
+        "preferred_entry_id": candidate.diagnostics.get("preferred_entry_id", ""),
+        "preferred_keyword": candidate.diagnostics.get("preferred_keyword", ""),
+        "preferred_website_status": candidate.diagnostics.get("preferred_website_status", ""),
     }
 
 
@@ -574,14 +592,36 @@ def _official_domains(row: dict) -> list[str]:
     return domains
 
 
-def _direct_candidate_urls(row: dict) -> list[str]:
-    urls: list[str] = []
+def _direct_candidate_urls(row: dict) -> list[dict[str, str]]:
+    urls: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(url: str, origin: str, title: str = "", preferred_entry_id: str = "", preferred_keyword: str = "") -> None:
+        clean = _text(url)
+        if not clean or clean in seen:
+            return
+        seen.add(clean)
+        urls.append({
+            "url": clean,
+            "origin": origin,
+            "title": title,
+            "preferred_entry_id": preferred_entry_id,
+            "preferred_keyword": preferred_keyword,
+        })
+
     product_url = _text(row.get("Product URL") or row.get("Product Resolution URL"))
     if product_url:
-        urls.append(product_url)
+        add(product_url, "existing_product_url", "existing verified product URL")
+    for entry in preferred_direct_urls_for_row(row):
+        add(
+            entry.get("url", ""),
+            "preferred_website",
+            "user preferred website",
+            preferred_entry_id=entry.get("entry_id", ""),
+            preferred_keyword=entry.get("keyword", ""),
+        )
     for url in successful_urls_for_row(row):
-        if url not in urls:
-            urls.append(url)
+        add(url, "source_success_cache", "previous successful source URL")
     return urls
 
 
@@ -599,9 +639,15 @@ def _record_source_outcomes(
     candidates: list[ProductCandidate],
     selected: ProductCandidate | None,
 ) -> None:
+    preferred_domains = set(preferred_domains_for_row(row))
     for candidate in candidates:
         if not candidate.domain:
             continue
+        candidate_from_preferred_source = (
+            bool(_text(candidate.diagnostics.get("preferred_entry_id")))
+            or candidate.diagnostics.get("candidate_origin") == "preferred_website"
+            or candidate.domain in preferred_domains
+        )
         fields_found = {
             "dimensions": bool(candidate.extracted_dimensions),
             "image": bool(candidate.extracted_image_url),
@@ -617,11 +663,37 @@ def _record_source_outcomes(
                 confidence=candidate.confidence,
             )
             candidate.diagnostics["source_registry_status"] = "success_stored" if entry else "success_not_stored"
+            if candidate_from_preferred_source:
+                pref_entry = record_preferred_website_result(
+                    entry_id=_text(candidate.diagnostics.get("preferred_entry_id")),
+                    domain=candidate.domain,
+                    url=candidate.url,
+                    success=True,
+                    fields_found={
+                        **fields_found,
+                        "price": bool(_text(candidate.extracted_fields.get("Price") if isinstance(candidate.extracted_fields, dict) else "")),
+                        "specs": bool(candidate.extracted_fields),
+                    },
+                    status="success",
+                )
+                if pref_entry:
+                    candidate.diagnostics["preferred_website_status"] = "success_stored"
             continue
         if candidate.confidence not in {"high", "medium"}:
             reason = candidate.rejection_reason or "no_dimensions_or_image"
             entry = record_source_failure(row, domain=candidate.domain, url=candidate.url, reason=reason)
             candidate.diagnostics["source_registry_status"] = "failure_stored" if entry else "failure_not_stored"
+            if candidate_from_preferred_source:
+                pref_entry = record_preferred_website_result(
+                    entry_id=_text(candidate.diagnostics.get("preferred_entry_id")),
+                    domain=candidate.domain,
+                    url=candidate.url,
+                    success=False,
+                    fields_found=fields_found,
+                    status=reason,
+                )
+                if pref_entry:
+                    candidate.diagnostics["preferred_website_status"] = "failure_stored"
 
 
 def _can_fetch(budget) -> bool:

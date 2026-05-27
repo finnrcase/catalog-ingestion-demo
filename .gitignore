@@ -88,3 +88,4 @@ SCHDATAINGEST/
 
 # Per-session image recovery scratch space (PDFs + recovered images)
 .tmp/
+.vercel/

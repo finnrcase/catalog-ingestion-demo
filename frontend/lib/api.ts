@@ -3,6 +3,7 @@ import type {
   IntakeRow,
   PdfParseJob,
   ProgramaExportValidation,
+  PreferredWebsiteEntry,
   SchemaResponse,
   VendorCallRefreshResponse,
   VendorCallResponse,
@@ -12,6 +13,12 @@ import type {
 
 const RAW_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "";
 const BACKEND_UNAVAILABLE = "Backend is offline or not configured.";
+const LOCAL_BACKEND_CONFIGURED =
+  "Backend API URL is set to localhost, which only works on your machine. Set NEXT_PUBLIC_API_BASE_URL to the deployed backend URL.";
+
+function isLocalHost(hostname: string) {
+  return ["localhost", "127.0.0.1", "0.0.0.0", "::1"].includes(hostname.toLowerCase());
+}
 
 function resolveApiBase(rawUrl: string) {
   if (!rawUrl || rawUrl === "undefined" || rawUrl === "null") return "";
@@ -30,8 +37,20 @@ if (typeof window !== "undefined") {
   console.info(`[API BASE URL] ${API_BASE || "not configured"}`);
 }
 
+function apiBaseIsUsableInThisBrowser() {
+  if (!API_BASE || typeof window === "undefined") return true;
+  try {
+    const apiHost = new URL(API_BASE).hostname;
+    const pageHost = window.location.hostname;
+    return !isLocalHost(apiHost) || isLocalHost(pageHost);
+  } catch {
+    return false;
+  }
+}
+
 function apiUrl(path: string) {
   if (!API_BASE) throw new Error(BACKEND_UNAVAILABLE);
+  if (!apiBaseIsUsableInThisBrowser()) throw new Error(LOCAL_BACKEND_CONFIGURED);
   return `${API_BASE}${path}`;
 }
 
@@ -198,6 +217,45 @@ export async function saveManufacturerOverride(input: {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(input),
     }),
+  );
+}
+
+export async function fetchPreferredWebsites(): Promise<{ entries: PreferredWebsiteEntry[] }> {
+  return parseJson<{ entries: PreferredWebsiteEntry[] }>(
+    await apiFetch(apiUrl("/settings/preferred-websites"), { cache: "no-store" }),
+  );
+}
+
+export async function createPreferredWebsite(input: {
+  keyword: string;
+  url: string;
+  notes?: string;
+}): Promise<{ status: string; entry: PreferredWebsiteEntry; entries: PreferredWebsiteEntry[] }> {
+  return parseJson<{ status: string; entry: PreferredWebsiteEntry; entries: PreferredWebsiteEntry[] }>(
+    await apiFetch(apiUrl("/settings/preferred-websites"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function updatePreferredWebsite(
+  entryId: string,
+  input: { keyword: string; url: string; notes?: string },
+): Promise<{ status: string; entry: PreferredWebsiteEntry; entries: PreferredWebsiteEntry[] }> {
+  return parseJson<{ status: string; entry: PreferredWebsiteEntry; entries: PreferredWebsiteEntry[] }>(
+    await apiFetch(apiUrl(`/settings/preferred-websites/${encodeURIComponent(entryId)}`), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function deletePreferredWebsite(entryId: string): Promise<{ status: string; entries: PreferredWebsiteEntry[] }> {
+  return parseJson<{ status: string; entries: PreferredWebsiteEntry[] }>(
+    await apiFetch(apiUrl(`/settings/preferred-websites/${encodeURIComponent(entryId)}`), { method: "DELETE" }),
   );
 }
 

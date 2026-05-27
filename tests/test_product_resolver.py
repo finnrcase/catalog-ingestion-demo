@@ -133,6 +133,73 @@ def test_existing_product_url_extracted_before_search(monkeypatch):
     assert result.selected.extracted_image_url == "https://cdn.wolfappliance.com/images/mdd30ts-product.jpg"
 
 
+def test_preferred_direct_url_extracted_before_search(monkeypatch, tmp_path):
+    import src.product_resolver as pr
+    from src.preferred_websites import add_preferred_website, load_preferred_websites
+
+    preferred_path = tmp_path / "preferred_product_websites.json"
+    monkeypatch.setenv("PREFERRED_WEBSITES_PATH", str(preferred_path))
+    entry = add_preferred_website(
+        keyword="warming drawer",
+        url="https://preferred.example.com/products/mdd30ts",
+        notes="trusted showroom source",
+        path=preferred_path,
+    )
+    monkeypatch.setattr(pr, "search_product_candidates", lambda *a, **k: pytest.fail("search should not run"))
+    monkeypatch.setattr(pr.httpx, "get", lambda url, **kwargs: _resp(url, _wolf_html()))
+
+    result = resolve_product_page(_wolf_row())
+
+    assert result.selected is not None
+    assert result.selected.url == entry["url"]
+    assert result.selected.diagnostics["candidate_origin"] == "preferred_website"
+    assert result.selected.diagnostics["preferred_entry_id"] == entry["id"]
+    stored = load_preferred_websites(preferred_path)[0]
+    assert stored["success_count"] == 1
+    assert stored["last_fields_found"]["dimensions"] is True
+    assert stored["last_fields_found"]["image"] is True
+
+
+def test_preferred_domain_queries_run_before_normal_search(monkeypatch, tmp_path):
+    from src.preferred_websites import add_preferred_website
+
+    preferred_path = tmp_path / "preferred_product_websites.json"
+    monkeypatch.setenv("PREFERRED_WEBSITES_PATH", str(preferred_path))
+    add_preferred_website(keyword="warming drawer", url="https://preferred.example.com/", path=preferred_path)
+
+    queries, domains = build_resolver_queries(_wolf_row())
+
+    assert queries[0] == 'site:preferred.example.com "MDD30TS" dimensions'
+    assert queries[1] == 'site:preferred.example.com "MDD30TS" product'
+    assert "preferred.example.com" not in domains
+    assert any(query.startswith("site:") and "subzero-wolf.com" in query for query in queries)
+
+
+def test_preferred_website_failure_is_tracked(monkeypatch, tmp_path):
+    import src.product_resolver as pr
+    from src.preferred_websites import add_preferred_website, load_preferred_websites
+
+    preferred_path = tmp_path / "preferred_product_websites.json"
+    monkeypatch.setenv("PREFERRED_WEBSITES_PATH", str(preferred_path))
+    entry = add_preferred_website(
+        keyword="warming drawer",
+        url="https://preferred.example.com/products/other",
+        path=preferred_path,
+    )
+    wrong_html = _wolf_html().replace("MDD30TS", "OTHER999").replace("mdd30ts", "other999")
+    monkeypatch.setattr(pr, "search_product_candidates", lambda *a, **k: [])
+    monkeypatch.setattr(pr.httpx, "get", lambda url, **kwargs: _resp(url, wrong_html))
+
+    result = resolve_product_page(_wolf_row())
+
+    assert result.selected is None
+    assert result.diagnostics[0]["preferred_entry_id"] == entry["id"]
+    assert result.diagnostics[0]["preferred_website_status"] == "failure_stored"
+    stored = load_preferred_websites(preferred_path)[0]
+    assert stored["failure_count"] == 1
+    assert stored["last_status"] == "sku_not_found"
+
+
 def test_official_exact_sku_page_produces_high_dimensions_and_image(monkeypatch):
     import src.product_resolver as pr
 

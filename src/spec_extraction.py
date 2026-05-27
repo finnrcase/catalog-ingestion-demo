@@ -24,6 +24,10 @@ class DimensionExtractionResult:
     height: str = ""
     depth: str = ""
     length: str = ""
+    unit: str = "in"
+    raw_dimensions_text: str = ""
+    dimensions_source_url: str = ""
+    confidence_score: int = 0
     confidence: str = "none"
     source_type: str = "none"
     evidence_text: str = ""
@@ -34,13 +38,28 @@ class DimensionExtractionResult:
 
 _DIMENSION_LABEL_RE = re.compile(
     r"dimensions?|product dimensions?|overall dimensions?|appliance dimensions?|"
+    r"size|product size|overall size|measurements?|product measurements?|"
     r"width|height|depth|\bW\b|\bH\b|\bD\b",
     re.IGNORECASE,
 )
 _CUTOUT_RE = re.compile(r"cut[\s-]?out|rough opening|opening dimensions", re.IGNORECASE)
 _SHIPPING_RE = re.compile(r"shipping|package|packaged|carton|box dimensions", re.IGNORECASE)
 _SPEC_HINT_RE = re.compile(
-    r"dimension|width|height|depth|length|diameter|finish|color|material|spec|sku|model",
+    r"dimension|size|measurement|width|height|depth|length|diameter|finish|color|material|spec|sku|model",
+    re.IGNORECASE,
+)
+_AXIS_TOKEN_RE = r"(?:W|Width|D|Depth|H|Height|L|Length)"
+_AXIS_ORDER_RE = re.compile(
+    rf"\b(?P<a>{_AXIS_TOKEN_RE})\b\s*(?:x|×|by|/)\s*"
+    rf"\b(?P<b>{_AXIS_TOKEN_RE})\b\s*(?:x|×|by|/)\s*"
+    rf"\b(?P<c>{_AXIS_TOKEN_RE})\b(?:\s*(?:x|×|by|/)\s*\b(?P<d>{_AXIS_TOKEN_RE})\b)?",
+    re.IGNORECASE,
+)
+_VALUE_TRIPLE_RE = re.compile(
+    r"(?P<a>\d+(?:\.\d+)?(?:\s+\d+/\d+)?|\d+/\d+)\s*(?P<unit_a>\"|in\.?|inches|inch|ft\.?|feet|foot|cm|mm)?\s*(?:x|×|by|/)\s*"
+    r"(?P<b>\d+(?:\.\d+)?(?:\s+\d+/\d+)?|\d+/\d+)\s*(?P<unit_b>\"|in\.?|inches|inch|ft\.?|feet|foot|cm|mm)?\s*(?:x|×|by|/)\s*"
+    r"(?P<c>\d+(?:\.\d+)?(?:\s+\d+/\d+)?|\d+/\d+)\s*(?P<unit_c>\"|in\.?|inches|inch|ft\.?|feet|foot|cm|mm)?"
+    r"(?:\s*(?:x|×|by|/)\s*(?P<d>\d+(?:\.\d+)?(?:\s+\d+/\d+)?|\d+/\d+)\s*(?P<unit_d>\"|in\.?|inches|inch|ft\.?|feet|foot|cm|mm)?)?",
     re.IGNORECASE,
 )
 
@@ -126,6 +145,10 @@ def _html_dimension_chunks(soup: BeautifulSoup) -> tuple[list[str], list[str]]:
     itemprop_chunk = _itemprop_dimension_chunk(soup)
     if itemprop_chunk:
         chunks.append(itemprop_chunk)
+
+    meta_chunk = _meta_dimension_chunk(soup)
+    if meta_chunk:
+        chunks.append(meta_chunk)
 
     for table in soup.find_all("table"):
         rows = []
@@ -280,9 +303,23 @@ def _itemprop_dimension_chunk(soup: BeautifulSoup) -> str:
     return " ".join(parts)
 
 
+def _meta_dimension_chunk(soup: BeautifulSoup) -> str:
+    parts: list[str] = []
+    hint = re.compile(r"dimension|size|measurement|width|height|depth|product:width|product:height|product:depth", re.I)
+    for tag in soup.find_all("meta"):
+        name = _text(tag.get("name") or tag.get("property") or tag.get("itemprop"))
+        content = _text(tag.get("content"))
+        if name and content and hint.search(name):
+            parts.append(f"{name}: {content}")
+    return "\n".join(parts)
+
+
 def _adjacent_label_value_dimension_chunk(soup: BeautifulSoup) -> str:
     parts: list[str] = []
-    label_re = re.compile(r"^(?:overall |product |appliance )?(?:dimensions?|width|height|depth)$", re.I)
+    label_re = re.compile(
+        r"^(?:overall |product |appliance )?(?:dimensions?|size|measurements?|width|height|depth)$",
+        re.I,
+    )
     for node in soup.find_all(["div", "span", "li", "p"]):
         label = node.get_text(" ", strip=True)
         if not label or not label_re.fullmatch(label.strip(": ")):
@@ -327,7 +364,7 @@ def _extract_dimensions_from_chunks(
     cutout_dimensions = ""
     for chunk in cutout_chunks:
         if _CUTOUT_RE.search(chunk):
-            cutout_dimensions = _combined_if_complete(parse_dimensions(chunk))
+            cutout_dimensions = _combined_if_complete(_parse_dimension_parts(chunk))
             if cutout_dimensions:
                 break
 
@@ -335,23 +372,29 @@ def _extract_dimensions_from_chunks(
         for chunk in candidates:
             if _CUTOUT_RE.search(chunk) and not used_shipping:
                 continue
-            parts = parse_dimensions(_normalise_dimension_text(chunk))
+            parts = _parse_dimension_parts(_normalise_dimension_text(chunk))
             dimensions = _combined_if_complete(parts)
             if not dimensions:
                 continue
+            if not _parts_are_plausible(parts):
+                continue
             confidence = "medium" if used_shipping else "high"
+            confidence_score = 65 if used_shipping else 90
             return DimensionExtractionResult(
                 dimensions=dimensions,
                 width=parts.get("width", ""),
                 height=parts.get("height", ""),
                 depth=parts.get("depth", ""),
                 length=parts.get("length", ""),
+                unit="in",
+                raw_dimensions_text=chunk[:500],
+                confidence_score=confidence_score,
                 confidence=confidence,
                 source_type=source_type,
                 evidence_text=chunk[:500],
                 cutout_dimensions=cutout_dimensions,
                 used_shipping_dimensions=used_shipping,
-                diagnostics={"chunks_checked": len(chunks)},
+                diagnostics={"chunks_checked": len(chunks), "method": "dimension_chunks"},
             )
 
     return DimensionExtractionResult(
@@ -363,11 +406,131 @@ def _extract_dimensions_from_chunks(
 
 def _normalise_dimension_text(text: str) -> str:
     value = str(text or "")
-    value = re.sub(r"\bW\s*x\s*H\s*x\s*D\b", "Width x Height x Depth", value, flags=re.I)
+    value = value.replace("×", "x").replace(" by ", " x ")
+    value = re.sub(r"\bWxDxH\b", "W x D x H", value, flags=re.I)
+    value = re.sub(r"\bHxWxD\b", "H x W x D", value, flags=re.I)
+    value = re.sub(r"\bWxHxD\b", "W x H x D", value, flags=re.I)
     return value
 
 
+def _parse_dimension_parts(text: str) -> dict[str, str]:
+    ordered = _parse_axis_ordered_dimensions(text)
+    if _has_w_h_d(ordered):
+        return ordered
+    return parse_dimensions(text)
+
+
+def _parse_axis_ordered_dimensions(text: str) -> dict[str, str]:
+    value = _normalise_dimension_text(text)
+    result = {"width": "", "height": "", "depth": "", "length": "", "diameter": ""}
+    for order_match in _AXIS_ORDER_RE.finditer(value):
+        labels = [
+            _axis_key(order_match.group(name))
+            for name in ("a", "b", "c", "d")
+            if order_match.group(name)
+        ]
+        if len(labels) < 3 or len(set(labels[:3])) < 3:
+            continue
+
+        window = value[order_match.end(): order_match.end() + 160]
+        value_match = _VALUE_TRIPLE_RE.search(window)
+        if not value_match:
+            before = value[max(0, order_match.start() - 160): order_match.start()]
+            matches = list(_VALUE_TRIPLE_RE.finditer(before))
+            value_match = matches[-1] if matches else None
+        if not value_match:
+            continue
+
+        units = [
+            _text(value_match.group(f"unit_{name}"))
+            for name in ("a", "b", "c", "d")
+            if value_match.group(name)
+        ]
+        fallback_unit = next((unit for unit in units if unit), "")
+        for idx, label in enumerate(labels):
+            group_name = ("a", "b", "c", "d")[idx]
+            raw_num = _text(value_match.group(group_name))
+            if not raw_num:
+                continue
+            raw_unit = _text(value_match.group(f"unit_{group_name}")) or fallback_unit
+            converted = _dimension_number_to_inches(raw_num, raw_unit)
+            if converted and not result.get(label):
+                result[label] = converted
+        if _has_w_h_d(result):
+            return result
+    return result
+
+
+def _axis_key(value: object) -> str:
+    text = _text(value).lower()
+    if text.startswith("w"):
+        return "width"
+    if text.startswith("h"):
+        return "height"
+    if text.startswith("d"):
+        return "depth"
+    if text.startswith("l"):
+        return "length"
+    return ""
+
+
+def _dimension_number_to_inches(raw: str, unit: str = "") -> str:
+    number = _fraction_to_float(raw)
+    if number is None:
+        return ""
+    unit_l = unit.lower().strip().strip(".")
+    if unit_l in {"ft", "feet", "foot", "'"}:
+        number *= 12
+    elif unit_l == "cm":
+        number /= 2.54
+    elif unit_l == "mm":
+        number /= 25.4
+    return f"{round(number, 4):.4f}".rstrip("0").rstrip(".")
+
+
+def _fraction_to_float(raw: str) -> float | None:
+    total = 0.0
+    seen = False
+    for part in str(raw or "").strip().split():
+        if "/" in part:
+            try:
+                num, den = part.split("/", 1)
+                if float(den) == 0:
+                    return None
+                total += float(num) / float(den)
+                seen = True
+            except Exception:
+                return None
+        else:
+            try:
+                total += float(part)
+                seen = True
+            except Exception:
+                return None
+    return total if seen else None
+
+
+def _has_w_h_d(parts: dict[str, str]) -> bool:
+    return bool(parts.get("width") and parts.get("height") and parts.get("depth"))
+
+
+def _parts_are_plausible(parts: dict[str, str]) -> bool:
+    values: list[float] = []
+    for key in ("width", "height", "depth"):
+        raw = parts.get(key)
+        if not raw:
+            return False
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return False
+        values.append(value)
+    return all(0.1 <= value <= 600 for value in values)
+
+
 def _combined_if_complete(parts: dict[str, str]) -> str:
+    if not _parts_are_plausible(parts):
+        return ""
     dims = combined_dimensions(parts)
     return dims if has_complete_3d_dimensions(dims) else ""
 
