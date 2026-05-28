@@ -29,13 +29,14 @@ def test_normalize_mode_valid():
     assert normalize_mode("fast") == "fast"
     assert normalize_mode("standard") == "standard"
     assert normalize_mode("deep") == "deep"
+    assert normalize_mode("manual_retry") == "manual_retry"
 
 
-def test_normalize_mode_invalid_falls_back_to_standard():
+def test_normalize_mode_invalid_falls_back_to_fast():
     from src.enrichment_cache import normalize_mode
-    assert normalize_mode("turbo") == "standard"
-    assert normalize_mode("") == "standard"
-    assert normalize_mode("FAST") == "standard"  # case-sensitive
+    assert normalize_mode("turbo") == "fast"
+    assert normalize_mode("") == "fast"
+    assert normalize_mode("FAST") == "fast"  # case-sensitive
 
 
 # ── SearchBudget ───────────────────────────────────────────────────────────────
@@ -59,8 +60,9 @@ def test_search_budget_exhausted():
 def test_budget_for_mode_standard_defaults():
     from src.enrichment_cache import budget_for_mode
     b = budget_for_mode("standard")
-    assert b.max_searches == 4
-    assert b.max_urls == 5
+    assert b.max_searches == 3
+    assert b.max_urls == 6
+    assert b.max_ai_calls == 1
     assert not b.allows_retailer
     assert b.allows_general_fallback
 
@@ -69,16 +71,41 @@ def test_budget_for_mode_fast():
     from src.enrichment_cache import budget_for_mode
     b = budget_for_mode("fast")
     assert b.max_searches == 1
+    assert b.max_urls == 1
+    assert b.max_ai_calls == 0
     assert not b.allows_retailer
     assert not b.allows_general_fallback
+
+
+def test_budget_for_mode_fast_clamps_generic_env(monkeypatch):
+    from src.enrichment_cache import budget_for_mode
+
+    monkeypatch.setenv("BRAVE_MAX_SEARCHES_PER_PRODUCT", "5")
+    monkeypatch.setenv("ENRICHMENT_MAX_URLS_PER_PRODUCT", "5")
+    monkeypatch.setenv("ENRICHMENT_MAX_AI_CALLS_PER_PRODUCT", "2")
+
+    b = budget_for_mode("fast")
+
+    assert (b.max_searches, b.max_urls, b.max_ai_calls) == (1, 1, 0)
 
 
 def test_budget_for_mode_deep():
     from src.enrichment_cache import budget_for_mode
     b = budget_for_mode("deep")
-    assert b.max_searches == 8
+    assert b.max_searches == 6
+    assert b.max_urls == 12
+    assert b.max_ai_calls == 2
     assert b.allows_retailer
     assert b.allows_general_fallback
+
+
+def test_budget_for_mode_manual_retry():
+    from src.enrichment_cache import budget_for_mode
+    b = budget_for_mode("manual_retry")
+    assert b.max_searches == 10
+    assert b.max_urls == 20
+    assert b.max_ai_calls == 3
+    assert b.allows_retailer
 
 
 # ── SessionCache ───────────────────────────────────────────────────────────────

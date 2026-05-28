@@ -25,6 +25,13 @@ PROGRAMA_BROWSER_PROFILE=/persistent/programa_assistant
 ANTHROPIC_API_KEY=<set in platform secrets>
 BRAVE_API_KEY=<set in platform secrets>
 FRONTEND_ORIGINS=https://your-vercel-preview-url.vercel.app,https://your-production-domain.example
+MAX_UPLOAD_BYTES=104857600
+SCH_TMP_UPLOAD_ROOT=/tmp/sch-designops/uploads
+UPLOAD_STORAGE_PROVIDER=supabase
+REQUIRE_PERSISTENT_UPLOAD_STORAGE=true
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=<set in platform secrets>
+SUPABASE_STORAGE_BUCKET=sch-intake-uploads
 ```
 
 Never commit real values to the repo.
@@ -86,6 +93,17 @@ client information.
 - Do not commit `data/automation_logs/`.
 - Set a retention policy before production use.
 - Consider external private object storage for long-term retention.
+
+## Uploaded PDF Storage
+
+Production uploads should not rely only on the host filesystem. Configure
+Supabase Storage or equivalent object storage for uploaded PDFs:
+
+- Create a private bucket matching `SUPABASE_STORAGE_BUCKET`.
+- Keep `SUPABASE_SERVICE_ROLE_KEY` on the backend only.
+- Set `UPLOAD_STORAGE_PROVIDER=supabase`.
+- Set `REQUIRE_PERSISTENT_UPLOAD_STORAGE=true` once the bucket is verified.
+- Use `/tmp` through `SCH_TMP_UPLOAD_ROOT` only for parser working files.
 
 ## Controlled End-To-End Test Flow
 

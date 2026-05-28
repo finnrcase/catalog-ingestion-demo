@@ -11,9 +11,11 @@ parse_pdf_rows(pdf_file, project, room, supplier, notes) -> list[dict]
     Unknown fields are left at their default — never invented.
 """
 
+import hashlib
 import re
 
 from src.intake_schema import IMPORTANT_FIELDS, SOURCE_PDF, make_base_row
+from src.pdf_item_normalizer import build_quote_item_rows
 
 # ── Regex patterns ─────────────────────────────────────────────────────────────
 
@@ -108,6 +110,23 @@ def _compute_status(row: dict) -> str:
     return "Needs Enrichment" if (has_serial and missing) else "Needs Review"
 
 
+def _stamp_extraction_audit_fields(row: dict) -> dict:
+    """Attach the raw extracted lookup key and a simple parser confidence."""
+    model = str(row.get("Model/SKU", "") or "").strip()
+    row["_extracted_model_sku"] = model
+    score = 55
+    if str(row.get("Product Name", "") or "").strip():
+        score += 15
+    if str(row.get("Brand", "") or "").strip():
+        score += 15
+    if model:
+        score += 15
+    if str(row.get("Dimensions", "") or "").strip():
+        score += 5
+    row["_extraction_confidence"] = min(100, score)
+    return row
+
+
 def _row_from_line(
     line: str, project: str, room: str, supplier: str, notes: str
 ) -> dict | None:
@@ -135,7 +154,7 @@ def _row_from_line(
         row["Notes"] = f"{notes} {note_tag}".strip() if notes else note_tag
 
     row["Status"] = _compute_status(row)
-    return row
+    return _stamp_extraction_audit_fields(row)
 
 
 def _parse_table_rows(
@@ -147,6 +166,29 @@ def _parse_table_rows(
         tables = page.find_tables()
     except Exception:
         return rows
+    tables = list(tables)
+
+    page_lines = (page.get_text("text") or "").splitlines()
+    table_lines: list[str] = []
+    for table in tables:
+        extracted = table.extract()
+        if not extracted:
+            continue
+        for trow in extracted:
+            cells = [str(c or "").strip() for c in trow]
+            if any(cells):
+                table_lines.append(" | ".join(cells))
+
+    grouped_rows = build_quote_item_rows(
+        table_lines,
+        project=project,
+        room=room,
+        supplier=supplier,
+        notes=notes,
+        context_lines=page_lines,
+    )
+    if grouped_rows:
+        return grouped_rows
 
     for table in tables:
         extracted = table.extract()
@@ -209,6 +251,7 @@ def _parse_table_rows(
                 continue
 
             row["Status"] = _compute_status(row)
+            _stamp_extraction_audit_fields(row)
             rows.append(row)
 
     return rows
@@ -237,6 +280,11 @@ def parse_pdf_rows(
     -------
     list[dict] of partial row dicts aligned to make_base_row() field names.
     Empty list if the PDF has no parseable text.
+
+    Phase 1 image recovery (2026-05-08) annotates each row with internal
+    `_source_pdf_id` (SHA1[:12] of the PDF bytes), `_source_page_number`
+    (1-indexed page the row came from), and `_source_filename` (when the
+    upload object exposes a `name` attribute).
     """
     try:
         import fitz
@@ -246,12 +294,17 @@ def parse_pdf_rows(
     raw = pdf_file.read()
     pdf_file.seek(0)
 
+    pdf_id = hashlib.sha1(raw).hexdigest()[:12]
+    filename = getattr(pdf_file, "name", "") or ""
+
     doc = fitz.open(stream=raw, filetype="pdf")
     all_rows: list[dict] = []
     seen_keys: set[tuple[str, str]] = set()
 
-    for page in doc:
-        # 1. Try table extraction first
+    for page_index, page in enumerate(doc):
+        page_number = page_index + 1
+
+        # 1. Try table extraction / quote item grouping first
         table_rows = _parse_table_rows(page, project, room, supplier, notes)
         if table_rows:
             for r in table_rows:
@@ -261,11 +314,36 @@ def parse_pdf_rows(
                 )
                 if key not in seen_keys:
                     seen_keys.add(key)
+                    r["_source_pdf_id"] = pdf_id
+                    r["_source_page_number"] = page_number
+                    r["_source_filename"] = filename
                     all_rows.append(r)
             continue
 
-        # 2. Fall back to line-by-line text parsing
+        # 2. Group raw text into quote items before falling back to line parsing.
         text = page.get_text("text")
+        grouped_rows = build_quote_item_rows(
+            text.splitlines(),
+            project=project,
+            room=room,
+            supplier=supplier,
+            notes=notes,
+        )
+        if grouped_rows:
+            for row in grouped_rows:
+                key = (
+                    str(row.get("Product Name", "")).lower().strip(),
+                    str(row.get("Model/SKU", "")).lower().strip(),
+                )
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    row["_source_pdf_id"] = pdf_id
+                    row["_source_page_number"] = page_number
+                    row["_source_filename"] = filename
+                    all_rows.append(row)
+            continue
+
+        # 3. Last resort: line-by-line text parsing
         for line in text.splitlines():
             line = line.strip()
             if len(line) < 3:
@@ -279,6 +357,9 @@ def parse_pdf_rows(
             )
             if key not in seen_keys:
                 seen_keys.add(key)
+                row["_source_pdf_id"] = pdf_id
+                row["_source_page_number"] = page_number
+                row["_source_filename"] = filename
                 all_rows.append(row)
 
     doc.close()

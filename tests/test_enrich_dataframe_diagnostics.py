@@ -62,6 +62,17 @@ def _make_df(dims="", brand="Kohler", model="K-3999") -> pd.DataFrame:
     }])
 
 
+def _metric_diagnostic(diagnostics):
+    return next((d for d in diagnostics if d.get("report_type") == "enrichment_metrics"), None)
+
+
+def _dimension_diagnostics(diagnostics):
+    return [
+        d for d in diagnostics
+        if d.get("report_type") not in {"enrichment_metrics", "targeted_missing_field_retry"}
+    ]
+
+
 def test_enrich_dataframe_returns_three_values():
     with patch("src.product_enrichment.search_product_candidates", return_value=[]):
         result = enrich_dataframe(_make_df())
@@ -83,8 +94,12 @@ def test_enrich_dataframe_diagnostics_populated_when_lookup_ran():
         with patch("src.product_enrichment._find_dimensions", return_value=mock_result):
             df, errors, diagnostics = enrich_dataframe(_make_df())
 
-    assert len(diagnostics) == 1
-    d = diagnostics[0]
+    metrics = _metric_diagnostic(diagnostics)
+    dimension_diagnostics = _dimension_diagnostics(diagnostics)
+    assert metrics is not None
+    assert metrics["summary"]["external_enrichment_rows"] == 1
+    assert len(dimension_diagnostics) == 1
+    d = dimension_diagnostics[0]
     assert d["row_index"] == 0
     assert d["product_name"] == "Test Product"
     assert d["model_searched"] == "K-3999"
@@ -103,7 +118,11 @@ def test_enrich_dataframe_no_diagnostics_when_lookup_not_triggered():
     with patch("src.product_enrichment.search_product_candidates", return_value=[]):
         df, errors, diagnostics = enrich_dataframe(_make_df(dims='28"W x 30"H x 17"D'))
 
-    assert diagnostics == []
+    metrics = _metric_diagnostic(diagnostics)
+    dimension_diagnostics = _dimension_diagnostics(diagnostics)
+    assert metrics is not None
+    assert metrics["summary"]["eligible_rows"] == 1
+    assert dimension_diagnostics == []
     assert errors == []
 
 
@@ -119,9 +138,59 @@ def test_enrich_dataframe_diagnostics_failure_reason_on_not_found():
         with patch("src.product_enrichment._find_dimensions", return_value=mock_result):
             df, errors, diagnostics = enrich_dataframe(_make_df())
 
-    assert len(diagnostics) == 1
-    assert diagnostics[0]["status"] == "not_found"
-    assert diagnostics[0]["failure_reason"] == "no dimensions found after 5 queries and 3 URLs checked"
-    assert diagnostics[0]["queries_tried"] == ["query1"]
-    assert diagnostics[0]["urls_checked"] == ["https://example.com"]
-    assert diagnostics[0]["domain_used"] == ""  # no source URL for not_found
+    metrics = _metric_diagnostic(diagnostics)
+    dimension_diagnostics = _dimension_diagnostics(diagnostics)
+    assert metrics is not None
+    assert len(dimension_diagnostics) == 1
+    assert dimension_diagnostics[0]["status"] == "not_found"
+    assert dimension_diagnostics[0]["failure_reason"] == "no dimensions found after 5 queries and 3 URLs checked"
+    assert dimension_diagnostics[0]["queries_tried"] == ["query1"]
+    assert dimension_diagnostics[0]["urls_checked"] == ["https://example.com"]
+    assert dimension_diagnostics[0]["domain_used"] == ""  # no source URL for not_found
+
+
+def test_enrich_dataframe_metrics_include_bravi_cost_and_history(monkeypatch, tmp_path):
+    from src.brave_search import SearchResult
+    from src.enrichment_cost_history import load_cost_history
+
+    monkeypatch.setenv("ENRICHMENT_COST_HISTORY_PATH", str(tmp_path / "cost_history.json"))
+
+    def fake_search(query, brand="", session_cache=None):
+        return [SearchResult(
+            title="Kohler K-3999 Product",
+            url="https://www.kohler.com/product/k-3999",
+            description="K-3999 dimensions",
+            domain_score=100,
+        )]
+
+    html = """
+    <html><head><title>Kohler K-3999 Product</title></head>
+    <body>Kohler K-3999 Test Product <table><tr><th>Dimensions</th><td>28"W x 30"H x 17"D</td></tr></table></body></html>
+    """
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "text/html"}
+        text = html
+        content = html.encode("utf-8")
+        url = "https://www.kohler.com/product/k-3999"
+
+    monkeypatch.setattr("src.product_resolver.search_product_candidates", fake_search)
+    monkeypatch.setattr("src.product_resolver.httpx.get", lambda *args, **kwargs: Response())
+
+    df, errors, diagnostics = enrich_dataframe(_make_df())
+
+    metrics = _metric_diagnostic(diagnostics)["summary"]
+    assert errors == []
+    assert metrics["bravi_searches"] >= 1
+    assert metrics["bravi_cost_usd"] > 0
+    assert metrics["avg_cost_per_item_usd"] > 0
+    assert "bravi_calls" in metrics
+    assert df.iloc[0]["Bravi Used"] == "yes"
+    assert float(df.iloc[0]["Bravi Cost USD"]) > 0
+    assert "K-3999" in df.iloc[0]["Bravi Query"]
+
+    history = load_cost_history(tmp_path / "cost_history.json")
+    assert len(history) == 1
+    assert history[0]["bravi_calls"] == metrics["bravi_searches"]
+    assert history[0]["bravi_cost_usd"] == metrics["bravi_cost_usd"]

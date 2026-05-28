@@ -85,3 +85,7 @@ SCHDATAINGEST/
 .DS_Store
 .vscode/
 .idea/
+
+# Per-session image recovery scratch space (PDFs + recovered images)
+.tmp/
+.vercel/

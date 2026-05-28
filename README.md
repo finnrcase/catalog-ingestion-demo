@@ -100,6 +100,9 @@ NEXT_PUBLIC_API_BASE_URL=https://your-backend.example.com
 3. Add `NEXT_PUBLIC_API_BASE_URL` pointing to the deployed backend.
 4. Deploy.
 
+See `docs/VERCEL_DEPLOYMENT.md` for the production hardening checklist,
+required Vercel env vars, and backend storage requirements.
+
 ### Backend on Render/Railway/Fly.io
 
 See `BACKEND_DEPLOYMENT_CHECKLIST.md` before deploying the backend.
@@ -119,6 +122,11 @@ Add environment variables:
 - `ANTHROPIC_API_KEY`
 - `BRAVE_API_KEY`
 - `FRONTEND_ORIGINS` (comma-separated allowed frontend URLs)
+- `MAX_UPLOAD_BYTES` (defaults to 100 MB)
+- `SCH_TMP_UPLOAD_ROOT` (`/tmp/...` for ephemeral hosts, persistent private disk when available)
+- `UPLOAD_STORAGE_PROVIDER=supabase`, `SUPABASE_URL`,
+  `SUPABASE_SERVICE_ROLE_KEY`, and `SUPABASE_STORAGE_BUCKET` when persistent
+  upload storage is required
 
 For Programa automation, the backend host must support Playwright and a usable
 Chromium/Chrome install. Keep the browser profile path on persistent storage if

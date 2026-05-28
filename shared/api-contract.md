@@ -101,3 +101,95 @@ JSON body:
 ```
 
 Returns `text/csv`.
+
+## `POST /export/programa/csv`
+
+JSON body:
+
+```json
+{ "rows": [] }
+```
+
+Returns a Programa custom-import CSV. The image column is text-only and contains
+only direct public HTTPS image URLs when present.
+
+## `POST /export/programa/xlsx`
+
+JSON body:
+
+```json
+{ "rows": [] }
+```
+
+Returns the same Programa custom-import data as a plain XLSX.
+
+## `POST /export/programa/xlsx-with-images`
+
+JSON body:
+
+```json
+{
+  "rows": [],
+  "session_id": "abc123",
+  "include_low_confidence_images": false
+}
+```
+
+Returns an XLSX with product images embedded in a `Product Image` column on the
+same row as each product, plus `Image URL`, `Image Filename`, and
+`Image Import Status` backup columns. This is the preferred image-import file
+because Programa's public import guidance says images should be included on the
+same row as the product.
+
+## `POST /export/programa/zip`
+
+JSON body:
+
+```json
+{
+  "rows": [],
+  "session_id": "abc123",
+  "include_low_confidence_images": false
+}
+```
+
+Returns `programa_import.csv`, `programa_import.xlsx`, `images/*.jpg`,
+`manifest.csv`, and manual-upload instructions as a fallback image package.
+
+## `POST /intake/upload-pdf`
+
+Multipart form data:
+
+| Field | Type | Notes |
+|---|---|---|
+| `file` | PDF | The PDF file to upload |
+
+Optional request header:
+
+| Header | Type | Notes |
+|---|---|---|
+| `X-Session-Id` | string | Reuse an existing session; generated server-side if absent |
+
+Persists the PDF to `.tmp/uploads/{session_id}/pdfs/{pdf_id}.pdf` (deduped by SHA1[:12] of the file bytes) and returns parsed product rows.
+
+Returns:
+
+```json
+{
+  "session_id": "abc123",
+  "pdf_id": "def456",
+  "rows": []
+}
+```
+
+## `POST /intake/recover-images`
+
+JSON body:
+
+```json
+{ "rows": [], "session_id": "abc123" }
+```
+
+`session_id` is optional. When provided, the backend looks up PDFs stored under `.tmp/uploads/{session_id}/pdfs/` and uses them as the source for PDF crop recovery. Rows that already have an `Image URL` are skipped.
+
+Returns `IntakeResponse` with recovery diagnostics in `dimension_diagnostics`.

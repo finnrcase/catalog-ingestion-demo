@@ -35,13 +35,40 @@ ALL_COLUMNS: list[str] = [
     "AI Category Confidence",
     "Category Source",
     "Image URL",
+    "Original Image URL",
     "Local Image Path",
     "Image Filename",
     "Image Upload Status",
+    "cloudinary_secure_url",
+    "cloudinary_url",
+    "cloudinary_public_id",
+    "cloudinary_width",
+    "cloudinary_height",
+    "cloudinary_format",
+    "cloudinary_bytes",
+    "original_image_url",
+    "image_confidence",
+    "image_source_url",
+    "cloudinary_status",
+    "cloudinary_error",
+    "programa_image_ready",
+    "image_upload_status",
+    "image_upload_failure_reason",
     "Dimension Source URL",
     "Dimension Confidence",
     "Dimension Source Type",
     "Dimension Lookup Status",
+    "Product Width (in)",
+    "Product Height (in)",
+    "Product Depth (in)",
+    "Cutout Dimensions",
+    "Cutout Width (in)",
+    "Cutout Height (in)",
+    "Cutout Depth (in)",
+    "Shipping/Package Dimensions",
+    "Shipping Width (in)",
+    "Shipping Height (in)",
+    "Shipping Depth (in)",
 ]
 
 # ── Category options ───────────────────────────────────────────────────────────
@@ -127,8 +154,18 @@ def make_base_row(
     """
     Return a blank row dict with every column at its default value.
     Callers fill in the source-specific fields after calling this.
+
+    Internal `_source_*` fields (added Phase 1 image recovery, 2026-05-08)
+    record which uploaded PDF and page a row was parsed from. They are
+    intentionally NOT in ALL_COLUMNS so the standard Programa CSV/XLSX
+    export stays clean. They surface only in the debug export and in the
+    manifest CSV inside the Programa ZIP.
+
+    Internal `_extracted_*` fields are the PDF extraction audit trail. They
+    keep the raw model/SKU key and extraction confidence available for later
+    manufacturer lookup without leaking into standard Programa exports.
     """
-    return {
+    base = {
         "Include":          True,
         "Project":          project,
         "Room":             room,
@@ -152,11 +189,44 @@ def make_base_row(
         "AI Category Confidence": 0,
         "Category Source":        "Unknown",
         "Image URL":              "",
+        "Original Image URL":     "",
         "Local Image Path":       "",
         "Image Filename":         "",
         "Image Upload Status":    "",
+        "cloudinary_secure_url":  "",
+        "cloudinary_url":         "",
+        "cloudinary_public_id":   "",
+        "cloudinary_width":       "",
+        "cloudinary_height":      "",
+        "cloudinary_format":      "",
+        "cloudinary_bytes":       "",
+        "original_image_url":     "",
+        "image_confidence":       "",
+        "image_source_url":       "",
+        "cloudinary_status":      "",
+        "cloudinary_error":       "",
+        "programa_image_ready":   "False",
+        "image_upload_status":    "",
+        "image_upload_failure_reason": "",
         "Dimension Source URL":   "",
         "Dimension Confidence":   "",
         "Dimension Source Type":  "",
         "Dimension Lookup Status": "",
+        "Product Width (in)":     "",
+        "Product Height (in)":    "",
+        "Product Depth (in)":     "",
+        "Cutout Dimensions":      "",
+        "Cutout Width (in)":      "",
+        "Cutout Height (in)":     "",
+        "Cutout Depth (in)":      "",
+        "Shipping/Package Dimensions": "",
+        "Shipping Width (in)":    "",
+        "Shipping Height (in)":   "",
+        "Shipping Depth (in)":    "",
     }
+    base["_source_pdf_id"] = ""
+    base["_source_page_number"] = None
+    base["_source_filename"] = ""
+    base["_extracted_model_sku"] = ""
+    base["_extraction_confidence"] = ""
+    return base

@@ -53,12 +53,19 @@ def _brave_search_urls(
     if session_cache is not None and query in session_cache.queries:
         return [r.url for r in session_cache.queries[query][:limit]]
     # Budget check before real API call
-    if budget is not None and not budget.can_search():
-        return []
+    if budget is not None:
+        try:
+            can_search = budget.can_search(query=query, field="Dimensions", reason="dimension lookup search")
+        except TypeError:
+            can_search = budget.can_search()
+        if not can_search:
+            return []
+        try:
+            budget.consume_search(query=query, field="Dimensions", reason="dimension lookup search")
+        except TypeError:
+            budget.consume_search()
     try:
         results = _brave_candidates(query, brand, session_cache=session_cache)
-        if budget is not None:
-            budget.consume_search()
         return [r.url for r in results[:limit]]
     except Exception:
         return []
@@ -107,6 +114,25 @@ BRAND_DOMAIN_TABLE: dict[str, str] = {
     "whirlpool": "whirlpool.com",
     "kitchenaid": "kitchenaid.com",
     "viking": "vikingrange.com",
+    "visual comfort": "visualcomfort.com",
+    "circa lighting": "visualcomfort.com",
+    "palecek": "palecek.com",
+    "four hands": "fourhands.com",
+    "arteriors": "arteriorshome.com",
+    "mcgee & co": "mcgeeandco.com",
+    "rh": "rh.com",
+    "restoration hardware": "rh.com",
+    "west elm": "westelm.com",
+    "pottery barn": "potterybarn.com",
+    "rejuvenation": "rejuvenation.com",
+    "serena & lily": "serenaandlily.com",
+    "cb2": "cb2.com",
+    "crate & barrel": "crateandbarrel.com",
+    "lulu and georgia": "luluandgeorgia.com",
+    "burke decor": "burkedecor.com",
+    "wayfair": "wayfair.com",
+    "perigold": "perigold.com",
+    "1stdibs": "1stdibs.com",
 }
 
 RETAILER_DOMAINS: list[str] = [
@@ -724,11 +750,11 @@ def find_dimensions(
                 urls_checked.append(url)
                 if budget is not None and not budget.can_fetch():
                     break
+                if budget is not None:
+                    budget.consume_fetch()
                 product_dims, cutout_dims, src_suffix = _fetch_and_parse_url(
                     url, is_appliance=is_appliance
                 )
-                if budget is not None:
-                    budget.consume_fetch()
                 if not product_dims or not has_complete_3d_dimensions(product_dims):
                     continue
                 matched_variant = None

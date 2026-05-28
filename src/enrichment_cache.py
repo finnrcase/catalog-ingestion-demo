@@ -6,9 +6,11 @@ Public API
 ----------
 normalize_key(brand, model) -> str
 normalize_mode(mode) -> str
-budget_for_mode(mode) -> SearchBudget
+budget_for_mode(mode) -> ProductLookupBudget
 confidence_ok(entry, field_name) -> bool
-SearchBudget       — per-product Brave call counter
+ProductLookupBudget — per-product Brave/page/AI call counter
+EnrichmentRunBudget — per-upload cost/call limiter
+SearchBudget       — backwards-compatible alias
 SessionCache       — in-memory per-run query/URL dedup store
 ManufacturerDomainCache  — persistent data/manufacturer_domain_cache.json
 ProductEnrichmentCache   — persistent data/product_enrichment_cache.json
@@ -22,16 +24,25 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from src.durable_cache import durable_cache_enabled, load_map, upsert_payload
+from src.product_lookup_budget import EnrichmentRunBudget, ProductLookupBudget, run_budget_for_mode
+
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 _MFR_CACHE_PATH = os.path.normpath(os.path.join(_DATA_DIR, "manufacturer_domain_cache.json"))
 _PRODUCT_CACHE_PATH = os.path.normpath(os.path.join(_DATA_DIR, "product_enrichment_cache.json"))
 
 _CACHE_ENABLED: bool = os.getenv("ENRICHMENT_CACHE_ENABLED", "true").lower() != "false"
 
+
+def _is_default_path(path: str, default: str) -> bool:
+    return os.path.normpath(path) == os.path.normpath(default)
+
 _MODE_LIMITS: dict[str, dict] = {
-    "fast":     {"max_searches": 1, "max_urls": 3,  "retailer": False, "general_fallback": False},
-    "standard": {"max_searches": 4, "max_urls": 5,  "retailer": False, "general_fallback": True},
-    "deep":     {"max_searches": 8, "max_urls": 10, "retailer": True,  "general_fallback": True},
+    "fast": {"max_searches": 1, "max_urls": 1, "max_ai_calls": 0, "retailer": False, "general_fallback": False},
+    "standard": {"max_searches": 3, "max_urls": 6, "max_ai_calls": 1, "retailer": False, "general_fallback": True},
+    "balanced": {"max_searches": 3, "max_urls": 6, "max_ai_calls": 1, "retailer": False, "general_fallback": True},
+    "deep": {"max_searches": 6, "max_urls": 12, "max_ai_calls": 2, "retailer": True, "general_fallback": True},
+    "manual_retry": {"max_searches": 10, "max_urls": 20, "max_ai_calls": 3, "retailer": True, "general_fallback": True},
 }
 
 VALID_MODES: frozenset[str] = frozenset(_MODE_LIMITS)
@@ -55,20 +66,38 @@ def normalize_key(brand: str, model: str) -> str:
 
 
 def normalize_mode(mode: str) -> str:
-    """Return mode unchanged if valid, else 'standard'."""
-    return mode if mode in VALID_MODES else "standard"
+    """Return mode unchanged if valid, else 'fast'."""
+    return mode if mode in VALID_MODES else "fast"
 
 
-def budget_for_mode(mode: str) -> "SearchBudget":
-    """Create a SearchBudget for the given enrichment mode, respecting env overrides."""
-    limits = _MODE_LIMITS[normalize_mode(mode)]
+def budget_for_mode(
+    mode: str,
+    *,
+    run_budget: EnrichmentRunBudget | None = None,
+    item_key: str = "",
+) -> ProductLookupBudget:
+    """Create a ProductLookupBudget for the given enrichment mode, respecting env overrides."""
+    mode_name = normalize_mode(mode)
+    limits = _MODE_LIMITS[mode_name]
     env_searches = os.getenv("BRAVE_MAX_SEARCHES_PER_PRODUCT")
     env_urls = os.getenv("ENRICHMENT_MAX_URLS_PER_PRODUCT")
-    return SearchBudget(
-        max_searches=int(env_searches) if env_searches else limits["max_searches"],
-        max_urls=int(env_urls) if env_urls else limits["max_urls"],
+    env_ai_calls = os.getenv("ENRICHMENT_MAX_AI_CALLS_PER_PRODUCT")
+    max_searches = int(env_searches) if env_searches else limits["max_searches"]
+    max_urls = int(env_urls) if env_urls else limits["max_urls"]
+    max_ai_calls = int(env_ai_calls) if env_ai_calls else limits["max_ai_calls"]
+    if mode_name == "fast":
+        max_searches = min(max_searches, limits["max_searches"])
+        max_urls = min(max_urls, limits["max_urls"])
+        max_ai_calls = min(max_ai_calls, limits["max_ai_calls"])
+    return ProductLookupBudget(
+        max_searches=max_searches,
+        max_urls=max_urls,
+        max_ai_calls=max_ai_calls,
+        mode=mode_name,
         allows_retailer=limits["retailer"],
         allows_general_fallback=limits["general_fallback"],
+        run_budget=run_budget,
+        item_key=item_key,
     )
 
 
@@ -80,26 +109,7 @@ def confidence_ok(entry: dict, field_name: str) -> bool:
 
 # ── SearchBudget ───────────────────────────────────────────────────────────────
 
-@dataclass
-class SearchBudget:
-    max_searches: int
-    max_urls: int
-    allows_retailer: bool = False
-    allows_general_fallback: bool = True
-    searches_used: int = 0
-    urls_used: int = 0
-
-    def can_search(self) -> bool:
-        return self.searches_used < self.max_searches
-
-    def can_fetch(self) -> bool:
-        return self.urls_used < self.max_urls
-
-    def consume_search(self) -> None:
-        self.searches_used += 1
-
-    def consume_fetch(self) -> None:
-        self.urls_used += 1
+SearchBudget = ProductLookupBudget
 
 
 # ── SessionCache ───────────────────────────────────────────────────────────────
@@ -123,19 +133,45 @@ class ManufacturerDomainCache:
     def _load(self) -> None:
         if self._data is not None:
             return
-        if not _CACHE_ENABLED or not os.path.exists(self._path):
-            self._data = {}
+        data: dict = {}
+        if _CACHE_ENABLED and os.path.exists(self._path):
+            try:
+                with open(self._path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    data = loaded if isinstance(loaded, dict) else {}
+            except Exception as exc:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "ManufacturerDomainCache: could not load %s (%s) — treating as empty",
+                    self._path, exc,
+                )
+                data = {}
+        if _CACHE_ENABLED and _is_default_path(self._path, _MFR_CACHE_PATH) and durable_cache_enabled():
+            durable = load_map("manufacturer_domain_cache", "brand")
+            if durable:
+                data.update(durable)
+        self._data = data
+
+    def _durable_enabled(self) -> bool:
+        return _CACHE_ENABLED and _is_default_path(self._path, _MFR_CACHE_PATH) and durable_cache_enabled()
+
+    def _write_durable_entry(self, brand_key: str, entry: dict) -> None:
+        if not self._durable_enabled():
             return
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
-                self._data = json.load(f)
-        except Exception as exc:
-            import logging as _logging
-            _logging.getLogger(__name__).warning(
-                "ManufacturerDomainCache: could not load %s (%s) — treating as empty",
-                self._path, exc,
+            upsert_payload(
+                "manufacturer_domain_cache",
+                "brand",
+                brand_key,
+                entry,
+                extra={
+                    "official_domain": entry.get("official_domain") or entry.get("domain") or "",
+                    "source": entry.get("source") or "",
+                    "confidence": entry.get("confidence") or "",
+                },
             )
-            self._data = {}
+        except Exception:
+            pass
 
     def _save(self) -> None:
         if not _CACHE_ENABLED or self._data is None:
@@ -166,6 +202,7 @@ class ManufacturerDomainCache:
             "last_verified": datetime.now().strftime("%Y-%m-%d"),
         }
         self._save()
+        self._write_durable_entry(brand_key, self._data[brand_key])
 
 
 # ── ProductEnrichmentCache ─────────────────────────────────────────────────────
@@ -180,19 +217,47 @@ class ProductEnrichmentCache:
     def _load(self) -> None:
         if self._data is not None:
             return
-        if not _CACHE_ENABLED or not os.path.exists(self._path):
-            self._data = {}
+        data: dict = {}
+        if _CACHE_ENABLED and os.path.exists(self._path):
+            try:
+                with open(self._path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    data = loaded if isinstance(loaded, dict) else {}
+            except Exception as exc:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "ProductEnrichmentCache: could not load %s (%s) — treating as empty",
+                    self._path, exc,
+                )
+                data = {}
+        if _CACHE_ENABLED and _is_default_path(self._path, _PRODUCT_CACHE_PATH) and durable_cache_enabled():
+            durable = load_map("product_enrichment_cache", "cache_key")
+            if durable:
+                data.update(durable)
+        self._data = data
+
+    def _durable_enabled(self) -> bool:
+        return _CACHE_ENABLED and _is_default_path(self._path, _PRODUCT_CACHE_PATH) and durable_cache_enabled()
+
+    def _write_durable_entry(self, key: str, entry: dict) -> None:
+        if not self._durable_enabled():
             return
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
-                self._data = json.load(f)
-        except Exception as exc:
-            import logging as _logging
-            _logging.getLogger(__name__).warning(
-                "ProductEnrichmentCache: could not load %s (%s) — treating as empty",
-                self._path, exc,
+            parts = key.split("_", 1)
+            upsert_payload(
+                "product_enrichment_cache",
+                "cache_key",
+                key,
+                entry,
+                extra={
+                    "normalized_brand": parts[0] if parts else "",
+                    "normalized_model": parts[1] if len(parts) > 1 else "",
+                    "confidence": entry.get("general_confidence") or entry.get("dimension_confidence") or "",
+                    "source_url": entry.get("product_url") or entry.get("dimension_source_url") or "",
+                },
             )
-            self._data = {}
+        except Exception:
+            pass
 
     def _save(self) -> None:
         if not _CACHE_ENABLED or self._data is None:
@@ -238,3 +303,4 @@ class ProductEnrichmentCache:
             entry["timestamp"] = now
         self._data[key] = entry
         self._save()
+        self._write_durable_entry(key, entry)

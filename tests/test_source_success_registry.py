@@ -1,0 +1,127 @@
+from __future__ import annotations
+
+import json
+
+from src.source_success_registry import (
+    brand_source_hints,
+    category_source_hints,
+    load_source_registry,
+    preferred_source_domains_for_row,
+    record_source_failure,
+    record_source_success,
+    source_success_score,
+    successful_urls_for_row,
+)
+
+
+def _row(brand="Wolf", model="MDD30TS", category="Appliances") -> dict:
+    return {
+        "Brand": brand,
+        "Model/SKU": model,
+        "Product Category": category,
+        "Product Name": "30 Inch Warming Drawer",
+    }
+
+
+def test_brand_source_hints_include_required_appliance_sources():
+    assert brand_source_hints("Sub-Zero")[:2] == ["subzero-wolf.com", "ca.subzero-wolf.com"]
+    assert "mieleusa.com" in brand_source_hints("Miele")
+    assert brand_source_hints("Fisher Paykel") == ["fisherpaykel.com"]
+
+
+def test_category_source_hints_seed_design_product_sources():
+    appliances = category_source_hints("Appliances")
+    lighting = category_source_hints("Lighting")
+    plumbing = category_source_hints("Plumbing / Bath")
+    furniture = category_source_hints("Furniture / Decor")
+    tile = category_source_hints("Stone/Tile")
+
+    assert "thermador.com" in appliances
+    assert "home.hestan.com" in appliances
+    assert "visualcomfort.com" in lighting
+    assert "kohler.com" in plumbing
+    assert "ferguson.com" in plumbing
+    assert "rh.com" in furniture
+    assert "annesacks.com" in tile
+
+
+def test_preferred_sources_use_brand_before_category_hints(tmp_path):
+    row = _row("Wolf", "MDD30TS", "Appliances")
+
+    preferred = preferred_source_domains_for_row(row, tmp_path / "empty.json")
+
+    assert preferred.index("subzero-wolf.com") < preferred.index("thermador.com")
+    assert "scotsman-ice.com" in preferred
+
+
+def test_source_success_registry_saves_and_prefers_successful_domain(tmp_path):
+    path = tmp_path / "source_success_registry.json"
+
+    record_source_success(
+        _row(),
+        domain="subzero-wolf.com",
+        url="https://subzero-wolf.com/wolf/products/mdd30ts",
+        fields_found={"dimensions": True, "image": True, "product_url": True},
+        confidence="high",
+        path=path,
+    )
+
+    data = load_source_registry(path)
+    entry = next(iter(data.values()))
+    assert entry["successful_domain"] == "subzero-wolf.com"
+    assert entry["fields_usually_found"]["dimensions"] is True
+    assert entry["fields_usually_found"]["image"] is True
+    assert entry["image_success_rate"] == 1.0
+    assert entry["dimension_success_rate"] == 1.0
+    assert entry["average_confidence"] == 1.0
+    assert "successful_url" not in entry
+    assert entry.get("normalized_sku", "") == ""
+    assert preferred_source_domains_for_row(_row(), path)[0] == "subzero-wolf.com"
+    assert successful_urls_for_row(_row(), path) == []
+
+
+def test_source_failure_downranks_failed_domain(tmp_path):
+    path = tmp_path / "source_success_registry.json"
+    row = _row("Acme", "AX100", "Appliances")
+
+    record_source_success(row, domain="good.example.com", url="https://good.example.com/ax100", path=path)
+    record_source_success(row, domain="bad.example.com", url="https://bad.example.com/ax100", path=path)
+    for _ in range(3):
+        record_source_failure(row, domain="bad.example.com", reason="no_dimensions", path=path)
+
+    preferred = preferred_source_domains_for_row(row, path)
+    assert preferred.index("good.example.com") < preferred.index("bad.example.com")
+    assert source_success_score(row, "good.example.com", path) > source_success_score(row, "bad.example.com", path)
+
+
+def test_domain_success_memory_removes_stale_exact_product_fields(tmp_path):
+    path = tmp_path / "source_success_registry.json"
+    row = _row("Acme", "AX100", "Appliances")
+
+    record_source_success(row, domain="specs.acme.com", url="https://specs.acme.com/old-ax100", path=path)
+    data = load_source_registry(path)
+    key = next(iter(data))
+    data[key].update({
+        "successful_url": "https://specs.acme.com/other-product",
+        "model": "OTHER",
+        "normalized_sku": "other",
+        "cloudinary_url": "https://res.cloudinary.com/demo/image/upload/other.jpg",
+    })
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    record_source_success(row, domain="specs.acme.com", fields_found={"image": True}, path=path)
+
+    entry = next(iter(load_source_registry(path).values()))
+    assert "successful_url" not in entry
+    assert "model" not in entry
+    assert "normalized_sku" not in entry
+    assert "cloudinary_url" not in entry
+
+
+def test_marketplace_failures_are_not_stored(tmp_path):
+    path = tmp_path / "source_success_registry.json"
+
+    entry = record_source_failure(_row(), domain="amazon.com", reason="marketplace", path=path)
+
+    assert entry is None
+    assert load_source_registry(path) == {}

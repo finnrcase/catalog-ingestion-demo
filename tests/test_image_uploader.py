@@ -3,7 +3,14 @@ from types import SimpleNamespace
 
 from PIL import Image
 
-from src.image_uploader import MAX_UPLOAD_BYTES, compress_image, upload_image, upload_images
+from src.image_uploader import (
+    MAX_UPLOAD_BYTES,
+    compress_image,
+    fetch_convert_upload_remote_image,
+    upload_image,
+    upload_image_with_metadata,
+    upload_images,
+)
 
 
 def _image_file(size=(800, 600), mode="RGB", image_format="PNG") -> io.BytesIO:
@@ -15,6 +22,9 @@ def _image_file(size=(800, 600), mode="RGB", image_format="PNG") -> io.BytesIO:
 
 
 def test_upload_image_returns_cloudinary_secure_url(monkeypatch):
+    monkeypatch.setenv("CLOUDINARY_CLOUD_NAME", "demo")
+    monkeypatch.setenv("CLOUDINARY_API_KEY", "key")
+    monkeypatch.setenv("CLOUDINARY_API_SECRET", "secret")
     uploaded_files = []
 
     def fake_upload(file):
@@ -36,6 +46,9 @@ def test_upload_image_returns_cloudinary_secure_url(monkeypatch):
 
 
 def test_upload_image_returns_none_without_secure_url(monkeypatch):
+    monkeypatch.setenv("CLOUDINARY_CLOUD_NAME", "demo")
+    monkeypatch.setenv("CLOUDINARY_API_KEY", "key")
+    monkeypatch.setenv("CLOUDINARY_API_SECRET", "secret")
     fake_cloudinary = SimpleNamespace(uploader=SimpleNamespace(upload=lambda file: {"url": "http://example.com/a.jpg"}))
     monkeypatch.setattr("src.image_uploader.cloudinary", fake_cloudinary)
 
@@ -62,3 +75,161 @@ def test_upload_images_preserves_order_and_failures(monkeypatch):
         None,
         "https://res.cloudinary.com/demo/image/upload/3.jpg",
     ]
+
+
+def test_upload_image_with_metadata_returns_cloudinary_fields(monkeypatch):
+    monkeypatch.setenv("CLOUDINARY_CLOUD_NAME", "demo")
+    monkeypatch.setenv("CLOUDINARY_API_KEY", "key")
+    monkeypatch.setenv("CLOUDINARY_API_SECRET", "secret")
+    monkeypatch.setenv("CLOUDINARY_UPLOAD_FOLDER", "sch-test")
+
+    def fake_upload(file, **kwargs):
+        assert kwargs["folder"] == "sch-test"
+        return {
+            "secure_url": "https://res.cloudinary.com/demo/image/upload/product.jpg",
+            "public_id": "sch-test/product",
+            "width": 800,
+            "height": 600,
+            "format": "jpg",
+            "bytes": 12345,
+        }
+
+    monkeypatch.setattr("src.image_uploader.cloudinary", SimpleNamespace(uploader=SimpleNamespace(upload=fake_upload), config=lambda **_: None))
+
+    result = upload_image_with_metadata(_image_file())
+
+    assert result.status == "uploaded"
+    assert result.secure_url == "https://res.cloudinary.com/demo/image/upload/product.jpg"
+    assert result.public_id == "sch-test/product"
+    assert result.width == 800
+    assert result.height == 600
+    assert result.format == "jpg"
+    assert result.bytes == 12345
+
+
+def test_fetch_convert_upload_remote_image_sets_user_agent_and_uploads_jpg(monkeypatch):
+    monkeypatch.setenv("CLOUDINARY_CLOUD_NAME", "demo")
+    monkeypatch.setenv("CLOUDINARY_API_KEY", "key")
+    monkeypatch.setenv("CLOUDINARY_API_SECRET", "secret")
+    source = _image_file(image_format="WEBP").getvalue()
+    seen_headers = {}
+
+    class FakeResponse:
+        status_code = 200
+        url = "https://manufacturer.example.com/product.webp"
+        headers = {"content-type": "image/webp"}
+
+        def iter_content(self, chunk_size=65536):
+            yield source
+
+    def fake_get(url, headers=None, **kwargs):
+        seen_headers.update(headers or {})
+        return FakeResponse()
+
+    def fake_upload(file, **kwargs):
+        with Image.open(file) as image:
+            assert image.format == "JPEG"
+        return {
+            "secure_url": "https://res.cloudinary.com/demo/image/upload/product.jpg",
+            "public_id": "product",
+            "width": 800,
+            "height": 600,
+            "format": "jpg",
+            "bytes": 1000,
+        }
+
+    monkeypatch.setattr("src.image_uploader.requests.get", fake_get)
+    monkeypatch.setattr("src.image_uploader.cloudinary", SimpleNamespace(uploader=SimpleNamespace(upload=fake_upload), config=lambda **_: None))
+
+    result = fetch_convert_upload_remote_image("https://manufacturer.example.com/product.webp", source_type="json_ld")
+
+    assert "SCH-DesignOps" in seen_headers["User-Agent"]
+    assert result.status == "uploaded"
+    assert result.secure_url.startswith("https://res.cloudinary.com/")
+    assert result.debug["content_type"] == "image/webp"
+    assert result.debug["conversion_result_format"] == "jpg"
+
+
+def test_fetch_convert_upload_remote_image_rejects_logo_before_fetch(monkeypatch):
+    calls = []
+    monkeypatch.setattr("src.image_uploader.requests.get", lambda *args, **kwargs: calls.append(args))
+
+    result = fetch_convert_upload_remote_image("https://manufacturer.example.com/logo.svg", source_type="og:image")
+
+    assert result.status == "failed"
+    assert "rejected_url_hint" in result.error
+    assert calls == []
+
+
+def test_fetch_convert_upload_remote_image_rejects_tiny_remote_image(monkeypatch):
+    monkeypatch.setenv("CLOUDINARY_CLOUD_NAME", "demo")
+    monkeypatch.setenv("CLOUDINARY_API_KEY", "key")
+    monkeypatch.setenv("CLOUDINARY_API_SECRET", "secret")
+    source = _image_file(size=(50, 50), image_format="PNG").getvalue()
+    upload_calls = []
+
+    class FakeResponse:
+        status_code = 200
+        url = "https://manufacturer.example.com/product-thumb.png"
+        headers = {"content-type": "image/png"}
+
+        def iter_content(self, chunk_size=65536):
+            yield source
+
+    monkeypatch.setattr("src.image_uploader.requests.get", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr(
+        "src.image_uploader.cloudinary",
+        SimpleNamespace(
+            uploader=SimpleNamespace(upload=lambda file, **kwargs: upload_calls.append(file)),
+            config=lambda **_: None,
+        ),
+    )
+
+    result = fetch_convert_upload_remote_image("https://manufacturer.example.com/product-thumb.png", source_type="gallery")
+
+    assert result.status == "failed"
+    assert result.error == "remote_image_too_small:50x50"
+    assert result.debug["source_width"] == 50
+    assert result.debug["source_height"] == 50
+    assert upload_calls == []
+
+
+def test_fetch_convert_upload_remote_image_uses_cloudinary_direct_fallback_for_avif(monkeypatch):
+    monkeypatch.setenv("CLOUDINARY_CLOUD_NAME", "demo")
+    monkeypatch.setenv("CLOUDINARY_API_KEY", "key")
+    monkeypatch.setenv("CLOUDINARY_API_SECRET", "secret")
+    uploaded_sources = []
+
+    class FakeResponse:
+        status_code = 200
+        url = "https://manufacturer.example.com/product.avif"
+        headers = {"content-type": "image/avif"}
+
+        def iter_content(self, chunk_size=65536):
+            yield b"fake-avif-bytes"
+
+    def fake_upload(source, **kwargs):
+        uploaded_sources.append((source, kwargs))
+        return {
+            "secure_url": "https://res.cloudinary.com/demo/image/upload/product.jpg",
+            "public_id": "product",
+            "width": 900,
+            "height": 700,
+            "format": "jpg",
+            "bytes": 1234,
+        }
+
+    monkeypatch.setattr("src.image_uploader.requests.get", lambda *args, **kwargs: FakeResponse())
+    monkeypatch.setattr(
+        "src.image_uploader.cloudinary",
+        SimpleNamespace(uploader=SimpleNamespace(upload=fake_upload), config=lambda **_: None),
+    )
+
+    result = fetch_convert_upload_remote_image("https://manufacturer.example.com/product.avif", source_type="json_ld")
+
+    assert result.status == "uploaded"
+    assert result.secure_url == "https://res.cloudinary.com/demo/image/upload/product.jpg"
+    assert uploaded_sources == [("https://manufacturer.example.com/product.avif", {"resource_type": "image", "format": "jpg"})]
+    assert result.debug["cloudinary_direct_remote_upload"] is True
+    assert result.debug["conversion_attempted"] is True
+    assert "local_avif_probe_failed" in result.debug["image_probe_warning"]

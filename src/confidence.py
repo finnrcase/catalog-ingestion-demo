@@ -186,11 +186,14 @@ def calculate_row_confidence(row: dict) -> int:
             score -= 10
         return max(0, score)
 
-    # PDF, Manual, and any other source — score against IMPORTANT_FIELDS
+    # PDF, Manual, and any other source — reward complete identity first, then
+    # reduce confidence for downstream gaps like room, dimensions, and image.
     score = 85
     if not _str(row.get("Product Name")):
         score -= 20
     if not _str(row.get("Brand")):
+        score -= 15
+    if not _str(row.get("Model/SKU")):
         score -= 15
     qty = row.get("Quantity")
     if not qty or _str(qty) in ("", "0"):
@@ -201,7 +204,9 @@ def calculate_row_confidence(row: dict) -> int:
         score -= 10
     if not _str(row.get("Product Category")):
         score -= 10
-    if not _str(row.get("Model/SKU")):
+    if not has_complete_3d_dimensions(_str(row.get("Dimensions"))):
+        score -= 10
+    if not _str(row.get("Image URL")):
         score -= 5
     if not _str(row.get("Price")):
         score -= 5

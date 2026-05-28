@@ -25,6 +25,42 @@ export type IntakeResponse = {
   errors: string[];
   eligible_count: number;
   blocked_count: number;
+  dimension_diagnostics?: Record<string, unknown>[];
+};
+
+export type PdfParseJob = {
+  job_id: string;
+  session_id: string;
+  pdf_id: string;
+  filename: string;
+  status: "queued" | "parsing" | "ocr_fallback" | "complete" | "failed" | "cancelled" | string;
+  stage: string;
+  rows: IntakeRow[];
+  errors: string[];
+  telemetry: Record<string, unknown>;
+  created_at: number;
+  updated_at: number;
+  log_count: number;
+  logs?: Record<string, unknown>[] | null;
+};
+
+export type PhotoDiscoveryReport = {
+  total_rows: number;
+  official_product_pages_found: number;
+  images_found: number;
+  images_inserted_into_excel: number;
+  rows_needing_review: number;
+  rows_missing_images: number;
+  failure_reasons: Record<string, number>;
+  failed_rows: {
+    brand: string;
+    product_name: string;
+    model_sku: string;
+    search_query_used: string;
+    candidate_url_found: string;
+    why_it_failed: string;
+    recommended_next_action: string;
+  }[];
 };
 
 export type SchemaResponse = {
@@ -91,4 +127,20 @@ export type VendorCallRefreshResponse = {
   extracted_values?: Record<string, string>;
   confidence?: number;
   review_required?: boolean;
+};
+
+export type PreferredWebsiteEntry = {
+  id: string;
+  keyword: string;
+  url: string;
+  domain: string;
+  notes?: string;
+  created_at?: string;
+  updated_at?: string;
+  success_count?: number;
+  failure_count?: number;
+  last_checked?: string;
+  last_status?: string;
+  last_fields_found?: Record<string, boolean>;
+  field_success_counts?: Record<string, number>;
 };
