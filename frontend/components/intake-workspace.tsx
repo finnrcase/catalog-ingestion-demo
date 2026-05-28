@@ -39,6 +39,7 @@ import {
   generateVendorCallScript,
   recoverImages,
   refreshVendorCall,
+  retryMissingData,
   retryPdfParseJob,
   startVendorCall,
   updatePreferredWebsite,
@@ -141,6 +142,9 @@ const uiDensityStorageKey = "sch:uiDensity";
 const animationPreferenceStorageKey = "sch:animationPreference";
 const enrichmentPriorityStorageKey = "sch:enrichmentPriority";
 const missingFieldRetryModeStorageKey = "sch:missingFieldRetryMode";
+const missingFieldRetryRunCostStorageKey = "sch:missingFieldRetryRunCost";
+const missingFieldRetryItemCostStorageKey = "sch:missingFieldRetryItemCost";
+const replaceLowConfidenceStorageKey = "sch:replaceLowConfidenceData";
 const autoRetryStorageKey = "sch:autoRetryFailed";
 const measurementUnitStorageKey = "sch:measurementUnit";
 const itemDebugModeStorageKey = "sch:itemDebugMode";
@@ -338,6 +342,11 @@ function formatFileSize(bytes: number) {
 function formatUsd(value: unknown) {
   const numeric = Number(value ?? 0);
   return `$${Number.isFinite(numeric) ? numeric.toFixed(4) : "0.0000"}`;
+}
+
+function optionalPositiveNumber(value: string) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : undefined;
 }
 
 function formatPercent(value: number | null) {
@@ -604,7 +613,9 @@ function buildInternalDebugReport(
   const groupingWarnings = rows
     .filter((row) => rowText(row, "Source Type") === "PDF" && !rowText(row, "_raw_grouped_text"))
     .map((row, index) => `Item ${index + 1} was parsed by line/table fallback without grouped quote text.`);
-  const enrichmentMetricsEntry = diagnostics.find((entry) => entry.report_type === "enrichment_metrics");
+  const enrichmentMetricsEntry =
+    diagnostics.find((entry) => entry.report_type === "enrichment_metrics") ||
+    diagnostics.find((entry) => entry.report_type === "missing_field_retry_metrics");
   const enrichmentMetrics =
     enrichmentMetricsEntry?.summary && typeof enrichmentMetricsEntry.summary === "object"
       ? enrichmentMetricsEntry.summary as Record<string, unknown>
@@ -923,6 +934,58 @@ function missingFieldsForRow(row: IntakeRow) {
   return missing;
 }
 
+function missingRetryFieldsForRow(row: IntakeRow) {
+  if (row.Include === false) return [];
+  const missing: string[] = [];
+  if (!isPublicHttpsImageUrl(rowText(row, "Image URL"))) missing.push("image");
+  if (!hasComplete3dDimensions(row.Dimensions)) missing.push("dimensions");
+  if (!rowText(row, "Brand").trim()) missing.push("manufacturer");
+  if (!rowText(row, "Product URL").trim()) missing.push("product URL");
+  if (!rowText(row, "Finish / Color").trim() && !rowText(row, "Material").trim()) missing.push("finish/material");
+  if (!rowText(row, "Model/SKU").trim() && !rowText(row, "SKU").trim()) missing.push("SKU/model");
+  return missing;
+}
+
+function retrySummaryFromRows(beforeRows: IntakeRow[], afterRows: IntakeRow[], diagnostics?: Record<string, unknown>[]) {
+  const retryMetrics = diagnostics?.find((entry) => entry.report_type === "missing_field_retry_metrics")?.summary as Record<string, unknown> | undefined;
+  const beforeByIndex = beforeRows;
+  let rowsImproved = 0;
+  let imagesAdded = 0;
+  let dimensionsAdded = 0;
+  let productUrlsAdded = 0;
+  let manufacturersAdded = 0;
+  let skuModelsAdded = 0;
+  let finishMaterialAdded = 0;
+  afterRows.forEach((after, index) => {
+    const before = beforeByIndex[index] || {};
+    const imageAdded = !isPublicHttpsImageUrl(rowText(before, "Image URL")) && isPublicHttpsImageUrl(rowText(after, "Image URL"));
+    const dimensionsAddedNow = !hasComplete3dDimensions(before.Dimensions) && hasComplete3dDimensions(after.Dimensions);
+    const productUrlAdded = !rowText(before, "Product URL").trim() && Boolean(rowText(after, "Product URL").trim());
+    const manufacturerAdded = !rowText(before, "Brand").trim() && Boolean(rowText(after, "Brand").trim());
+    const modelAdded = !(rowText(before, "Model/SKU").trim() || rowText(before, "SKU").trim()) && Boolean(rowText(after, "Model/SKU").trim() || rowText(after, "SKU").trim());
+    const finishAdded = !(rowText(before, "Finish / Color").trim() || rowText(before, "Material").trim()) && Boolean(rowText(after, "Finish / Color").trim() || rowText(after, "Material").trim());
+    if (imageAdded) imagesAdded += 1;
+    if (dimensionsAddedNow) dimensionsAdded += 1;
+    if (productUrlAdded) productUrlsAdded += 1;
+    if (manufacturerAdded) manufacturersAdded += 1;
+    if (modelAdded) skuModelsAdded += 1;
+    if (finishAdded) finishMaterialAdded += 1;
+    if (imageAdded || dimensionsAddedNow || productUrlAdded || manufacturerAdded || modelAdded || finishAdded) rowsImproved += 1;
+  });
+  const fieldsStillMissing = afterRows.reduce((total, row) => total + missingRetryFieldsForRow(row).length, 0);
+  return {
+    rowsImproved: Number(retryMetrics?.rows_improved ?? rowsImproved),
+    imagesAdded: Number(retryMetrics?.images_added ?? imagesAdded),
+    dimensionsAdded: Number(retryMetrics?.dimensions_added ?? dimensionsAdded),
+    productUrlsAdded: Number(retryMetrics?.product_urls_added ?? productUrlsAdded),
+    manufacturersAdded: Number(retryMetrics?.manufacturers_added ?? manufacturersAdded),
+    skuModelsAdded: Number(retryMetrics?.sku_model_added ?? skuModelsAdded),
+    finishMaterialAdded: Number(retryMetrics?.finish_material_added ?? finishMaterialAdded),
+    fieldsStillMissing: Number(retryMetrics?.fields_still_missing ?? fieldsStillMissing),
+    extraCost: Number(retryMetrics?.estimated_cost_usd ?? retryMetrics?.targeted_retry_extra_cost_usd ?? 0),
+  };
+}
+
 function enrichmentBudgetPreview(rows: IntakeRow[], mode: "fast" | "standard" | "deep" | "manual_retry") {
   const included = rows.filter((row) => row.Include !== false);
   const needsDimensions = included.filter((row) => rowText(row, "Brand") && rowText(row, "Model/SKU") && !hasComplete3dDimensions(row.Dimensions));
@@ -1013,6 +1076,9 @@ export function IntakeWorkspace() {
   const [animationPreference, setAnimationPreference] = useState<AnimationPreferenceId>("smooth");
   const [enrichmentPriority, setEnrichmentPriority] = useState<EnrichmentPriorityId>("balanced");
   const [missingFieldRetryMode, setMissingFieldRetryMode] = useState<MissingFieldRetryModeId>("conservative");
+  const [missingFieldRetryMaxRunCost, setMissingFieldRetryMaxRunCost] = useState("0.04");
+  const [missingFieldRetryMaxItemCost, setMissingFieldRetryMaxItemCost] = useState("0.006");
+  const [allowReplaceLowConfidenceData, setAllowReplaceLowConfidenceData] = useState(false);
   const [autoRetryFailedItems, setAutoRetryFailedItems] = useState(false);
   const [measurementUnit, setMeasurementUnit] = useState<MeasurementUnitId>("imperial");
   const [itemDebugMode, setItemDebugMode] = useState(false);
@@ -1030,8 +1096,10 @@ export function IntakeWorkspace() {
   const [enrichmentMode, setEnrichmentMode] = useState<"fast" | "standard" | "deep" | "manual_retry">("fast");
   const [includeLowConfidenceImages, setIncludeLowConfidenceImages] = useState(false);
   const [photoDiscoveryReport, setPhotoDiscoveryReport] = useState<PhotoDiscoveryReport | null>(null);
+  const [missingRetryStatus, setMissingRetryStatus] = useState("");
+  const [missingRetrySummary, setMissingRetrySummary] = useState<ReturnType<typeof retrySummaryFromRows> | null>(null);
   const [productImageUploads, setProductImageUploads] = useState<Record<number, string>>({});
-  const [busy, setBusy] = useState<"generate" | "validate" | "vendorCall" | "export" | "photoBulk" | "imageRecovery" | "">("");
+  const [busy, setBusy] = useState<"generate" | "validate" | "vendorCall" | "export" | "photoBulk" | "imageRecovery" | "missingRetry" | "">("");
   const [exportSummary, setExportSummary] = useState({
     skipped: [] as { index: number; product_name: string }[],
     missing_section: [] as { index: number; product_name: string }[],
@@ -1069,6 +1137,9 @@ export function IntakeWorkspace() {
     const storedAnimationPreference = window.localStorage.getItem(animationPreferenceStorageKey);
     const storedEnrichmentPriority = window.localStorage.getItem(enrichmentPriorityStorageKey);
     const storedMissingFieldRetryMode = window.localStorage.getItem(missingFieldRetryModeStorageKey);
+    const storedMissingFieldRetryRunCost = window.localStorage.getItem(missingFieldRetryRunCostStorageKey);
+    const storedMissingFieldRetryItemCost = window.localStorage.getItem(missingFieldRetryItemCostStorageKey);
+    const storedReplaceLowConfidence = window.localStorage.getItem(replaceLowConfidenceStorageKey);
     const storedAutoRetry = window.localStorage.getItem(autoRetryStorageKey);
     const storedMeasurementUnit = window.localStorage.getItem(measurementUnitStorageKey);
     const storedItemDebugMode = window.localStorage.getItem(itemDebugModeStorageKey);
@@ -1089,6 +1160,15 @@ export function IntakeWorkspace() {
     }
     if (missingFieldRetryModeOptions.some((option) => option.id === storedMissingFieldRetryMode)) {
       setMissingFieldRetryMode(storedMissingFieldRetryMode as MissingFieldRetryModeId);
+    }
+    if (storedMissingFieldRetryRunCost && Number.isFinite(Number(storedMissingFieldRetryRunCost))) {
+      setMissingFieldRetryMaxRunCost(storedMissingFieldRetryRunCost);
+    }
+    if (storedMissingFieldRetryItemCost && Number.isFinite(Number(storedMissingFieldRetryItemCost))) {
+      setMissingFieldRetryMaxItemCost(storedMissingFieldRetryItemCost);
+    }
+    if (storedReplaceLowConfidence === "true" || storedReplaceLowConfidence === "false") {
+      setAllowReplaceLowConfidenceData(storedReplaceLowConfidence === "true");
     }
     if (storedAutoRetry === "true" || storedAutoRetry === "false") {
       setAutoRetryFailedItems(storedAutoRetry === "true");
@@ -1131,10 +1211,13 @@ export function IntakeWorkspace() {
     window.localStorage.setItem(animationPreferenceStorageKey, animationPreference);
     window.localStorage.setItem(enrichmentPriorityStorageKey, enrichmentPriority);
     window.localStorage.setItem(missingFieldRetryModeStorageKey, missingFieldRetryMode);
+    window.localStorage.setItem(missingFieldRetryRunCostStorageKey, missingFieldRetryMaxRunCost);
+    window.localStorage.setItem(missingFieldRetryItemCostStorageKey, missingFieldRetryMaxItemCost);
+    window.localStorage.setItem(replaceLowConfidenceStorageKey, String(allowReplaceLowConfidenceData));
     window.localStorage.setItem(autoRetryStorageKey, String(autoRetryFailedItems));
     window.localStorage.setItem(measurementUnitStorageKey, measurementUnit);
     window.localStorage.setItem(itemDebugModeStorageKey, String(itemDebugMode));
-  }, [accentColor, animationPreference, autoRetryFailedItems, enrichmentPriority, itemDebugMode, measurementUnit, missingFieldRetryMode, themeSettingsLoaded, uiDensity, websiteTheme]);
+  }, [accentColor, allowReplaceLowConfidenceData, animationPreference, autoRetryFailedItems, enrichmentPriority, itemDebugMode, measurementUnit, missingFieldRetryMaxItemCost, missingFieldRetryMaxRunCost, missingFieldRetryMode, themeSettingsLoaded, uiDensity, websiteTheme]);
 
   useEffect(() => {
     fetchHealth().catch(() => {
@@ -1178,6 +1261,10 @@ export function IntakeWorkspace() {
   const readyRows = exportSummary.export_count;
   const missingInputRows = useMemo(
     () => includedRows.filter((row) => missingFieldsForRow(row).length > 0),
+    [includedRows],
+  );
+  const missingRetryRows = useMemo(
+    () => includedRows.filter((row) => missingRetryFieldsForRow(row).length > 0),
     [includedRows],
   );
   const productListNeedsReview = Math.max(0, includedRows.length - readyRows);
@@ -1830,6 +1917,9 @@ export function IntakeWorkspace() {
         sessionId: pdfSessionIdRef.current || undefined,
         enrichmentMode: effectiveEnrichmentMode,
         targetedRetryMode: missingFieldRetryMode,
+        maxExtraCostPerRow: optionalPositiveNumber(missingFieldRetryMaxItemCost),
+        maxExtraCostPerRun: optionalPositiveNumber(missingFieldRetryMaxRunCost),
+        allowReplaceLowConfidenceData: allowReplaceLowConfidenceData,
       });
       setRows(response.rows);
       setErrors(response.errors);
@@ -1844,6 +1934,53 @@ export function IntakeWorkspace() {
       setMessage(error instanceof Error ? error.message : "Could not save input updates.");
     } finally {
       setBusy("");
+    }
+  }
+
+  async function handleRetryMissingData() {
+    if (!rows.length) return;
+    if (!useWebEnrichment) {
+      setMessage("Website enrichment is off. Enable it before trying missing data again.");
+      return;
+    }
+    if (missingFieldRetryMode === "off") {
+      setMessage("Missing-field retry is turned off in Settings.");
+      return;
+    }
+    setBusy("missingRetry");
+    setMissingRetrySummary(null);
+    setMissingRetryStatus("Checking missing images...");
+    const beforeRows = rows;
+    try {
+      await sleep(100);
+      setMissingRetryStatus("Checking missing dimensions...");
+      await sleep(100);
+      setMissingRetryStatus("Checking cached pages and preferred websites...");
+      const response = await retryMissingData({
+        rows,
+        useWebEnrichment,
+        sessionId: pdfSessionIdRef.current || undefined,
+        targetedRetryMode: missingFieldRetryMode,
+        maxExtraCostPerRow: optionalPositiveNumber(missingFieldRetryMaxItemCost),
+        maxExtraCostPerRun: optionalPositiveNumber(missingFieldRetryMaxRunCost),
+        allowReplaceLowConfidenceData,
+      });
+      setMissingRetryStatus("Updating rows...");
+      const summary = retrySummaryFromRows(beforeRows, response.rows, response.dimension_diagnostics);
+      setRows(response.rows);
+      setErrors(response.errors);
+      setLatestDiagnostics(response.dimension_diagnostics || []);
+      setPhotoDiscoveryReport(photoReportFromDiagnostics(response.dimension_diagnostics));
+      setMissingRetrySummary(summary);
+      setShowMissingDetailItems(false);
+      setMessage(
+        `Missing-data retry complete. ${summary.rowsImproved} rows improved · ${summary.imagesAdded} images added · ${summary.dimensionsAdded} dimensions added · ${summary.fieldsStillMissing} fields still missing · extra cost ${formatUsd(summary.extraCost)}`,
+      );
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not retry missing data.");
+    } finally {
+      setBusy("");
+      setMissingRetryStatus("");
     }
   }
 
@@ -2618,12 +2755,46 @@ export function IntakeWorkspace() {
             )}
             <button
               className="btn-primary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
-              disabled={busy === "validate" || rows.length === 0}
+              disabled={busy === "validate" || busy === "missingRetry" || rows.length === 0}
               onClick={handleValidate}
             >
               {busy === "validate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
               Fill Missing Details
             </button>
+            {enrichmentMetrics && missingRetryRows.length > 0 ? (
+              <div className="grid gap-3 rounded-xl border border-orange/20 bg-paper/70 p-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-semibold text-charcoal">Still missing data?</div>
+                    <div className="mt-1 text-xs text-taupe">
+                      {missingRetryRows.length} rows have missing images, dimensions, URLs, manufacturers, finish/material, or model data.
+                    </div>
+                  </div>
+                  <button
+                    className="btn-secondary inline-flex h-10 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                    disabled={busy !== "" || missingFieldRetryMode === "off" || !useWebEnrichment}
+                    onClick={handleRetryMissingData}
+                  >
+                    {busy === "missingRetry" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+                    Try Again for Missing Data
+                  </button>
+                </div>
+                {busy === "missingRetry" ? (
+                  <div className="rounded-lg border border-orange/20 bg-orangeSoft/25 px-3 py-2 text-xs text-bronze">
+                    {missingRetryStatus || "Checking missing data..."}
+                  </div>
+                ) : null}
+                {missingRetrySummary ? (
+                  <div className="grid gap-2 text-xs text-taupe sm:grid-cols-5">
+                    <div><span className="block font-semibold text-charcoal">{missingRetrySummary.rowsImproved}</span>Rows improved</div>
+                    <div><span className="block font-semibold text-charcoal">{missingRetrySummary.imagesAdded}</span>Images added</div>
+                    <div><span className="block font-semibold text-charcoal">{missingRetrySummary.dimensionsAdded}</span>Dimensions added</div>
+                    <div><span className="block font-semibold text-charcoal">{missingRetrySummary.fieldsStillMissing}</span>Fields still missing</div>
+                    <div><span className="block font-semibold text-charcoal">{formatUsd(missingRetrySummary.extraCost)}</span>Extra cost</div>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </Panel>
 
@@ -2920,6 +3091,9 @@ export function IntakeWorkspace() {
             enrichmentMode={enrichmentMode}
             enrichmentPriority={enrichmentPriority}
             missingFieldRetryMode={missingFieldRetryMode}
+            missingFieldRetryMaxRunCost={missingFieldRetryMaxRunCost}
+            missingFieldRetryMaxItemCost={missingFieldRetryMaxItemCost}
+            allowReplaceLowConfidenceData={allowReplaceLowConfidenceData}
             autoRetryFailedItems={autoRetryFailedItems}
             measurementUnit={measurementUnit}
             itemDebugMode={itemDebugMode}
@@ -2938,6 +3112,9 @@ export function IntakeWorkspace() {
             onChangeEnrichmentMode={setEnrichmentMode}
             onChangeEnrichmentPriority={setEnrichmentPriority}
             onChangeMissingFieldRetryMode={setMissingFieldRetryMode}
+            onChangeMissingFieldRetryMaxRunCost={setMissingFieldRetryMaxRunCost}
+            onChangeMissingFieldRetryMaxItemCost={setMissingFieldRetryMaxItemCost}
+            onChangeAllowReplaceLowConfidenceData={setAllowReplaceLowConfidenceData}
             onChangeAutoRetry={setAutoRetryFailedItems}
             onChangeMeasurementUnit={setMeasurementUnit}
             onChangeItemDebugMode={setItemDebugMode}
@@ -3340,6 +3517,9 @@ function SettingsDialog({
   enrichmentMode,
   enrichmentPriority,
   missingFieldRetryMode,
+  missingFieldRetryMaxRunCost,
+  missingFieldRetryMaxItemCost,
+  allowReplaceLowConfidenceData,
   autoRetryFailedItems,
   measurementUnit,
   itemDebugMode,
@@ -3358,6 +3538,9 @@ function SettingsDialog({
   onChangeEnrichmentMode,
   onChangeEnrichmentPriority,
   onChangeMissingFieldRetryMode,
+  onChangeMissingFieldRetryMaxRunCost,
+  onChangeMissingFieldRetryMaxItemCost,
+  onChangeAllowReplaceLowConfidenceData,
   onChangeAutoRetry,
   onChangeMeasurementUnit,
   onChangeItemDebugMode,
@@ -3384,6 +3567,9 @@ function SettingsDialog({
   enrichmentMode: "fast" | "standard" | "deep" | "manual_retry";
   enrichmentPriority: EnrichmentPriorityId;
   missingFieldRetryMode: MissingFieldRetryModeId;
+  missingFieldRetryMaxRunCost: string;
+  missingFieldRetryMaxItemCost: string;
+  allowReplaceLowConfidenceData: boolean;
   autoRetryFailedItems: boolean;
   measurementUnit: MeasurementUnitId;
   itemDebugMode: boolean;
@@ -3410,6 +3596,9 @@ function SettingsDialog({
   onChangeEnrichmentMode: (mode: "fast" | "standard" | "deep" | "manual_retry") => void;
   onChangeEnrichmentPriority: (priority: EnrichmentPriorityId) => void;
   onChangeMissingFieldRetryMode: (mode: MissingFieldRetryModeId) => void;
+  onChangeMissingFieldRetryMaxRunCost: (value: string) => void;
+  onChangeMissingFieldRetryMaxItemCost: (value: string) => void;
+  onChangeAllowReplaceLowConfidenceData: (enabled: boolean) => void;
   onChangeAutoRetry: (enabled: boolean) => void;
   onChangeMeasurementUnit: (unit: MeasurementUnitId) => void;
   onChangeItemDebugMode: (enabled: boolean) => void;
@@ -3691,6 +3880,38 @@ function SettingsDialog({
                   </select>
                 </Field>
                 <div className="text-xs leading-5 text-taupe">{selectedRetryMode.description}</div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <Field label="Max retry cost / run">
+                    <input
+                      className="input-surface h-10 w-full rounded-xl px-3 text-sm text-charcoal"
+                      value={missingFieldRetryMaxRunCost}
+                      onChange={(event) => onChangeMissingFieldRetryMaxRunCost(event.target.value)}
+                      inputMode="decimal"
+                      placeholder="0.04"
+                      disabled={!useWebEnrichment}
+                    />
+                  </Field>
+                  <Field label="Max retry cost / item">
+                    <input
+                      className="input-surface h-10 w-full rounded-xl px-3 text-sm text-charcoal"
+                      value={missingFieldRetryMaxItemCost}
+                      onChange={(event) => onChangeMissingFieldRetryMaxItemCost(event.target.value)}
+                      inputMode="decimal"
+                      placeholder="0.006"
+                      disabled={!useWebEnrichment}
+                    />
+                  </Field>
+                </div>
+                <label className="flex items-start gap-2 text-xs text-taupe">
+                  <input
+                    type="checkbox"
+                    checked={allowReplaceLowConfidenceData}
+                    onChange={(event) => onChangeAllowReplaceLowConfidenceData(event.target.checked)}
+                    className="mt-0.5 h-4 w-4 accent-bronze"
+                    disabled={!useWebEnrichment}
+                  />
+                  <span>Allow replacing low-confidence data during manual missing-field retry.</span>
+                </label>
               </div>
 
               <div className="grid gap-3 rounded-xl border border-linen bg-ivory/35 p-4">

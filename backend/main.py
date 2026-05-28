@@ -66,7 +66,7 @@ from src.persistent_storage import (
     require_persistent_upload_storage,
     upload_file_to_persistent_storage,
 )
-from src.product_enrichment import enrich_dataframe, recover_images_for_dataframe
+from src.product_enrichment import enrich_dataframe, recover_images_for_dataframe, retry_missing_fields_dataframe
 from src.programa_export import (
     CANONICAL_SECTIONS,
     build_programa_debug_dataframe,
@@ -172,6 +172,7 @@ class RowsPayload(BaseModel):
     max_extra_retries_per_item: int | None = None
     max_extra_cost_per_row: float | None = None
     max_extra_cost_per_run: float | None = None
+    allow_replace_low_confidence_data: bool = False
 
 
 class ProgramaPayload(RowsPayload):
@@ -730,6 +731,7 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
         max_extra_retries_per_item=payload.max_extra_retries_per_item,
         max_extra_cost_per_row=payload.max_extra_cost_per_row,
         max_extra_cost_per_run=payload.max_extra_cost_per_run,
+        allow_replace_low_confidence_data=payload.allow_replace_low_confidence_data,
     )
     if payload.use_web_enrichment:
         session_id = payload.session_id or "default"
@@ -760,6 +762,22 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
             ]
     df = apply_confidence_checks(df)
     return _df_response(df, errors, dimension_diagnostics)
+
+
+@app.post("/intake/retry-missing-data", response_model=IntakeResponse)
+def retry_missing_data(payload: RowsPayload) -> IntakeResponse:
+    df, errors, diagnostics = retry_missing_fields_dataframe(
+        pd.DataFrame(payload.rows),
+        retry_mode=payload.targeted_retry_mode,
+        force_refresh=payload.force_refresh,
+        use_web_enrichment=payload.use_web_enrichment,
+        max_extra_retries_per_item=payload.max_extra_retries_per_item,
+        max_extra_cost_per_row=payload.max_extra_cost_per_row,
+        max_extra_cost_per_run=payload.max_extra_cost_per_run,
+        allow_replace_low_confidence_data=payload.allow_replace_low_confidence_data,
+    )
+    df = apply_confidence_checks(df)
+    return _df_response(df, errors, diagnostics)
 
 
 @app.post("/intake/upload-pdf", response_model=UploadPdfResponse)

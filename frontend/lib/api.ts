@@ -186,6 +186,7 @@ export async function enrichRows(input: {
   maxExtraRetriesPerItem?: number;
   maxExtraCostPerRow?: number;
   maxExtraCostPerRun?: number;
+  allowReplaceLowConfidenceData?: boolean;
 }): Promise<IntakeResponse> {
   return parseJson<IntakeResponse>(
     await apiFetch(apiUrl("/intake/enrich"), {
@@ -200,6 +201,35 @@ export async function enrichRows(input: {
         max_extra_retries_per_item: input.maxExtraRetriesPerItem,
         max_extra_cost_per_row: input.maxExtraCostPerRow,
         max_extra_cost_per_run: input.maxExtraCostPerRun,
+        allow_replace_low_confidence_data: input.allowReplaceLowConfidenceData || false,
+      }),
+    }),
+  );
+}
+
+export async function retryMissingData(input: {
+  rows: IntakeRow[];
+  useWebEnrichment: boolean;
+  sessionId?: string;
+  targetedRetryMode?: "off" | "conservative" | "balanced" | "aggressive";
+  maxExtraRetriesPerItem?: number;
+  maxExtraCostPerRow?: number;
+  maxExtraCostPerRun?: number;
+  allowReplaceLowConfidenceData?: boolean;
+}): Promise<IntakeResponse> {
+  return parseJson<IntakeResponse>(
+    await apiFetch(apiUrl("/intake/retry-missing-data"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        rows: input.rows,
+        use_web_enrichment: input.useWebEnrichment,
+        session_id: input.sessionId,
+        targeted_retry_mode: input.targetedRetryMode || "conservative",
+        max_extra_retries_per_item: input.maxExtraRetriesPerItem,
+        max_extra_cost_per_row: input.maxExtraCostPerRow,
+        max_extra_cost_per_run: input.maxExtraCostPerRun,
+        allow_replace_low_confidence_data: input.allowReplaceLowConfidenceData || false,
       }),
     }),
   );

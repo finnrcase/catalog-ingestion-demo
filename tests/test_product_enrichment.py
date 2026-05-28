@@ -7,6 +7,7 @@ from src.product_enrichment import (
     build_search_queries,
     enrich_row,
     enrich_dataframe,
+    retry_missing_fields_dataframe,
     has_enough_search_identity,
 )
 
@@ -1866,3 +1867,88 @@ def test_targeted_retry_uses_narrow_dimension_search_when_no_product_url(monkeyp
     assert queries
     assert all("dimensions" in query.lower() or "product" in query.lower() for query in queries)
     assert diagnostics[0]["summary"]["targeted_retry_extra_cost_usd"] <= 0.006
+
+
+def test_retry_missing_fields_dataframe_does_not_run_full_enrichment(monkeypatch):
+    import src.product_enrichment as pe
+
+    monkeypatch.setattr(pe, "enrich_row", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("full enrichment should not run")))
+    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: _targeted_retry_html())
+    monkeypatch.setattr(pe, "_maybe_upload_selected_image_to_cloudinary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pe, "search_product_candidates", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("broad search should not run for existing verified page")))
+
+    df = pd.DataFrame([{
+        "Source Type": "PDF",
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product Name": "Drawer Microwave",
+        "Dimensions": "",
+        "Product Category": "Appliances",
+        "Product URL": "https://www.subzero-wolf.com/products/mdd30ts",
+        "Product Resolution Confidence": "high",
+        "Image URL": "",
+        "Confidence Score": 90,
+    }])
+
+    updated_df, errors, diagnostics = retry_missing_fields_dataframe(df, retry_mode="conservative")
+
+    assert errors == []
+    row = updated_df.iloc[0].to_dict()
+    assert row["Dimensions"] == '29.875"W x 23.5"D x 11.875"H'
+    assert row["Image URL"]
+    assert row["Targeted Retry Status"] == "filled"
+    assert diagnostics[0]["report_type"] == "missing_field_retry_metrics"
+    assert diagnostics[0]["summary"]["rows_improved"] == 1
+
+
+def test_retry_missing_fields_dataframe_preserves_complete_rows(monkeypatch):
+    import src.product_enrichment as pe
+
+    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: (_ for _ in ()).throw(AssertionError("complete row should not fetch")))
+
+    df = pd.DataFrame([{
+        "Source Type": "PDF",
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product Name": "Drawer Microwave",
+        "Dimensions": '29.875"W x 23.5"D x 11.875"H',
+        "Product Category": "Appliances",
+        "Product URL": "https://www.subzero-wolf.com/products/mdd30ts",
+        "Image URL": "https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg",
+        "Image Recovery Confidence": "HIGH",
+        "Finish / Color": "Stainless",
+    }])
+
+    updated_df, errors, diagnostics = retry_missing_fields_dataframe(df, retry_mode="conservative")
+
+    assert errors == []
+    assert updated_df.iloc[0].to_dict() == df.iloc[0].to_dict()
+    assert diagnostics[0]["summary"]["rows_targeted"] == 0
+
+
+def test_retry_missing_fields_dataframe_can_fill_missing_model_from_verified_page(monkeypatch):
+    import src.product_enrichment as pe
+
+    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: _targeted_retry_html())
+    monkeypatch.setattr(pe, "_maybe_upload_selected_image_to_cloudinary", lambda *args, **kwargs: None)
+
+    df = pd.DataFrame([{
+        "Source Type": "PDF",
+        "Brand": "Wolf",
+        "Model/SKU": "",
+        "Product Name": "Drawer Microwave",
+        "Dimensions": '29.875"W x 23.5"D x 11.875"H',
+        "Product Category": "Appliances",
+        "Product URL": "https://www.subzero-wolf.com/products/mdd30ts",
+        "Product Resolution Confidence": "high",
+        "Image URL": "https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg",
+        "Image Recovery Confidence": "HIGH",
+    }])
+
+    updated_df, errors, diagnostics = retry_missing_fields_dataframe(df, retry_mode="conservative")
+
+    assert errors == []
+    row = updated_df.iloc[0].to_dict()
+    assert row["Model/SKU"] == "MDD30TS"
+    assert row["SKU Source Pass"] == "targeted_retry"
+    assert diagnostics[0]["summary"]["sku_model_added"] == 1
