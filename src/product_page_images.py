@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 import httpx
 from bs4 import BeautifulSoup
 
+from src.embedded_product_data import css_background_image_urls, embedded_product_images
 from src.image_evidence import (
     is_official_domain,
     product_name_appears_in_text,
@@ -186,11 +187,13 @@ def _score_candidate(
         "jsonld_image": 90,
         "og_image": 75,
         "twitter_image": 65,
+        "embedded_json_image": 88,
         "gallery_image": 80,
         "source_srcset": 65,
         "img_srcset": 60,
         "lazy_image": 55,
         "lazy_srcset": 55,
+        "css_background_image": 50,
         "html_image": 40,
     }.get(source_kind, 35)
     domain_text = urllib.parse.urlparse(page_url).netloc.lower().replace("-", "").replace(".", "")
@@ -338,6 +341,12 @@ def extract_product_page_image(
         for value in _jsonld_image_values(data):
             candidates.append(("jsonld_image", value, None, None, "", "jsonld_product"))
 
+    for value in embedded_product_images(soup):
+        candidates.append(("embedded_json_image", value, None, None, "", "embedded_product_json"))
+
+    for value, context in css_background_image_urls(soup):
+        candidates.append(("css_background_image", value, None, None, "", context))
+
     for source in soup.select("source[srcset], source[data-srcset]"):
         raw_srcset = str(source.get("srcset") or source.get("data-srcset") or "")
         src = _srcset_best(raw_srcset)
@@ -430,11 +439,13 @@ def extract_product_page_image(
             "og_image": "og_image",
             "twitter_image": "og_image",
             "jsonld_image": "jsonld_image",
+            "embedded_json_image": "jsonld_image",
             "gallery_image": "html_image",
             "source_srcset": "html_image",
             "img_srcset": "html_image",
             "lazy_image": "html_image",
             "lazy_srcset": "html_image",
+            "css_background_image": "html_image",
             "html_image": "html_image",
         }.get(kind, "html_image")
         result = ProductPageImageResult(

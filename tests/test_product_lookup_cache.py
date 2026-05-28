@@ -8,6 +8,7 @@ from src.product_lookup_cache import (
     can_reuse_lookup,
     is_no_result,
     make_lookup_cache_key,
+    product_name_hash,
 )
 from src.product_resolver import ProductCandidate, ProductResolutionResult
 
@@ -113,6 +114,7 @@ def test_product_lookup_cache_saves_high_result(tmp_path):
         finish="Stainless Steel",
         material="Stainless Steel",
         image_url="https://cdn.wolfappliance.com/images/mdd30ts.jpg",
+        cloudinary_url="https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg",
         image_confidence="HIGH",
         evidence_summary="official exact sku",
     )
@@ -124,8 +126,12 @@ def test_product_lookup_cache_saves_high_result(tmp_path):
     assert saved["sku"] == "MDD30TS"
     assert saved["selected_product_url"] == "https://wolfappliance.com/products/mdd30ts"
     assert saved["selected_product_page_url"] == "https://wolfappliance.com/products/mdd30ts"
+    assert saved["verified_product_url"] == "https://wolfappliance.com/products/mdd30ts"
     assert saved["confidence"] == "high"
     assert saved["image_confidence"] == "HIGH"
+    assert saved["verified_image_url"] == "https://cdn.wolfappliance.com/images/mdd30ts.jpg"
+    assert saved["cloudinary_url"] == "https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg"
+    assert saved["product_name_hash"] == product_name_hash("30 Inch Warming Drawer")
     assert saved["last_verified"]
 
 
@@ -144,6 +150,7 @@ def test_second_lookup_uses_cache_and_does_not_call_live_search(monkeypatch, iso
         height_in="11.875",
         depth_in="23.5",
         image_url="https://cdn.wolfappliance.com/images/mdd30ts.jpg",
+        cloudinary_url="https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg",
         image_confidence="HIGH",
         evidence_summary="official exact sku",
     )
@@ -153,7 +160,9 @@ def test_second_lookup_uses_cache_and_does_not_call_live_search(monkeypatch, iso
 
     assert updated["Product URL"] == "https://wolfappliance.com/products/mdd30ts"
     assert updated["Dimensions"] == '29.875"W x 23.5"D x 11.875"H'
-    assert updated["Image URL"] == "https://cdn.wolfappliance.com/images/mdd30ts.jpg"
+    assert updated["Image URL"] == "https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg"
+    assert updated["cloudinary_url"] == "https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg"
+    assert updated["Original Image URL"] == "https://cdn.wolfappliance.com/images/mdd30ts.jpg"
     assert dim_result is not None
     assert debug["product_lookup_cache_status"] == "hit"
 

@@ -59,15 +59,66 @@ from src.image_evidence import (
 )
 from src.brand_lookup_registry import registry_domains_for_brand
 from src.manufacturer_domains import get_domain_for_brand
+from src.image_cache import ImageCache
 from src.image_presence import row_has_image, row_image_status
 from src.product_page_images import extract_image_from_url
 from src.web_product_lookup import lookup_official_product_image
-from src.image_uploader import upload_image_with_metadata
+from src.image_uploader import is_public_https_image_url, upload_image_with_metadata
 
 
 _log = logging.getLogger(__name__)
+_image_cache = ImageCache()
 
 _USER_AGENT = "Mozilla/5.0 (compatible; SCH-Intake/1.0)"
+
+
+def _image_budget_item_key(row: dict) -> str:
+    parts = [
+        _str_val(row.get("Brand")),
+        _str_val(row.get("Model/SKU") or row.get("SKU")),
+        _str_val(row.get("Product Name")),
+    ]
+    return "|".join(part for part in parts if part)[:160]
+
+
+def _consume_image_budget(
+    run_budget,
+    kind: str,
+    *,
+    item_key: str,
+    field: str,
+    reason: str,
+    stage: str,
+    source_function: str,
+    debug: dict | None = None,
+) -> bool:
+    if run_budget is None:
+        return True
+    if kind == "image_search":
+        cost = float(getattr(run_budget, "image_search_cost_usd", 0.003) or 0.0)
+    elif kind == "image_upload":
+        cost = float(getattr(run_budget, "image_upload_cost_usd", 0.001) or 0.0)
+    elif kind == "screenshot":
+        cost = float(getattr(run_budget, "screenshot_cost_usd", 0.005) or 0.0)
+    else:
+        cost = float(getattr(run_budget, "fetch_cost_usd", 0.0005) or 0.0)
+    ok = run_budget.consume(
+        kind,
+        cost,
+        item_key=item_key,
+        field=field,
+        reason=reason,
+        stage=stage,
+        source_function=source_function,
+    )
+    if not ok and debug is not None:
+        debug.setdefault("budget_skipped_actions", []).append({
+            "kind": kind,
+            "field": field,
+            "reason": reason,
+            "source_function": source_function,
+        })
+    return ok
 
 
 @dataclass
@@ -255,8 +306,14 @@ def recover_from_product_page(row: dict, page_url: str, debug: dict | None = Non
     return _result_from_page_result(page_result)
 
 
-def recover_from_official_lookup(row: dict, debug: dict | None = None) -> ImageRecoveryResult:
-    web = lookup_official_product_image(row)
+def recover_from_official_lookup(
+    row: dict,
+    debug: dict | None = None,
+    *,
+    run_budget=None,
+    item_key: str = "",
+) -> ImageRecoveryResult:
+    web = lookup_official_product_image(row, run_budget=run_budget, item_key=item_key)
     if debug is not None:
         debug.update(web.debug)
     return _result_from_page_result(web.image_result)
@@ -1155,6 +1212,8 @@ def recover_image_for_row(
     enable_screenshot: bool = True,
     enable_web_lookup: bool = True,
     enable_product_page: bool = True,
+    run_budget=None,
+    item_key: str = "",
     debug: dict | None = None,
 ) -> ImageRecoveryResult:
     """
@@ -1172,6 +1231,7 @@ def recover_image_for_row(
     caller can produce an Image Recovery Debug Report.
     """
     held: ImageRecoveryResult | None = None
+    item_key = item_key or _image_budget_item_key(row)
 
     if debug is not None:
         debug.setdefault("pdf_path_exists", None)
@@ -1225,6 +1285,19 @@ def recover_image_for_row(
             page_url = _str_val(row.get(page_key))
             if not page_url:
                 continue
+            if not _consume_image_budget(
+                run_budget,
+                "fetch",
+                item_key=item_key,
+                field="Image URL",
+                reason="image recovery fetch product page",
+                stage="image_recovery_product_page",
+                source_function="recover_image_for_row:product_page",
+                debug=debug,
+            ):
+                if debug is not None:
+                    debug.setdefault("product_url_rejection_reasons", []).append("budget_exhausted")
+                break
             page_result = recover_from_product_page(row, page_url, debug=debug)
             if page_result.confidence == "HIGH":
                 if debug is not None:
@@ -1233,6 +1306,19 @@ def recover_image_for_row(
             if page_result.confidence in ("MEDIUM", "LOW"):
                 held = page_result
             if enable_screenshot:
+                if not _consume_image_budget(
+                    run_budget,
+                    "screenshot",
+                    item_key=item_key,
+                    field="Image URL",
+                    reason="image recovery screenshot fallback",
+                    stage="image_recovery_screenshot",
+                    source_function="recover_image_for_row:screenshot",
+                    debug=debug,
+                ):
+                    if debug is not None:
+                        debug.setdefault("screenshot_rejection_reasons", []).append("budget_exhausted")
+                    break
                 shot_result = recover_from_screenshot(row, page_url, debug=debug)
                 if shot_result.confidence == "HIGH":
                     if debug is not None:
@@ -1246,7 +1332,12 @@ def recover_image_for_row(
 
     # 2) Official manufacturer/supplier web lookup.
     if enable_web_lookup:
-        web_result = recover_from_official_lookup(row, debug=debug)
+        web_result = recover_from_official_lookup(
+            row,
+            debug=debug,
+            run_budget=run_budget,
+            item_key=item_key,
+        )
         if web_result.confidence == "HIGH":
             if debug is not None:
                 _record_final_debug(debug, web_result)
@@ -1255,7 +1346,21 @@ def recover_image_for_row(
             held = _better(held, web_result)
         selected_page = _str_val(debug.get("selected_product_page_url")) if debug is not None else ""
         if enable_screenshot and selected_page and not _str_val(row.get("Product URL")):
-            shot_result = recover_from_screenshot(row, selected_page, debug=debug)
+            if not _consume_image_budget(
+                run_budget,
+                "screenshot",
+                item_key=item_key,
+                field="Image URL",
+                reason="image recovery screenshot selected web page",
+                stage="image_recovery_screenshot",
+                source_function="recover_image_for_row:web_screenshot",
+                debug=debug,
+            ):
+                if debug is not None:
+                    debug.setdefault("screenshot_rejection_reasons", []).append("budget_exhausted")
+                shot_result = ImageRecoveryResult(error="budget_exhausted")
+            else:
+                shot_result = recover_from_screenshot(row, selected_page, debug=debug)
             if shot_result.confidence == "HIGH":
                 if debug is not None:
                     _record_final_debug(debug, shot_result)
@@ -1268,7 +1373,19 @@ def recover_image_for_row(
     # 3) Existing image URL on row.
     url_val = _str_val(row.get("Image URL"))
     if url_val:
-        url_result = recover_from_url(row)
+        if not _consume_image_budget(
+            run_budget,
+            "fetch",
+            item_key=item_key,
+            field="Image URL",
+            reason="validate/download existing image URL",
+            stage="image_recovery_existing_url",
+            source_function="recover_image_for_row:existing_url",
+            debug=debug,
+        ):
+            url_result = ImageRecoveryResult(error="budget_exhausted")
+        else:
+            url_result = recover_from_url(row)
         if url_result.confidence == "HIGH":
             if debug is not None:
                 _record_final_debug(debug, url_result)
@@ -1322,8 +1439,15 @@ _RECOVERY_COLUMNS = [
     "image_source", "confidence", "evidence", "needs_image_review",
     "local_image_filename", "local_image_path",
     "review_image_filename", "review_image_path", "Review Image URL",
+    "Original Image URL", "cloudinary_secure_url", "cloudinary_url",
+    "cloudinary_public_id", "cloudinary_width", "cloudinary_height",
+    "cloudinary_format", "cloudinary_bytes",
+    "original_image_url", "image_confidence", "image_source_url",
+    "cloudinary_status", "cloudinary_error", "programa_image_ready",
+    "image_upload_status", "image_upload_failure_reason",
     "_image_query_used", "_image_candidates", "_image_rejected_candidates",
     "_selected_image_candidate", "_image_source_type", "_image_final_confidence",
+    "_image_upload_debug",
 ]
 
 
@@ -1413,6 +1537,47 @@ def _image_query_debug_text(debug: dict) -> str:
     return " | ".join(dict.fromkeys(all_queries))
 
 
+def _image_source_url(row: dict, debug: dict) -> str:
+    return _str_val(
+        debug.get("selected_product_page_url")
+        or debug.get("screenshot_url_attempted")
+        or row.get("Product URL")
+        or row.get("Source URL")
+    )
+
+
+def _stamp_cloudinary_handoff_fields(
+    df: pd.DataFrame,
+    idx,
+    debug: dict,
+    *,
+    original_url: str,
+    confidence: str,
+    source_url: str,
+    status: str,
+    error: str = "",
+    cloudinary_url: str = "",
+) -> None:
+    ready = bool(cloudinary_url and is_public_https_image_url(cloudinary_url))
+    values = {
+        "original_image_url": original_url,
+        "cloudinary_url": cloudinary_url,
+        "image_confidence": confidence,
+        "image_source_url": source_url,
+        "cloudinary_status": status,
+        "cloudinary_error": error,
+        "programa_image_ready": str(ready),
+    }
+    for key, value in values.items():
+        df.at[idx, key] = value
+        debug[key] = value
+    if original_url:
+        existing = _str_val(df.at[idx, "Original Image URL"]) if "Original Image URL" in df.columns else ""
+        df.at[idx, "Original Image URL"] = existing or original_url
+    if cloudinary_url:
+        df.at[idx, "cloudinary_secure_url"] = cloudinary_url
+
+
 def recover_images_for_dataframe(
     df: pd.DataFrame,
     pdf_lookup: dict[str, str] | None = None,
@@ -1420,6 +1585,7 @@ def recover_images_for_dataframe(
     enable_screenshot: bool = True,
     enable_web_lookup: bool = True,
     max_product_page_fetches: int | None = None,
+    run_budget=None,
 ) -> tuple[pd.DataFrame, list[dict]]:
     """
     Run the recovery pipeline on rows that don't already carry a HIGH-confidence
@@ -1436,7 +1602,11 @@ def recover_images_for_dataframe(
     if not session_id:
         session_id = "default"
     images_dir = _session_image_dir(session_id)
-    product_page_fetches = 0
+    if max_product_page_fetches is not None:
+        _log.info(
+            "[IMAGE RECOVERY] ignoring deprecated max_product_page_fetches=%s; shared run budget controls product-page fetches",
+            max_product_page_fetches,
+        )
 
     for idx, row in df.iterrows():
         if _row_already_high(row):
@@ -1444,19 +1614,15 @@ def recover_images_for_dataframe(
 
         row_dict = row.to_dict()
         debug: dict = {}
-        has_page_url = any(_str_val(row_dict.get(key)) for key in ("Product URL", "Supplier URL", "Source URL"))
-        enable_product_page_for_row = True
-        if max_product_page_fetches is not None and has_page_url:
-            enable_product_page_for_row = product_page_fetches < max_product_page_fetches
-            if enable_product_page_for_row:
-                product_page_fetches += 1
         result = recover_image_for_row(
             row_dict,
             pdf_lookup=pdf_lookup,
             session_id=session_id,
             enable_screenshot=enable_screenshot,
             enable_web_lookup=enable_web_lookup,
-            enable_product_page=enable_product_page_for_row,
+            enable_product_page=True,
+            run_budget=run_budget,
+            item_key=_image_budget_item_key(row_dict),
             debug=debug,
         )
 
@@ -1484,29 +1650,76 @@ def recover_images_for_dataframe(
             df.at[idx, "Review Image URL"] = result.image_url
 
         if result.confidence in {"HIGH", "MEDIUM"} and result.jpeg_bytes:
-            upload_result = upload_image_with_metadata(io.BytesIO(result.jpeg_bytes), source_url=result.image_url)
-            upload_debug = upload_result.debug or {}
-            if upload_result.secure_url:
-                if result.confidence == "HIGH":
-                    original_url = result.image_url
-                    df.at[idx, "Original Image URL"] = original_url
-                    df.at[idx, "Image URL"] = upload_result.secure_url
-                    result.image_url = upload_result.secure_url
+            original_image_url = _str_val(result.image_url)
+            source_url = _image_source_url(row_dict, debug)
+            upload_debug = {
+                "candidate_url": original_image_url,
+                "source_type": result.image_source,
+                "cloudinary_upload_attempted": False,
+            }
+            if _consume_image_budget(
+                run_budget,
+                "image_upload",
+                item_key=_image_budget_item_key(row_dict),
+                field="Image URL",
+                reason="Cloudinary upload recovered product image",
+                stage="image_recovery_cloudinary_upload",
+                source_function="recover_images_for_dataframe:cloudinary_upload",
+                debug=debug,
+            ):
+                upload_result = upload_image_with_metadata(io.BytesIO(result.jpeg_bytes), source_url=original_image_url)
+                upload_debug = upload_result.debug or upload_debug
+                upload_debug["cloudinary_upload_attempted"] = True
+                _stamp_cloudinary_handoff_fields(
+                    df,
+                    idx,
+                    debug,
+                    original_url=original_image_url,
+                    confidence=result.confidence,
+                    source_url=source_url,
+                    status=upload_result.status,
+                    error=upload_result.error,
+                    cloudinary_url=upload_result.secure_url,
+                )
+                if upload_result.secure_url:
+                    if result.confidence == "HIGH":
+                        df.at[idx, "Image URL"] = upload_result.secure_url
+                        result.image_url = upload_result.secure_url
+                    else:
+                        df.at[idx, "Review Image URL"] = upload_result.secure_url
+                    df.at[idx, "cloudinary_url"] = upload_result.secure_url
+                    df.at[idx, "cloudinary_secure_url"] = upload_result.secure_url
+                    df.at[idx, "cloudinary_public_id"] = upload_result.public_id
+                    df.at[idx, "cloudinary_width"] = str(upload_result.width or "")
+                    df.at[idx, "cloudinary_height"] = str(upload_result.height or "")
+                    df.at[idx, "cloudinary_format"] = upload_result.format
+                    df.at[idx, "cloudinary_bytes"] = str(upload_result.bytes or "")
+                    df.at[idx, "image_upload_status"] = "uploaded"
+                    df.at[idx, "Image Upload Status"] = "Uploaded"
+                    upload_debug["final_saved_image_url"] = upload_result.secure_url
                 else:
-                    df.at[idx, "Review Image URL"] = upload_result.secure_url
-                df.at[idx, "cloudinary_secure_url"] = upload_result.secure_url
-                df.at[idx, "cloudinary_public_id"] = upload_result.public_id
-                df.at[idx, "cloudinary_width"] = upload_result.width
-                df.at[idx, "cloudinary_height"] = upload_result.height
-                df.at[idx, "cloudinary_format"] = upload_result.format
-                df.at[idx, "cloudinary_bytes"] = upload_result.bytes
-                df.at[idx, "image_upload_status"] = "uploaded"
-                df.at[idx, "Image Upload Status"] = "Uploaded"
-                upload_debug["final_saved_image_url"] = upload_result.secure_url
+                    df.at[idx, "image_upload_status"] = upload_result.status
+                    df.at[idx, "image_upload_failure_reason"] = upload_result.error
+                    df.at[idx, "Image Upload Status"] = "Upload skipped" if upload_result.status == "skipped" else "Upload failed"
             else:
-                df.at[idx, "image_upload_status"] = upload_result.status
-                df.at[idx, "image_upload_failure_reason"] = upload_result.error
-                df.at[idx, "Image Upload Status"] = "Upload skipped" if upload_result.status == "skipped" else "Upload failed"
+                _stamp_cloudinary_handoff_fields(
+                    df,
+                    idx,
+                    debug,
+                    original_url=original_image_url,
+                    confidence=result.confidence,
+                    source_url=source_url,
+                    status="skipped",
+                    error="budget_exhausted",
+                )
+                df.at[idx, "image_upload_status"] = "skipped"
+                df.at[idx, "image_upload_failure_reason"] = "budget_exhausted"
+                df.at[idx, "Image Upload Status"] = "Upload skipped"
+                upload_debug.update({
+                    "status": "skipped",
+                    "failure_reason": "budget_exhausted",
+                    "cloudinary_upload_attempted": False,
+                })
             df.at[idx, "_image_upload_debug"] = json.dumps(upload_debug)
 
         # Only HIGH images feed the Excel-with-images export path. MEDIUM
@@ -1567,6 +1780,19 @@ def recover_images_for_dataframe(
         source_pdf_path = (pdf_lookup or {}).get(source_pdf_id, "") if source_pdf_id else ""
         image_url_after = _str_val(row_after.get("Image URL"))
         confidence_after = result.confidence
+        if image_url_after and confidence_after in {"HIGH", "MEDIUM"}:
+            try:
+                _image_cache.save_for_row(
+                    row_after,
+                    image_url=image_url_after,
+                    source_url=_str_val(row_after.get("Product URL") or row_after.get("Source URL")),
+                    source_domain=urllib.parse.urlparse(_str_val(row_after.get("Product URL") or row_after.get("Source URL"))).netloc,
+                    source_type=result.image_source,
+                    confidence=confidence_after,
+                    evidence=";".join(result.evidence),
+                )
+            except Exception:
+                pass
         local_path_exists = bool(local_path_after and Path(local_path_after).exists())
         exported_to_zip = bool(
             confidence_after == "HIGH"
@@ -1605,6 +1831,13 @@ def recover_images_for_dataframe(
             "local_image_path": local_path_after,
             "image_filename": _str_val(row_after.get("Image Filename") or row_after.get("local_image_filename")),
             "image_url": image_url_after,
+            "original_image_url": _str_val(row_after.get("original_image_url") or row_after.get("Original Image URL")),
+            "cloudinary_url": _str_val(row_after.get("cloudinary_url") or row_after.get("cloudinary_secure_url")),
+            "image_confidence": _str_val(row_after.get("image_confidence") or result.confidence),
+            "image_source_url": _str_val(row_after.get("image_source_url") or _image_source_url(row_dict, debug)),
+            "cloudinary_status": _str_val(row_after.get("cloudinary_status")),
+            "cloudinary_error": _str_val(row_after.get("cloudinary_error")),
+            "programa_image_ready": _str_val(row_after.get("programa_image_ready")),
             "row_has_image": row_has_image(row_after),
             "exported_to_zip": exported_to_zip,
             "export_skip_reason": export_skip_reason,
@@ -1664,6 +1897,10 @@ def recover_images_for_dataframe(
             "selected_image_candidate": _str_val(row_after.get("_selected_image_candidate")),
             "image_source_type": _str_val(row_after.get("_image_source_type")),
             "image_final_confidence": _str_val(row_after.get("_image_final_confidence")),
+            "budget_skipped_actions": list(debug.get("budget_skipped_actions", [])),
+            "run_budget_estimated_cost_usd": round(float(getattr(run_budget, "estimated_cost_usd", 0.0) or 0.0), 6),
+            "run_budget_hard_cap_usd": round(float(getattr(run_budget, "hard_budget_usd", 0.0) or 0.0), 6),
+            "cost_ledger": list(getattr(run_budget, "cost_ledger", [])[-25:]) if run_budget is not None else [],
         })
 
     return df, diagnostics
@@ -1747,6 +1984,13 @@ _DEBUG_REPORT_COLUMNS = [
     "image_source_type",
     "image_final_confidence",
     "image_url",
+    "original_image_url",
+    "cloudinary_url",
+    "image_confidence",
+    "image_source_url",
+    "cloudinary_status",
+    "cloudinary_error",
+    "programa_image_ready",
     "row_has_image",
     "exported_to_zip",
     "export_skip_reason",

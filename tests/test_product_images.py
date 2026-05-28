@@ -87,6 +87,54 @@ def test_json_ld_image_extracted():
     assert result.confidence in {"HIGH", "MEDIUM"}
 
 
+def test_next_data_product_image_extracted():
+    html = """
+    <html>
+      <script id="__NEXT_DATA__" type="application/json">
+      {"props":{"pageProps":{"product":{
+        "title":"Wolf MDD30TS 30 Inch Warming Drawer",
+        "sku":"MDD30TS",
+        "images":["https://cdn.wolfappliance.com/images/mdd30ts-next-data.jpg"]
+      }}}}
+      </script>
+      <body>Wolf MDD30TS 30 Inch Warming Drawer</body>
+    </html>
+    """
+
+    result = extract_product_page_image(
+        html,
+        "https://wolfappliance.com/products/mdd30ts",
+        _row(),
+        page_evidence=_high_page_evidence(),
+        source_prefix="official_site",
+    )
+
+    assert result.image_found is True
+    assert result.image_url == "https://cdn.wolfappliance.com/images/mdd30ts-next-data.jpg"
+    assert result.image_source == "official_site_jsonld_image"
+
+
+def test_product_css_background_image_extracted():
+    html = """
+    <html><body>
+      <section class="product-gallery hero" style="background-image: url('/images/mdd30ts-background.jpg')">
+        Wolf MDD30TS 30 Inch Warming Drawer
+      </section>
+    </body></html>
+    """
+
+    result = extract_product_page_image(
+        html,
+        "https://wolfappliance.com/products/mdd30ts",
+        _row(),
+        page_evidence=_high_page_evidence(),
+    )
+
+    assert result.image_found is True
+    assert result.image_url == "https://wolfappliance.com/images/mdd30ts-background.jpg"
+    assert result.image_source.endswith("_html_image")
+
+
 def test_srcset_best_image_extracted():
     html = """
     <html><body>

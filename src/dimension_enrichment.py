@@ -60,13 +60,12 @@ def _brave_search_urls(
             can_search = budget.can_search()
         if not can_search:
             return []
+        try:
+            budget.consume_search(query=query, field="Dimensions", reason="dimension lookup search")
+        except TypeError:
+            budget.consume_search()
     try:
         results = _brave_candidates(query, brand, session_cache=session_cache)
-        if budget is not None:
-            try:
-                budget.consume_search(query=query, field="Dimensions", reason="dimension lookup search")
-            except TypeError:
-                budget.consume_search()
         return [r.url for r in results[:limit]]
     except Exception:
         return []
@@ -751,11 +750,11 @@ def find_dimensions(
                 urls_checked.append(url)
                 if budget is not None and not budget.can_fetch():
                     break
+                if budget is not None:
+                    budget.consume_fetch()
                 product_dims, cutout_dims, src_suffix = _fetch_and_parse_url(
                     url, is_appliance=is_appliance
                 )
-                if budget is not None:
-                    budget.consume_fetch()
                 if not product_dims or not has_complete_3d_dimensions(product_dims):
                     continue
                 matched_variant = None

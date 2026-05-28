@@ -56,6 +56,7 @@ from src.document_parser import parse_pdf_rows
 from src.category_ai import suggest_categories_batch
 from src.notes import remove_notes_row_prefix
 from src.product_enrichment import enrich_dataframe, recover_images_for_dataframe, has_complete_3d_dimensions
+from src.product_lookup_budget import run_budget_for_mode
 from src.image_presence import row_has_image, row_image_status
 from src.brave_search import BRAVE_API_KEY as _BRAVE_API_KEY
 from src.manufacturer_domains import save_manufacturer_override
@@ -800,9 +801,21 @@ if generate:
             ai_errors = []
 
             for pdf_file in uploaded_files:
-                df_ai, error = extract_products_from_pdf_with_ai(
-                    pdf_file, selected_project, room, ""
-                )
+                _pdf_ai_budget = run_budget_for_mode("fast")
+                if _pdf_ai_budget.consume(
+                    "ai",
+                    _pdf_ai_budget.ai_call_cost_usd,
+                    item_key=getattr(pdf_file, "name", "uploaded_pdf"),
+                    field="PDF extraction",
+                    reason="Streamlit AI PDF extraction",
+                    stage="pdf_ai_extraction",
+                    source_function="app:extract_products_from_pdf_with_ai",
+                ):
+                    df_ai, error = extract_products_from_pdf_with_ai(
+                        pdf_file, selected_project, room, ""
+                    )
+                else:
+                    df_ai, error = None, "AI PDF extraction skipped due to budget cap"
                 if error:
                     ai_errors.append(f"**{pdf_file.name}:** {error}")
                     fallback = create_pdf_rows(
@@ -1024,10 +1037,12 @@ if st.session_state.intake_df is not None:
     if st.session_state.pending_enrichment:
         if st.session_state.get("use_web_enrichment", True) and _BRAVE_API_KEY:
             with st.spinner("Searching manufacturer sources to fill missing product details…"):
+                _run_budget = run_budget_for_mode("fast")
                 _enriched_df, _enrich_errors, _dimension_diagnostics = enrich_dataframe(
                     df,
                     use_web_enrichment=st.session_state.get("use_web_enrichment", True),
                     force_refresh=st.session_state.get("force_refresh_enrichment", False),
+                    run_budget=_run_budget,
                 )
                 st.session_state.intake_df = apply_confidence_checks(_enriched_df)
                 st.session_state.enrichment_errors = _enrich_errors
@@ -1082,11 +1097,13 @@ if st.session_state.intake_df is not None:
                     with st.spinner(f"Recovering images for {_missing_image_count} row(s)…"):
                         sid = _ensure_session_id()
                         pdf_lookup = _build_pdf_lookup()
+                        _run_budget = run_budget_for_mode("fast")
                         _recovered_df, _img_diagnostics = recover_images_for_dataframe(
                             df,
                             pdf_lookup=pdf_lookup,
                             session_id=sid,
                             enable_screenshot=True,
+                            run_budget=_run_budget,
                         )
                         st.session_state.intake_df = apply_confidence_checks(_recovered_df)
                         st.session_state.manual_image_uploads = {}
@@ -2727,7 +2744,19 @@ if st.session_state.intake_df is not None:
     if cat_clicked and use_cat_ai and _blank_cat_n > 0:
         _blank_rows = edited_df.loc[_blank_cat_indices].to_dict("records")
         with st.spinner(f"Suggesting categories for {_blank_cat_n} row{'s' if _blank_cat_n != 1 else ''}…"):
-            _suggestions, _cat_error = suggest_categories_batch(_blank_rows, _blank_cat_indices)
+            _cat_budget = run_budget_for_mode("fast")
+            if _cat_budget.consume(
+                "ai",
+                _cat_budget.ai_call_cost_usd,
+                item_key="category_suggestions",
+                field="Product Category",
+                reason="Streamlit AI category suggestion batch",
+                stage="category_ai",
+                source_function="app:suggest_categories_batch",
+            ):
+                _suggestions, _cat_error = suggest_categories_batch(_blank_rows, _blank_cat_indices)
+            else:
+                _suggestions, _cat_error = {}, "Category AI skipped due to budget cap."
         if _cat_error:
             st.session_state.cat_ai_error = _cat_error
             st.rerun()

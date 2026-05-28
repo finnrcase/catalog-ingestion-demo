@@ -1,22 +1,29 @@
-"""Persistent cache for verified product page/image/spec lookup results.
+"""Exact product memory for verified product page/image/spec lookup results.
 
-The cache is keyed by normalized brand + SKU.  Entries may be either reusable
-HIGH/MEDIUM verified lookups or LOW/NONE searched-no-result records that prevent
-repeat expensive searches without autofilling row fields.
+The cache is keyed by normalized brand + SKU/model with an optional product-name
+hash stored for audit/disambiguation. Entries may be reusable HIGH/MEDIUM
+verified lookups or LOW/NONE searched-no-result records that prevent repeat
+expensive searches without autofilling row fields.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import hashlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from src.durable_cache import durable_cache_enabled, load_map, upsert_payload
 from src.product_evidence import normalize_brand, normalize_sku
 
 _CACHE_PATH = Path(__file__).resolve().parent.parent / "data" / "product_lookup_cache.json"
 DEFAULT_MAX_AGE_DAYS = 30
+
+
+def _uses_default_path(path: Path) -> bool:
+    return path.resolve() == _CACHE_PATH.resolve()
 
 
 def _clean(value: object) -> str:
@@ -32,6 +39,14 @@ def make_lookup_cache_key(row: dict) -> str:
     return key or "unknown"
 
 
+def product_name_hash(value: object) -> str:
+    """Short stable hash for optional product-name disambiguation."""
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    if not normalized:
+        return ""
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:12]
+
+
 class ProductLookupCache:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path else _CACHE_PATH
@@ -40,13 +55,20 @@ class ProductLookupCache:
     def _load(self) -> None:
         if self._data is not None:
             return
+        data: dict = {}
         if not self.path.exists():
-            self._data = {}
-            return
-        try:
-            self._data = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            self._data = {}
+            data = {}
+        else:
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                data = loaded if isinstance(loaded, dict) else {}
+            except Exception:
+                data = {}
+        if _uses_default_path(self.path) and durable_cache_enabled():
+            durable = load_map("exact_product_lookup_cache", "cache_key")
+            if durable:
+                data.update({key: _normalise_entry(value) for key, value in durable.items()})
+        self._data = data
 
     def get(self, key: str) -> dict | None:
         self._load()
@@ -55,8 +77,10 @@ class ProductLookupCache:
     def set(self, key: str, value: dict) -> None:
         self._load()
         data = self._data if self._data is not None else {}
-        data[key] = _normalise_entry(value)
+        entry = _normalise_entry(value)
+        data[key] = entry
         self._save(data)
+        self._write_durable_entry(key, entry)
 
     def get_for_row(self, row: dict, *, force_refresh: bool = False, max_age_days: int = DEFAULT_MAX_AGE_DAYS) -> dict | None:
         if force_refresh:
@@ -108,11 +132,47 @@ class ProductLookupCache:
         tmp.replace(self.path)
         self._data = data
 
+    def _write_durable_entry(self, key: str, entry: dict) -> None:
+        if not (_uses_default_path(self.path) and durable_cache_enabled()):
+            return
+        upsert_payload(
+            "exact_product_lookup_cache",
+            "cache_key",
+            key,
+            entry,
+            extra={
+                "normalized_brand": entry.get("normalized_brand") or "",
+                "normalized_sku": entry.get("normalized_sku") or "",
+                "confidence": entry.get("confidence") or "",
+                "source_type": entry.get("source_type") or "",
+                "product_name_hash": entry.get("product_name_hash") or "",
+                "selected_product_url": entry.get("selected_product_url") or "",
+                "cloudinary_url": entry.get("cloudinary_url") or "",
+            },
+        )
+
+
+ExactProductMemory = ProductLookupCache
+
 
 def can_reuse_lookup(entry: dict | None) -> bool:
     if not entry or entry.get("status") == "searched_no_result":
         return False
     return str(entry.get("confidence", "")).lower() in {"high", "medium"}
+
+
+def exact_product_urls_for_row(row: dict) -> list[str]:
+    """Return verified exact product URLs from exact product memory only."""
+    entry = ProductLookupCache().get_for_row(row)
+    if not can_reuse_lookup(entry):
+        return []
+    url = str(
+        (entry or {}).get("verified_product_url")
+        or (entry or {}).get("selected_product_url")
+        or (entry or {}).get("selected_product_page_url")
+        or ""
+    ).strip()
+    return [url] if url else []
 
 
 def is_no_result(entry: dict | None) -> bool:
@@ -149,12 +209,14 @@ def _normalise_entry(value: dict) -> dict:
         confidence = "none"
 
     selected_url = str(
-        entry.get("selected_product_url")
+        entry.get("verified_product_url")
+        or entry.get("selected_product_url")
         or entry.get("selected_product_page_url")
         or entry.get("Product Resolution URL")
         or ""
     ).strip()
-    image_url = str(entry.get("image_url") or entry.get("selected_image_url") or entry.get("Image URL") or "").strip()
+    cloudinary_url = str(entry.get("cloudinary_url") or entry.get("cloudinary_secure_url") or "").strip()
+    image_url = str(entry.get("verified_image_url") or entry.get("image_url") or entry.get("selected_image_url") or entry.get("Image URL") or "").strip()
     image_confidence = str(entry.get("image_confidence") or entry.get("Image Recovery Confidence") or "").upper()
     if image_confidence not in {"HIGH", "MEDIUM", "LOW", "NONE"}:
         image_confidence = ""
@@ -166,6 +228,8 @@ def _normalise_entry(value: dict) -> dict:
         "sku": sku,
         "normalized_sku": normalize_sku(sku),
         "product_name": str(entry.get("product_name") or entry.get("Product Name") or "").strip(),
+        "product_name_hash": str(entry.get("product_name_hash") or product_name_hash(entry.get("product_name") or entry.get("Product Name"))),
+        "verified_product_url": selected_url,
         "selected_product_url": selected_url,
         "selected_product_page_url": selected_url,
         "source_type": str(entry.get("source_type") or "unknown"),
@@ -177,6 +241,9 @@ def _normalise_entry(value: dict) -> dict:
         "depth_in": str(entry.get("depth_in") or entry.get("Depth (in)") or "").strip(),
         "finish": str(entry.get("finish") or entry.get("Finish / Color") or "").strip(),
         "material": str(entry.get("material") or entry.get("Material") or "").strip(),
+        "verified_image_url": image_url,
+        "cloudinary_url": cloudinary_url,
+        "cloudinary_secure_url": cloudinary_url,
         "image_url": image_url,
         "selected_image_url": image_url,
         "image_confidence": image_confidence,

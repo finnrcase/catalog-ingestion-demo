@@ -64,6 +64,19 @@ def test_product_url_with_jsonld_image():
     assert result.confidence == "HIGH"
 
 
+def test_product_url_with_next_data_image():
+    html = """
+    <script id="__NEXT_DATA__" type="application/json">
+      {"props":{"pageProps":{"product":{"sku":"WWD30","images":["https://wolfappliance.com/i/wwd30-next.jpg"]}}}}
+    </script>
+    <body>Wolf WWD30</body>
+    """
+    result = extract_product_page_image(html, "https://wolfappliance.com/product/wwd30", _row())
+    assert result.image_found is True
+    assert result.image_source == "product_url_jsonld_image"
+    assert result.image_url == "https://wolfappliance.com/i/wwd30-next.jpg"
+
+
 def test_product_url_with_gallery_img_tags():
     html = """
     <body>Wolf WWD30

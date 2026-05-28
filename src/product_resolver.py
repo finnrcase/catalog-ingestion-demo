@@ -22,6 +22,7 @@ from src.product_evidence import (
     normalize_sku,
     product_name_similarity,
 )
+from src.product_lookup_cache import exact_product_urls_for_row
 from src.preferred_websites import (
     preferred_direct_urls_for_row,
     preferred_domains_for_row,
@@ -37,7 +38,6 @@ from src.source_success_registry import (
     record_source_failure,
     record_source_success,
     source_success_score,
-    successful_urls_for_row,
 )
 from src.spec_extraction import (
     DimensionExtractionResult,
@@ -258,11 +258,17 @@ def build_resolver_queries(row: dict, mode: str = "standard") -> tuple[list[str]
     primary_domain = official_domains[0] if official_domains else ""
     for domain in preferred_domains_for_row(row):
         if sku:
-            add(f'site:{domain} "{sku}" dimensions')
             add(f'site:{domain} "{sku}" product')
+            add(f'site:{domain} "{sku}" dimensions')
+            add(f'site:{domain} "{sku}" image OR gallery')
+            add(f'site:{domain} "{sku}" spec sheet OR filetype:pdf')
         elif product_name:
-            add(f'site:{domain} "{product_name}"')
+            add(f'site:{domain} "{product_name}" product')
+            add(f'site:{domain} "{product_name}" dimensions')
+            add(f'site:{domain} "{product_name}" image OR gallery')
+            add(f'site:{domain} "{product_name}" spec sheet OR filetype:pdf')
     if primary_domain and sku:
+        add(f'site:{primary_domain} "{sku}" product')
         add(f'site:{primary_domain} "{sku}" dimensions')
     if brand and sku:
         add(f'"{brand}" "{sku}" official product page')
@@ -290,8 +296,8 @@ def build_resolver_queries(row: dict, mode: str = "standard") -> tuple[list[str]
         add(f'"{brand}" "{product_name}" product image dimensions')
     if mode == "fast":
         queries = queries[:1]
-    elif mode == "standard":
-        queries = queries[:3]
+    elif mode in {"standard", "balanced"}:
+        queries = queries[:8]
     return queries, official_domains
 
 
@@ -609,6 +615,9 @@ def _direct_candidate_urls(row: dict) -> list[dict[str, str]]:
             "preferred_keyword": preferred_keyword,
         })
 
+    for url in exact_product_urls_for_row(row):
+        add(url, "exact_product_memory", "verified exact product memory URL")
+
     product_url = _text(row.get("Product URL") or row.get("Product Resolution URL"))
     if product_url:
         add(product_url, "existing_product_url", "existing verified product URL")
@@ -620,8 +629,6 @@ def _direct_candidate_urls(row: dict) -> list[dict[str, str]]:
             preferred_entry_id=entry.get("entry_id", ""),
             preferred_keyword=entry.get("keyword", ""),
         )
-    for url in successful_urls_for_row(row):
-        add(url, "source_success_cache", "previous successful source URL")
     return urls
 
 

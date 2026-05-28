@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+from src.durable_cache import durable_cache_enabled, load_map, upsert_payload
+
 DATA_DIR = Path("data")
 CACHE_PATH = DATA_DIR / "manufacturer_domain_cache.json"
 
@@ -71,21 +73,47 @@ def _cache_path(path: Path | None = None) -> Path:
     return path or CACHE_PATH
 
 
+def _use_durable(path: Path | None = None) -> bool:
+    return path is None and durable_cache_enabled()
+
+
 def load_domain_cache(path: Path | None = None) -> dict:
     path = _cache_path(path)
+    data: dict = {}
     if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+        data = {}
+    else:
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            data = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            data = {}
+    if _use_durable(None if path == CACHE_PATH else path):
+        durable = load_map("manufacturer_domain_cache", "brand")
+        if durable:
+            data.update(durable)
+    return data
 
 
 def save_domain_cache(cache: dict, path: Path | None = None) -> None:
     path = _cache_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if path == CACHE_PATH and durable_cache_enabled():
+        for brand_key, entry in cache.items():
+            if not isinstance(entry, dict):
+                continue
+            upsert_payload(
+                "manufacturer_domain_cache",
+                "brand",
+                str(brand_key),
+                entry,
+                extra={
+                    "official_domain": entry.get("official_domain") or entry.get("domain") or "",
+                    "source": entry.get("source") or "",
+                    "confidence": entry.get("confidence") or "",
+                },
+            )
 
 
 def _entry(

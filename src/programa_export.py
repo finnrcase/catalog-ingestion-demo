@@ -108,12 +108,40 @@ _DEBUG_EXTRA_COLUMNS: list[str] = [
     "Source Type",
     "AI Category Confidence",
     "Category Source",
+    "Original Image URL",
     "Local Image Path",
     "Image Filename",
+    "Image Upload Status",
+    "cloudinary_secure_url",
+    "cloudinary_url",
+    "cloudinary_public_id",
+    "cloudinary_width",
+    "cloudinary_height",
+    "cloudinary_format",
+    "cloudinary_bytes",
+    "original_image_url",
+    "image_confidence",
+    "image_source_url",
+    "cloudinary_status",
+    "cloudinary_error",
+    "programa_image_ready",
+    "image_upload_status",
+    "image_upload_failure_reason",
     "Dimension Source URL",
     "Dimension Confidence",
     "Dimension Source Type",
     "Dimension Lookup Status",
+    "Product Width (in)",
+    "Product Height (in)",
+    "Product Depth (in)",
+    "Cutout Dimensions",
+    "Cutout Width (in)",
+    "Cutout Height (in)",
+    "Cutout Depth (in)",
+    "Shipping/Package Dimensions",
+    "Shipping Width (in)",
+    "Shipping Height (in)",
+    "Shipping Depth (in)",
     # Phase 1 image recovery internal source metadata
     "_source_pdf_id",
     "_source_page_number",
@@ -419,7 +447,10 @@ def validate_public_image_url(url: str | None, timeout: float = 6.0) -> dict:
 
 
 def _programa_image_url(row: dict, *, validate_urls: bool = False) -> str:
-    url = _str_val(row.get("Image URL"))
+    raw_image_url = _str_val(row.get("Image URL"))
+    if not raw_image_url:
+        return ""
+    url = _str_val(row.get("cloudinary_secure_url") or row.get("cloudinary_url") or raw_image_url)
     if not _is_public_https_image_url(url):
         return ""
     if validate_urls and not validate_public_image_url(url).get("ok"):
@@ -928,7 +959,7 @@ def _resolve_programa_row_image(
         except Exception as exc:
             status["reason"] = f"manual_image_conversion_failed:{exc}"
 
-    image_url = _str_val(row.get("Image URL"))
+    image_url = _programa_image_url(row)
     if image_url:
         validation = validate_public_image_url(image_url)
         status["valid_url"] = bool(validation.get("ok"))

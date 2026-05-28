@@ -10,6 +10,7 @@ from src.source_success_registry import record_source_success
 @pytest.fixture(autouse=True)
 def _isolate_source_registry(monkeypatch, tmp_path):
     monkeypatch.setenv("SOURCE_SUCCESS_REGISTRY_PATH", str(tmp_path / "source_success_registry.json"))
+    monkeypatch.setenv("PREFERRED_WEBSITES_PATH", str(tmp_path / "preferred_product_websites.json"))
 
 
 def _wolf_row() -> dict:
@@ -111,7 +112,29 @@ def test_build_resolver_queries_uses_successful_source_registry_first():
     queries, domains = build_resolver_queries(row)
 
     assert domains[0] == "specs.acme.com"
-    assert queries[0] == 'site:specs.acme.com "AX100" dimensions'
+    assert queries[0] == 'site:specs.acme.com "AX100" product'
+
+
+def test_exact_product_memory_url_checked_before_domain_success(monkeypatch):
+    import src.product_resolver as pr
+
+    row = {"Brand": "Acme", "Model/SKU": "AX100", "Product Category": "Appliances"}
+    record_source_success(row, domain="specs.acme.com", url="https://specs.acme.com/wrong-product", confidence="high")
+    monkeypatch.setattr(pr, "exact_product_urls_for_row", lambda _: ["https://exact.acme.com/products/ax100"])
+    monkeypatch.setattr(pr, "search_product_candidates", lambda *a, **k: pytest.fail("exact product memory should be tried before search"))
+    monkeypatch.setattr(pr.httpx, "get", lambda url, **kwargs: _resp(url, """
+        <html><body>
+          <h1>Acme AX100 Appliance</h1>
+          <script type="application/ld+json">{"@type":"Product","brand":{"name":"Acme"},"sku":"AX100","image":"https://exact.acme.com/ax100.jpg"}</script>
+          <table><tr><th>Width</th><td>10 in</td></tr><tr><th>Height</th><td>20 in</td></tr><tr><th>Depth</th><td>30 in</td></tr></table>
+        </body></html>
+    """))
+
+    result = resolve_product_page(row)
+
+    assert result.selected is not None
+    assert result.selected.url == "https://exact.acme.com/products/ax100"
+    assert result.selected.diagnostics["candidate_origin"] == "exact_product_memory"
 
 
 def test_existing_product_url_extracted_before_search(monkeypatch):
@@ -169,8 +192,9 @@ def test_preferred_domain_queries_run_before_normal_search(monkeypatch, tmp_path
 
     queries, domains = build_resolver_queries(_wolf_row())
 
-    assert queries[0] == 'site:preferred.example.com "MDD30TS" dimensions'
-    assert queries[1] == 'site:preferred.example.com "MDD30TS" product'
+    assert queries[0] == 'site:preferred.example.com "MDD30TS" product'
+    assert queries[1] == 'site:preferred.example.com "MDD30TS" dimensions'
+    assert queries[2] == 'site:preferred.example.com "MDD30TS" image OR gallery'
     assert "preferred.example.com" not in domains
     assert any(query.startswith("site:") and "subzero-wolf.com" in query for query in queries)
 

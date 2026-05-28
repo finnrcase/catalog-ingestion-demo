@@ -89,6 +89,10 @@ def _provider_for_kind(kind: str) -> str:
         return "brave"
     if kind == "ai":
         return "ai"
+    if kind == "image_upload":
+        return "cloudinary"
+    if kind == "screenshot":
+        return "browser"
     if kind in {"fetch", "external_lookup"}:
         return "page_fetch"
     return kind or "unknown"
@@ -114,6 +118,8 @@ class EnrichmentRunBudget:
     fetch_cost_usd: float = 0.0005
     ai_call_cost_usd: float = 0.03
     image_search_cost_usd: float = 0.003
+    image_upload_cost_usd: float = 0.001
+    screenshot_cost_usd: float = 0.005
     retry_cost_usd: float = 0.0
     estimated_cost_usd: float = 0.0
     external_lookups_used: int = 0
@@ -129,6 +135,7 @@ class EnrichmentRunBudget:
     field_costs: dict[str, float] = field(default_factory=dict)
     broad_searches_used: int = 0
     brave_calls: list[dict] = field(default_factory=list)
+    cost_ledger: list[dict] = field(default_factory=list)
 
     def remaining_budget_usd(self) -> float:
         return max(0.0, self.hard_budget_usd - self.estimated_cost_usd)
@@ -152,7 +159,7 @@ class EnrichmentRunBudget:
         )
 
     def _limit_reached(self, kind: str) -> str:
-        if kind in {"search", "fetch", "external_lookup"} and self.external_lookups_used >= self.max_external_lookups:
+        if kind in {"search", "fetch", "external_lookup", "image_search", "image_upload", "screenshot"} and self.external_lookups_used >= self.max_external_lookups:
             return "external lookup limit reached"
         if kind == "ai" and self.ai_calls_used >= self.max_ai_calls:
             return "AI call limit reached"
@@ -172,15 +179,32 @@ class EnrichmentRunBudget:
         reason: str = "",
         record_skip: bool = True,
         query: str = "",
+        source_function: str = "",
     ) -> bool:
         limit_reason = self._limit_reached(kind)
         if limit_reason:
             if record_skip:
-                self.record_skip(kind, cost_usd, item_key=item_key, field=field, reason=limit_reason, query=query)
+                self.record_skip(
+                    kind,
+                    cost_usd,
+                    item_key=item_key,
+                    field=field,
+                    reason=limit_reason,
+                    query=query,
+                    source_function=source_function,
+                )
             return False
         if self.estimated_cost_usd + cost_usd > self.hard_budget_usd:
             if record_skip:
-                self.record_skip(kind, cost_usd, item_key=item_key, field=field, reason="hard budget exceeded", query=query)
+                self.record_skip(
+                    kind,
+                    cost_usd,
+                    item_key=item_key,
+                    field=field,
+                    reason="hard budget exceeded",
+                    query=query,
+                    source_function=source_function,
+                )
             return False
         return True
 
@@ -193,18 +217,26 @@ class EnrichmentRunBudget:
         field: str = "",
         reason: str = "",
         query: str = "",
+        source_function: str = "",
     ) -> None:
+        cumulative = round(self.estimated_cost_usd, 6)
         record = {
             "kind": kind,
+            "action_type": kind,
             "provider": _provider_for_kind(kind),
             "estimated_cost_usd": round(float(cost_usd), 6),
+            "cumulative_pdf_cost_usd": cumulative,
             "item_key": item_key,
+            "item_id": item_key,
             "field": field,
             "query": query,
             "reason": reason or "budget limit",
+            "skipped_reason": reason or "budget limit",
+            "source_function": source_function,
             "status": "skipped",
         }
         self.skipped_calls.append(record)
+        self.cost_ledger.append(record)
         if field:
             self.skipped_fields.append(record)
         if record["provider"] == "brave":
@@ -220,13 +252,22 @@ class EnrichmentRunBudget:
         reason: str = "",
         stage: str = "",
         query: str = "",
+        source_function: str = "",
     ) -> bool:
-        if not self.can_spend(kind, cost_usd, item_key=item_key, field=field, reason=reason, query=query):
+        if not self.can_spend(
+            kind,
+            cost_usd,
+            item_key=item_key,
+            field=field,
+            reason=reason,
+            query=query,
+            source_function=source_function,
+        ):
             return False
         self.estimated_cost_usd += cost_usd
-        if kind in {"search", "fetch", "external_lookup"}:
+        if kind in {"search", "fetch", "external_lookup", "image_search", "image_upload", "screenshot"}:
             self.external_lookups_used += 1
-        elif kind == "ai":
+        if kind == "ai":
             self.ai_calls_used += 1
         elif kind == "image_search":
             self.image_searches_used += 1
@@ -242,29 +283,26 @@ class EnrichmentRunBudget:
         self.provider_costs[provider] = round(self.provider_costs.get(provider, 0.0) + cost_usd, 6)
         if field:
             self.field_costs[field] = round(self.field_costs.get(field, 0.0) + cost_usd, 6)
-        self.paid_call_reasons.append({
+        ledger_record = {
             "kind": kind,
+            "action_type": kind,
             "stage": stage_key,
             "provider": provider,
             "item_key": item_key,
+            "item_id": item_key,
             "field": field,
             "query": query,
             "reason": reason,
+            "skipped_reason": "",
+            "source_function": source_function,
             "estimated_cost_usd": round(cost_usd, 6),
+            "cumulative_pdf_cost_usd": round(self.estimated_cost_usd, 6),
             "status": "called",
-        })
+        }
+        self.paid_call_reasons.append(ledger_record)
+        self.cost_ledger.append(ledger_record)
         if provider == "brave":
-            self.brave_calls.append({
-                "kind": kind,
-                "stage": stage_key,
-                "provider": provider,
-                "item_key": item_key,
-                "field": field,
-                "query": query,
-                "reason": reason,
-                "estimated_cost_usd": round(cost_usd, 6),
-                "status": "called",
-            })
+            self.brave_calls.append(ledger_record)
         return True
 
     def diagnostics(self) -> dict:
@@ -300,6 +338,7 @@ class EnrichmentRunBudget:
             "most_expensive_item": most_expensive_item,
             "most_expensive_item_cost_usd": round(most_expensive_item_cost, 4),
             "paid_call_reasons": self.paid_call_reasons[-25:],
+            "cost_ledger": self.cost_ledger[-100:],
         }
 
 
@@ -323,6 +362,8 @@ def run_budget_for_mode(mode: str) -> EnrichmentRunBudget:
         fetch_cost_usd=_float_env("ENRICHMENT_FETCH_COST_USD", 0.0005),
         ai_call_cost_usd=_float_env("ENRICHMENT_AI_CALL_COST_USD", 0.03),
         image_search_cost_usd=_float_env("ENRICHMENT_IMAGE_SEARCH_COST_USD", 0.003),
+        image_upload_cost_usd=_float_env("ENRICHMENT_IMAGE_UPLOAD_COST_USD", 0.001),
+        screenshot_cost_usd=_float_env("ENRICHMENT_SCREENSHOT_COST_USD", 0.005),
     )
 
 
@@ -427,6 +468,7 @@ class ProductLookupBudget:
                 field=field,
                 reason=reason,
                 query=query,
+                source_function="ProductLookupBudget.can_search",
             )
             if not allowed and not self.stopped_reason:
                 self.stopped_reason = "run budget exhausted"
@@ -438,6 +480,7 @@ class ProductLookupBudget:
                 field=field,
                 query=query,
                 reason=self.stopped_reason or "search budget exhausted",
+                source_function="ProductLookupBudget.can_search",
             )
         return allowed
 
@@ -452,9 +495,19 @@ class ProductLookupBudget:
                 item_key=self.item_key,
                 field="Product URL",
                 reason="candidate page fetch",
+                source_function="ProductLookupBudget.can_fetch",
             )
             if not allowed and not self.stopped_reason:
                 self.stopped_reason = "run budget exhausted"
+        elif not allowed and self.run_budget is not None:
+            self.run_budget.record_skip(
+                "fetch",
+                self.run_budget.fetch_cost_usd,
+                item_key=self.item_key,
+                field="Product URL",
+                reason=self.stopped_reason or "page fetch budget exhausted",
+                source_function="ProductLookupBudget.can_fetch",
+            )
         return allowed
 
     def can_ai_call(self) -> bool:
@@ -468,9 +521,19 @@ class ProductLookupBudget:
                 item_key=self.item_key,
                 field="missing verified-page fields",
                 reason="verified page deterministic extraction incomplete",
+                source_function="ProductLookupBudget.can_ai_call",
             )
             if not allowed and not self.stopped_reason:
                 self.stopped_reason = "run budget exhausted"
+        elif not allowed and self.run_budget is not None:
+            self.run_budget.record_skip(
+                "ai",
+                self.run_budget.ai_call_cost_usd,
+                item_key=self.item_key,
+                field="missing verified-page fields",
+                reason=self.stopped_reason or "AI budget exhausted",
+                source_function="ProductLookupBudget.can_ai_call",
+            )
         return allowed
 
     def consume_search(self, *, query: str = "", field: str = "Product URL", reason: str = "product search") -> None:
@@ -488,6 +551,7 @@ class ProductLookupBudget:
                 reason=call_reason,
                 stage=stage,
                 query=query,
+                source_function="ProductLookupBudget.consume_search",
             )
 
     def consume_fetch(self) -> None:
@@ -502,6 +566,7 @@ class ProductLookupBudget:
                 field="Product URL",
                 reason="candidate page fetch",
                 stage="page_fetch",
+                source_function="ProductLookupBudget.consume_fetch",
             )
 
     def consume_ai_call(self) -> None:
@@ -516,6 +581,7 @@ class ProductLookupBudget:
                 field="missing verified-page fields",
                 reason="verified page deterministic extraction incomplete",
                 stage="ai",
+                source_function="ProductLookupBudget.consume_ai_call",
             )
 
     def stop(self, reason: str) -> None:

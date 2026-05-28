@@ -158,6 +158,47 @@ def test_run_budget_tracks_provider_field_and_broad_search_costs():
     assert diag["brave_calls"][0]["query"] == '"Wolf" "MDD30TS" dimensions'
 
 
+def test_run_budget_cost_ledger_records_source_and_cumulative_cost():
+    budget = run_budget_for_mode("fast")
+
+    assert budget.consume(
+        "image_upload",
+        budget.image_upload_cost_usd,
+        item_key="wolf|mdd30ts",
+        field="Image URL",
+        reason="upload recovered image",
+        stage="image_recovery_cloudinary_upload",
+        source_function="recover_images_for_dataframe:cloudinary_upload",
+    )
+
+    ledger = budget.diagnostics()["cost_ledger"]
+    assert ledger[-1]["item_id"] == "wolf|mdd30ts"
+    assert ledger[-1]["action_type"] == "image_upload"
+    assert ledger[-1]["provider"] == "cloudinary"
+    assert ledger[-1]["source_function"] == "recover_images_for_dataframe:cloudinary_upload"
+    assert ledger[-1]["cumulative_pdf_cost_usd"] == budget.image_upload_cost_usd
+
+
+def test_run_budget_cost_ledger_records_budget_skips():
+    budget = EnrichmentRunBudget(hard_budget_usd=0.001, search_cost_usd=0.003)
+
+    assert not budget.consume(
+        "search",
+        budget.search_cost_usd,
+        item_key="wolf|mdd30ts",
+        field="Dimensions",
+        reason="dimension retry",
+        query='"Wolf" "MDD30TS" dimensions',
+        source_function="_targeted_missing_field_retry",
+    )
+
+    ledger = budget.diagnostics()["cost_ledger"]
+    assert ledger[-1]["status"] == "skipped"
+    assert ledger[-1]["skipped_reason"] == "hard budget exceeded"
+    assert ledger[-1]["source_function"] == "_targeted_missing_field_retry"
+    assert ledger[-1]["cumulative_pdf_cost_usd"] == 0
+
+
 def test_standard_mode_never_exceeds_three_brave_calls(monkeypatch):
     import src.product_resolver as pr
 

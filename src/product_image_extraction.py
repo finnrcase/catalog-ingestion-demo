@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 from bs4 import BeautifulSoup
 
+from src.embedded_product_data import css_background_image_urls, embedded_product_images
 from src.product_evidence import normalize_sku
 
 
@@ -97,6 +98,12 @@ def extract_product_image_candidates(html: str, page_url: str, row: dict) -> lis
 
     for value in _jsonld_images(soup):
         candidates.append(ImageCandidate(_abs(value, page_url), "jsonld_image", context="jsonld_product"))
+
+    for value in embedded_product_images(soup):
+        candidates.append(ImageCandidate(_abs(value, page_url), "embedded_json_image", context="embedded_product_json"))
+
+    for value, context in css_background_image_urls(soup):
+        candidates.append(ImageCandidate(_abs(value, page_url), "css_background_image", context=context))
 
     for source in soup.select("source[srcset]"):
         url, width = _best_srcset(str(source.get("srcset") or ""))
@@ -369,9 +376,11 @@ def _large_enough(width: int | None, height: int | None) -> bool:
 def _source_score(source: str) -> int:
     return {
         "jsonld_image": 95,
+        "embedded_json_image": 90,
         "og_image": 85,
         "twitter_image": 35,
         "gallery_image": 35,
+        "css_background_image": 30,
         "source_srcset": 60,
         "img_srcset": 28,
         "lazy_srcset": 25,

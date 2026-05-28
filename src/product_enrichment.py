@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 
 import httpx
 import pandas as pd
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from src.brand_lookup_registry import registry_domains_for_brand
@@ -28,13 +29,19 @@ from src.category_ai import _normalise_category
 from src.dimension_enrichment import DimensionResult as _DimensionResult, find_dimensions as _find_dimensions
 from src.dimensions import has_complete_3d_dimensions
 from src.enrichment_cost_history import append_cost_history
+from src.image_cache import ImageCache as _ImageCache
 from src.image_presence import row_has_image
 from src.image_evidence import product_name_appears_in_text, sku_appears_in_text
 from src.image_uploader import fetch_convert_upload_remote_image, is_public_https_image_url
 from src.measurement_parser import normalize_dimension_fields
 from src.manufacturer_domains import get_domain_for_brand, record_discovered_domain, record_verified_domain
 from src.official_product_lookup import lookup_official_product_page
-from src.product_evidence import ProductEvidence, score_product_page
+from src.preferred_websites import (
+    preferred_direct_urls_for_row,
+    preferred_domains_for_row,
+    record_preferred_website_result,
+)
+from src.product_evidence import ProductEvidence, normalize_sku, score_product_page
 from src.product_images import extract_product_page_image
 from src.product_lookup_cache import (
     ProductLookupCache as _ProductLookupCache,
@@ -44,7 +51,7 @@ from src.product_lookup_cache import (
 )
 from src.product_page_specs import extract_product_page_specs
 from src.product_resolver import resolve_product_page
-from src.spec_extraction import DimensionExtractionResult, extract_dimensions_from_html
+from src.spec_extraction import DimensionExtractionResult, extract_dimensions_from_html, extract_dimensions_from_pdf_bytes
 from src.source_success_registry import preferred_source_domains_for_row, record_source_success
 
 try:
@@ -75,6 +82,7 @@ from src.enrichment_cache import (
 # Module-level singleton — lazy-loads on first access
 _product_cache = _ProductEnrichmentCache()
 _lookup_cache = _ProductLookupCache()
+_image_cache = _ImageCache()
 
 # Cache field mappings: cache field name → row column name
 _CACHE_GENERAL_FIELDS: dict[str, str] = {
@@ -117,13 +125,13 @@ _TARGETED_RETRY_MODES: dict[str, dict[str, object]] = {
         "allow_unverified_product_url_fetch": False,
     },
     "conservative": {
-        "max_extra_retries_per_item": 1,
+        "max_extra_retries_per_item": 2,
         "max_extra_cost_per_row": 0.006,
         "max_extra_cost_per_run": 0.04,
         "max_searches_per_item": 1,
-        "max_fetches_per_item": 1,
+        "max_fetches_per_item": 2,
         "allow_search": True,
-        "allow_image_search": False,
+        "allow_image_search": True,
         "allow_unverified_product_url_fetch": False,
     },
     "balanced": {
@@ -428,6 +436,14 @@ def build_search_queries(row: dict) -> list[str]:
         if cleaned and cleaned not in queries:
             queries.append(cleaned)
 
+    for domain in preferred_domains_for_row(row):
+        if model:
+            add(f'site:{domain} "{model}" dimensions')
+            add(f'site:{domain} "{model}" product image')
+            add(f'site:{domain} "{model}" spec sheet')
+        elif product_name:
+            add(f'site:{domain} "{product_name}" dimensions')
+            add(f'site:{domain} "{product_name}" product image')
     if brand and model:
         add(f'"{brand}" "{model}"')
     if brand and product_name:
@@ -443,9 +459,15 @@ def build_search_queries(row: dict) -> list[str]:
 def _manufacturer_domains_for_search(row: dict) -> list[str]:
     brand = _str_val(row.get("Brand"))
     domains: list[str] = []
+    for domain in preferred_domains_for_row(row):
+        if domain not in domains:
+            domains.append(domain)
     direct = get_domain_for_brand(brand)
     if direct and direct[0] not in domains:
         domains.append(direct[0])
+    for domain in preferred_source_domains_for_row(row):
+        if domain not in domains:
+            domains.append(domain)
     for domain in registry_domains_for_brand(brand):
         if domain not in domains:
             domains.append(domain)
@@ -470,6 +492,10 @@ def build_product_search_queries(row: dict, manufacturer_domain: str | None = No
             queries.append(cleaned)
 
     if domain and sku:
+        for preferred_domain in preferred_domains_for_row(row):
+            add(f'site:{preferred_domain} "{sku}" dimensions')
+            add(f'site:{preferred_domain} "{sku}" product image')
+            add(f'site:{preferred_domain} "{sku}" spec sheet')
         add(f'site:{domain} "{sku}" specifications')
         add(f'site:{domain} "{sku}" product')
         add(f'site:{domain} "{sku}" images')
@@ -678,21 +704,26 @@ def _apply_enrichment(
         if field == "Dimensions":
             dim_extracted = _str_val(extracted.get("Dimensions"))
             if dim_extracted:
-                if has_complete_3d_dimensions(dim_extracted):
-                    # Always accept complete 3D, even if row already had partial dims
-                    updated["Dimensions"] = dim_extracted
-                else:
-                    # Partial found — note it, but do not fill
-                    existing_notes = _str_val(updated.get("Notes"))
-                    partial_note = (
-                        f"[Partial dimension found: {dim_extracted}; "
-                        "full W x H x D still needed]"
+                parsed_parts = normalize_dimension_fields({"Dimensions": dim_extracted})[0]
+                incoming_confidence = "high" if has_complete_3d_dimensions(dim_extracted) else "low"
+                if incoming_confidence == "high" or not _str_val(updated.get("Dimensions")):
+                    _apply_dimension_evidence_to_row(
+                        updated,
+                        {
+                            "dimensions": _str_val(parsed_parts.get("Dimensions")) or dim_extracted,
+                            "width": _str_val(parsed_parts.get("Width (in)")),
+                            "height": _str_val(parsed_parts.get("Height (in)")),
+                            "depth": _str_val(parsed_parts.get("Depth (in)")),
+                            "length": _str_val(parsed_parts.get("Length (in)")),
+                            "confidence": incoming_confidence,
+                            "evidence_text": dim_extracted,
+                        },
+                        source_url=source_url,
+                        confidence=incoming_confidence,
+                        source_type="legacy_enrichment",
+                        method="legacy_enrichment:extracted_dimensions",
+                        source_pass="legacy_enrichment",
                     )
-                    if partial_note not in existing_notes:
-                        updated["Notes"] = (
-                            f"{existing_notes} {partial_note}".strip()
-                            if existing_notes else partial_note
-                        )
             continue
 
         # Never overwrite non-empty fields for all other enrichable fields
@@ -1026,14 +1057,244 @@ def _try_image_from_url(
     _log.info("[IMAGE PIPELINE] found url=%s img=%s", product_url[:60], candidate[:80])
     if cache_key:
         _product_cache.update(cache_key, {"image_url": candidate, "general_confidence": "medium"})
+    if row:
+        cached_row = {**row, "Image URL": candidate, "Product URL": product_url, "confidence": "MEDIUM", "image_source": "product_url"}
+        _save_image_cache_from_row(cached_row, {"selected_image_reason": "product_url_image_extraction"})
     return candidate
 
 
 _CONF_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3}
 
 
+def _dimension_attr(source, name: str) -> str:
+    if isinstance(source, dict):
+        return _str_val(source.get(name))
+    return _str_val(getattr(source, name, ""))
+
+
+def _stamp_separate_dimension_fields(updated: dict, source) -> None:
+    """Persist product/cutout/shipping axes without changing export columns."""
+    product_width = _dimension_attr(source, "product_width") or _dimension_attr(source, "width")
+    product_height = _dimension_attr(source, "product_height") or _dimension_attr(source, "height")
+    product_depth = _dimension_attr(source, "product_depth") or _dimension_attr(source, "depth")
+    for key, value in (
+        ("Product Width (in)", product_width),
+        ("Product Height (in)", product_height),
+        ("Product Depth (in)", product_depth),
+        ("Cutout Dimensions", _dimension_attr(source, "cutout_dimensions")),
+        ("Cutout Width (in)", _dimension_attr(source, "cutout_width")),
+        ("Cutout Height (in)", _dimension_attr(source, "cutout_height")),
+        ("Cutout Depth (in)", _dimension_attr(source, "cutout_depth")),
+        ("Shipping/Package Dimensions", _dimension_attr(source, "shipping_dimensions")),
+        ("Shipping Width (in)", _dimension_attr(source, "shipping_width")),
+        ("Shipping Height (in)", _dimension_attr(source, "shipping_height")),
+        ("Shipping Depth (in)", _dimension_attr(source, "shipping_depth")),
+    ):
+        if value and not _str_val(updated.get(key)):
+            updated[key] = value
+
+
+def _apply_dimension_evidence_to_row(
+    updated: dict,
+    source,
+    *,
+    source_url: str,
+    confidence: str,
+    source_type: str,
+    method: str,
+    source_pass: str,
+    debug: dict | None = None,
+    allow_replace_low_confidence_data: bool = False,
+) -> bool:
+    """Store complete or partial product dimensions by confidence tier.
+
+    HIGH is complete W/H/D, MEDIUM is two useful product axes, LOW is one
+    useful product axis. Cutout and shipping/package dimensions are recorded
+    separately and never used as the main product dimensions.
+    """
+    _stamp_separate_dimension_fields(updated, source)
+    dimensions = _dimension_attr(source, "dimensions")
+    if not dimensions:
+        return False
+
+    dim_conf = _str_val(confidence or _dimension_attr(source, "confidence")).lower()
+    if dim_conf not in {"high", "medium", "low"}:
+        return False
+
+    existing_dims = _str_val(updated.get("Dimensions"))
+    existing_conf = _str_val(updated.get("Dimension Confidence") or updated.get("dimension_confidence")).lower() or "none"
+    existing_complete = has_complete_3d_dimensions(existing_dims)
+    current_rank = _CONF_RANK.get(existing_conf, 0)
+    incoming_rank = _CONF_RANK.get(dim_conf, 0)
+    should_write = (
+        not existing_dims
+        or (
+            allow_replace_low_confidence_data
+            and existing_conf in {"none", "low"}
+            and incoming_rank >= current_rank
+        )
+        or (
+            not existing_complete
+            and incoming_rank > current_rank
+        )
+    )
+    if not should_write:
+        return False
+
+    updated["Dimensions"] = dimensions
+    for attr, column in (
+        ("width", "Width (in)"),
+        ("height", "Height (in)"),
+        ("depth", "Depth (in)"),
+        ("length", "Length (in)"),
+    ):
+        value = _dimension_attr(source, attr)
+        if value:
+            updated[column] = value
+    updated["dimension_width"] = _dimension_attr(source, "width")
+    updated["dimension_height"] = _dimension_attr(source, "height")
+    updated["dimension_depth"] = _dimension_attr(source, "depth")
+    updated["dimension_unit"] = _dimension_attr(source, "unit") or "in"
+    updated["raw_dimensions_text"] = _dimension_attr(source, "raw_dimensions_text") or _dimension_attr(source, "evidence_text")
+    updated["dimensions_source_url"] = source_url
+    updated["dimension_confidence_score"] = _dimension_attr(source, "confidence_score")
+    updated["Dimension Source URL"] = source_url
+    updated["Dimension Confidence"] = dim_conf
+    updated["Dimension Source Type"] = source_type
+    updated["Dimension Lookup Status"] = "found" if dim_conf in {"high", "medium"} else "found_low_confidence_partial"
+    updated["dimension_source_url"] = source_url
+    updated["dimension_confidence"] = dim_conf
+    updated["dimension_evidence"] = _dimension_attr(source, "evidence_text")
+    updated["dimension_raw_text"] = _dimension_attr(source, "raw_dimensions_text") or _dimension_attr(source, "evidence_text")
+    updated["Dimensions Extraction Method"] = method
+    updated["Dimensions Source Pass"] = source_pass
+    if dim_conf == "low":
+        updated["Review Required"] = True
+        if not _str_val(updated.get("Suggested Action")):
+            updated["Suggested Action"] = "Verify partial dimensions"
+    if debug is not None:
+        debug.update({
+            "dimensions_found": True,
+            "dimension_source_url": source_url,
+            "dimension_confidence": dim_conf,
+            "dimension_evidence": _dimension_attr(source, "evidence_text") or _dimension_attr(source, "raw_dimensions_text"),
+            "Dimensions Extraction Method": method,
+            "Dimension Failure Reason": "",
+        })
+    return True
+
+
 def _is_manual_image(row: dict) -> bool:
     return _str_val(row.get("image_source")).lower() == "manual_upload"
+
+
+def _append_diag(existing: object, note: str) -> str:
+    text = _str_val(existing)
+    if not text:
+        return note
+    if note in text:
+        return text
+    return f"{text}; {note}"
+
+
+def _apply_image_cache_to_row(row: dict, debug: dict | None = None) -> tuple[dict, bool]:
+    """Fill a blank image from durable/local image cache before any paid lookup."""
+    if row_has_image(row) or _is_manual_image(row):
+        return row, False
+    try:
+        entry = _image_cache.get_for_row(row)
+    except Exception:
+        entry = None
+    if not entry:
+        return row, False
+
+    image_url = _str_val(entry.get("image_url") or entry.get("Image URL"))
+    confidence = _str_val(entry.get("confidence") or entry.get("image_confidence")).upper()
+    if not image_url or confidence not in {"HIGH", "MEDIUM"}:
+        return row, False
+
+    updated = row.copy()
+    updated["Image URL"] = image_url
+    updated["image_source"] = _str_val(entry.get("source_type")) or "image_cache"
+    updated["confidence"] = confidence
+    updated["evidence"] = _str_val(entry.get("evidence")) or "image_cache_hit"
+    updated["needs_image_review"] = str(confidence != "HIGH")
+    updated["Image Recovery Source"] = "image_cache"
+    updated["Image Recovery Confidence"] = confidence
+    updated["Search Diagnostics"] = _append_diag(updated.get("Search Diagnostics"), "image_cache_hit")
+    if debug is not None:
+        debug["image_cache_status"] = "hit"
+        debug["selected_image_url"] = image_url
+        debug["Image Recovery Source"] = "image_cache"
+        debug["Image Recovery Confidence"] = confidence
+    return updated, True
+
+
+def _save_image_cache_from_row(row: dict, debug: dict | None = None) -> None:
+    image_url = _str_val(row.get("cloudinary_secure_url") or row.get("cloudinary_url") or row.get("Image URL"))
+    confidence = _str_val(
+        row.get("Image Recovery Confidence")
+        or row.get("_image_final_confidence")
+        or row.get("confidence")
+    ).upper()
+    if not image_url or confidence not in {"HIGH", "MEDIUM"}:
+        return
+    try:
+        _image_cache.save_for_row(
+            row,
+            image_url=image_url,
+            source_url=_str_val(row.get("Product URL") or row.get("Product Resolution URL")),
+            source_domain=urllib.parse.urlparse(_str_val(row.get("Product URL") or row.get("Product Resolution URL"))).netloc,
+            source_type=_str_val(row.get("image_source") or row.get("Image Recovery Source")),
+            confidence=confidence,
+            evidence=_str_val(row.get("evidence") or (debug or {}).get("selected_image_reason")),
+        )
+    except Exception:
+        return
+
+
+def _image_source_url(updated: dict, debug: dict) -> str:
+    return _str_val(
+        debug.get("selected_product_page_url")
+        or updated.get("Product Resolution URL")
+        or updated.get("Product URL")
+    )
+
+
+def _stamp_cloudinary_handoff_fields(
+    updated: dict,
+    debug: dict,
+    *,
+    original_url: str,
+    source_type: str,
+    status: str,
+    error: str = "",
+    cloudinary_url: str = "",
+) -> None:
+    confidence = _str_val(
+        debug.get("Image Recovery Confidence")
+        or updated.get("Image Recovery Confidence")
+        or updated.get("_image_final_confidence")
+        or updated.get("confidence")
+    ).upper()
+    source_url = _image_source_url(updated, debug)
+    ready = bool(cloudinary_url and is_public_https_image_url(cloudinary_url))
+    values = {
+        "original_image_url": original_url,
+        "cloudinary_url": cloudinary_url,
+        "image_confidence": confidence,
+        "image_source_url": source_url,
+        "cloudinary_status": status,
+        "cloudinary_error": error,
+        "programa_image_ready": str(ready),
+    }
+    for key, value in values.items():
+        updated[key] = value
+        debug[key] = value
+    if original_url:
+        updated["Original Image URL"] = _str_val(updated.get("Original Image URL")) or original_url
+    if cloudinary_url:
+        updated["cloudinary_secure_url"] = cloudinary_url
 
 
 def _budget_diagnostics(budget) -> dict:
@@ -1130,11 +1391,15 @@ def _maybe_upload_selected_image_to_cloudinary(
     *,
     candidate_url: str,
     source_type: str = "",
+    run_budget=None,
+    item_key: str = "",
 ) -> None:
     candidate = _str_val(candidate_url)
     if not candidate or _is_manual_image(updated):
         return
     if "res.cloudinary.com/" in candidate.lower():
+        updated["Original Image URL"] = _str_val(updated.get("Original Image URL")) or candidate
+        updated["cloudinary_secure_url"] = candidate
         updated["image_upload_status"] = "uploaded"
         updated["Image Upload Status"] = "Uploaded"
         debug["image_upload_status"] = "uploaded"
@@ -1145,6 +1410,15 @@ def _maybe_upload_selected_image_to_cloudinary(
             "final_saved_image_url": candidate,
             "status": "already_cloudinary",
         }
+        _stamp_cloudinary_handoff_fields(
+            updated,
+            debug,
+            original_url=candidate,
+            source_type=source_type,
+            status="uploaded",
+            cloudinary_url=candidate,
+        )
+        _save_image_cache_from_row(updated, debug)
         return
     if not is_public_https_image_url(candidate):
         updated["image_upload_status"] = "failed"
@@ -1152,7 +1426,41 @@ def _maybe_upload_selected_image_to_cloudinary(
         updated["image_upload_failure_reason"] = "non_https_candidate_url"
         debug["image_upload_status"] = "failed"
         debug["image_upload_failure_reason"] = "non_https_candidate_url"
+        _stamp_cloudinary_handoff_fields(
+            updated,
+            debug,
+            original_url=candidate,
+            source_type=source_type,
+            status="failed",
+            error="non_https_candidate_url",
+        )
         return
+
+    if run_budget is not None:
+        cost = float(getattr(run_budget, "image_upload_cost_usd", 0.001) or 0.0)
+        if not run_budget.consume(
+            "image_upload",
+            cost,
+            item_key=item_key or _duplicate_key(updated),
+            field="Image URL",
+            reason="Cloudinary fetch/convert/upload selected product image",
+            stage="image_upload",
+            source_function="_maybe_upload_selected_image_to_cloudinary",
+        ):
+            updated["image_upload_status"] = "skipped"
+            updated["Image Upload Status"] = "Upload skipped"
+            updated["image_upload_failure_reason"] = "budget_exhausted"
+            debug["image_upload_status"] = "skipped"
+            debug["image_upload_failure_reason"] = "budget_exhausted"
+            _stamp_cloudinary_handoff_fields(
+                updated,
+                debug,
+                original_url=candidate,
+                source_type=source_type,
+                status="skipped",
+                error="budget_exhausted",
+            )
+            return
 
     result = fetch_convert_upload_remote_image(candidate, source_type=source_type)
     upload_debug = result.debug or {}
@@ -1162,9 +1470,19 @@ def _maybe_upload_selected_image_to_cloudinary(
     updated["_image_upload_debug"] = json.dumps(upload_debug)
     updated["image_upload_status"] = result.status
     updated["image_upload_failure_reason"] = result.error
+    _stamp_cloudinary_handoff_fields(
+        updated,
+        debug,
+        original_url=candidate,
+        source_type=source_type,
+        status=result.status,
+        error=result.error,
+        cloudinary_url=result.secure_url,
+    )
     if result.secure_url:
         updated["Original Image URL"] = candidate
         updated["Image URL"] = result.secure_url
+        updated["cloudinary_url"] = result.secure_url
         updated["cloudinary_secure_url"] = result.secure_url
         updated["cloudinary_public_id"] = result.public_id
         updated["cloudinary_width"] = result.width
@@ -1174,6 +1492,7 @@ def _maybe_upload_selected_image_to_cloudinary(
         updated["Image Upload Status"] = "Uploaded"
         debug["original_selected_image_url"] = candidate
         debug["selected_image_url"] = result.secure_url
+        debug["cloudinary_url"] = result.secure_url
         debug["cloudinary_secure_url"] = result.secure_url
         debug["cloudinary_public_id"] = result.public_id
         debug["cloudinary_width"] = result.width
@@ -1184,6 +1503,7 @@ def _maybe_upload_selected_image_to_cloudinary(
         updated["Image Upload Status"] = "Upload skipped"
     else:
         updated["Image Upload Status"] = "Upload failed"
+    _save_image_cache_from_row(updated, debug)
 
 
 def _dimension_result_from_extraction(
@@ -1285,38 +1605,27 @@ def _focused_dimension_pass_from_cached_pages(
             continue
 
         extraction = extract_dimensions_from_html(html, updated)
-        confidence = "high" if page_evidence.confidence == "high" and extraction.confidence == "high" else "medium"
-        if extraction.dimensions and extraction.confidence in {"high", "medium"}:
-            updated["Dimensions"] = extraction.dimensions
-            updated["Width (in)"] = extraction.width
-            updated["Height (in)"] = extraction.height
-            updated["Depth (in)"] = extraction.depth
-            if extraction.length:
-                updated["Length (in)"] = extraction.length
-            updated["dimension_width"] = extraction.width
-            updated["dimension_height"] = extraction.height
-            updated["dimension_depth"] = extraction.depth
-            updated["dimension_unit"] = extraction.unit or "in"
-            updated["raw_dimensions_text"] = extraction.raw_dimensions_text or extraction.evidence_text
-            updated["dimensions_source_url"] = url
-            updated["dimension_confidence_score"] = extraction.confidence_score
-            updated["Dimension Source URL"] = url
-            updated["Dimension Confidence"] = confidence
-            updated["Dimension Source Type"] = "cached_verified_product_page"
-            updated["Dimension Lookup Status"] = "found"
-            updated["dimension_source_url"] = url
-            updated["dimension_confidence"] = confidence
-            updated["dimension_evidence"] = extraction.evidence_text or extraction.raw_dimensions_text
-            updated["dimension_raw_text"] = extraction.raw_dimensions_text or extraction.evidence_text
-
+        confidence = (
+            "low"
+            if extraction.confidence == "low"
+            else "high"
+            if page_evidence.confidence == "high" and extraction.confidence == "high"
+            else "medium"
+        )
+        if extraction.dimensions and extraction.confidence in {"high", "medium", "low"}:
+            method = f"focused_cached_page:{extraction.diagnostics.get('method', extraction.source_type)}"
+            filled_main = _apply_dimension_evidence_to_row(
+                updated,
+                extraction,
+                source_url=url,
+                confidence=confidence,
+                source_type="cached_verified_product_page",
+                method=method,
+                source_pass="focused_cached_page",
+                debug=debug,
+            )
             debug.update({
-                "dimensions_found": True,
-                "dimension_source_url": url,
-                "dimension_confidence": confidence,
-                "dimension_evidence": extraction.evidence_text or extraction.raw_dimensions_text,
-                "Dimensions Extraction Method": f"focused_cached_page:{extraction.diagnostics.get('method', extraction.source_type)}",
                 "Dimension Search Sources": json.dumps([source[0] for source in sources]),
-                "Dimension Failure Reason": "",
                 "Dimension Extra Cost": "$0.0000 (reused cached/selected page HTML)",
             })
             record_source_success(
@@ -1324,7 +1633,7 @@ def _focused_dimension_pass_from_cached_pages(
                 domain=urllib.parse.urlparse(url).netloc,
                 url=url,
                 fields_found={
-                    "dimensions": True,
+                    "dimensions": filled_main,
                     "image": row_has_image(updated),
                     "product_url": True,
                     "spec_sheet": False,
@@ -1455,17 +1764,49 @@ def _retry_can_consume(
         return False
     if state.get("attempts", 0) >= config.max_extra_retries_per_item:
         if run_budget is not None:
-            run_budget.record_skip(kind, cost_usd, item_key=item_key, field=field, reason="targeted retry per-item limit", query=query)
+            run_budget.record_skip(
+                kind,
+                cost_usd,
+                item_key=item_key,
+                field=field,
+                reason="targeted retry per-item limit",
+                query=query,
+                source_function="_targeted_missing_field_retry",
+            )
         return False
     if state.get("extra_cost_usd", 0.0) + cost_usd > config.max_extra_cost_per_row:
         if run_budget is not None:
-            run_budget.record_skip(kind, cost_usd, item_key=item_key, field=field, reason="targeted retry per-row cost cap", query=query)
+            run_budget.record_skip(
+                kind,
+                cost_usd,
+                item_key=item_key,
+                field=field,
+                reason="targeted retry per-row cost cap",
+                query=query,
+                source_function="_targeted_missing_field_retry",
+            )
         return False
     if config.extra_cost_used + cost_usd > config.max_extra_cost_per_run:
         if run_budget is not None:
-            run_budget.record_skip(kind, cost_usd, item_key=item_key, field=field, reason="targeted retry per-run cost cap", query=query)
+            run_budget.record_skip(
+                kind,
+                cost_usd,
+                item_key=item_key,
+                field=field,
+                reason="targeted retry per-run cost cap",
+                query=query,
+                source_function="_targeted_missing_field_retry",
+            )
         return False
-    if run_budget is not None and not run_budget.can_spend(kind, cost_usd, item_key=item_key, field=field, reason=reason, query=query):
+    if run_budget is not None and not run_budget.can_spend(
+        kind,
+        cost_usd,
+        item_key=item_key,
+        field=field,
+        reason=reason,
+        query=query,
+        source_function="_targeted_missing_field_retry",
+    ):
         return False
     return True
 
@@ -1493,6 +1834,7 @@ def _retry_consume(
             reason=reason,
             stage="targeted_missing_field_retry",
             query=query,
+            source_function="_targeted_missing_field_retry",
         ):
             return False
     state["extra_cost_usd"] = round(float(state.get("extra_cost_usd", 0.0)) + cost_usd, 6)
@@ -1516,7 +1858,14 @@ def _fetch_retry_html(
     cost = getattr(run_budget, "fetch_cost_usd", 0.0005) if run_budget is not None else 0.0
     if state.get("fetches", 0) >= config.max_fetches_per_item:
         if run_budget is not None:
-            run_budget.record_skip("fetch", cost, item_key=item_key, field=field, reason="targeted retry fetch limit")
+            run_budget.record_skip(
+                "fetch",
+                cost,
+                item_key=item_key,
+                field=field,
+                reason="targeted retry fetch limit",
+                source_function="_fetch_retry_html",
+            )
         return "", "fetch_limit"
     if not _retry_consume(
         config,
@@ -1536,6 +1885,339 @@ def _fetch_retry_html(
     return html, "fetched_product_page" if html else "fetch_failed"
 
 
+def _spec_pdf_links_from_html(html: str, page_url: str, row: dict) -> list[str]:
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    sku = _str_val(row.get("Model/SKU") or row.get("SKU"))
+    product_name = _str_val(row.get("Product Name"))
+    brand = _str_val(row.get("Brand"))
+    identity = " ".join(part for part in (sku, product_name, brand) if part)
+    urls: list[str] = []
+    for link in soup.find_all("a", href=True):
+        href = _str_val(link.get("href"))
+        label = link.get_text(" ", strip=True)
+        context = f"{href} {label}".lower()
+        if not href or ".pdf" not in href.lower():
+            continue
+        if not re.search(r"spec|dimension|measurement|install|guide|manual|download|resource|sheet", context, re.I):
+            continue
+        if sku and not sku_appears_in_text(sku, f"{href} {label} {page_url}"):
+            # Allow generic "spec sheet" links on an already verified product
+            # page, but reject PDFs that point at a different explicit model.
+            compact_context = re.sub(r"[^a-z0-9]+", "", context)
+            explicit_models = re.findall(r"\b[a-z]{1,6}[- ]?\d[a-z0-9/-]{3,}\b", context, re.I)
+            if explicit_models and normalize_sku(sku) not in compact_context:
+                continue
+        elif not sku and identity and not product_name_appears_in_text(identity, f"{href} {label} {page_url}"):
+            continue
+        absolute = urllib.parse.urljoin(page_url, href)
+        if absolute not in urls:
+            urls.append(absolute)
+    return urls[:3]
+
+
+def _url_looks_like_pdf(url: str) -> bool:
+    return urllib.parse.urlparse(url).path.lower().endswith(".pdf")
+
+
+def _fetch_retry_pdf_bytes(
+    url: str,
+    *,
+    session_cache: "_SessionCache | None",
+    config: TargetedRetryConfig,
+    state: dict,
+    run_budget,
+    item_key: str,
+    field: str,
+) -> tuple[bytes, str]:
+    if session_cache is not None and url in session_cache.urls:
+        cached = session_cache.urls[url]
+        if isinstance(cached, bytes):
+            return cached, "cached_spec_pdf"
+    cost = getattr(run_budget, "fetch_cost_usd", 0.0005) if run_budget is not None else 0.0
+    if state.get("fetches", 0) >= config.max_fetches_per_item:
+        if run_budget is not None:
+            run_budget.record_skip(
+                "fetch",
+                cost,
+                item_key=item_key,
+                field=field,
+                reason="targeted retry spec PDF fetch limit",
+                source_function="_fetch_retry_pdf_bytes",
+            )
+        return b"", "fetch_limit"
+    if not _retry_consume(
+        config,
+        state,
+        run_budget,
+        "fetch",
+        cost,
+        item_key=item_key,
+        field=field,
+        reason=f"targeted retry fetch spec PDF for {field}",
+    ):
+        return b"", "budget_skipped"
+    state["fetches"] = int(state.get("fetches", 0)) + 1
+    try:
+        resp = httpx.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; SCH-Intake/1.0)"},
+            timeout=12,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        content_type = str(resp.headers.get("content-type", "") or "").lower()
+        if "pdf" not in content_type and not url.lower().split("?", 1)[0].endswith(".pdf"):
+            return b"", "not_pdf"
+        data = resp.content
+        if session_cache is not None and data:
+            session_cache.urls[url] = data
+        return data, "fetched_spec_pdf" if data else "empty_pdf"
+    except Exception as exc:
+        return b"", f"fetch_failed:{exc}"
+
+
+def _fetch_verified_spec_pdf_bytes(
+    url: str,
+    *,
+    session_cache: "_SessionCache | None",
+    budget: "_SearchBudget | None",
+) -> tuple[bytes, str]:
+    """Fetch a spec PDF linked from an already verified product page.
+
+    This is still budgeted, but it is intentionally separate from the targeted
+    retry limits because it exploits the selected product page before any new
+    search or AI fallback.
+    """
+    if session_cache is not None and url in session_cache.urls:
+        cached = session_cache.urls[url]
+        if isinstance(cached, bytes):
+            return cached, "cached_spec_pdf"
+
+    if budget is not None:
+        if hasattr(budget, "can_fetch") and not budget.can_fetch():
+            return b"", "budget_skipped"
+        if hasattr(budget, "consume_fetch"):
+            budget.consume_fetch()
+
+    try:
+        resp = httpx.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; SCH-Intake/1.0)"},
+            timeout=12,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        content_type = str(resp.headers.get("content-type", "") or "").lower()
+        if "pdf" not in content_type and not url.lower().split("?", 1)[0].endswith(".pdf"):
+            return b"", "not_pdf"
+        data = resp.content
+        if session_cache is not None and data:
+            session_cache.urls[url] = data
+        return data, "fetched_spec_pdf" if data else "empty_pdf"
+    except Exception as exc:
+        return b"", f"fetch_failed:{exc}"
+
+
+def _apply_verified_spec_pdf_dimensions(
+    updated: dict,
+    *,
+    pdf_url: str,
+    pdf_bytes: bytes,
+    page_evidence: ProductEvidence | None,
+    debug: dict,
+) -> _DimensionResult | None:
+    if not pdf_bytes or has_complete_3d_dimensions(_str_val(updated.get("Dimensions"))):
+        return None
+
+    extraction = extract_dimensions_from_pdf_bytes(pdf_bytes, updated)
+    attempt = {
+        "url": pdf_url,
+        "status": "parsed",
+        "confidence": extraction.confidence,
+        "method": extraction.diagnostics.get("method", extraction.source_type),
+        "failure_reason": extraction.diagnostics.get("failure_reason", ""),
+    }
+    debug.setdefault("verified_spec_pdf_attempts", []).append(attempt)
+    if not extraction.dimensions or extraction.confidence not in {"high", "medium", "low"}:
+        debug.setdefault("failed_fields", {})["verified_spec_pdf_dimensions"] = (
+            extraction.diagnostics.get("failure_reason") or "product_dimensions_not_found_in_verified_spec_pdf"
+        )
+        return None
+
+    page_confidence = _str_val(getattr(page_evidence, "confidence", "")).lower()
+    dim_confidence = (
+        "low"
+        if extraction.confidence == "low"
+        else "high"
+        if page_confidence == "high" and extraction.confidence == "high"
+        else "medium"
+    )
+    method = f"verified_page:spec_pdf:{extraction.diagnostics.get('method', extraction.source_type)}"
+    _apply_dimension_evidence_to_row(
+        updated,
+        extraction,
+        source_url=pdf_url,
+        confidence=dim_confidence,
+        source_type="verified_product_page_spec_pdf",
+        method=method,
+        source_pass="verified_product_page",
+        debug=debug,
+    )
+
+    debug.update({
+        "dimensions_found": True,
+        "dimension_source_url": pdf_url,
+        "dimension_confidence": dim_confidence,
+        "dimension_evidence": extraction.evidence_text or extraction.raw_dimensions_text,
+        "dimension_spec_pdf_url": pdf_url,
+        "Dimensions Extraction Method": method,
+        "Dimension Search Sources": json.dumps([pdf_url]),
+        "Dimension Failure Reason": "",
+    })
+    record_source_success(
+        updated,
+        domain=urllib.parse.urlparse(pdf_url).netloc,
+        url=pdf_url,
+        fields_found={
+            "dimensions": True,
+            "image": row_has_image(updated),
+            "product_url": bool(_str_val(updated.get("Product URL"))),
+            "spec_sheet": True,
+        },
+        confidence=dim_confidence,
+    )
+    record_preferred_website_result(
+        domain=urllib.parse.urlparse(pdf_url).netloc,
+        url=pdf_url,
+        success=True,
+        fields_found={
+            "dimensions": True,
+            "image": row_has_image(updated),
+            "product_url": bool(_str_val(updated.get("Product URL"))),
+            "spec_sheet": True,
+            "specs": True,
+        },
+        status="verified_page_spec_pdf_success",
+    )
+    return _DimensionResult(
+        dimensions=extraction.dimensions,
+        width=extraction.width,
+        height=extraction.height,
+        depth=extraction.depth,
+        length=extraction.length,
+        source_url=pdf_url,
+        confidence=dim_confidence,
+        source_type="verified_product_page_spec_pdf",
+        status="found",
+        urls_checked=[pdf_url],
+        evidence_text=extraction.evidence_text or extraction.raw_dimensions_text,
+    )
+
+
+def _try_verified_spec_pdfs_for_dimensions(
+    updated: dict,
+    *,
+    html: str,
+    page_url: str,
+    page_evidence: ProductEvidence | None,
+    session_cache: "_SessionCache | None",
+    budget: "_SearchBudget | None",
+    debug: dict,
+) -> _DimensionResult | None:
+    if has_complete_3d_dimensions(_str_val(updated.get("Dimensions"))):
+        return None
+
+    links = _spec_pdf_links_from_html(html, page_url, updated)
+    debug["verified_spec_pdf_links_found"] = len(links)
+    for pdf_url in links[:2]:
+        pdf_bytes, status = _fetch_verified_spec_pdf_bytes(
+            pdf_url,
+            session_cache=session_cache,
+            budget=budget,
+        )
+        debug.setdefault("verified_spec_pdf_attempts", []).append({
+            "url": pdf_url,
+            "status": status,
+        })
+        if not pdf_bytes:
+            continue
+        result = _apply_verified_spec_pdf_dimensions(
+            updated,
+            pdf_url=pdf_url,
+            pdf_bytes=pdf_bytes,
+            page_evidence=page_evidence,
+            debug=debug,
+        )
+        if result is not None:
+            return result
+    return None
+
+
+def _apply_retry_dimensions_from_spec_pdf(
+    updated: dict,
+    *,
+    pdf_url: str,
+    pdf_bytes: bytes,
+    page_evidence: ProductEvidence,
+    debug: dict,
+    source_label: str,
+) -> list[str]:
+    if not pdf_bytes or has_complete_3d_dimensions(_str_val(updated.get("Dimensions"))):
+        return []
+    extraction = extract_dimensions_from_pdf_bytes(pdf_bytes, updated)
+    if not extraction.dimensions or extraction.confidence not in {"high", "medium", "low"}:
+        debug.setdefault("failed_fields", {})["dimensions_pdf"] = extraction.diagnostics.get("failure_reason") or "product_dimensions_not_found_in_pdf"
+        return []
+    dim_confidence = (
+        "low"
+        if extraction.confidence == "low"
+        else "high"
+        if page_evidence.confidence == "high" and extraction.confidence == "high"
+        else "medium"
+    )
+    method = f"targeted_retry:{source_label}:spec_pdf:{extraction.diagnostics.get('method', extraction.source_type)}"
+    filled = _apply_dimension_evidence_to_row(
+        updated,
+        extraction,
+        source_url=pdf_url,
+        confidence=dim_confidence,
+        source_type=f"targeted_retry_{source_label}_spec_pdf",
+        method=method,
+        source_pass="targeted_retry",
+        debug=debug,
+    )
+    record_source_success(
+        updated,
+        domain=urllib.parse.urlparse(pdf_url).netloc,
+        url=pdf_url,
+        fields_found={
+            "dimensions": True,
+            "image": row_has_image(updated),
+            "product_url": bool(_str_val(updated.get("Product URL"))),
+            "spec_sheet": True,
+        },
+        confidence=dim_confidence,
+    )
+    record_preferred_website_result(
+        domain=urllib.parse.urlparse(pdf_url).netloc,
+        url=pdf_url,
+        success=True,
+        fields_found={
+            "dimensions": True,
+            "image": row_has_image(updated),
+            "product_url": bool(_str_val(updated.get("Product URL"))),
+            "spec_sheet": True,
+            "specs": True,
+        },
+        status="targeted_retry_spec_pdf_success",
+    )
+    debug["dimension_method"] = method
+    debug["dimension_spec_pdf_url"] = pdf_url
+    return ["dimensions"] if filled else []
+
+
 def _page_evidence_for_retry(row: dict, url: str, html: str) -> ProductEvidence:
     confidence = _str_val(row.get("Product Resolution Confidence")).lower()
     resolution_url = _str_val(row.get("Product Resolution URL") or row.get("selected_product_page_url"))
@@ -1553,6 +2235,31 @@ def _page_evidence_for_retry(row: dict, url: str, html: str) -> ProductEvidence:
     return score_product_page(row, url, html)
 
 
+def _preferred_page_evidence_for_retry(row: dict, url: str, html: str) -> ProductEvidence:
+    evidence = _page_evidence_for_retry(row, url, html)
+    if evidence.confidence in {"high", "medium"}:
+        return evidence
+    if _str_val(row.get("Model/SKU") or row.get("SKU")):
+        return evidence
+    brand = _str_val(row.get("Brand"))
+    product_name = _str_val(row.get("Product Name"))
+    page_text = _html_to_text(html)
+    brand_ok = bool(brand and product_name_appears_in_text(brand, f"{url} {page_text}"))
+    product_ok = bool(product_name and product_name_appears_in_text(product_name, f"{url} {page_text}"))
+    if brand_ok and product_ok:
+        return ProductEvidence(
+            confidence="medium",
+            score=max(65, evidence.score),
+            matched_sku=False,
+            matched_brand=True,
+            matched_product_name=True,
+            official_domain=evidence.official_domain,
+            domain=evidence.domain or urllib.parse.urlparse(url).netloc.lower(),
+            evidence_summary="preferred_direct_page_brand_product_match",
+        )
+    return evidence
+
+
 def _apply_retry_extraction_from_html(
     updated: dict,
     *,
@@ -1563,6 +2270,8 @@ def _apply_retry_extraction_from_html(
     debug: dict,
     source_label: str,
     allow_replace_low_confidence_data: bool = False,
+    run_budget=None,
+    item_key: str = "",
 ) -> list[str]:
     filled: list[str] = []
     if page_evidence.confidence not in {"high", "medium"}:
@@ -1571,6 +2280,13 @@ def _apply_retry_extraction_from_html(
             "reason": page_evidence.rejection_reason or page_evidence.confidence,
             "score": page_evidence.score,
         })
+        record_preferred_website_result(
+            domain=urllib.parse.urlparse(url).netloc,
+            url=url,
+            success=False,
+            fields_found={},
+            status=page_evidence.rejection_reason or page_evidence.confidence or "rejected_page",
+        )
         return filled
 
     specs_result = None
@@ -1622,30 +2338,24 @@ def _apply_retry_extraction_from_html(
     ):
         page_specs = specs()
         dim_conf = page_specs.confidence
-        if page_specs.dimensions and dim_conf in {"high", "medium"}:
-            updated["Dimensions"] = page_specs.dimensions
-            if page_specs.width:
-                updated["Width (in)"] = page_specs.width
-            if page_specs.height:
-                updated["Height (in)"] = page_specs.height
-            if page_specs.depth:
-                updated["Depth (in)"] = page_specs.depth
-            if page_specs.length:
-                updated["Length (in)"] = page_specs.length
-            updated["Dimension Source URL"] = url
-            updated["Dimension Confidence"] = dim_conf
-            updated["Dimension Source Type"] = f"targeted_retry_{source_label}"
-            updated["Dimension Lookup Status"] = "found"
-            updated["dimension_source_url"] = url
-            updated["dimension_confidence"] = dim_conf
-            updated["dimension_evidence"] = page_specs.evidence
-            updated["dimension_raw_text"] = page_specs.raw_text
-            updated["Dimensions Extraction Method"] = f"targeted_retry:{source_label}:{page_specs.debug.get('dimension_failure_reason') or page_specs.evidence or 'spec_extraction'}"
-            updated["Dimensions Source Pass"] = "targeted_retry"
-            filled.append("dimensions")
-            debug["dimension_method"] = updated["Dimensions Extraction Method"]
+        if page_specs.dimensions and dim_conf in {"high", "medium", "low"}:
+            method = f"targeted_retry:{source_label}:{page_specs.debug.get('dimension_failure_reason') or page_specs.evidence or 'spec_extraction'}"
+            filled_dim = _apply_dimension_evidence_to_row(
+                updated,
+                page_specs,
+                source_url=url,
+                confidence=dim_conf,
+                source_type=f"targeted_retry_{source_label}",
+                method=method,
+                source_pass="targeted_retry",
+                debug=debug,
+                allow_replace_low_confidence_data=allow_replace_low_confidence_data,
+            )
+            if filled_dim:
+                filled.append("dimensions")
+            debug["dimension_method"] = method
         else:
-            debug.setdefault("failed_fields", {})["dimensions"] = page_specs.debug.get("dimension_failure_reason") or "complete_w_h_d_not_found"
+            debug.setdefault("failed_fields", {})["dimensions"] = page_specs.debug.get("dimension_failure_reason") or "product_dimensions_not_found"
 
     if (
         "image" in missing_fields
@@ -1678,6 +2388,8 @@ def _apply_retry_extraction_from_html(
                 debug,
                 candidate_url=image.image_url,
                 source_type=image.image_source,
+                run_budget=run_budget,
+                item_key=item_key,
             )
             filled.append("image")
         else:
@@ -1705,6 +2417,18 @@ def _apply_retry_extraction_from_html(
             },
             confidence=page_evidence.confidence,
         )
+        record_preferred_website_result(
+            domain=urllib.parse.urlparse(url).netloc,
+            url=url,
+            success=True,
+            fields_found={
+                "dimensions": has_complete_3d_dimensions(_str_val(updated.get("Dimensions"))),
+                "image": row_has_image(updated),
+                "product_url": bool(_str_val(updated.get("Product URL"))),
+                "specs": bool(filled),
+            },
+            status="targeted_retry_success",
+        )
     return filled
 
 
@@ -1713,7 +2437,7 @@ def _targeted_retry_queries(row: dict, missing_fields: list[str], config: Target
     model = _str_val(row.get("Model/SKU") or row.get("SKU"))
     product_name = _str_val(row.get("Product Name"))
     domains: list[str] = []
-    for domain in [*preferred_source_domains_for_row(row), *_manufacturer_domains_for_search(row)]:
+    for domain in [*preferred_domains_for_row(row), *preferred_source_domains_for_row(row), *_manufacturer_domains_for_search(row)]:
         if domain and domain not in domains:
             domains.append(domain)
     queries: list[str] = []
@@ -1823,12 +2547,179 @@ def _targeted_missing_field_retry(
     def record_attempt(**payload) -> None:
         debug["attempts"].append(payload)
 
+    def try_spec_pdfs(page_url: str, html: str, evidence: ProductEvidence, source_label: str, query: str = "") -> list[str]:
+        if "dimensions" not in actionable_missing or has_complete_3d_dimensions(_str_val(updated.get("Dimensions"))):
+            return []
+        if evidence.confidence not in {"high", "medium"}:
+            return []
+        filled_pdf_fields: list[str] = []
+        for pdf_url in _spec_pdf_links_from_html(html, page_url, updated):
+            if state["attempts"] >= config.max_extra_retries_per_item:
+                break
+            pdf_bytes, pdf_status = _fetch_retry_pdf_bytes(
+                pdf_url,
+                session_cache=session_cache,
+                config=config,
+                state=state,
+                run_budget=run_budget,
+                item_key=item_key,
+                field="dimensions",
+            )
+            state["attempts"] += 1
+            if not pdf_bytes:
+                record_attempt(source=f"{source_label}_spec_pdf", query=query, url=pdf_url, status=pdf_status, fields=[])
+                continue
+            filled = _apply_retry_dimensions_from_spec_pdf(
+                updated,
+                pdf_url=pdf_url,
+                pdf_bytes=pdf_bytes,
+                page_evidence=evidence,
+                debug=debug,
+                source_label=source_label,
+            )
+            debug["filled_fields"].extend(field for field in filled if field not in debug["filled_fields"])
+            filled_pdf_fields.extend(field for field in filled if field not in filled_pdf_fields)
+            record_attempt(
+                source=f"{source_label}_spec_pdf",
+                query=query,
+                url=pdf_url,
+                status="filled" if filled else "no_field_filled",
+                fields=filled,
+            )
+            if filled:
+                break
+        return filled_pdf_fields
+
     # Free or one-fetch retry from the already selected/verified product URL.
     product_url = _str_val(updated.get("Product URL") or updated.get("Product Resolution URL"))
     if product_url and (config.allow_unverified_product_url_fetch or _existing_product_url_is_trusted(updated, product_url)):
         field_label = ", ".join(actionable_missing)
+        if _url_looks_like_pdf(product_url) and "dimensions" in actionable_missing:
+            pdf_bytes, pdf_status = _fetch_retry_pdf_bytes(
+                product_url,
+                session_cache=session_cache,
+                config=config,
+                state=state,
+                run_budget=run_budget,
+                item_key=item_key,
+                field="dimensions",
+            )
+            state["attempts"] += 1
+            confidence = _str_val(updated.get("Product Resolution Confidence")).lower()
+            evidence = ProductEvidence(
+                confidence=confidence if confidence in {"high", "medium"} else "medium",
+                score=90 if confidence == "high" else 70,
+                matched_sku=True,
+                matched_brand=True,
+                matched_product_name=bool(_str_val(updated.get("Product Name"))),
+                official_domain=True,
+                domain=urllib.parse.urlparse(product_url).netloc.lower(),
+                evidence_summary="existing_verified_spec_pdf",
+            )
+            filled = _apply_retry_dimensions_from_spec_pdf(
+                updated,
+                pdf_url=product_url,
+                pdf_bytes=pdf_bytes,
+                page_evidence=evidence,
+                debug=debug,
+                source_label="existing_product_page",
+            )
+            debug["filled_fields"].extend(field for field in filled if field not in debug["filled_fields"])
+            record_attempt(source="existing_product_page_spec_pdf", url=product_url, status="filled" if filled else pdf_status, fields=filled)
+        else:
+            html, html_status = _fetch_retry_html(
+                product_url,
+                session_cache=session_cache,
+                config=config,
+                state=state,
+                run_budget=run_budget,
+                item_key=item_key,
+                field=field_label,
+            )
+            state["attempts"] += 1
+            if html:
+                evidence = _page_evidence_for_retry(updated, product_url, html)
+                filled = _apply_retry_extraction_from_html(
+                    updated,
+                    url=product_url,
+                    html=html,
+                    page_evidence=evidence,
+                    missing_fields=actionable_missing,
+                    debug=debug,
+                    source_label="existing_product_page",
+                    allow_replace_low_confidence_data=allow_replace_low_confidence_data,
+                    run_budget=run_budget,
+                    item_key=item_key,
+                )
+                debug["filled_fields"].extend(field for field in filled if field not in debug["filled_fields"])
+                pdf_filled = try_spec_pdfs(product_url, html, evidence, "existing_product_page")
+                record_attempt(
+                    source="existing_product_page",
+                    url=product_url,
+                    status="filled" if filled or pdf_filled else "no_field_filled",
+                    html_status=html_status,
+                    page_confidence=evidence.confidence,
+                    fields=[*filled, *pdf_filled],
+                )
+            else:
+                record_attempt(source="existing_product_page", url=product_url, status=html_status, fields=[])
+
+    tried_direct_preferred_urls: set[str] = {product_url} if product_url else set()
+    for direct in preferred_direct_urls_for_row(updated):
+        if state["attempts"] >= config.max_extra_retries_per_item:
+            break
+        direct_url = _str_val(direct.get("url"))
+        if not direct_url or direct_url in tried_direct_preferred_urls:
+            continue
+        tried_direct_preferred_urls.add(direct_url)
+        field_label = ", ".join(actionable_missing)
+        if _url_looks_like_pdf(direct_url) and "dimensions" in actionable_missing:
+            pdf_bytes, pdf_status = _fetch_retry_pdf_bytes(
+                direct_url,
+                session_cache=session_cache,
+                config=config,
+                state=state,
+                run_budget=run_budget,
+                item_key=item_key,
+                field="dimensions",
+            )
+            state["attempts"] += 1
+            evidence = ProductEvidence(
+                confidence="medium",
+                score=70,
+                matched_sku=bool(_str_val(updated.get("Model/SKU") or updated.get("SKU"))),
+                matched_brand=bool(_str_val(updated.get("Brand"))),
+                matched_product_name=bool(_str_val(updated.get("Product Name"))),
+                official_domain=False,
+                domain=urllib.parse.urlparse(direct_url).netloc.lower(),
+                evidence_summary="preferred_direct_spec_pdf",
+            )
+            filled = _apply_retry_dimensions_from_spec_pdf(
+                updated,
+                pdf_url=direct_url,
+                pdf_bytes=pdf_bytes,
+                page_evidence=evidence,
+                debug=debug,
+                source_label="preferred_direct_page",
+            )
+            if filled and not _str_val(updated.get("Product URL")):
+                updated["Product URL"] = direct_url
+                updated["Product Resolution URL"] = direct_url
+                updated["Product Resolution Confidence"] = "medium"
+                updated["Product Resolution Evidence"] = "preferred_direct_spec_pdf"
+                filled.append("product URL")
+            debug["filled_fields"].extend(field for field in filled if field not in debug["filled_fields"])
+            record_attempt(
+                source="preferred_direct_page_spec_pdf",
+                url=direct_url,
+                status="filled" if filled else pdf_status,
+                preferred_entry_id=direct.get("entry_id", ""),
+                preferred_keyword=direct.get("keyword", ""),
+                fields=filled,
+            )
+            continue
         html, html_status = _fetch_retry_html(
-            product_url,
+            direct_url,
             session_cache=session_cache,
             config=config,
             state=state,
@@ -1838,28 +2729,47 @@ def _targeted_missing_field_retry(
         )
         state["attempts"] += 1
         if html:
-            evidence = _page_evidence_for_retry(updated, product_url, html)
+            evidence = _preferred_page_evidence_for_retry(updated, direct_url, html)
             filled = _apply_retry_extraction_from_html(
                 updated,
-                url=product_url,
+                url=direct_url,
                 html=html,
                 page_evidence=evidence,
                 missing_fields=actionable_missing,
                 debug=debug,
-                source_label="existing_product_page",
+                source_label="preferred_direct_page",
                 allow_replace_low_confidence_data=allow_replace_low_confidence_data,
+                run_budget=run_budget,
+                item_key=item_key,
             )
             debug["filled_fields"].extend(field for field in filled if field not in debug["filled_fields"])
+            pdf_filled = try_spec_pdfs(direct_url, html, evidence, "preferred_direct_page")
+            if evidence.confidence in {"high", "medium"} and not _str_val(updated.get("Product URL")):
+                updated["Product URL"] = direct_url
+                updated["Product Resolution URL"] = direct_url
+                updated["Product Resolution Confidence"] = evidence.confidence
+                updated["Product Resolution Evidence"] = evidence.evidence_summary or "preferred_direct_page"
+                debug["filled_fields"].append("product URL")
+                filled.append("product URL")
             record_attempt(
-                source="existing_product_page",
-                url=product_url,
-                status="filled" if filled else "no_field_filled",
+                source="preferred_direct_page",
+                url=direct_url,
+                status="filled" if filled or pdf_filled else "no_field_filled",
                 html_status=html_status,
                 page_confidence=evidence.confidence,
-                fields=filled,
+                preferred_entry_id=direct.get("entry_id", ""),
+                preferred_keyword=direct.get("keyword", ""),
+                fields=[*filled, *pdf_filled],
             )
         else:
-            record_attempt(source="existing_product_page", url=product_url, status=html_status, fields=[])
+            record_attempt(
+                source="preferred_direct_page",
+                url=direct_url,
+                status=html_status,
+                preferred_entry_id=direct.get("entry_id", ""),
+                preferred_keyword=direct.get("keyword", ""),
+                fields=[],
+            )
 
     remaining_missing = _missing_critical_fields_for_retry(
         updated,
@@ -1926,18 +2836,21 @@ def _targeted_missing_field_retry(
                     debug={**debug, "query": query},
                     source_label="targeted_search",
                     allow_replace_low_confidence_data=allow_replace_low_confidence_data,
+                    run_budget=run_budget,
+                    item_key=item_key,
                 )
                 debug["filled_fields"].extend(field for field in filled if field not in debug["filled_fields"])
+                pdf_filled = try_spec_pdfs(url, html, evidence, "targeted_search", query)
                 record_attempt(
                     source="targeted_search",
                     query=query,
                     url=url,
                     rank=rank,
-                    status="filled" if filled else "no_field_filled",
+                    status="filled" if filled or pdf_filled else "no_field_filled",
                     page_confidence=evidence.confidence,
                     evidence_score=evidence.score,
                     rejection_reason=evidence.rejection_reason,
-                    fields=filled,
+                    fields=[*filled, *pdf_filled],
                 )
                 if not any(field in _missing_critical_fields_for_retry(updated, allow_replace_low_confidence_data=allow_replace_low_confidence_data) for field in actionable_missing):
                     break
@@ -2033,7 +2946,8 @@ def _apply_product_lookup_cache_entry(row: dict, cache_entry: dict, debug: dict)
         updated["Material"] = _str_val(cache_entry.get("material"))
 
     dimensions = _str_val(cache_entry.get("dimensions"))
-    if dimensions and has_complete_3d_dimensions(dimensions) and not _str_val(updated.get("Dimensions")):
+    dimension_confidence = _str_val(cache_entry.get("dimension_confidence") or confidence).lower()
+    if dimensions and dimension_confidence in {"high", "medium", "low"} and not _str_val(updated.get("Dimensions")):
         updated["Dimensions"] = dimensions
         if _str_val(cache_entry.get("width_in")):
             updated["Width (in)"] = _str_val(cache_entry.get("width_in"))
@@ -2042,16 +2956,19 @@ def _apply_product_lookup_cache_entry(row: dict, cache_entry: dict, debug: dict)
         if _str_val(cache_entry.get("depth_in")):
             updated["Depth (in)"] = _str_val(cache_entry.get("depth_in"))
         updated["Dimension Source URL"] = product_url
-        updated["Dimension Confidence"] = confidence
+        updated["Dimension Confidence"] = dimension_confidence
         updated["Dimension Source Type"] = source_type
-        updated["Dimension Lookup Status"] = "found"
+        updated["Dimension Lookup Status"] = "found" if dimension_confidence in {"high", "medium"} else "found_low_confidence_partial"
         updated["dimension_source_url"] = product_url
-        updated["dimension_confidence"] = confidence
+        updated["dimension_confidence"] = dimension_confidence
         updated["dimension_evidence"] = evidence
+        updated["Product Width (in)"] = _str_val(cache_entry.get("width_in"))
+        updated["Product Height (in)"] = _str_val(cache_entry.get("height_in"))
+        updated["Product Depth (in)"] = _str_val(cache_entry.get("depth_in"))
         debug.update({
             "dimensions_found": True,
             "dimension_source_url": product_url,
-            "dimension_confidence": confidence,
+            "dimension_confidence": dimension_confidence,
             "dimension_evidence": evidence,
         })
         dim_result = _DimensionResult(
@@ -2060,13 +2977,18 @@ def _apply_product_lookup_cache_entry(row: dict, cache_entry: dict, debug: dict)
             height=_str_val(cache_entry.get("height_in")),
             depth=_str_val(cache_entry.get("depth_in")),
             source_url=product_url,
-            confidence=confidence,
+            confidence=dimension_confidence,
             source_type=source_type,
             status="found",
             evidence_text=evidence,
         )
 
-    image_url = _str_val(cache_entry.get("image_url") or cache_entry.get("selected_image_url"))
+    image_url = _str_val(
+        cache_entry.get("cloudinary_url")
+        or cache_entry.get("cloudinary_secure_url")
+        or cache_entry.get("image_url")
+        or cache_entry.get("selected_image_url")
+    )
     image_confidence = _str_val(cache_entry.get("image_confidence")).upper()
     if image_url and image_confidence in {"HIGH", "MEDIUM"}:
         debug.update({
@@ -2074,19 +2996,27 @@ def _apply_product_lookup_cache_entry(row: dict, cache_entry: dict, debug: dict)
             "selected_image_reason": evidence or "product_lookup_cache",
             "Image Recovery Confidence": image_confidence,
             "Image Recovery Source": "product_lookup_cache",
+            "cloudinary_url": _str_val(cache_entry.get("cloudinary_url") or cache_entry.get("cloudinary_secure_url")),
+            "cloudinary_status": "uploaded" if _str_val(cache_entry.get("cloudinary_url") or cache_entry.get("cloudinary_secure_url")) else "",
+            "programa_image_ready": str(bool(_str_val(cache_entry.get("cloudinary_url") or cache_entry.get("cloudinary_secure_url")))),
         })
         if not _is_manual_image(updated) and not row_has_image(updated):
             updated["Image URL"] = image_url
+            if _str_val(cache_entry.get("verified_image_url")) and _str_val(cache_entry.get("verified_image_url")) != image_url:
+                updated["Original Image URL"] = _str_val(cache_entry.get("verified_image_url"))
+                updated["original_image_url"] = _str_val(cache_entry.get("verified_image_url"))
+            if _str_val(cache_entry.get("cloudinary_url") or cache_entry.get("cloudinary_secure_url")):
+                updated["cloudinary_url"] = _str_val(cache_entry.get("cloudinary_url") or cache_entry.get("cloudinary_secure_url"))
+                updated["cloudinary_secure_url"] = _str_val(cache_entry.get("cloudinary_url") or cache_entry.get("cloudinary_secure_url"))
+                updated["cloudinary_status"] = "uploaded"
+                updated["cloudinary_error"] = ""
+                updated["programa_image_ready"] = "True"
             updated["image_source"] = "product_lookup_cache"
             updated["confidence"] = image_confidence
             updated["evidence"] = evidence
             updated["needs_image_review"] = str(image_confidence != "HIGH" or confidence == "medium")
-            _maybe_upload_selected_image_to_cloudinary(
-                updated,
-                debug,
-                candidate_url=image_url,
-                source_type="product_lookup_cache",
-            )
+            # Cache hits must remain zero-cost; any Cloudinary conversion should
+            # already be represented by the cached URL from the original run.
 
     if confidence == "medium":
         updated["Review Required"] = True
@@ -2127,6 +3057,13 @@ def _apply_official_product_lookup(
         "Product Resolution URL": "",
         "Image Recovery Confidence": "",
         "Image Recovery Source": "",
+        "original_image_url": "",
+        "cloudinary_url": "",
+        "image_confidence": "",
+        "image_source_url": "",
+        "cloudinary_status": "",
+        "cloudinary_error": "",
+        "programa_image_ready": "False",
         "Search Diagnostics": "",
         "Source Domains Tried": "",
         "Selected Source Domain": "",
@@ -2170,6 +3107,13 @@ def _apply_official_product_lookup(
                 "Product Resolution URL",
                 "Image Recovery Confidence",
                 "Image Recovery Source",
+                "original_image_url",
+                "cloudinary_url",
+                "image_confidence",
+                "image_source_url",
+                "cloudinary_status",
+                "cloudinary_error",
+                "programa_image_ready",
                 "Search Diagnostics",
                 "Source Domains Tried",
                 "Selected Source Domain",
@@ -2350,6 +3294,8 @@ def _apply_official_product_lookup(
                 debug,
                 candidate_url=extracted_fields["Image URL"],
                 source_type=_str_val(extracted_fields.get("image_source")) or "verified_product_page",
+                run_budget=getattr(budget, "run_budget", None),
+                item_key=getattr(budget, "item_key", ""),
             )
         _merge_budget_debug(debug, budget)
         return _stamp_debug_fields(updated), None, debug
@@ -2404,7 +3350,7 @@ def _apply_official_product_lookup(
     existing_dim_conf = _str_val(updated.get("Dimension Confidence")).lower() or "none"
     resolved_dimensions = specs.dimensions or _str_val(resolver_fields.get("Dimensions"))
     resolved_dim_confidence = specs.confidence or _str_val(resolver_fields.get("dimension_confidence")) or "none"
-    if resolved_dimensions and resolved_dim_confidence in {"high", "medium"}:
+    if resolved_dimensions and resolved_dim_confidence in {"high", "medium", "low"}:
         should_fill_dims = (
             not existing_dims
             or (
@@ -2412,27 +3358,40 @@ def _apply_official_product_lookup(
                 and resolved_dim_confidence == "high"
                 and _CONF_RANK.get(resolved_dim_confidence, 0) > _CONF_RANK.get(existing_dim_conf, 0)
             )
+            or (
+                not has_complete_3d_dimensions(existing_dims)
+                and _CONF_RANK.get(resolved_dim_confidence, 0) > _CONF_RANK.get(existing_dim_conf, 0)
+            )
         )
         if should_fill_dims:
-            updated["Dimensions"] = resolved_dimensions
-            if specs.width or resolver_fields.get("width"):
-                updated["Width (in)"] = specs.width or resolver_fields.get("width")
-            if specs.height or resolver_fields.get("height"):
-                updated["Height (in)"] = specs.height or resolver_fields.get("height")
-            if specs.depth or resolver_fields.get("depth"):
-                updated["Depth (in)"] = specs.depth or resolver_fields.get("depth")
-            if specs.length:
-                updated["Length (in)"] = specs.length
+            if specs.dimensions:
+                _apply_dimension_evidence_to_row(
+                    updated,
+                    specs,
+                    source_url=specs.source_url or page_url,
+                    confidence=resolved_dim_confidence,
+                    source_type="official_product_page",
+                    method=f"official_product_page:{specs.debug.get('dimension_failure_reason') or specs.evidence or 'spec_extraction'}",
+                    source_pass="verified_product_page",
+                    debug=debug,
+                )
+            else:
+                updated["Dimensions"] = resolved_dimensions
+                if resolver_fields.get("width"):
+                    updated["Width (in)"] = resolver_fields.get("width")
+                if resolver_fields.get("height"):
+                    updated["Height (in)"] = resolver_fields.get("height")
+                if resolver_fields.get("depth"):
+                    updated["Depth (in)"] = resolver_fields.get("depth")
+                updated["Dimension Source URL"] = specs.source_url or page_url
+                updated["Dimension Confidence"] = resolved_dim_confidence
+                updated["Dimension Source Type"] = "official_product_page"
+                updated["Dimension Lookup Status"] = "found" if resolved_dim_confidence in {"high", "medium"} else "found_low_confidence_partial"
+                updated["dimension_source_url"] = specs.source_url or page_url
+                updated["dimension_confidence"] = resolved_dim_confidence
+                updated["dimension_evidence"] = resolver_fields.get("dimension_evidence", "")
             if specs.diameter:
                 updated["Diameter (in)"] = specs.diameter
-            updated["Dimension Source URL"] = specs.source_url
-            updated["Dimension Confidence"] = resolved_dim_confidence
-            updated["Dimension Source Type"] = "official_product_page"
-            updated["Dimension Lookup Status"] = "found"
-            updated["dimension_source_url"] = specs.source_url
-            updated["dimension_confidence"] = resolved_dim_confidence
-            updated["dimension_evidence"] = specs.evidence or resolver_fields.get("dimension_evidence", "")
-            updated["dimension_raw_text"] = specs.raw_text
             dim_result = _DimensionResult(
                 dimensions=resolved_dimensions,
                 width=specs.width or resolver_fields.get("width", ""),
@@ -2452,6 +3411,23 @@ def _apply_official_product_lookup(
         value = _str_val(getattr(specs, source))
         if value and not _str_val(updated.get(dest)):
             updated[dest] = value
+
+    verified_pdf_dim_result = _try_verified_spec_pdfs_for_dimensions(
+        updated,
+        html=html,
+        page_url=page_url,
+        page_evidence=selected_evidence,
+        session_cache=session_cache,
+        budget=budget,
+        debug=debug,
+    )
+    if verified_pdf_dim_result is not None:
+        dim_result = verified_pdf_dim_result
+        resolved_dimensions = verified_pdf_dim_result.dimensions
+        resolved_dim_confidence = verified_pdf_dim_result.confidence
+        specs.width = verified_pdf_dim_result.width or specs.width
+        specs.height = verified_pdf_dim_result.height or specs.height
+        specs.depth = verified_pdf_dim_result.depth or specs.depth
 
     if _needs_verified_page_extraction(updated):
         if budget is not None and not getattr(budget, "can_ai_call", lambda: True)():
@@ -2491,6 +3467,8 @@ def _apply_official_product_lookup(
                 debug,
                 candidate_url=image.image_url,
                 source_type=image.image_source,
+                run_budget=getattr(budget, "run_budget", None),
+                item_key=getattr(budget, "item_key", ""),
             )
     if (
         not image.image_found
@@ -2514,6 +3492,8 @@ def _apply_official_product_lookup(
             debug,
             candidate_url=resolver_fields["Image URL"],
             source_type=_str_val(resolver_fields.get("image_source")) or "verified_product_page",
+            run_budget=getattr(budget, "run_budget", None),
+            item_key=getattr(budget, "item_key", ""),
         )
 
     focused_dim_result = _focused_dimension_pass_from_cached_pages(
@@ -2567,6 +3547,32 @@ def _apply_official_product_lookup(
         else ""
     )
     dim_conf_for_cache = resolved_dim_confidence if resolved_dim_confidence in {"high", "medium"} else ""
+    explicit_lookup_fields = {
+        "brand",
+        "sku",
+        "product_name",
+        "selected_product_url",
+        "source_type",
+        "confidence",
+        "evidence_score",
+        "dimensions",
+        "width_in",
+        "height_in",
+        "depth_in",
+        "finish",
+        "material",
+        "verified_image_url",
+        "image_url",
+        "cloudinary_url",
+        "image_confidence",
+        "evidence_summary",
+        "source_domain",
+    }
+    debug_for_cache = {
+        key: value
+        for key, value in debug.items()
+        if key not in explicit_lookup_fields
+    }
     _lookup_cache.save_verified_lookup(
         updated,
         brand=_str_val(updated.get("Brand") or row.get("Brand")),
@@ -2582,11 +3588,13 @@ def _apply_official_product_lookup(
         depth_in=specs.depth or resolver_fields.get("depth", ""),
         finish=specs.finish or _str_val(updated.get("Finish / Color")),
         material=specs.material or _str_val(updated.get("Material")),
+        verified_image_url=_str_val(updated.get("Original Image URL") or debug.get("original_image_url")),
         image_url=image_url_for_cache,
+        cloudinary_url=_str_val(debug.get("cloudinary_url") or updated.get("cloudinary_url") or updated.get("cloudinary_secure_url")),
         image_confidence=image_conf_for_cache if image_url_for_cache else "",
         evidence_summary=_str_val(debug.get("Product Resolution Evidence")) or _str_val(debug.get("selected_product_page_reason")),
         source_domain=urllib.parse.urlparse(page_url).netloc,
-        **debug,
+        **debug_for_cache,
     )
     _merge_budget_debug(debug, budget)
     return _stamp_debug_fields(updated), dim_result, debug
@@ -2823,6 +3831,7 @@ def enrich_row(
             return row, None, None
 
         row, local_metrics = _apply_cheap_local_enrichment(row)
+        row, _image_cache_hit = _apply_image_cache_to_row(row)
 
         if not _needs_external_enrichment(row):
             updated = row.copy()
@@ -2997,7 +4006,7 @@ def enrich_row(
                         tag = f"[Cutout Dimensions: {cutout_part}]"
                         if tag not in existing_notes:
                             updated["Notes"] = f"{existing_notes} {tag}".strip() if existing_notes else tag
-            if dim_result:
+            if dim_result and not (dim_result.status == "not_found" and _str_val(updated.get("Dimensions"))):
                 updated["Dimension Source URL"] = dim_result.source_url
                 updated["Dimension Confidence"] = dim_result.confidence if dim_result.confidence not in ("", "none", None) else ""
                 updated["Dimension Source Type"] = dim_result.source_type if dim_result.source_type not in ("", "none", None) else ""
@@ -3037,6 +4046,23 @@ def _apply_duplicate_enrichment_result(row: dict, template: dict) -> dict:
     for field in (
         "Product URL",
         "Image URL",
+        "Original Image URL",
+        "cloudinary_secure_url",
+        "cloudinary_url",
+        "cloudinary_public_id",
+        "cloudinary_width",
+        "cloudinary_height",
+        "cloudinary_format",
+        "cloudinary_bytes",
+        "original_image_url",
+        "image_confidence",
+        "image_source_url",
+        "cloudinary_status",
+        "cloudinary_error",
+        "programa_image_ready",
+        "Image Upload Status",
+        "image_upload_status",
+        "image_upload_failure_reason",
         "image_source",
         "confidence",
         "evidence",
@@ -3187,6 +4213,7 @@ def _live_lookup_blocked_by_budget(budget, row: dict, *, item_key: str, field: s
             item_key=item_key,
             field=field,
             reason="hard budget exhausted before item lookup",
+            source_function="_live_lookup_blocked_by_budget",
         )
         budget.stop("Skipped enrichment due to budget cap")
         return True
@@ -3219,6 +4246,7 @@ def enrich_dataframe(
     max_extra_cost_per_row: float | None = None,
     max_extra_cost_per_run: float | None = None,
     allow_replace_low_confidence_data: bool = False,
+    run_budget=None,
 ) -> tuple[pd.DataFrame, list[str], list[dict]]:
     """
     Enrich all qualifying rows in df. Returns (updated_df, error_list, dimension_diagnostics).
@@ -3228,7 +4256,7 @@ def enrich_dataframe(
     errors: list[str] = []
     dimension_diagnostics: list[dict] = []
     started_at = time.perf_counter()
-    run_budget = _run_budget_for_mode(_normalize_mode(enrichment_mode))
+    run_budget = run_budget or _run_budget_for_mode(_normalize_mode(enrichment_mode))
     retry_config = _targeted_retry_config(
         targeted_retry_mode,
         max_extra_retries_per_item=max_extra_retries_per_item,
@@ -3279,6 +4307,7 @@ def enrich_dataframe(
             "most_expensive_item": "",
             "most_expensive_item_cost_usd": 0.0,
             "paid_call_reasons": [],
+            "cost_ledger": [],
             "budget_skipped_calls": [],
             "budget_skipped_fields": [],
             "cache_hit_rate": 0.0,
@@ -3299,6 +4328,7 @@ def enrich_dataframe(
         row = df.loc[idx]
         raw = row.to_dict()
         r, local_metrics = _apply_cheap_local_enrichment(raw)
+        r, _image_cache_hit = _apply_image_cache_to_row(r)
         if r != raw:
             _write_updated_row(df, idx, r)
 
@@ -3327,6 +4357,7 @@ def enrich_dataframe(
         dup_key = _duplicate_key(r)
         if dup_key and not force_refresh and dup_key in duplicate_results:
             updated = _apply_duplicate_enrichment_result(r, duplicate_results[dup_key])
+            updated, _image_cache_hit = _apply_image_cache_to_row(updated)
             updated = _stamp_bravi_cost_debug(updated, r, run_budget, dup_key, fallback_status="duplicate_reuse")
             _write_updated_row(df, idx, updated)
             metrics["summary"]["duplicate_reuse"] += 1
@@ -3479,6 +4510,7 @@ def enrich_dataframe(
         "most_expensive_item": run_diag["most_expensive_item"],
         "most_expensive_item_cost_usd": run_diag["most_expensive_item_cost_usd"],
         "paid_call_reasons": run_diag["paid_call_reasons"],
+        "cost_ledger": run_diag.get("cost_ledger", []),
         "budget_skipped_calls": run_diag["skipped_calls"],
         "budget_skipped_fields": run_diag["skipped_fields_due_budget"],
     })
@@ -3501,6 +4533,7 @@ def retry_missing_fields_dataframe(
     max_extra_cost_per_row: float | None = None,
     max_extra_cost_per_run: float | None = None,
     allow_replace_low_confidence_data: bool = False,
+    run_budget=None,
 ) -> tuple[pd.DataFrame, list[str], list[dict]]:
     """Run only the surgical missing-field retry pass after enrichment.
 
@@ -3519,7 +4552,7 @@ def retry_missing_fields_dataframe(
         max_extra_cost_per_row=max_extra_cost_per_row,
         max_extra_cost_per_run=max_extra_cost_per_run,
     )
-    run_budget = _run_budget_for_mode("fast")
+    run_budget = run_budget or _run_budget_for_mode("fast")
     metrics = {
         "report_type": "missing_field_retry_metrics",
         "summary": {
@@ -3566,6 +4599,7 @@ def retry_missing_fields_dataframe(
             "most_expensive_item": "",
             "most_expensive_item_cost_usd": 0.0,
             "paid_call_reasons": [],
+            "cost_ledger": [],
             "duration_ms": 0,
         },
     }
@@ -3729,6 +4763,7 @@ def retry_missing_fields_dataframe(
         "most_expensive_item": run_diag["most_expensive_item"],
         "most_expensive_item_cost_usd": run_diag["most_expensive_item_cost_usd"],
         "paid_call_reasons": run_diag["paid_call_reasons"],
+        "cost_ledger": run_diag.get("cost_ledger", []),
         "budget_skipped_calls": run_diag["skipped_calls"],
         "budget_skipped_fields": run_diag["skipped_fields_due_budget"],
     })
@@ -3747,6 +4782,8 @@ def recover_images_for_dataframe(
     session_id: str | None = None,
     enable_screenshot: bool = True,
     enable_web_lookup: bool = True,
+    max_product_page_fetches: int | None = None,
+    run_budget=None,
 ):
     """
     Backward-compatible alias for src.image_recovery.recover_images_for_dataframe.
@@ -3762,4 +4799,6 @@ def recover_images_for_dataframe(
         session_id=session_id,
         enable_screenshot=enable_screenshot,
         enable_web_lookup=enable_web_lookup,
+        max_product_page_fetches=max_product_page_fetches,
+        run_budget=run_budget,
     )

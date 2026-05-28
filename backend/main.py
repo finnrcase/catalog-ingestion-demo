@@ -67,6 +67,7 @@ from src.persistent_storage import (
     upload_file_to_persistent_storage,
 )
 from src.product_enrichment import enrich_dataframe, recover_images_for_dataframe, retry_missing_fields_dataframe
+from src.product_lookup_budget import run_budget_for_mode
 from src.programa_export import (
     CANONICAL_SECTIONS,
     build_programa_debug_dataframe,
@@ -612,7 +613,19 @@ async def generate_intake(
         pdf = UploadedPDF(upload.filename or "upload.pdf", content)
 
         if use_ai_pdf:
-            df_ai, error = extract_products_from_pdf_with_ai(pdf, project, room, "")
+            pdf_budget = run_budget_for_mode("fast")
+            if pdf_budget.consume(
+                "ai",
+                pdf_budget.ai_call_cost_usd,
+                item_key=pdf.name,
+                field="PDF extraction",
+                reason="legacy /intake/generate AI PDF extraction",
+                stage="pdf_ai_extraction",
+                source_function="backend.generate_intake:extract_products_from_pdf_with_ai",
+            ):
+                df_ai, error = extract_products_from_pdf_with_ai(pdf, project, room, "")
+            else:
+                df_ai, error = None, "AI PDF extraction skipped due to budget cap"
             if error:
                 errors.append(f"{pdf.name}: {error}")
                 try:
@@ -682,7 +695,23 @@ async def upload_image_endpoint(file: UploadFile = File(...)) -> ImageUploadResp
         raise HTTPException(status_code=400, detail="Only image files can be uploaded.")
 
     content = await _read_upload_with_limit(file, max_bytes=min(_MAX_UPLOAD_BYTES, 25 * 1024 * 1024))
+    run_budget = run_budget_for_mode("fast")
+    if not run_budget.consume(
+        "image_upload",
+        run_budget.image_upload_cost_usd,
+        item_key=file.filename or "manual_image_upload",
+        field="Image URL",
+        reason="manual image upload to Cloudinary",
+        stage="manual_image_upload",
+        source_function="backend.upload_image_endpoint:upload_image_with_metadata",
+    ):
+        raise HTTPException(status_code=429, detail="Image upload skipped due to enrichment budget cap.")
     result = upload_image_with_metadata(io.BytesIO(content))
+    debug = {
+        **(result.debug or {}),
+        "budget": run_budget.diagnostics(),
+        "cost_ledger": run_budget.diagnostics().get("cost_ledger", []),
+    }
     secure_url = result.secure_url
     if not secure_url or not is_public_https_image_url(secure_url):
         if result.error == "cloudinary_not_configured":
@@ -703,7 +732,7 @@ async def upload_image_endpoint(file: UploadFile = File(...)) -> ImageUploadResp
         format=result.format,
         bytes=result.bytes,
         image_upload_status=result.status,
-        debug=result.debug,
+        debug=debug,
     )
 
 
@@ -722,6 +751,7 @@ def validate_intake(payload: RowsPayload) -> IntakeResponse:
 def enrich_intake(payload: RowsPayload) -> IntakeResponse:
     if payload.enrichment_mode not in {"", "fast"} and not _admin_enrichment_modes_allowed():
         raise HTTPException(status_code=403, detail="Balanced and deep enrichment are admin-only.")
+    shared_budget = run_budget_for_mode(payload.enrichment_mode or "fast")
     df, errors, dimension_diagnostics = enrich_dataframe(
         pd.DataFrame(payload.rows),
         enrichment_mode=payload.enrichment_mode,
@@ -732,6 +762,7 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
         max_extra_cost_per_row=payload.max_extra_cost_per_row,
         max_extra_cost_per_run=payload.max_extra_cost_per_run,
         allow_replace_low_confidence_data=payload.allow_replace_low_confidence_data,
+        run_budget=shared_budget,
     )
     if payload.use_web_enrichment:
         session_id = payload.session_id or "default"
@@ -742,14 +773,14 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
             "session_id": session_id,
             "enable_screenshot": payload.enrichment_mode != "fast",
             "enable_web_lookup": payload.enrichment_mode != "fast",
-            "max_product_page_fetches": 3 if payload.enrichment_mode == "fast" else None,
+            "run_budget": shared_budget,
         }
         try:
             df, image_diagnostics = recover_images_for_dataframe(df, **image_recovery_kwargs)
         except TypeError as exc:
-            if "max_product_page_fetches" not in str(exc):
+            if "run_budget" not in str(exc):
                 raise
-            image_recovery_kwargs.pop("max_product_page_fetches", None)
+            image_recovery_kwargs.pop("run_budget", None)
             df, image_diagnostics = recover_images_for_dataframe(df, **image_recovery_kwargs)
         if image_diagnostics:
             dimension_diagnostics = [
@@ -760,12 +791,24 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
                 },
                 *image_diagnostics,
             ]
+    final_budget = shared_budget.diagnostics()
+    dimension_diagnostics = [
+        {
+            "report_type": "enrichment_run_budget",
+            "summary": final_budget,
+            "cost_ledger": final_budget.get("cost_ledger", []),
+        },
+        *dimension_diagnostics,
+    ]
     df = apply_confidence_checks(df)
     return _df_response(df, errors, dimension_diagnostics)
 
 
 @app.post("/intake/retry-missing-data", response_model=IntakeResponse)
 def retry_missing_data(payload: RowsPayload) -> IntakeResponse:
+    if payload.enrichment_mode not in {"", "fast"} and not _admin_enrichment_modes_allowed():
+        raise HTTPException(status_code=403, detail="Balanced and deep enrichment are admin-only.")
+    shared_budget = run_budget_for_mode(payload.enrichment_mode or "fast")
     df, errors, diagnostics = retry_missing_fields_dataframe(
         pd.DataFrame(payload.rows),
         retry_mode=payload.targeted_retry_mode,
@@ -775,7 +818,17 @@ def retry_missing_data(payload: RowsPayload) -> IntakeResponse:
         max_extra_cost_per_row=payload.max_extra_cost_per_row,
         max_extra_cost_per_run=payload.max_extra_cost_per_run,
         allow_replace_low_confidence_data=payload.allow_replace_low_confidence_data,
+        run_budget=shared_budget,
     )
+    final_budget = shared_budget.diagnostics()
+    diagnostics = [
+        {
+            "report_type": "enrichment_run_budget",
+            "summary": final_budget,
+            "cost_ledger": final_budget.get("cost_ledger", []),
+        },
+        *diagnostics,
+    ]
     df = apply_confidence_checks(df)
     return _df_response(df, errors, diagnostics)
 
@@ -898,6 +951,9 @@ def recover_images(payload: RowsPayload) -> IntakeResponse:
     Diagnostics (per-row status, source, recovered URL) are returned in the
     dimension_diagnostics field for now — the contract may be extended later.
     """
+    if payload.enrichment_mode not in {"", "fast"} and not _admin_enrichment_modes_allowed():
+        raise HTTPException(status_code=403, detail="Balanced and deep enrichment are admin-only.")
+    shared_budget = run_budget_for_mode(payload.enrichment_mode or "fast")
     session_id = payload.session_id or "default"
     pdfs_dir = _TMP_UPLOADS / session_id / "pdfs"
     pdf_lookup = {f.stem: str(f) for f in pdfs_dir.glob("*.pdf")} if pdfs_dir.exists() else {}
@@ -906,14 +962,29 @@ def recover_images(payload: RowsPayload) -> IntakeResponse:
         pdf_lookup=pdf_lookup,
         session_id=session_id,
         enable_screenshot=True,
+        run_budget=shared_budget,
     )
+    final_budget = shared_budget.diagnostics()
     if diagnostics:
         diagnostics = [
+            {
+                "report_type": "enrichment_run_budget",
+                "summary": final_budget,
+                "cost_ledger": final_budget.get("cost_ledger", []),
+            },
             {
                 "report_type": "photo_discovery",
                 "summary": build_photo_discovery_report(df, diagnostics),
             },
             *diagnostics,
+        ]
+    else:
+        diagnostics = [
+            {
+                "report_type": "enrichment_run_budget",
+                "summary": final_budget,
+                "cost_ledger": final_budget.get("cost_ledger", []),
+            }
         ]
     df = apply_confidence_checks(df)
     return _df_response(df, dimension_diagnostics=diagnostics)

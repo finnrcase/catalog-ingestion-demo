@@ -24,9 +24,12 @@ _JPEG_QUALITIES = [70, 60, 50, 40]
 _REMOTE_USER_AGENT = "SCH-DesignOps/1.0 (+https://saffroncasehomes.com)"
 _BAD_IMAGE_URL_RE = re.compile(
     r"(?:logo|icon|favicon|placeholder|default-meta-image|default_meta_image|"
-    r"sprite|swatch|transparent|blank|noimage|no-image|loading)",
+    r"sprite|swatch|transparent|blank|noimage|no-image|loading|tracking|pixel|"
+    r"lifestyle|roomscene|room-scene|inspiration)",
     re.IGNORECASE,
 )
+MIN_REMOTE_PRODUCT_IMAGE_DIMENSION = 100
+MIN_REMOTE_PRODUCT_IMAGE_AREA = 10_000
 
 try:
     import cloudinary
@@ -240,6 +243,61 @@ def upload_image_with_metadata(file, *, source_url: str = "") -> ImageUploadResu
     return ImageUploadResult(status="failed", error=last_error or "cloudinary_upload_failed", debug=debug)
 
 
+def _upload_remote_url_with_cloudinary(candidate_url: str, debug: dict[str, Any]) -> ImageUploadResult:
+    """Ask Cloudinary to fetch a remote image URL directly and normalize it to JPG."""
+    folder = os.getenv("CLOUDINARY_UPLOAD_FOLDER", "").strip()
+    upload_options: dict[str, Any] = {"resource_type": "image", "format": "jpg"}
+    if folder:
+        upload_options["folder"] = folder
+
+    last_error = ""
+    for attempt in range(2):
+        try:
+            _configure_cloudinary()
+            debug["cloudinary_upload_attempted"] = True
+            debug["cloudinary_upload_attempt"] = attempt + 1
+            debug["cloudinary_direct_remote_upload"] = True
+            try:
+                result = cloudinary.uploader.upload(candidate_url, **upload_options)
+            except TypeError:
+                result = cloudinary.uploader.upload(candidate_url)
+            url = str(result.get("secure_url") or "").strip()
+            debug["cloudinary_response"] = {
+                key: result.get(key)
+                for key in ("secure_url", "public_id", "width", "height", "format", "bytes")
+                if key in result
+            }
+            if not is_public_https_image_url(url):
+                last_error = "cloudinary_missing_secure_url"
+                debug["failure_reason"] = last_error
+                continue
+            width = int(result.get("width") or 0)
+            height = int(result.get("height") or 0)
+            if width and height and (
+                max(width, height) < MIN_REMOTE_PRODUCT_IMAGE_DIMENSION
+                or (width * height) < MIN_REMOTE_PRODUCT_IMAGE_AREA
+            ):
+                last_error = f"remote_image_too_small:{width}x{height}"
+                debug["failure_reason"] = last_error
+                return ImageUploadResult(status="failed", error=last_error, debug=debug)
+            return ImageUploadResult(
+                secure_url=url,
+                public_id=str(result.get("public_id") or ""),
+                width=width,
+                height=height,
+                format=str(result.get("format") or "jpg"),
+                bytes=int(result.get("bytes") or 0),
+                status="uploaded",
+                debug=debug,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            debug["cloudinary_error"] = last_error
+            if attempt == 0:
+                time.sleep(0.25)
+    return ImageUploadResult(status="failed", error=last_error or "cloudinary_upload_failed", debug=debug)
+
+
 def upload_image(file) -> str | None:
     """Upload a file-like object to Cloudinary and return secure_url."""
     result = upload_image_with_metadata(file)
@@ -309,6 +367,29 @@ def fetch_convert_upload_remote_image(url: str, *, source_type: str = "") -> Ima
             raw.write(chunk)
         raw.seek(0)
         debug["fetched_bytes"] = total
+        is_avif = content_type == "image/avif" or candidate_url.lower().split("?", 1)[0].endswith(".avif")
+        try:
+            with Image.open(raw) as opened:
+                width, height = opened.size
+                debug["source_width"] = int(width or 0)
+                debug["source_height"] = int(height or 0)
+                if width <= 1 or height <= 1:
+                    debug["failure_reason"] = "tracking_pixel"
+                    return ImageUploadResult(status="failed", error="tracking_pixel", debug=debug)
+                if max(width, height) < MIN_REMOTE_PRODUCT_IMAGE_DIMENSION or (width * height) < MIN_REMOTE_PRODUCT_IMAGE_AREA:
+                    debug["failure_reason"] = f"remote_image_too_small:{width}x{height}"
+                    return ImageUploadResult(status="failed", error=debug["failure_reason"], debug=debug)
+        except Exception as exc:
+            if is_avif:
+                debug["image_probe_warning"] = f"local_avif_probe_failed:{exc}"
+                debug["conversion_attempted"] = True
+                result = _upload_remote_url_with_cloudinary(candidate_url, debug)
+                if result.secure_url:
+                    result.debug["final_saved_image_url"] = result.secure_url
+                return result
+            debug["failure_reason"] = f"image_probe_failed:{exc}"
+            return ImageUploadResult(status="failed", error=debug["failure_reason"], debug=debug)
+        raw.seek(0)
         debug["conversion_attempted"] = True
         result = upload_image_with_metadata(raw, source_url=candidate_url)
         result.debug = {**debug, **result.debug}

@@ -24,6 +24,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from src.durable_cache import durable_cache_enabled, load_map, upsert_payload
 from src.product_lookup_budget import EnrichmentRunBudget, ProductLookupBudget, run_budget_for_mode
 
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
@@ -31,6 +32,10 @@ _MFR_CACHE_PATH = os.path.normpath(os.path.join(_DATA_DIR, "manufacturer_domain_
 _PRODUCT_CACHE_PATH = os.path.normpath(os.path.join(_DATA_DIR, "product_enrichment_cache.json"))
 
 _CACHE_ENABLED: bool = os.getenv("ENRICHMENT_CACHE_ENABLED", "true").lower() != "false"
+
+
+def _is_default_path(path: str, default: str) -> bool:
+    return os.path.normpath(path) == os.path.normpath(default)
 
 _MODE_LIMITS: dict[str, dict] = {
     "fast": {"max_searches": 1, "max_urls": 1, "max_ai_calls": 0, "retailer": False, "general_fallback": False},
@@ -128,19 +133,45 @@ class ManufacturerDomainCache:
     def _load(self) -> None:
         if self._data is not None:
             return
-        if not _CACHE_ENABLED or not os.path.exists(self._path):
-            self._data = {}
+        data: dict = {}
+        if _CACHE_ENABLED and os.path.exists(self._path):
+            try:
+                with open(self._path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    data = loaded if isinstance(loaded, dict) else {}
+            except Exception as exc:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "ManufacturerDomainCache: could not load %s (%s) — treating as empty",
+                    self._path, exc,
+                )
+                data = {}
+        if _CACHE_ENABLED and _is_default_path(self._path, _MFR_CACHE_PATH) and durable_cache_enabled():
+            durable = load_map("manufacturer_domain_cache", "brand")
+            if durable:
+                data.update(durable)
+        self._data = data
+
+    def _durable_enabled(self) -> bool:
+        return _CACHE_ENABLED and _is_default_path(self._path, _MFR_CACHE_PATH) and durable_cache_enabled()
+
+    def _write_durable_entry(self, brand_key: str, entry: dict) -> None:
+        if not self._durable_enabled():
             return
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
-                self._data = json.load(f)
-        except Exception as exc:
-            import logging as _logging
-            _logging.getLogger(__name__).warning(
-                "ManufacturerDomainCache: could not load %s (%s) — treating as empty",
-                self._path, exc,
+            upsert_payload(
+                "manufacturer_domain_cache",
+                "brand",
+                brand_key,
+                entry,
+                extra={
+                    "official_domain": entry.get("official_domain") or entry.get("domain") or "",
+                    "source": entry.get("source") or "",
+                    "confidence": entry.get("confidence") or "",
+                },
             )
-            self._data = {}
+        except Exception:
+            pass
 
     def _save(self) -> None:
         if not _CACHE_ENABLED or self._data is None:
@@ -171,6 +202,7 @@ class ManufacturerDomainCache:
             "last_verified": datetime.now().strftime("%Y-%m-%d"),
         }
         self._save()
+        self._write_durable_entry(brand_key, self._data[brand_key])
 
 
 # ── ProductEnrichmentCache ─────────────────────────────────────────────────────
@@ -185,19 +217,47 @@ class ProductEnrichmentCache:
     def _load(self) -> None:
         if self._data is not None:
             return
-        if not _CACHE_ENABLED or not os.path.exists(self._path):
-            self._data = {}
+        data: dict = {}
+        if _CACHE_ENABLED and os.path.exists(self._path):
+            try:
+                with open(self._path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    data = loaded if isinstance(loaded, dict) else {}
+            except Exception as exc:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "ProductEnrichmentCache: could not load %s (%s) — treating as empty",
+                    self._path, exc,
+                )
+                data = {}
+        if _CACHE_ENABLED and _is_default_path(self._path, _PRODUCT_CACHE_PATH) and durable_cache_enabled():
+            durable = load_map("product_enrichment_cache", "cache_key")
+            if durable:
+                data.update(durable)
+        self._data = data
+
+    def _durable_enabled(self) -> bool:
+        return _CACHE_ENABLED and _is_default_path(self._path, _PRODUCT_CACHE_PATH) and durable_cache_enabled()
+
+    def _write_durable_entry(self, key: str, entry: dict) -> None:
+        if not self._durable_enabled():
             return
         try:
-            with open(self._path, "r", encoding="utf-8") as f:
-                self._data = json.load(f)
-        except Exception as exc:
-            import logging as _logging
-            _logging.getLogger(__name__).warning(
-                "ProductEnrichmentCache: could not load %s (%s) — treating as empty",
-                self._path, exc,
+            parts = key.split("_", 1)
+            upsert_payload(
+                "product_enrichment_cache",
+                "cache_key",
+                key,
+                entry,
+                extra={
+                    "normalized_brand": parts[0] if parts else "",
+                    "normalized_model": parts[1] if len(parts) > 1 else "",
+                    "confidence": entry.get("general_confidence") or entry.get("dimension_confidence") or "",
+                    "source_url": entry.get("product_url") or entry.get("dimension_source_url") or "",
+                },
             )
-            self._data = {}
+        except Exception:
+            pass
 
     def _save(self) -> None:
         if not _CACHE_ENABLED or self._data is None:
@@ -243,3 +303,4 @@ class ProductEnrichmentCache:
             entry["timestamp"] = now
         self._data[key] = entry
         self._save()
+        self._write_durable_entry(key, entry)

@@ -14,6 +14,7 @@ from typing import Any
 from bs4 import BeautifulSoup
 
 from src.dimensions import has_complete_3d_dimensions
+from src.embedded_product_data import embedded_product_metadata, embedded_product_text
 from src.measurement_parser import combined_dimensions, parse_dimensions
 
 
@@ -25,6 +26,9 @@ class DimensionExtractionResult:
     depth: str = ""
     length: str = ""
     unit: str = "in"
+    product_width: str = ""
+    product_height: str = ""
+    product_depth: str = ""
     raw_dimensions_text: str = ""
     dimensions_source_url: str = ""
     confidence_score: int = 0
@@ -32,6 +36,13 @@ class DimensionExtractionResult:
     source_type: str = "none"
     evidence_text: str = ""
     cutout_dimensions: str = ""
+    cutout_width: str = ""
+    cutout_height: str = ""
+    cutout_depth: str = ""
+    shipping_dimensions: str = ""
+    shipping_width: str = ""
+    shipping_height: str = ""
+    shipping_depth: str = ""
     used_shipping_dimensions: bool = False
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
@@ -142,6 +153,12 @@ def _html_dimension_chunks(soup: BeautifulSoup) -> tuple[list[str], list[str]]:
         if _CUTOUT_RE.search(jsonld_text):
             cutout_chunks.append(jsonld_text)
 
+    embedded_text = embedded_product_text(soup)
+    if embedded_text:
+        chunks.append(embedded_text)
+        if _CUTOUT_RE.search(embedded_text):
+            cutout_chunks.append(embedded_text)
+
     itemprop_chunk = _itemprop_dimension_chunk(soup)
     if itemprop_chunk:
         chunks.append(itemprop_chunk)
@@ -204,6 +221,8 @@ def _html_dimension_chunks(soup: BeautifulSoup) -> tuple[list[str], list[str]]:
 def _extract_html_metadata(html: str) -> dict[str, str]:
     soup = BeautifulSoup(html, "html.parser")
     _jsonld_text, metadata = _jsonld_product_data(soup)
+    for key, value in embedded_product_metadata(soup).items():
+        metadata.setdefault(key, value)
     h1 = soup.select_one("h1")
     if h1 and not metadata.get("Product Name"):
         metadata["Product Name"] = h1.get_text(" ", strip=True)
@@ -362,45 +381,94 @@ def _extract_dimensions_from_chunks(
     search_sets = [(non_shipping, False), (shipping, True)]
 
     cutout_dimensions = ""
+    cutout_parts: dict[str, str] = {}
     for chunk in cutout_chunks:
         if _CUTOUT_RE.search(chunk):
-            cutout_dimensions = _combined_if_complete(_parse_dimension_parts(chunk))
+            parsed = _parse_dimension_parts(_normalise_dimension_text(chunk))
+            cutout_dimensions = _combined_if_plausible(parsed)
             if cutout_dimensions:
+                cutout_parts = parsed
                 break
 
+    shipping_dimensions = ""
+    shipping_parts: dict[str, str] = {}
+    for chunk in shipping:
+        parsed = _parse_dimension_parts(_normalise_dimension_text(chunk))
+        shipping_dimensions = _combined_if_plausible(parsed)
+        if shipping_dimensions:
+            shipping_parts = parsed
+            break
+
+    best_product: tuple[int, int, str, dict[str, str], str] | None = None
     for candidates, used_shipping in search_sets:
         for chunk in candidates:
             if _CUTOUT_RE.search(chunk) and not used_shipping:
                 continue
+            if used_shipping:
+                continue
             parts = _parse_dimension_parts(_normalise_dimension_text(chunk))
-            dimensions = _combined_if_complete(parts)
+            dimensions = _combined_if_plausible(parts)
             if not dimensions:
                 continue
-            if not _parts_are_plausible(parts):
-                continue
-            confidence = "medium" if used_shipping else "high"
-            confidence_score = 65 if used_shipping else 90
-            return DimensionExtractionResult(
-                dimensions=dimensions,
-                width=parts.get("width", ""),
-                height=parts.get("height", ""),
-                depth=parts.get("depth", ""),
-                length=parts.get("length", ""),
-                unit="in",
-                raw_dimensions_text=chunk[:500],
-                confidence_score=confidence_score,
-                confidence=confidence,
-                source_type=source_type,
-                evidence_text=chunk[:500],
-                cutout_dimensions=cutout_dimensions,
-                used_shipping_dimensions=used_shipping,
-                diagnostics={"chunks_checked": len(chunks), "method": "dimension_chunks"},
-            )
+            useful_count = _useful_axis_count(parts)
+            confidence = "high" if useful_count >= 3 else "medium" if useful_count == 2 else "low"
+            confidence_score = 90 if confidence == "high" else 65 if confidence == "medium" else 35
+            candidate_rank = (useful_count, confidence_score, len(dimensions))
+            if best_product is None or candidate_rank > best_product[:3]:
+                best_product = (useful_count, confidence_score, len(dimensions), parts, chunk)
+
+    if best_product is not None:
+        useful_count, confidence_score, _length, parts, chunk = best_product
+        dimensions = combined_dimensions(parts)
+        confidence = "high" if useful_count >= 3 else "medium" if useful_count == 2 else "low"
+        return DimensionExtractionResult(
+            dimensions=dimensions,
+            width=parts.get("width", ""),
+            height=parts.get("height", ""),
+            depth=parts.get("depth", ""),
+            length=parts.get("length", ""),
+            unit="in",
+            product_width=parts.get("width", ""),
+            product_height=parts.get("height", ""),
+            product_depth=parts.get("depth", ""),
+            raw_dimensions_text=chunk[:500],
+            confidence_score=confidence_score,
+            confidence=confidence,
+            source_type=source_type,
+            evidence_text=chunk[:500],
+            cutout_dimensions=cutout_dimensions,
+            cutout_width=cutout_parts.get("width", ""),
+            cutout_height=cutout_parts.get("height", ""),
+            cutout_depth=cutout_parts.get("depth", ""),
+            shipping_dimensions=shipping_dimensions,
+            shipping_width=shipping_parts.get("width", ""),
+            shipping_height=shipping_parts.get("height", ""),
+            shipping_depth=shipping_parts.get("depth", ""),
+            used_shipping_dimensions=False,
+            diagnostics={
+                "chunks_checked": len(chunks),
+                "method": "dimension_chunks",
+                "dimension_tier": confidence,
+                "useful_axis_count": useful_count,
+            },
+        )
 
     return DimensionExtractionResult(
         source_type=source_type,
         cutout_dimensions=cutout_dimensions,
-        diagnostics={"chunks_checked": len(chunks), "failure_reason": "complete_w_h_d_not_found"},
+        cutout_width=cutout_parts.get("width", ""),
+        cutout_height=cutout_parts.get("height", ""),
+        cutout_depth=cutout_parts.get("depth", ""),
+        shipping_dimensions=shipping_dimensions,
+        shipping_width=shipping_parts.get("width", ""),
+        shipping_height=shipping_parts.get("height", ""),
+        shipping_depth=shipping_parts.get("depth", ""),
+        diagnostics={
+            "chunks_checked": len(chunks),
+            "failure_reason": "product_dimensions_not_found" if (cutout_dimensions or shipping_dimensions) else "complete_w_h_d_not_found",
+            "shipping_rejected": bool(shipping_dimensions),
+            "cutout_stored_separately": bool(cutout_dimensions),
+        },
     )
 
 
@@ -516,23 +584,26 @@ def _has_w_h_d(parts: dict[str, str]) -> bool:
 
 def _parts_are_plausible(parts: dict[str, str]) -> bool:
     values: list[float] = []
-    for key in ("width", "height", "depth"):
+    for key in ("width", "height", "depth", "length"):
         raw = parts.get(key)
         if not raw:
-            return False
+            continue
         try:
             value = float(raw)
         except (TypeError, ValueError):
             return False
         values.append(value)
-    return all(0.1 <= value <= 600 for value in values)
+    return bool(values) and all(0.1 <= value <= 600 for value in values)
 
 
-def _combined_if_complete(parts: dict[str, str]) -> str:
-    if not _parts_are_plausible(parts):
+def _useful_axis_count(parts: dict[str, str]) -> int:
+    return sum(1 for key in ("width", "height", "depth") if parts.get(key))
+
+
+def _combined_if_plausible(parts: dict[str, str]) -> str:
+    if _useful_axis_count(parts) < 1 or not _parts_are_plausible(parts):
         return ""
-    dims = combined_dimensions(parts)
-    return dims if has_complete_3d_dimensions(dims) else ""
+    return combined_dimensions(parts)
 
 
 def _dedupe(values: list[str]) -> list[str]:

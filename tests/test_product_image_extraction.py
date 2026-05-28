@@ -65,6 +65,32 @@ def test_srcset_and_lazy_fields_are_collected_and_scored():
     assert best.confidence in {"HIGH", "MEDIUM"}
 
 
+def test_shopify_embedded_product_json_image_candidates_are_scored():
+    html = """
+    <script>
+      ShopifyAnalytics.meta = {
+        "product": {
+          "vendor": "Wolf",
+          "variants": [
+            {"sku": "MDD30TS", "featured_image": {"src": "https://cdn.wolfappliance.com/mdd30ts-shopify-variant.jpg"}}
+          ],
+          "images": ["https://cdn.wolfappliance.com/mdd30ts-shopify-main.jpg"]
+        }
+      };
+    </script>
+    <body>Wolf MDD30TS 30 Inch Warming Drawer</body>
+    """
+
+    candidates = extract_product_image_candidates(html, "https://wolfappliance.com/products/mdd30ts", _row())
+    urls = {candidate.url for candidate in candidates}
+    scored = score_image_candidates(candidates, _row(), _evidence())
+    best = max(scored, key=lambda candidate: candidate.score)
+
+    assert "https://cdn.wolfappliance.com/mdd30ts-shopify-main.jpg" in urls
+    assert "https://cdn.wolfappliance.com/mdd30ts-shopify-variant.jpg" in urls
+    assert best.confidence in {"HIGH", "MEDIUM"}
+
+
 def test_rejects_logo_icon_placeholder_and_unrelated_alt_text():
     html = """
     <img src="https://wolfappliance.com/assets/logo-icon.png" width="800" height="400">

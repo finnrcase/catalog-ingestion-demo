@@ -1,9 +1,9 @@
 """Persistent source success memory for product dimensions/images.
 
-This registry is intentionally lightweight: it remembers which domains have
-worked for a brand/category so future uploads can try those sources before broad
-search. It stores only upstream enrichment evidence and never writes export
-columns directly.
+This registry is intentionally domain-level memory only: it remembers which
+domains have worked for a brand/category so future uploads can try those sources
+before broad search. Exact product URLs/images/spec values belong in exact
+product memory, not here.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+from src.durable_cache import durable_cache_enabled, load_map, upsert_payload
 from src.product_evidence import normalize_brand, normalize_sku
 
 DATA_DIR = Path("data")
@@ -215,15 +216,24 @@ def registry_path(path: str | Path | None = None) -> Path:
     return Path(env_path) if env_path else DEFAULT_REGISTRY_PATH
 
 
+def _use_durable(path: str | Path | None = None) -> bool:
+    return path is None and not os.getenv("SOURCE_SUCCESS_REGISTRY_PATH", "").strip() and durable_cache_enabled()
+
+
 def load_source_registry(path: str | Path | None = None) -> dict:
     path_obj = registry_path(path)
-    if not path_obj.exists():
-        return {}
-    try:
-        data = json.loads(path_obj.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    data: dict = {}
+    if path_obj.exists():
+        try:
+            loaded = json.loads(path_obj.read_text(encoding="utf-8"))
+            data = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            data = {}
+    if _use_durable(path):
+        durable = load_map("source_success_registry", "cache_key")
+        if durable:
+            data.update(durable)
+    return data
 
 
 def save_source_registry(registry: dict, path: str | Path | None = None) -> None:
@@ -232,6 +242,27 @@ def save_source_registry(registry: dict, path: str | Path | None = None) -> None
     tmp = path_obj.with_suffix(path_obj.suffix + ".tmp")
     tmp.write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(path_obj)
+    if _use_durable(path):
+        for key, entry in registry.items():
+            if not isinstance(entry, dict):
+                continue
+            upsert_payload(
+                "source_success_registry",
+                "cache_key",
+                str(key),
+                entry,
+                extra={
+                    "normalized_brand": entry.get("normalized_brand") or "",
+                    "normalized_sku": "",
+                    "normalized_category": entry.get("normalized_category") or "",
+                    "domain": entry.get("successful_domain") or entry.get("domain") or "",
+                    "success_count": int(entry.get("success_count") or 0),
+                    "failure_count": int(entry.get("failure_count") or 0),
+                    "average_confidence": float(entry.get("average_confidence") or 0.0),
+                    "image_success_rate": float(entry.get("image_success_rate") or 0.0),
+                    "dimension_success_rate": float(entry.get("dimension_success_rate") or 0.0),
+                },
+            )
 
 
 def preferred_source_domains_for_row(row: dict, path: str | Path | None = None) -> list[str]:
@@ -249,7 +280,15 @@ def preferred_source_domains_for_row(row: dict, path: str | Path | None = None) 
             continue
         entry_category = str(entry.get("normalized_category") or "")
         category_bonus = 5 if category_key and entry_category == category_key else 0
-        score = int(entry.get("success_count") or 0) * 10 - int(entry.get("failure_count") or 0) * 6 + category_bonus
+        success_count = int(entry.get("success_count") or 0)
+        failure_count = int(entry.get("failure_count") or 0)
+        score = (
+            success_count * 10
+            - failure_count * 6
+            + category_bonus
+            + int(_average_confidence(entry) * 6)
+            + int((_field_success_rate(entry, "image") + _field_success_rate(entry, "dimensions")) * 4)
+        )
         if score > scored.get(domain, -10_000):
             scored[domain] = score
 
@@ -293,23 +332,12 @@ def category_source_hints(category: object) -> list[str]:
 
 
 def successful_urls_for_row(row: dict, path: str | Path | None = None) -> list[str]:
-    """Return exact prior successful URLs for this brand/model, if any."""
-    brand_key = _brand_key(row)
-    sku_key = _sku_key(row)
-    if not brand_key or not sku_key:
-        return []
-    urls: list[str] = []
-    for entry in load_source_registry(path).values():
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("normalized_brand") != brand_key or entry.get("normalized_sku") != sku_key:
-            continue
-        if int(entry.get("success_count") or 0) <= 0:
-            continue
-        url = str(entry.get("successful_url") or "").strip()
-        if url and url not in urls:
-            urls.append(url)
-    return urls
+    """Deprecated compatibility shim.
+
+    Domain success memory must not return product URLs. Exact URLs now come from
+    product_lookup_cache / exact product memory.
+    """
+    return []
 
 
 def source_success_score(row: dict, domain: str, path: str | Path | None = None) -> int:
@@ -329,7 +357,9 @@ def source_success_score(row: dict, domain: str, path: str | Path | None = None)
         successes = int(entry.get("success_count") or 0)
         failures = int(entry.get("failure_count") or 0)
         category_bonus = 3 if category_key and entry.get("normalized_category") == category_key else 0
-        best = max(best, min(12, successes * 4 + category_bonus - failures * 3))
+        field_bonus = int((_field_success_rate(entry, "dimensions") + _field_success_rate(entry, "image")) * 2)
+        confidence_bonus = int(_average_confidence(entry) * 3)
+        best = max(best, min(12, successes * 4 + category_bonus + field_bonus + confidence_bonus - failures * 3))
     return best
 
 
@@ -348,24 +378,47 @@ def record_source_success(
     registry = load_source_registry(path)
     key = _entry_key(row, clean)
     existing = dict(registry.get(key) or {})
-    fields = _normalise_fields_found(fields_found or existing.get("fields_found") or {})
+    fields = _normalise_fields_found(fields_found or {})
+    previous_success_count = int(existing.get("success_count") or 0)
+    success_count = previous_success_count + 1
+    field_counts = {
+        "dimensions": int(existing.get("dimension_success_count") or 0) + int(fields["dimensions"]),
+        "image": int(existing.get("image_success_count") or 0) + int(fields["image"]),
+        "spec_sheet": int(existing.get("spec_sheet_success_count") or 0) + int(fields["spec_sheet"]),
+        "product_url": int(existing.get("product_url_success_count") or 0) + int(fields["product_url"]),
+    }
+    previous_average = _average_confidence(existing)
+    average_confidence = (
+        (previous_average * previous_success_count) + _confidence_value(confidence)
+    ) / success_count
+    last_success = _now()
     entry = {
         **existing,
         "brand": str(row.get("Brand") or existing.get("brand") or "").strip(),
         "normalized_brand": _brand_key(row) or existing.get("normalized_brand", ""),
-        "model": str(row.get("Model/SKU") or row.get("SKU") or existing.get("model") or "").strip(),
-        "normalized_sku": _sku_key(row) or existing.get("normalized_sku", ""),
         "category": str(row.get("Product Category") or existing.get("category") or "").strip(),
         "normalized_category": _category_key(row) or existing.get("normalized_category", ""),
         "successful_domain": clean,
         "domain": clean,
-        "successful_url": str(url or existing.get("successful_url") or "").strip(),
-        "fields_found": fields,
+        "fields_found": _fields_usually_found(field_counts, success_count),
+        "fields_usually_found": _fields_usually_found(field_counts, success_count),
+        "dimension_success_count": field_counts["dimensions"],
+        "image_success_count": field_counts["image"],
+        "spec_sheet_success_count": field_counts["spec_sheet"],
+        "product_url_success_count": field_counts["product_url"],
+        "dimension_success_rate": _success_rate(field_counts["dimensions"], success_count),
+        "image_success_rate": _success_rate(field_counts["image"], success_count),
+        "spec_sheet_success_rate": _success_rate(field_counts["spec_sheet"], success_count),
+        "product_url_success_rate": _success_rate(field_counts["product_url"], success_count),
+        "average_confidence": round(average_confidence, 4),
         "confidence": confidence if confidence in {"high", "medium", "low", "none"} else "medium",
-        "timestamp": _now(),
+        "timestamp": last_success,
+        "last_success_date": last_success,
         "failure_count": int(existing.get("failure_count") or 0),
-        "success_count": int(existing.get("success_count") or 0) + 1,
+        "success_count": success_count,
     }
+    for exact_field in ("model", "normalized_sku", "successful_url", "verified_product_url", "verified_image_url", "cloudinary_url"):
+        entry.pop(exact_field, None)
     registry[key] = entry
     save_source_registry(registry, path)
     return entry
@@ -389,20 +442,30 @@ def record_source_failure(
         **existing,
         "brand": str(row.get("Brand") or existing.get("brand") or "").strip(),
         "normalized_brand": _brand_key(row) or existing.get("normalized_brand", ""),
-        "model": str(row.get("Model/SKU") or row.get("SKU") or existing.get("model") or "").strip(),
-        "normalized_sku": _sku_key(row) or existing.get("normalized_sku", ""),
         "category": str(row.get("Product Category") or existing.get("category") or "").strip(),
         "normalized_category": _category_key(row) or existing.get("normalized_category", ""),
         "successful_domain": clean,
         "domain": clean,
-        "successful_url": str(existing.get("successful_url") or "").strip(),
         "fields_found": _normalise_fields_found(existing.get("fields_found") or {}),
+        "fields_usually_found": _normalise_fields_found(existing.get("fields_usually_found") or existing.get("fields_found") or {}),
+        "average_confidence": _average_confidence(existing),
+        "dimension_success_count": int(existing.get("dimension_success_count") or 0),
+        "image_success_count": int(existing.get("image_success_count") or 0),
+        "spec_sheet_success_count": int(existing.get("spec_sheet_success_count") or 0),
+        "product_url_success_count": int(existing.get("product_url_success_count") or 0),
+        "dimension_success_rate": float(existing.get("dimension_success_rate") or 0.0),
+        "image_success_rate": float(existing.get("image_success_rate") or 0.0),
+        "spec_sheet_success_rate": float(existing.get("spec_sheet_success_rate") or 0.0),
+        "product_url_success_rate": float(existing.get("product_url_success_rate") or 0.0),
         "confidence": str(existing.get("confidence") or "none"),
         "timestamp": _now(),
         "failure_count": int(existing.get("failure_count") or 0) + 1,
         "success_count": int(existing.get("success_count") or 0),
+        "last_success_date": str(existing.get("last_success_date") or ""),
         "last_failure_reason": str(reason or "unknown"),
     }
+    for exact_field in ("model", "normalized_sku", "successful_url", "verified_product_url", "verified_image_url", "cloudinary_url"):
+        entry.pop(exact_field, None)
     registry[key] = entry
     save_source_registry(registry, path)
     return entry
@@ -414,6 +477,48 @@ def _normalise_fields_found(fields: dict) -> dict:
         "image": bool(fields.get("image")),
         "spec_sheet": bool(fields.get("spec_sheet")),
         "product_url": bool(fields.get("product_url")),
+    }
+
+
+def _confidence_value(confidence: str) -> float:
+    return {
+        "high": 1.0,
+        "medium": 0.7,
+        "low": 0.25,
+        "none": 0.0,
+    }.get(str(confidence or "").lower(), 0.7)
+
+
+def _average_confidence(entry: dict) -> float:
+    try:
+        return float(entry.get("average_confidence"))
+    except (TypeError, ValueError):
+        return _confidence_value(str(entry.get("confidence") or "none"))
+
+
+def _success_rate(count: int, success_count: int) -> float:
+    if success_count <= 0:
+        return 0.0
+    return round(max(0.0, min(1.0, count / success_count)), 4)
+
+
+def _field_success_rate(entry: dict, field: str) -> float:
+    direct_key = "dimension_success_rate" if field == "dimensions" else f"{field}_success_rate"
+    try:
+        return float(entry.get(direct_key))
+    except (TypeError, ValueError):
+        fields = _normalise_fields_found(entry.get("fields_usually_found") or entry.get("fields_found") or {})
+        return 1.0 if fields.get(field) else 0.0
+
+
+def _fields_usually_found(field_counts: dict[str, int], success_count: int) -> dict:
+    if success_count <= 0:
+        return _normalise_fields_found({})
+    return {
+        "dimensions": field_counts.get("dimensions", 0) / success_count >= 0.5,
+        "image": field_counts.get("image", 0) / success_count >= 0.5,
+        "spec_sheet": field_counts.get("spec_sheet", 0) / success_count >= 0.5,
+        "product_url": field_counts.get("product_url", 0) / success_count >= 0.5,
     }
 
 

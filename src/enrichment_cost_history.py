@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.durable_cache import durable_cache_enabled, load_list, stable_or_random_id, upsert_payload
+
 
 DATA_DIR = Path("data")
 DEFAULT_COST_HISTORY_PATH = DATA_DIR / "enrichment_cost_history.json"
@@ -26,15 +28,29 @@ def cost_history_path(path: str | Path | None = None) -> Path:
     return Path(env_path) if env_path else DEFAULT_COST_HISTORY_PATH
 
 
+def _use_durable(path: str | Path | None = None) -> bool:
+    return path is None and not os.getenv("ENRICHMENT_COST_HISTORY_PATH", "").strip() and durable_cache_enabled()
+
+
 def load_cost_history(path: str | Path | None = None) -> list[dict[str, Any]]:
     path_obj = cost_history_path(path)
-    if not path_obj.exists():
-        return []
-    try:
-        data = json.loads(path_obj.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    entries: list[dict[str, Any]] = []
+    if path_obj.exists():
+        try:
+            data = json.loads(path_obj.read_text(encoding="utf-8"))
+            entries = data if isinstance(data, list) else []
+        except Exception:
+            entries = []
+    if _use_durable(path):
+        durable_entries = load_list("enrichment_cost_history")
+        if durable_entries:
+            seen = {str(entry.get("id") or entry.get("upload_id") or "") for entry in entries}
+            for entry in durable_entries:
+                key = str(entry.get("id") or entry.get("upload_id") or "")
+                if key and key in seen:
+                    continue
+                entries.append(entry)
+    return entries[-MAX_HISTORY_ENTRIES:]
 
 
 def save_cost_history(entries: list[dict[str, Any]], path: str | Path | None = None) -> None:
@@ -44,6 +60,23 @@ def save_cost_history(entries: list[dict[str, Any]], path: str | Path | None = N
     tmp = path_obj.with_suffix(path_obj.suffix + ".tmp")
     tmp.write_text(json.dumps(trimmed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(path_obj)
+    if _use_durable(path):
+        for entry in trimmed:
+            entry_id = stable_or_random_id(entry, "id", "upload_id")
+            entry.setdefault("id", entry_id)
+            upsert_payload(
+                "enrichment_cost_history",
+                "id",
+                entry_id,
+                entry,
+                extra={
+                    "upload_id": str(entry.get("upload_id") or ""),
+                    "project_name": str(entry.get("project_name") or ""),
+                    "file_name": str(entry.get("file_name") or ""),
+                    "bravi_cost_usd": float(entry.get("bravi_cost_usd") or 0.0),
+                    "total_enrichment_cost_usd": float(entry.get("total_enrichment_cost_usd") or 0.0),
+                },
+            )
 
 
 def append_cost_history(
@@ -65,6 +98,7 @@ def build_cost_history_entry(summary: dict[str, Any], rows: list[dict[str, Any]]
     if not upload_id:
         upload_id = f"run_{uuid.uuid4().hex[:12]}"
     return {
+        "id": f"cost_{uuid.uuid4().hex[:12]}",
         "upload_id": upload_id,
         "project_name": _first_non_empty(rows, ("Project", "Project Name", "project", "project_name")),
         "file_name": source_filename,

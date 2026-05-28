@@ -1,0 +1,56 @@
+# Deploy the FastAPI backend only. The Streamlit app and Next frontend have
+# their own local/deployment paths and should not be bundled into this Python
+# serverless function.
+app.py
+frontend/
+
+# Tests and development-only artifacts are not serverless entrypoints.
+tests/
+docs/
+scripts/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments, uploads, exports, caches, and generated files.
+.venv/
+venv/
+env/
+.tmp/
+temp/
+uploads/
+uploaded_files/
+exports/
+downloads/
+automation_logs/
+logs/
+*.log
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.pdf
+*.zip
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Browser/Playwright state can contain local credentials.
+playwright-report/
+test-results/
+storage_state*.json
+*.storage-state.json
+cookies*.json
+localStorage*.json
+sessionStorage*.json
+
+# OS/editor noise.
+.DS_Store
+.vscode/
+.idea/

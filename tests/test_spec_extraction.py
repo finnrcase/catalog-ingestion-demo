@@ -112,6 +112,45 @@ def test_extract_dimensions_from_meta_product_schema():
     assert result.dimensions == '30"W x 18"D x 12"H'
 
 
+def test_extract_dimensions_and_metadata_from_next_data_product_json():
+    html = """
+    <html>
+      <script id="__NEXT_DATA__" type="application/json">
+      {
+        "props": {
+          "pageProps": {
+            "product": {
+              "title": "Wolf MDD30TS Drawer Microwave",
+              "vendor": "Wolf",
+              "sku": "MDD30TS",
+              "dimensions": "Width: 30 in Height: 12 in Depth: 24 in",
+              "material": "Stainless Steel",
+              "finish": "Stainless"
+            }
+          }
+        }
+      }
+      </script>
+      <body>Wolf MDD30TS drawer microwave</body>
+    </html>
+    """
+
+    result = extract_dimensions_from_html(html, {"Brand": "Wolf", "Model/SKU": "MDD30TS"})
+    specs = extract_product_page_specs(
+        html,
+        "https://wolfappliance.com/products/mdd30ts",
+        {"Brand": "Wolf", "Model/SKU": "MDD30TS"},
+        official_domain=True,
+        sku_match=True,
+    )
+
+    assert result.dimensions == '30"W x 24"D x 12"H'
+    assert specs.dimensions == '30"W x 24"D x 12"H'
+    assert specs.material == "Stainless Steel"
+    assert specs.finish == "Stainless"
+    assert specs.debug["embedded_product_json_found"] is True
+
+
 def test_impossible_dimensions_are_rejected():
     html = "<table><tr><th>Dimensions</th><td>Width: 9999 in Height: 12 in Depth: 24 in</td></tr></table>"
 
@@ -132,9 +171,13 @@ def test_shipping_dimensions_are_medium_fallback_only():
 
     result = extract_dimensions_from_html(html, {"Brand": "Kohler", "Model/SKU": "K-123"})
 
-    assert result.dimensions == '40"W x 30"D x 20"H'
-    assert result.confidence == "medium"
-    assert result.used_shipping_dimensions is True
+    assert result.dimensions == ""
+    assert result.confidence == "none"
+    assert result.shipping_dimensions == '40"W x 30"D x 20"H'
+    assert result.shipping_width == "40"
+    assert result.shipping_depth == "30"
+    assert result.shipping_height == "20"
+    assert result.diagnostics["shipping_rejected"] is True
 
 
 def test_cutout_dimensions_are_reported_separately():
@@ -149,6 +192,36 @@ def test_cutout_dimensions_are_reported_separately():
 
     assert result.dimensions == '30"W x 24"D x 12"H'
     assert result.cutout_dimensions == '28"W x 22"D x 10"H'
+    assert result.cutout_width == "28"
+    assert result.cutout_depth == "22"
+    assert result.cutout_height == "10"
+
+
+def test_extract_two_product_dimensions_as_medium_partial():
+    html = """
+    <table class="specifications">
+      <tr><th>Width</th><td>30 in</td></tr>
+      <tr><th>Depth</th><td>24 in</td></tr>
+    </table>
+    """
+
+    result = extract_dimensions_from_html(html, {"Brand": "Wolf", "Model/SKU": "MDD30TS"})
+
+    assert result.dimensions == '30"W x 24"D'
+    assert result.width == "30"
+    assert result.depth == "24"
+    assert result.height == ""
+    assert result.confidence == "medium"
+
+
+def test_extract_one_product_dimension_as_low_partial():
+    html = '<section class="product-specs"><p>Overall Width: 30 in</p></section>'
+
+    result = extract_dimensions_from_html(html, {"Brand": "Wolf", "Model/SKU": "MDD30TS"})
+
+    assert result.dimensions == '30"W'
+    assert result.width == "30"
+    assert result.confidence == "low"
 
 
 def test_extract_dimensions_from_pdf_bytes():

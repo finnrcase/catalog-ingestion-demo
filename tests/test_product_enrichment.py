@@ -32,6 +32,7 @@ def _isolate_caches(monkeypatch, tmp_path):
     import src.product_enrichment as pe
     import src.dimension_enrichment as de
     monkeypatch.setenv("SOURCE_SUCCESS_REGISTRY_PATH", str(tmp_path / "source_success_registry.json"))
+    monkeypatch.setenv("PREFERRED_WEBSITES_PATH", str(tmp_path / "preferred_product_websites.json"))
     # Prevent manufacturer_domains.py from writing to real data/manufacturer_domain_cache.json
     monkeypatch.setattr("src.product_enrichment.get_domain_for_brand", lambda brand: None)
     monkeypatch.setattr("src.product_enrichment.record_discovered_domain", lambda brand, domain: None)
@@ -1152,30 +1153,30 @@ def test_apply_enrichment_overwrites_partial_with_complete_3d():
     assert updated["Dimensions"] == '36"W x 84"H x 24"D'
 
 
-def test_apply_enrichment_partial_extracted_adds_note():
-    """Partial extracted → no fill, note appended to Notes."""
+def test_apply_enrichment_partial_extracted_fills_low_confidence():
+    """Partial extracted → fill Dimensions with low confidence for review."""
     row = _base_row_for_apply()
     extracted = {
         "Product Name": "",
-        "Dimensions": "36 inch",   # partial
+        "Dimensions": '36"W',   # partial
         "Finish / Color": "",
         "Product Category": "",
         "materials": "",
     }
     updated = _apply_enrichment(row, extracted, "https://example.com", 85)
-    assert updated["Dimensions"] == ""   # not filled
-    assert "[Partial dimension found:" in updated["Notes"]
-    assert "36 inch" in updated["Notes"]
-    assert "full W x H x D still needed" in updated["Notes"]
+    assert updated["Dimensions"] == '36"W'
+    assert updated["Width (in)"] == "36"
+    assert updated["Dimension Confidence"] == "low"
+    assert updated["Dimension Lookup Status"] == "found_low_confidence_partial"
 
 
-def test_apply_enrichment_partial_note_not_duplicated():
-    """Partial dim note is not appended twice if already present."""
-    row = _base_row_for_apply()
-    row["Notes"] = "[Partial dimension found: 36 inch; full W x H x D still needed]"
-    extracted = {"Product Name": "", "Dimensions": "36 inch", "Finish / Color": "", "Product Category": "", "materials": ""}
+def test_apply_enrichment_lower_confidence_partial_does_not_overwrite_better_dimensions():
+    """Lower-confidence partial dimensions do not overwrite existing useful dimensions."""
+    row = {**_base_row_for_apply(), "Dimensions": '36"W x 24"D', "Dimension Confidence": "medium"}
+    extracted = {"Product Name": "", "Dimensions": '36"W', "Finish / Color": "", "Product Category": "", "materials": ""}
     updated = _apply_enrichment(row, extracted, "https://example.com", 85)
-    assert updated["Notes"].count("[Partial dimension found:") == 1
+    assert updated["Dimensions"] == '36"W x 24"D'
+    assert updated["Dimension Confidence"] == "medium"
 
 
 def test_apply_enrichment_no_dim_extracted_blank_row_unchanged():
@@ -1548,6 +1549,160 @@ def test_low_confidence_page_image_is_diagnostic_only(monkeypatch):
     assert updated["Image URL"] == ""
 
 
+def test_verified_page_linked_spec_pdf_fills_dimensions_before_ai(monkeypatch):
+    fitz = pytest.importorskip("fitz")
+    from src.product_resolver import ProductCandidate, ProductResolutionResult
+    import src.product_enrichment as pe
+
+    page_url = "https://wolfappliance.com/products/mdd30ts"
+    html = """
+    <html><body>
+      <h1>Wolf MDD30TS 30 Inch Warming Drawer</h1>
+      <a href="/resources/mdd30ts-spec-sheet.pdf">Spec Sheet</a>
+      Wolf MDD30TS
+    </body></html>
+    """
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Wolf MDD30TS Product Dimensions: Width: 30 in Height: 12 in Depth: 24 in")
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    candidate = ProductCandidate(
+        url=page_url,
+        domain="wolfappliance.com",
+        title="Wolf MDD30TS 30 Inch Warming Drawer",
+        html=html,
+        source_type="manufacturer_page",
+        evidence_score=95,
+        confidence="high",
+        matched_sku=True,
+        matched_brand=True,
+        matched_product_name=True,
+        is_official_domain=True,
+    )
+    monkeypatch.setattr(
+        pe,
+        "resolve_product_page",
+        lambda *a, **k: ProductResolutionResult(
+            selected=candidate,
+            candidates=[candidate],
+            diagnostics=[{"url": page_url, "domain": "wolfappliance.com", "confidence": "high"}],
+            queries_tried=['site:wolfappliance.com "MDD30TS"'],
+            urls_checked=[page_url],
+            confidence="high",
+            evidence_score=95,
+            selected_url=page_url,
+        ),
+    )
+
+    class PdfResp:
+        headers = {"content-type": "application/pdf"}
+        content = pdf_bytes
+        text = ""
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(pe.httpx, "get", lambda *a, **k: PdfResp())
+    monkeypatch.setattr(pe, "_extract_with_claude", lambda *a, **k: pytest.fail("AI should not run before linked spec PDF extraction"))
+
+    row = {
+        "Source Type": "PDF",
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product Name": "30 Inch Warming Drawer",
+        "Dimensions": "",
+        "Finish / Color": "Stainless",
+        "Material": "Steel",
+        "Product Category": "Appliances",
+        "Image URL": "",
+        "Product URL": "",
+        "Notes": "",
+    }
+
+    updated, err, dim_result = enrich_row(row)
+
+    assert err is None
+    assert updated["Product URL"] == page_url
+    assert updated["Dimensions"] == '30"W x 24"D x 12"H'
+    assert updated["Dimension Source Type"] == "verified_product_page_spec_pdf"
+    assert updated["Dimensions Extraction Method"].startswith("verified_page:spec_pdf")
+    assert dim_result is not None
+    assert dim_result.source_type == "verified_product_page_spec_pdf"
+
+
+def test_verified_page_partial_dimensions_fill_with_medium_confidence(monkeypatch):
+    from src.product_resolver import ProductCandidate, ProductResolutionResult
+    import src.product_enrichment as pe
+
+    page_url = "https://wolfappliance.com/products/mdd30ts"
+    html = """
+    <html><body>
+      <h1>Wolf MDD30TS 30 Inch Warming Drawer</h1>
+      <table>
+        <tr><th>Width</th><td>30 in</td></tr>
+        <tr><th>Depth</th><td>24 in</td></tr>
+      </table>
+      Wolf MDD30TS
+    </body></html>
+    """
+    candidate = ProductCandidate(
+        url=page_url,
+        domain="wolfappliance.com",
+        title="Wolf MDD30TS 30 Inch Warming Drawer",
+        html=html,
+        source_type="manufacturer_page",
+        evidence_score=95,
+        confidence="high",
+        matched_sku=True,
+        matched_brand=True,
+        matched_product_name=True,
+        is_official_domain=True,
+    )
+    monkeypatch.setattr(
+        pe,
+        "resolve_product_page",
+        lambda *a, **k: ProductResolutionResult(
+            selected=candidate,
+            candidates=[candidate],
+            diagnostics=[{"url": page_url, "domain": "wolfappliance.com", "confidence": "high"}],
+            queries_tried=['site:wolfappliance.com "MDD30TS"'],
+            urls_checked=[page_url],
+            confidence="high",
+            evidence_score=95,
+            selected_url=page_url,
+        ),
+    )
+    monkeypatch.setattr(pe, "_extract_with_claude", lambda *a, **k: {})
+    monkeypatch.setattr(pe, "_find_dimensions", lambda *a, **k: pe._DimensionResult())
+
+    row = {
+        "Source Type": "PDF",
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product Name": "30 Inch Warming Drawer",
+        "Dimensions": "",
+        "Finish / Color": "Stainless",
+        "Material": "Steel",
+        "Product Category": "Appliances",
+        "Image URL": "",
+        "Product URL": "",
+        "Notes": "",
+    }
+
+    updated, err, _ = enrich_row(row)
+
+    assert err is None
+    assert updated["Dimensions"] == '30"W x 24"D'
+    assert updated["Width (in)"] == "30"
+    assert updated["Depth (in)"] == "24"
+    assert updated["Product Width (in)"] == "30"
+    assert updated["Product Depth (in)"] == "24"
+    assert updated["Dimension Confidence"] == "medium"
+
+
 def test_existing_medium_pdf_image_not_overwritten_by_low_web_image(monkeypatch):
     import src.product_enrichment as pe
 
@@ -1672,9 +1827,17 @@ def test_cloudinary_upload_replaces_verified_candidate_image_url(monkeypatch):
 
     assert row["Image URL"] == "https://res.cloudinary.com/demo/image/upload/wolf.jpg"
     assert row["Original Image URL"] == "https://subzero-wolf.com/images/mdd30ts.webp"
+    assert row["original_image_url"] == "https://subzero-wolf.com/images/mdd30ts.webp"
+    assert row["cloudinary_url"] == "https://res.cloudinary.com/demo/image/upload/wolf.jpg"
+    assert row["cloudinary_secure_url"] == "https://res.cloudinary.com/demo/image/upload/wolf.jpg"
+    assert row["cloudinary_status"] == "uploaded"
+    assert row["cloudinary_error"] == ""
+    assert row["programa_image_ready"] == "True"
     assert row["cloudinary_public_id"] == "sch/wolf"
     assert row["image_upload_status"] == "uploaded"
     assert debug["selected_image_url"] == "https://res.cloudinary.com/demo/image/upload/wolf.jpg"
+    assert debug["cloudinary_url"] == "https://res.cloudinary.com/demo/image/upload/wolf.jpg"
+    assert debug["programa_image_ready"] == "True"
 
 
 def test_cloudinary_upload_failure_keeps_original_candidate_image_url(monkeypatch):
@@ -1702,6 +1865,9 @@ def test_cloudinary_upload_failure_keeps_original_candidate_image_url(monkeypatc
     assert row["Image URL"] == "https://subzero-wolf.com/images/mdd30ts.webp"
     assert row["image_upload_status"] == "failed"
     assert row["image_upload_failure_reason"] == "fetch_failed:403"
+    assert row["cloudinary_status"] == "failed"
+    assert row["cloudinary_error"] == "fetch_failed:403"
+    assert row["programa_image_ready"] == "False"
     assert debug["image_upload_failure_reason"] == "fetch_failed:403"
 
 
@@ -1731,6 +1897,33 @@ def _targeted_retry_html() -> str:
       </body>
     </html>
     """
+
+
+def _targeted_retry_spec_pdf_html() -> str:
+    return """
+    <html>
+      <head>
+        <script type="application/ld+json">
+          {"@type":"Product","name":"Wolf MDD30TS Drawer Microwave","brand":{"name":"Wolf"},"sku":"MDD30TS"}
+        </script>
+      </head>
+      <body>
+        <h1>Wolf MDD30TS Drawer Microwave</h1>
+        <a href="/docs/mdd30ts-spec.pdf">Specification Sheet PDF</a>
+      </body>
+    </html>
+    """
+
+
+def _pdf_bytes_with_text(text: str) -> bytes:
+    import fitz
+
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), text)
+    data = doc.tobytes()
+    doc.close()
+    return data
 
 
 def test_targeted_retry_fills_missing_image_from_existing_product_url_without_brave(monkeypatch):
@@ -1867,6 +2060,50 @@ def test_targeted_retry_uses_narrow_dimension_search_when_no_product_url(monkeyp
     assert queries
     assert all("dimensions" in query.lower() or "product" in query.lower() for query in queries)
     assert diagnostics[0]["summary"]["targeted_retry_extra_cost_usd"] <= 0.006
+
+
+def test_targeted_retry_parses_direct_spec_pdf_from_verified_product_page(monkeypatch):
+    import src.product_enrichment as pe
+
+    pdf_bytes = _pdf_bytes_with_text(
+        "Wolf MDD30TS Drawer Microwave specifications. Width: 29.875 in Height: 11.875 in Depth: 23.5 in"
+    )
+
+    class PdfResp:
+        headers = {"content-type": "application/pdf"}
+        content = pdf_bytes
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(pe, "_fetch_page_html", lambda url: _targeted_retry_spec_pdf_html())
+    monkeypatch.setattr(pe.httpx, "get", lambda url, **kwargs: PdfResp())
+    monkeypatch.setattr(pe, "_maybe_upload_selected_image_to_cloudinary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pe, "search_product_candidates", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("spec PDF came from verified page; broad search should not run")))
+
+    df = pd.DataFrame([{
+        "Source Type": "PDF",
+        "Brand": "Wolf",
+        "Model/SKU": "MDD30TS",
+        "Product Name": "Drawer Microwave",
+        "Dimensions": "",
+        "Product Category": "Appliances",
+        "Product URL": "https://www.subzero-wolf.com/products/mdd30ts",
+        "Product Resolution Confidence": "high",
+        "Image URL": "https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg",
+        "Image Recovery Confidence": "HIGH",
+        "Confidence Score": 90,
+    }])
+
+    updated_df, errors, diagnostics = retry_missing_fields_dataframe(df, retry_mode="conservative")
+
+    assert errors == []
+    row = updated_df.iloc[0].to_dict()
+    assert row["Dimensions"] == '29.875"W x 23.5"D x 11.875"H'
+    assert row["Dimension Source URL"] == "https://www.subzero-wolf.com/docs/mdd30ts-spec.pdf"
+    assert row["Dimension Source Type"] == "targeted_retry_existing_product_page_spec_pdf"
+    assert diagnostics[0]["summary"]["dimensions_added"] == 1
 
 
 def test_retry_missing_fields_dataframe_does_not_run_full_enrichment(monkeypatch):

@@ -228,7 +228,10 @@ def test_intake_enrich_endpoint_returns_photo_discovery_report(monkeypatch):
     def fake_enrich_dataframe(df, enrichment_mode="standard", force_refresh=False, use_web_enrichment=True, **kwargs):
         return df, [], []
 
-    def fake_recover_images_for_dataframe(df, pdf_lookup=None, session_id=None, enable_screenshot=True, enable_web_lookup=True):
+    image_kwargs = {}
+
+    def fake_recover_images_for_dataframe(df, pdf_lookup=None, session_id=None, enable_screenshot=True, enable_web_lookup=True, **kwargs):
+        image_kwargs.update(kwargs)
         out = df.copy()
         out["confidence"] = "HIGH"
         out["local_image_path"] = "/tmp/images/wolf_mdd30ts.jpg"
@@ -251,6 +254,8 @@ def test_intake_enrich_endpoint_returns_photo_discovery_report(monkeypatch):
     report = next(d for d in diagnostics if d.get("report_type") == "photo_discovery")["summary"]
     assert report["official_product_pages_found"] == 1
     assert report["images_inserted_into_excel"] == 1
+    assert "run_budget" in image_kwargs
+    assert "max_product_page_fetches" not in image_kwargs
 
 
 def test_programa_export_csv_endpoint_uses_programa_columns():

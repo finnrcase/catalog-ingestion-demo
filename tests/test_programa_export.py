@@ -304,6 +304,38 @@ def test_export_accepts_webp_image_url():
     assert df.iloc[0]["Image URL"] == "https://example.com/photo.webp"
 
 
+def test_export_prefers_cloudinary_stable_jpg_over_raw_image_url():
+    from src.programa_export import build_programa_import_dataframe
+
+    rows = _make_rows([
+        {
+            "Image URL": "https://manufacturer.example.com/photo.webp",
+            "cloudinary_secure_url": "https://res.cloudinary.com/demo/image/upload/photo.jpg",
+        }
+    ])
+
+    df = build_programa_import_dataframe(rows)
+
+    assert df.iloc[0]["Image URL"] == "https://res.cloudinary.com/demo/image/upload/photo.jpg"
+
+
+def test_export_does_not_use_review_only_cloudinary_url_without_image_url():
+    from src.programa_export import build_programa_import_dataframe
+
+    rows = _make_rows([
+        {
+            "Image URL": "",
+            "cloudinary_secure_url": "https://res.cloudinary.com/demo/image/upload/review.jpg",
+            "Review Image URL": "https://res.cloudinary.com/demo/image/upload/review.jpg",
+            "confidence": "MEDIUM",
+        }
+    ])
+
+    df = build_programa_import_dataframe(rows)
+
+    assert df.iloc[0]["Image URL"] == ""
+
+
 def test_export_accepts_cdn_url_without_extension():
     """CDN image URLs without file extension (Scene7-style) must pass through."""
     from src.programa_export import build_programa_import_dataframe

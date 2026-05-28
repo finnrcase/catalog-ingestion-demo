@@ -49,6 +49,28 @@ def test_matching_preferred_websites_and_direct_urls(tmp_path):
     assert preferred_domains_for_row(row, path) == ["scotsman-ice.com"]
 
 
+def test_matching_preferred_websites_uses_supplier_model_and_aliases(tmp_path):
+    path = tmp_path / "preferred.json"
+    add_preferred_website(
+        keyword="PC Richard",
+        url="https://pcrichard.com/",
+        notes="aliases: P.C. Richard, PCR, appliances",
+        path=path,
+    )
+    add_preferred_website(keyword="Visual Comfort", url="https://visualcomfort.com/", path=path)
+
+    row = {
+        "Supplier": "P.C. Richard",
+        "Brand": "Scotsman",
+        "Model/SKU": "SCN60PA1SU",
+        "Product Name": "Icemaker built in pump",
+    }
+
+    matches = matching_preferred_websites(row, path)
+
+    assert [match["domain"] for match in matches] == ["pcrichard.com"]
+
+
 def test_record_preferred_website_result_tracks_field_success(tmp_path):
     path = tmp_path / "preferred.json"
     entry = add_preferred_website(keyword="Kohler sink", url="https://kohler.com/product/k-123", path=path)

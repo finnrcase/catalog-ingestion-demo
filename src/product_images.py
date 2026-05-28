@@ -15,6 +15,7 @@ from typing import Any
 
 from bs4 import BeautifulSoup
 
+from src.embedded_product_data import css_background_image_urls, embedded_product_images
 from src.product_evidence import ProductEvidence, normalize_sku
 from src.product_page_images import ProductPageImageResult
 
@@ -180,6 +181,20 @@ def _collect_candidates(soup: BeautifulSoup, page_url: str) -> list[_ImageCandid
             url=_absolute_url(value, page_url),
             source_kind="jsonld_image",
             context="jsonld_product",
+        ))
+
+    for value in embedded_product_images(soup):
+        candidates.append(_ImageCandidate(
+            url=_absolute_url(value, page_url),
+            source_kind="embedded_json_image",
+            context="embedded_product_json",
+        ))
+
+    for value, context in css_background_image_urls(soup):
+        candidates.append(_ImageCandidate(
+            url=_absolute_url(value, page_url),
+            source_kind="css_background_image",
+            context=context,
         ))
 
     for source in soup.select("source[srcset], source[data-srcset]"):
@@ -560,9 +575,11 @@ def _is_product_context(context: str) -> bool:
 def _source_score(source_kind: str) -> int:
     return {
         "jsonld_image": 80,
+        "embedded_json_image": 78,
         "og_image": 75,
         "twitter_image": 70,
         "gallery_image": 70,
+        "css_background_image": 50,
         "source_srcset": 65,
         "img_srcset": 60,
         "lazy_srcset": 55,
@@ -591,7 +608,9 @@ def _source_suffix(source_kind: str) -> str:
         "og_image": "og_image",
         "twitter_image": "og_image",
         "jsonld_image": "jsonld_image",
+        "embedded_json_image": "jsonld_image",
         "gallery_image": "html_image",
+        "css_background_image": "html_image",
         "source_srcset": "html_image",
         "img_srcset": "html_image",
         "lazy_srcset": "html_image",

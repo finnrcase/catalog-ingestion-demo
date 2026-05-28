@@ -779,7 +779,7 @@ def test_dataframe_recovery_skips_high_confidence_rows(tmp_path):
     assert m.call_count == 1
 
 
-def test_dataframe_recovery_limits_product_page_image_fetches_in_fast_mode(tmp_path):
+def test_dataframe_recovery_ignores_deprecated_row_count_product_page_limit(tmp_path):
     df = pd.DataFrame([
         {"Product Name": "One", "Brand": "Wolf", "Model/SKU": "A1", "Image URL": "", "Product URL": "https://wolf.example/a1"},
         {"Product Name": "Two", "Brand": "Wolf", "Model/SKU": "A2", "Image URL": "", "Product URL": "https://wolf.example/a2"},
@@ -797,7 +797,40 @@ def test_dataframe_recovery_limits_product_page_image_fetches_in_fast_mode(tmp_p
             max_product_page_fetches=1,
         )
 
-    assert [call.kwargs["enable_product_page"] for call in m.call_args_list] == [True, False, False]
+    assert [call.kwargs["enable_product_page"] for call in m.call_args_list] == [True, True, True]
+
+
+def test_dataframe_recovery_uses_budget_for_product_page_image_fetches(tmp_path):
+    from src.product_lookup_budget import EnrichmentRunBudget
+
+    df = pd.DataFrame([
+        {"Product Name": "One", "Brand": "Wolf", "Model/SKU": "A1", "Image URL": "", "Product URL": "https://wolf.example/a1"},
+        {"Product Name": "Two", "Brand": "Wolf", "Model/SKU": "A2", "Image URL": "", "Product URL": "https://wolf.example/a2"},
+        {"Product Name": "Three", "Brand": "Wolf", "Model/SKU": "A3", "Image URL": "", "Product URL": "https://wolf.example/a3"},
+    ])
+    budget = EnrichmentRunBudget(
+        hard_budget_usd=0.001,
+        max_external_lookups=99,
+        fetch_cost_usd=0.0005,
+    )
+
+    with patch("src.image_recovery.recover_from_product_page") as m:
+        m.return_value = ImageRecoveryResult(confidence="NONE", image_source="none", error="missing")
+        _out_df, diags = recover_images_for_dataframe(
+            df,
+            pdf_lookup=None,
+            session_id="testsess",
+            enable_screenshot=False,
+            enable_web_lookup=False,
+            run_budget=budget,
+        )
+
+    assert m.call_count == 2
+    assert diags[2]["product_url_fetch_ran"] is False
+    assert "budget_exhausted" in diags[2]["product_url_rejection_reasons"]
+    ledger = budget.diagnostics()["cost_ledger"]
+    assert [entry["status"] for entry in ledger] == ["called", "called", "skipped"]
+    assert ledger[-1]["skipped_reason"] == "hard budget exceeded"
 
 
 def test_dataframe_recovery_skips_manual_uploaded_image_rows(tmp_path):
@@ -849,6 +882,53 @@ def test_dataframe_recovery_writes_files_to_session_images_dir(tmp_path, monkeyp
     assert row["local_image_filename"] == "wolf_mdd30ts.jpg"
     assert Path(row["local_image_path"]).resolve() == files[0].resolve()
     assert Path(row["Local Image Path"]).resolve() == files[0].resolve()
+
+
+def test_dataframe_recovery_uploads_high_confidence_image_to_cloudinary(tmp_path, monkeypatch):
+    from src.image_uploader import ImageUploadResult
+
+    monkeypatch.chdir(tmp_path)
+    df = pd.DataFrame([
+        {
+            "Product Name": "Wolf Drawer", "Brand": "Wolf", "Model/SKU": "MDD30TS",
+            "Image URL": "", "Product URL": "https://wolf.example/p",
+            "_source_pdf_id": "",
+        },
+    ])
+    with patch("src.image_recovery._TMP_ROOT", tmp_path / ".tmp" / "uploads"), \
+         patch("src.image_recovery.recover_image_for_row") as recover_mock, \
+         patch("src.image_recovery.upload_image_with_metadata") as upload_mock:
+        recover_mock.return_value = _result(
+            confidence="HIGH",
+            source="product_page_json_ld",
+            jpeg=_jpeg_bytes(),
+            image_url="https://wolf.example/images/mdd30ts.webp",
+        )
+        upload_mock.return_value = ImageUploadResult(
+            secure_url="https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg",
+            public_id="sch/mdd30ts",
+            width=800,
+            height=600,
+            format="jpg",
+            bytes=12000,
+            status="uploaded",
+            debug={"final_saved_image_url": "https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg"},
+        )
+        out_df, diags = recover_images_for_dataframe(
+            df, pdf_lookup=None, session_id="sess123",
+            enable_screenshot=True,
+        )
+
+    row = out_df.iloc[0]
+    assert row["Image URL"] == "https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg"
+    assert row["Original Image URL"] == "https://wolf.example/images/mdd30ts.webp"
+    assert row["cloudinary_secure_url"] == "https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg"
+    assert row["cloudinary_url"] == "https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg"
+    assert row["cloudinary_status"] == "uploaded"
+    assert row["programa_image_ready"] == "True"
+    assert row["cloudinary_public_id"] == "sch/mdd30ts"
+    assert diags[0]["cloudinary_url"] == "https://res.cloudinary.com/demo/image/upload/mdd30ts.jpg"
+    assert diags[0]["programa_image_ready"] == "True"
 
 
 def test_dataframe_recovery_medium_saved_as_review_candidate_not_excel_image(tmp_path, monkeypatch):

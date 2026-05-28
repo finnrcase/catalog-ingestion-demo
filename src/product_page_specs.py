@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 from bs4 import BeautifulSoup
 
+from src.embedded_product_data import embedded_product_metadata, embedded_product_text
 from src.measurement_parser import combined_dimensions, parse_dimensions
 from src.spec_extraction import extract_dimensions_from_html
 
@@ -31,6 +32,14 @@ class ProductPageSpecResult:
     material: str = ""
     lead_time: str = ""
     weight: str = ""
+    cutout_dimensions: str = ""
+    cutout_width: str = ""
+    cutout_height: str = ""
+    cutout_depth: str = ""
+    shipping_dimensions: str = ""
+    shipping_width: str = ""
+    shipping_height: str = ""
+    shipping_depth: str = ""
     source_url: str = ""
     confidence: str = "none"
     evidence: str = ""
@@ -217,11 +226,13 @@ def extract_product_page_specs(
         return ProductPageSpecResult(source_url=page_url, debug={"error": "empty_html"})
 
     soup = BeautifulSoup(html, "html.parser")
-    metadata = _jsonld_product_metadata(soup)
+    embedded_metadata = embedded_product_metadata(soup)
+    metadata = {**embedded_metadata, **_jsonld_product_metadata(soup)}
     jsonld_text = _jsonld_product_text(soup)
+    embedded_text = embedded_product_text(soup)
     table_text = _spec_table_text(soup)
     body_text = soup.get_text(" ", strip=True)
-    candidate_text = "\n".join(part for part in (jsonld_text, table_text, body_text[:4000]) if part)
+    candidate_text = "\n".join(part for part in (jsonld_text, embedded_text, table_text, body_text[:4000]) if part)
     dim_result = extract_dimensions_from_html(html, row)
     if dim_result.dimensions:
         parts = {
@@ -239,6 +250,8 @@ def extract_product_page_specs(
     evidence_bits: list[str] = []
     if jsonld_text:
         evidence_bits.append("jsonld_product")
+    if embedded_text:
+        evidence_bits.append("embedded_product_json")
     if table_text:
         evidence_bits.append("spec_table_or_detail")
     if sku_match:
@@ -250,14 +263,13 @@ def extract_product_page_specs(
 
     confidence = "none"
     if dims:
-        if official_domain and sku_match and (jsonld_text or table_text):
+        dim_confidence = dim_result.confidence if dim_result.dimensions else "low"
+        if dim_confidence == "high" and official_domain and sku_match and (jsonld_text or table_text):
             confidence = "high"
-        elif official_domain and (product_name_match or table_text):
+        elif dim_confidence in {"high", "medium"} and official_domain and (sku_match or product_name_match or table_text):
             confidence = "medium"
         else:
-            confidence = "low"
-        if dim_result.dimensions and dim_result.confidence in {"high", "medium"} and confidence == "low":
-            confidence = "medium"
+            confidence = dim_confidence if dim_confidence in {"high", "medium", "low"} else "low"
 
     return ProductPageSpecResult(
         product_name=metadata.get("product_name", "") or _text(soup.select_one("h1").get_text(" ", strip=True) if soup.select_one("h1") else ""),
@@ -276,12 +288,21 @@ def extract_product_page_specs(
         material=metadata.get("material", "") or _first_labeled_value(candidate_text, ("Material", "Materials")),
         lead_time=_first_labeled_value(candidate_text, ("Lead Time", "Availability")),
         weight=_first_labeled_value(candidate_text, ("Weight",)),
+        cutout_dimensions=dim_result.cutout_dimensions,
+        cutout_width=dim_result.cutout_width,
+        cutout_height=dim_result.cutout_height,
+        cutout_depth=dim_result.cutout_depth,
+        shipping_dimensions=dim_result.shipping_dimensions,
+        shipping_width=dim_result.shipping_width,
+        shipping_height=dim_result.shipping_height,
+        shipping_depth=dim_result.shipping_depth,
         source_url=page_url,
         confidence=confidence,
         evidence=";".join([*evidence_bits, dim_result.diagnostics.get("method", "")]).strip(";"),
         raw_text=dim_result.raw_dimensions_text or candidate_text[:1000],
         debug={
             "jsonld_found": bool(jsonld_text),
+            "embedded_product_json_found": bool(embedded_text),
             "spec_text_found": bool(table_text),
             "dimension_failure_reason": dim_result.diagnostics.get("failure_reason", ""),
             "dimension_confidence_score": dim_result.confidence_score,

@@ -69,6 +69,48 @@ def _confidence_rank(confidence: str) -> int:
     return {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}.get(str(confidence or "").upper(), 0)
 
 
+def _item_key(row: dict) -> str:
+    return "|".join(
+        part
+        for part in (
+            _str_val(row.get("Brand")),
+            _str_val(row.get("Model/SKU") or row.get("SKU")),
+            _str_val(row.get("Product Name")),
+        )
+        if part
+    )[:160]
+
+
+def _consume_run_budget(
+    run_budget,
+    kind: str,
+    *,
+    row: dict,
+    item_key: str = "",
+    field: str = "Image URL",
+    reason: str,
+    query: str = "",
+    stage: str,
+    source_function: str,
+) -> bool:
+    if run_budget is None:
+        return True
+    if kind == "image_search":
+        cost = float(getattr(run_budget, "image_search_cost_usd", 0.003) or 0.0)
+    else:
+        cost = float(getattr(run_budget, "fetch_cost_usd", 0.0005) or 0.0)
+    return run_budget.consume(
+        kind,
+        cost,
+        item_key=item_key or _item_key(row),
+        field=field,
+        reason=reason,
+        stage=stage,
+        query=query,
+        source_function=source_function,
+    )
+
+
 def _merge_page_image_debug(debug: dict, image: ProductPageImageResult, *, prefix: str = "web") -> None:
     image_debug = image.debug or {}
     debug["image_candidates_found"] = max(
@@ -89,6 +131,8 @@ def _search_image_candidate_pages(
     *,
     session_cache=None,
     skip_urls: set[str] | None = None,
+    run_budget=None,
+    item_key: str = "",
     debug: dict,
 ) -> ProductPageImageResult:
     brand = _str_val(row.get("Brand"))
@@ -100,6 +144,19 @@ def _search_image_candidate_pages(
 
     for query in queries[:3]:
         debug["fallback_image_queries_used"].append(query)
+        cached_query = bool(session_cache is not None and query in getattr(session_cache, "queries", {}))
+        if not cached_query and not _consume_run_budget(
+            run_budget,
+            "image_search",
+            row=row,
+            item_key=item_key,
+            reason="fallback product image search",
+            query=query,
+            stage="image_lookup_fallback_search",
+            source_function="_search_image_candidate_pages:search_product_candidates",
+        ):
+            debug.setdefault("web_rejection_reasons", []).append(f"{query}: budget_exhausted")
+            continue
         try:
             results = search_product_candidates(query, brand, session_cache=session_cache)
         except TypeError:
@@ -135,6 +192,18 @@ def _search_image_candidate_pages(
                 record["rejection_reason"] = "candidate_page_score_too_low"
                 continue
 
+            if not _consume_run_budget(
+                run_budget,
+                "fetch",
+                row=row,
+                item_key=item_key,
+                reason="fallback image candidate page fetch",
+                query=query,
+                stage="image_lookup_fallback_page_fetch",
+                source_function="_search_image_candidate_pages:extract_image_from_url",
+            ):
+                record["rejection_reason"] = "budget_exhausted"
+                continue
             image = extract_image_from_url(url, row, source_prefix="image_search")
             _merge_page_image_debug(debug, image, prefix="fallback")
             record["selected_image_url"] = image.image_url
@@ -187,7 +256,7 @@ def _result_score(row: dict, result) -> tuple[int, list[str]]:
     return score, reasons
 
 
-def lookup_official_product_image(row: dict, *, session_cache=None) -> WebLookupResult:
+def lookup_official_product_image(row: dict, *, session_cache=None, run_budget=None, item_key: str = "") -> WebLookupResult:
     queries = build_image_lookup_queries(row)
     debug = {
         "web_lookup_ran": True,
@@ -217,10 +286,27 @@ def lookup_official_product_image(row: dict, *, session_cache=None) -> WebLookup
     }
 
     brand = _str_val(row.get("Brand"))
+
+    def _budgeted_search(query: str, brand_name: str, session_cache=None):
+        cached_query = bool(session_cache is not None and query in getattr(session_cache, "queries", {}))
+        if not cached_query and not _consume_run_budget(
+            run_budget,
+            "image_search",
+            row=row,
+            item_key=item_key,
+            reason="official product page search for image recovery",
+            query=query,
+            stage="image_lookup_official_page_search",
+            source_function="lookup_official_product_image:lookup_official_product_page",
+        ):
+            debug.setdefault("web_rejection_reasons", []).append(f"{query}: budget_exhausted")
+            return []
+        return search_product_candidates(query, brand_name, session_cache=session_cache)
+
     page = lookup_official_product_page(
         row,
         session_cache=session_cache,
-        search_fn=search_product_candidates,
+        search_fn=_budgeted_search,
     )
     debug["brand_registry_match"] = page.registry_match
     debug["brand_registry_domains_checked"] = page.registry_domains_checked
@@ -243,6 +329,8 @@ def lookup_official_product_image(row: dict, *, session_cache=None) -> WebLookup
             queries,
             session_cache=session_cache,
             skip_urls=set(),
+            run_budget=run_budget,
+            item_key=item_key,
             debug=debug,
         )
         return WebLookupResult(fallback if fallback.image_found else ProductPageImageResult(error="no_web_results"), debug)
@@ -255,6 +343,17 @@ def lookup_official_product_image(row: dict, *, session_cache=None) -> WebLookup
         debug["web_rejection_reasons"].append(f"best_score_too_low:{page.score}")
         return WebLookupResult(ProductPageImageResult(error="no_confident_product_page"), debug)
 
+    if not _consume_run_budget(
+        run_budget,
+        "fetch",
+        row=row,
+        item_key=item_key,
+        reason="official product page fetch for image metadata",
+        stage="image_lookup_official_page_fetch",
+        source_function="lookup_official_product_image:extract_image_from_url",
+    ):
+        debug["web_rejection_reasons"].append("official_page_fetch_budget_exhausted")
+        return WebLookupResult(ProductPageImageResult(error="budget_exhausted"), debug)
     image = extract_image_from_url(page_url, row, source_prefix="official_site")
     _merge_page_image_debug(debug, image, prefix="web")
     debug["image_candidates_found"] = image.debug.get("images_found", 0)
@@ -273,6 +372,8 @@ def lookup_official_product_image(row: dict, *, session_cache=None) -> WebLookup
         queries,
         session_cache=session_cache,
         skip_urls={page_url},
+        run_budget=run_budget,
+        item_key=item_key,
         debug=debug,
     )
     if fallback.image_found and _confidence_rank(fallback.confidence) > _confidence_rank(image.confidence):

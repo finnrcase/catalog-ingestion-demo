@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from src.source_success_registry import (
     brand_source_hints,
     category_source_hints,
@@ -67,10 +69,15 @@ def test_source_success_registry_saves_and_prefers_successful_domain(tmp_path):
     data = load_source_registry(path)
     entry = next(iter(data.values()))
     assert entry["successful_domain"] == "subzero-wolf.com"
-    assert entry["fields_found"]["dimensions"] is True
-    assert entry["fields_found"]["image"] is True
+    assert entry["fields_usually_found"]["dimensions"] is True
+    assert entry["fields_usually_found"]["image"] is True
+    assert entry["image_success_rate"] == 1.0
+    assert entry["dimension_success_rate"] == 1.0
+    assert entry["average_confidence"] == 1.0
+    assert "successful_url" not in entry
+    assert entry.get("normalized_sku", "") == ""
     assert preferred_source_domains_for_row(_row(), path)[0] == "subzero-wolf.com"
-    assert successful_urls_for_row(_row(), path) == ["https://subzero-wolf.com/wolf/products/mdd30ts"]
+    assert successful_urls_for_row(_row(), path) == []
 
 
 def test_source_failure_downranks_failed_domain(tmp_path):
@@ -85,6 +92,30 @@ def test_source_failure_downranks_failed_domain(tmp_path):
     preferred = preferred_source_domains_for_row(row, path)
     assert preferred.index("good.example.com") < preferred.index("bad.example.com")
     assert source_success_score(row, "good.example.com", path) > source_success_score(row, "bad.example.com", path)
+
+
+def test_domain_success_memory_removes_stale_exact_product_fields(tmp_path):
+    path = tmp_path / "source_success_registry.json"
+    row = _row("Acme", "AX100", "Appliances")
+
+    record_source_success(row, domain="specs.acme.com", url="https://specs.acme.com/old-ax100", path=path)
+    data = load_source_registry(path)
+    key = next(iter(data))
+    data[key].update({
+        "successful_url": "https://specs.acme.com/other-product",
+        "model": "OTHER",
+        "normalized_sku": "other",
+        "cloudinary_url": "https://res.cloudinary.com/demo/image/upload/other.jpg",
+    })
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    record_source_success(row, domain="specs.acme.com", fields_found={"image": True}, path=path)
+
+    entry = next(iter(load_source_registry(path).values()))
+    assert "successful_url" not in entry
+    assert "model" not in entry
+    assert "normalized_sku" not in entry
+    assert "cloudinary_url" not in entry
 
 
 def test_marketplace_failures_are_not_stored(tmp_path):

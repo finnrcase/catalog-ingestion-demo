@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from src.durable_cache import delete_payload, durable_cache_enabled, load_list, upsert_payload
+
 
 DATA_DIR = Path("data")
 DEFAULT_PREFERRED_WEBSITES_PATH = DATA_DIR / "preferred_product_websites.json"
@@ -28,19 +30,32 @@ def preferred_websites_path(path: str | Path | None = None) -> Path:
     return Path(env_path) if env_path else DEFAULT_PREFERRED_WEBSITES_PATH
 
 
+def _use_durable(path: str | Path | None = None) -> bool:
+    return path is None and not os.getenv("PREFERRED_WEBSITES_PATH", "").strip() and durable_cache_enabled()
+
+
 def load_preferred_websites(path: str | Path | None = None) -> list[dict[str, Any]]:
     path_obj = preferred_websites_path(path)
-    if not path_obj.exists():
-        return []
-    try:
-        data = json.loads(path_obj.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-    if isinstance(data, dict):
-        entries = data.get("entries", [])
-    else:
-        entries = data
-    return [entry for entry in entries if isinstance(entry, dict)]
+    entries: list[dict[str, Any]] = []
+    if path_obj.exists():
+        try:
+            data = json.loads(path_obj.read_text(encoding="utf-8"))
+        except Exception:
+            data = []
+        if isinstance(data, dict):
+            loaded = data.get("entries", [])
+        else:
+            loaded = data
+        entries = [entry for entry in loaded if isinstance(entry, dict)]
+    if _use_durable(path):
+        durable_entries = load_list("preferred_product_websites")
+        by_id = {_text(entry.get("id")) or _duplicate_key(entry.get("keyword"), entry.get("url")): entry for entry in entries}
+        for entry in durable_entries:
+            key = _text(entry.get("id")) or _duplicate_key(entry.get("keyword"), entry.get("url"))
+            if key:
+                by_id[key] = entry
+        entries = list(by_id.values())
+    return entries
 
 
 def save_preferred_websites(entries: list[dict[str, Any]], path: str | Path | None = None) -> None:
@@ -49,6 +64,26 @@ def save_preferred_websites(entries: list[dict[str, Any]], path: str | Path | No
     tmp = path_obj.with_suffix(path_obj.suffix + ".tmp")
     tmp.write_text(json.dumps({"entries": entries}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(path_obj)
+    if _use_durable(path):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = _text(entry.get("id"))
+            if not entry_id:
+                continue
+            upsert_payload(
+                "preferred_product_websites",
+                "id",
+                entry_id,
+                entry,
+                extra={
+                    "keyword": _text(entry.get("keyword")),
+                    "domain": _clean_domain(entry.get("domain") or domain_from_url(entry.get("url"))),
+                    "url": _text(entry.get("url")),
+                    "success_count": int(entry.get("success_count") or 0),
+                    "failure_count": int(entry.get("failure_count") or 0),
+                },
+            )
 
 
 def list_preferred_websites(path: str | Path | None = None) -> list[dict[str, Any]]:
@@ -141,6 +176,8 @@ def delete_preferred_website(entry_id: str, path: str | Path | None = None) -> b
     if len(kept) == len(entries):
         return False
     save_preferred_websites(kept, path)
+    if _use_durable(path):
+        delete_payload("preferred_product_websites", "id", _text(entry_id))
     return True
 
 
@@ -151,21 +188,24 @@ def matching_preferred_websites(row: dict, path: str | Path | None = None) -> li
             "Product Name",
             "Description",
             "Brand",
+            "Manufacturer",
+            "Vendor",
+            "Supplier",
             "Model/SKU",
             "SKU",
+            "_extracted_model_sku",
             "Product Category",
             "Notes",
+            "Product URL",
+            "Source URL",
         )
     ))
     if not haystack:
         return []
     matches: list[dict[str, Any]] = []
     for entry in load_preferred_websites(path):
-        keyword = _normalise_match_text(entry.get("keyword"))
-        if not keyword:
-            continue
-        tokens = [token for token in keyword.split() if len(token) > 1]
-        if keyword in haystack or (tokens and all(token in haystack for token in tokens)):
+        terms = _preferred_match_terms(entry)
+        if any(_term_matches_haystack(term, haystack) for term in terms):
             matches.append(entry)
     return sorted(matches, key=lambda item: (-int(item.get("success_count") or 0), int(item.get("failure_count") or 0), _text(item.get("domain"))))
 
@@ -275,6 +315,48 @@ def _looks_like_direct_product_url(url: str) -> bool:
 
 def _duplicate_key(keyword: object, url: object) -> str:
     return f"{_normalise_match_text(keyword)}|{normalise_preferred_url(_text(url)).lower()}"
+
+
+def _preferred_match_terms(entry: dict[str, Any]) -> list[str]:
+    raw_terms: list[str] = [
+        _text(entry.get("keyword")),
+        _text(entry.get("domain")),
+        domain_from_url(entry.get("url")),
+    ]
+    aliases = entry.get("aliases") or entry.get("alias") or entry.get("keywords")
+    if isinstance(aliases, list):
+        raw_terms.extend(_text(alias) for alias in aliases)
+    elif aliases:
+        raw_terms.extend(re.split(r"[,;|/]+", _text(aliases)))
+
+    # Notes are not a required alias field, but users often paste shorthand
+    # cues there. Only consume explicit "aliases:" / "aka:" fragments so normal
+    # notes do not accidentally over-match broad terms.
+    notes = _text(entry.get("notes"))
+    note_match = re.search(r"\b(?:aliases?|aka|also known as)\s*:\s*([^.;\n]+)", notes, re.I)
+    if note_match:
+        raw_terms.extend(re.split(r"[,;|/]+", note_match.group(1)))
+
+    terms: list[str] = []
+    for term in raw_terms:
+        clean = _normalise_match_text(term)
+        compact = clean.replace(" ", "")
+        for candidate in (clean, compact):
+            if len(candidate) > 1 and candidate not in terms:
+                terms.append(candidate)
+    return terms
+
+
+def _term_matches_haystack(term: str, haystack: str) -> bool:
+    if not term or not haystack:
+        return False
+    if term in haystack:
+        return True
+    compact_haystack = haystack.replace(" ", "")
+    if len(term) >= 4 and term in compact_haystack:
+        return True
+    tokens = [token for token in term.split() if len(token) > 1]
+    return bool(tokens and all(token in haystack for token in tokens))
 
 
 def _clean_keyword(value: object) -> str:
