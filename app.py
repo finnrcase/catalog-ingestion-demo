@@ -210,6 +210,34 @@ if "vendor_call_extractions" not in st.session_state:
     st.session_state.vendor_call_extractions = {}
 if "custom_retell_test_result" not in st.session_state:
     st.session_state.custom_retell_test_result = None
+if "pipeline_stage_timings" not in st.session_state:
+    st.session_state.pipeline_stage_timings = {}
+
+
+def _empty_stage_timings() -> dict:
+    return {
+        "file_upload_ms": 0.0,
+        "pdf_text_extraction_ms": 0.0,
+        "table_row_parsing_ms": 0.0,
+        "normalization_ms": 0.0,
+        "enrichment_ms": 0.0,
+        "image_recovery_ms": 0.0,
+        "cloudinary_ms": 0.0,
+        "export_generation_ms": 0.0,
+        "ai_extraction_ms": 0.0,
+    }
+
+
+def _elapsed_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 2)
+
+
+def _merge_timing(target: dict, source: dict) -> None:
+    for key, value in (source or {}).items():
+        if isinstance(value, (int, float)):
+            target[key] = round(float(target.get(key, 0.0) or 0.0) + float(value), 2)
+        else:
+            target[key] = value
 
 # ── Programa Destination ───────────────────────────────────────────────────────
 with st.container(border=True):
@@ -358,18 +386,16 @@ with left_col:
         st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
         use_ai_pdf = st.checkbox(
             "Use AI to interpret uploaded PDFs",
-            value=True,
+            value=False,
             help=(
-                "AI will review the uploaded file, extract product rows, "
-                "suggest titles, descriptions, and categories, "
-                "and flag uncertain fields for review."
+                "Kept off for fast parsing. The upload parse step is local-only; "
+                "run enrichment separately after rows load."
             ),
         )
         if use_ai_pdf:
             st.caption(
-                "AI will review the uploaded file, extract product rows, "
-                "suggest titles / descriptions / categories, and flag "
-                "uncertain fields for review."
+                "AI PDF extraction no longer runs during upload parsing. "
+                "Generate the table first, then use enrichment tools after review."
             )
 
 with right_col:
@@ -691,79 +717,75 @@ with gen_col:
     generate = st.button("Generate Intake Table", type="primary", use_container_width=True)
 
 if generate:
+    total_start = time.perf_counter()
+    stage_timings = _empty_stage_timings()
+    stage_timings["parse_mode"] = "local_deterministic"
     raw_urls = [u.strip() for u in (url_input or "").splitlines() if u.strip()]
     url_rows = create_url_rows(raw_urls, selected_project, room, "", "")
     st.session_state.ai_errors = []
 
     if use_ai_pdf and uploaded_files:
-        # ── AI extraction path ─────────────────────────────────────────────────
-        with st.spinner(
-            f"AI is reading {len(uploaded_files)} PDF{'s' if len(uploaded_files) != 1 else ''}…"
-        ):
-            ai_dfs = []
-            ai_errors = []
+        st.info(
+            "Fast parse mode is local-only, so AI PDF extraction was skipped. "
+            "Use enrichment after review if fields need more data."
+        )
 
-            for pdf_file in uploaded_files:
-                df_ai, error = extract_products_from_pdf_with_ai(
-                    pdf_file, selected_project, room, ""
-                )
-                if error:
-                    ai_errors.append(f"**{pdf_file.name}:** {error}")
-                    fallback = create_pdf_rows(
-                        [pdf_file], selected_project, room, "", ""
-                    )
-                    ai_dfs.append(pd.DataFrame(fallback))
-                else:
-                    ai_dfs.append(df_ai)
-
-            st.session_state.ai_errors = ai_errors
-
-            url_df = pd.DataFrame(url_rows) if url_rows else pd.DataFrame()
-            all_frames = ai_dfs + ([url_df] if not url_df.empty else [])
-
-            if not all_frames:
-                st.warning(
-                    "Nothing to process — please upload at least one PDF "
-                    "or paste at least one URL."
-                )
+    # ── Standard path — parser runs first, no AI/enrichment/network calls ─────
+    parsed_pdf_rows = []
+    for pdf_file in (uploaded_files or []):
+        try:
+            parse_timings: dict = {}
+            rows = parse_pdf_rows(
+                pdf_file,
+                selected_project,
+                room,
+                "",
+                "",
+                stage_timings=parse_timings,
+            )
+            _merge_timing(stage_timings, parse_timings)
+            if rows:
+                parsed_pdf_rows.extend(rows)
             else:
-                combined = pd.concat(all_frames, ignore_index=True)
-                st.session_state.intake_df = apply_confidence_checks(combined)
-                st.session_state.automation_results = None
-                st.session_state.pending_enrichment = True
-
-    else:
-        # ── Standard path — parser runs first, no AI call ─────────────────────
-        parsed_pdf_rows = []
-        for pdf_file in (uploaded_files or []):
-            try:
-                rows = parse_pdf_rows(pdf_file, selected_project, room, "", "")
-                if rows:
-                    parsed_pdf_rows.extend(rows)
-                else:
-                    # Parser found nothing — fall back to filename-only row
-                    fallback = create_pdf_rows([pdf_file], selected_project, room, "", "")
-                    parsed_pdf_rows.extend(fallback)
-            except Exception as exc:
+                # Parser found nothing — fall back to filename-only row
                 fallback = create_pdf_rows([pdf_file], selected_project, room, "", "")
                 parsed_pdf_rows.extend(fallback)
-                st.warning(f"Could not parse '{pdf_file.name}': {exc}", icon="⚠️")
+        except Exception as exc:
+            fallback = create_pdf_rows([pdf_file], selected_project, room, "", "")
+            parsed_pdf_rows.extend(fallback)
+            st.warning(f"Could not parse '{pdf_file.name}': {exc}", icon="⚠️")
 
-        if not url_rows and not parsed_pdf_rows:
-            st.warning(
-                "Nothing to process — please upload at least one PDF "
-                "or paste at least one URL."
-            )
-        else:
-            base_df = build_intake_dataframe(url_rows, parsed_pdf_rows)
-            st.session_state.intake_df = apply_confidence_checks(base_df)
-            st.session_state.automation_results = None
-            st.session_state.pending_enrichment = True
+    if not url_rows and not parsed_pdf_rows:
+        st.warning(
+            "Nothing to process — please upload at least one PDF "
+            "or paste at least one URL."
+        )
+    else:
+        normalize_start = time.perf_counter()
+        base_df = build_intake_dataframe(url_rows, parsed_pdf_rows)
+        st.session_state.intake_df = apply_confidence_checks(base_df)
+        stage_timings["normalization_ms"] = round(
+            float(stage_timings.get("normalization_ms", 0.0) or 0.0) + _elapsed_ms(normalize_start),
+            2,
+        )
+        stage_timings["total_request_ms"] = _elapsed_ms(total_start)
+        st.session_state.pipeline_stage_timings = stage_timings
+        st.session_state.automation_results = None
+        st.session_state.pending_enrichment = False
+        st.session_state.enrichment_errors = []
+        st.success(
+            f"Parsed {len(st.session_state.intake_df)} row{'s' if len(st.session_state.intake_df) != 1 else ''}. "
+            "Review the rows, then run enrichment only if needed."
+        )
 
 # ── AI extraction error banner ─────────────────────────────────────────────────
 if st.session_state.get("ai_errors"):
     for err_msg in st.session_state.ai_errors:
         st.error(err_msg, icon="❌")
+
+if st.session_state.get("pipeline_stage_timings"):
+    with st.expander("Pipeline timing/debug", expanded=False):
+        st.json(st.session_state.pipeline_stage_timings)
 
 # ── Review section ─────────────────────────────────────────────────────────────
 if st.session_state.intake_df is not None:
@@ -913,11 +935,16 @@ if st.session_state.intake_df is not None:
     if st.session_state.pending_enrichment:
         if st.session_state.get("use_web_enrichment", True) and _BRAVE_API_KEY:
             with st.spinner("Searching manufacturer sources to fill missing product details…"):
+                enrich_start = time.perf_counter()
                 _enriched_df, _enrich_errors, _ = enrich_dataframe(
                     df,
                     use_web_enrichment=st.session_state.get("use_web_enrichment", True),
                     force_refresh=st.session_state.get("force_refresh_enrichment", False),
                 )
+                timings = _empty_stage_timings()
+                timings["enrichment_ms"] = _elapsed_ms(enrich_start)
+                timings["parse_mode"] = "enrichment_only"
+                st.session_state.pipeline_stage_timings = timings
                 st.session_state.intake_df = apply_confidence_checks(_enriched_df)
                 st.session_state.enrichment_errors = _enrich_errors
                 st.session_state.pending_enrichment = False
@@ -959,7 +986,12 @@ if st.session_state.intake_df is not None:
                     help="Fetches product pages for rows without Image URL and extracts images.",
                 ):
                     with st.spinner(f"Recovering images for {_missing_image_count} row(s)…"):
+                        image_start = time.perf_counter()
                         _recovered_df, _img_diagnostics = recover_images_for_dataframe(df)
+                        timings = _empty_stage_timings()
+                        timings["image_recovery_ms"] = _elapsed_ms(image_start)
+                        timings["parse_mode"] = "image_recovery_only"
+                        st.session_state.pipeline_stage_timings = timings
                         st.session_state.intake_df = apply_confidence_checks(_recovered_df)
                         st.session_state.manual_image_uploads = {}
                     _found = sum(1 for d in _img_diagnostics if d["status"] == "found")

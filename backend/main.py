@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import datetime
 import io
+import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -112,10 +114,12 @@ class IntakeResponse(BaseModel):
     eligible_count: int = 0
     blocked_count: int = 0
     dimension_diagnostics: list[dict] = Field(default_factory=list)
+    stage_timings: dict = Field(default_factory=dict)
 
 
 class ImageUploadResponse(BaseModel):
     secure_url: str
+    stage_timings: dict = Field(default_factory=dict)
 
 
 class ManufacturerOverridePayload(BaseModel):
@@ -171,6 +175,7 @@ def _df_response(
     df: pd.DataFrame,
     errors: list[str] | None = None,
     dimension_diagnostics: list[dict] | None = None,
+    stage_timings: dict | None = None,
 ) -> IntakeResponse:
     df = df.copy()
     if "Notes" in df.columns:
@@ -183,7 +188,22 @@ def _df_response(
         eligible_count=len(eligible),
         blocked_count=len(blocked),
         dimension_diagnostics=dimension_diagnostics or [],
+        stage_timings=stage_timings or {},
     )
+
+
+def _elapsed_ms(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 2)
+
+
+def _round_timing_values(stage_timings: dict) -> dict:
+    rounded = {}
+    for key, value in stage_timings.items():
+        if isinstance(value, float):
+            rounded[key] = round(value, 2)
+        else:
+            rounded[key] = value
+    return rounded
 
 
 @app.get("/health")
@@ -222,53 +242,89 @@ async def generate_intake(
     project: str = Form(""),
     room: str = Form(""),
     urls: str = Form(""),
-    use_ai_pdf: bool = Form(True),
+    use_ai_pdf: bool = Form(False),
     files: list[UploadFile] = File(default=[]),
 ) -> IntakeResponse:
+    total_start = time.perf_counter()
+    stage_timings = {
+        "file_upload_ms": 0.0,
+        "pdf_text_extraction_ms": 0.0,
+        "table_row_parsing_ms": 0.0,
+        "normalization_ms": 0.0,
+        "enrichment_ms": 0.0,
+        "image_recovery_ms": 0.0,
+        "cloudinary_ms": 0.0,
+        "export_generation_ms": 0.0,
+        "ai_extraction_ms": 0.0,
+        "parse_mode": "local_deterministic",
+    }
     raw_urls = [line.strip() for line in urls.splitlines() if line.strip()]
     url_rows = create_url_rows(raw_urls, project, room, "", "")
     pdf_rows: list[dict] = []
     errors: list[str] = []
 
+    if use_ai_pdf:
+        errors.append(
+            "AI PDF extraction was skipped during upload parsing. "
+            "The parse step is local-only; run enrichment separately after review."
+        )
+
     for upload in files:
+        upload_start = time.perf_counter()
         content = await upload.read()
+        stage_timings["file_upload_ms"] += _elapsed_ms(upload_start)
         pdf = UploadedPDF(upload.filename or "upload.pdf", content)
 
-        if use_ai_pdf:
-            df_ai, error = extract_products_from_pdf_with_ai(pdf, project, room, "")
-            if error:
-                errors.append(f"{pdf.name}: {error}")
-                pdf.seek(0)
-                pdf_rows.extend(create_pdf_rows([pdf], project, room, "", ""))
-            else:
-                pdf_rows.extend(df_ai.to_dict("records"))
-        else:
-            try:
-                parsed = parse_pdf_rows(pdf, project, room, "", "")
-                pdf_rows.extend(parsed or create_pdf_rows([pdf], project, room, "", ""))
-            except Exception as exc:
-                errors.append(f"{pdf.name}: {exc}")
-                pdf_rows.extend(create_pdf_rows([pdf], project, room, "", ""))
+        try:
+            parse_timings: dict = {}
+            parsed = parse_pdf_rows(pdf, project, room, "", "", stage_timings=parse_timings)
+            for key in (
+                "pdf_file_read_ms",
+                "pdf_open_ms",
+                "pdf_text_extraction_ms",
+                "table_row_parsing_ms",
+                "normalization_ms",
+                "pdf_parse_total_ms",
+                "page_count",
+                "rows_returned",
+            ):
+                if key in parse_timings:
+                    stage_timings[key] = stage_timings.get(key, 0) + parse_timings[key]
+            pdf_rows.extend(parsed or create_pdf_rows([pdf], project, room, "", ""))
+        except Exception as exc:
+            errors.append(f"{pdf.name}: {exc}")
+            pdf_rows.extend(create_pdf_rows([pdf], project, room, "", ""))
 
     if not url_rows and not pdf_rows:
         raise HTTPException(status_code=400, detail="Upload a PDF or paste at least one URL.")
 
+    normalize_start = time.perf_counter()
     df = build_intake_dataframe(url_rows, pdf_rows)
     df = apply_confidence_checks(df)
-    return _df_response(df, errors)
+    stage_timings["normalization_ms"] += _elapsed_ms(normalize_start)
+    stage_timings["total_request_ms"] = _elapsed_ms(total_start)
+    return _df_response(df, errors, stage_timings=_round_timing_values(stage_timings))
 
 
 @app.post("/api/upload-image", response_model=ImageUploadResponse)
 async def upload_image_endpoint(file: UploadFile = File(...)) -> ImageUploadResponse:
+    start = time.perf_counter()
     content_type = (file.content_type or "").lower()
     filename = (file.filename or "").lower()
     if not (content_type.startswith("image/") or filename.endswith((".jpg", ".jpeg", ".png", ".webp"))):
         raise HTTPException(status_code=400, detail="Only image files can be uploaded.")
 
+    cloudinary_start = time.perf_counter()
     secure_url = upload_image(file.file)
     if not secure_url or not is_public_https_image_url(secure_url):
         raise HTTPException(status_code=502, detail="Cloudinary upload failed or did not return a secure HTTPS URL.")
-    return ImageUploadResponse(secure_url=secure_url)
+    return ImageUploadResponse(
+        secure_url=secure_url,
+        stage_timings={
+            "cloudinary_ms": _elapsed_ms(cloudinary_start),
+            "total_request_ms": _elapsed_ms(start),
+        },
+    )
 
 
 @app.post("/upload-image", response_model=ImageUploadResponse)
@@ -284,6 +340,7 @@ def validate_intake(payload: RowsPayload) -> IntakeResponse:
 
 @app.post("/intake/enrich", response_model=IntakeResponse)
 def enrich_intake(payload: RowsPayload) -> IntakeResponse:
+    start = time.perf_counter()
     df, errors, dimension_diagnostics = enrich_dataframe(
         pd.DataFrame(payload.rows),
         enrichment_mode=payload.enrichment_mode,
@@ -291,7 +348,16 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
         use_web_enrichment=payload.use_web_enrichment,
     )
     df = apply_confidence_checks(df)
-    return _df_response(df, errors, dimension_diagnostics)
+    return _df_response(
+        df,
+        errors,
+        dimension_diagnostics,
+        stage_timings={
+            "enrichment_ms": _elapsed_ms(start),
+            "image_recovery_ms": 0.0,
+            "cloudinary_ms": 0.0,
+        },
+    )
 
 
 @app.post("/intake/recover-images", response_model=IntakeResponse)
@@ -302,9 +368,17 @@ def recover_images(payload: RowsPayload) -> IntakeResponse:
     Diagnostics (per-row status, source, recovered URL) are returned in the
     dimension_diagnostics field for now — the contract may be extended later.
     """
+    start = time.perf_counter()
     df, diagnostics = recover_images_for_dataframe(pd.DataFrame(payload.rows))
     df = apply_confidence_checks(df)
-    return _df_response(df, dimension_diagnostics=diagnostics)
+    return _df_response(
+        df,
+        dimension_diagnostics=diagnostics,
+        stage_timings={
+            "image_recovery_ms": _elapsed_ms(start),
+            "enrichment_ms": 0.0,
+        },
+    )
 
 
 @app.post("/manufacturer-override")
@@ -527,12 +601,17 @@ def send_to_programa(payload: ProgramaPayload) -> dict:
 
 @app.post("/export/csv")
 def export_csv(payload: RowsPayload) -> Response:
+    start = time.perf_counter()
     df = pd.DataFrame(payload.rows)
     today = datetime.date.today().isoformat()
+    content = get_csv_bytes(df)
     return Response(
-        content=get_csv_bytes(df),
+        content=content,
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="internal_intake_not_for_programa_{today}.csv"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="internal_intake_not_for_programa_{today}.csv"',
+            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": _elapsed_ms(start)}),
+        },
     )
 
 
@@ -543,43 +622,62 @@ def export_programa_validate(payload: RowsPayload) -> dict:
 
 @app.post("/export/programa/csv")
 def export_programa_import_csv(payload: RowsPayload) -> Response:
+    start = time.perf_counter()
     df = build_programa_import_dataframe(payload.rows)
     today = datetime.date.today().isoformat()
+    content = export_programa_csv(df)
     return Response(
-        content=export_programa_csv(df),
+        content=content,
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="programa_import_{today}.csv"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="programa_import_{today}.csv"',
+            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": _elapsed_ms(start)}),
+        },
     )
 
 
 @app.post("/export/programa/xlsx")
 def export_programa_import_xlsx(payload: RowsPayload) -> Response:
+    start = time.perf_counter()
     df = build_programa_import_dataframe(payload.rows)
     today = datetime.date.today().isoformat()
+    content = export_programa_xlsx(df)
     return Response(
-        content=export_programa_xlsx(df),
+        content=content,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="programa_import_{today}.xlsx"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="programa_import_{today}.xlsx"',
+            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": _elapsed_ms(start)}),
+        },
     )
 
 
 @app.post("/export/programa/zip")
 def export_programa_import_zip(payload: RowsPayload) -> Response:
     """ZIP archive: programa_import.csv + images/ folder + manifest.csv."""
+    start = time.perf_counter()
     today = datetime.date.today().isoformat()
     zip_bytes = export_programa_zip(payload.rows)
     return Response(
         content=zip_bytes,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="programa_export_{today}.zip"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="programa_export_{today}.zip"',
+            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": _elapsed_ms(start)}),
+        },
     )
 
 
 @app.post("/export/programa/debug-csv")
 def export_programa_import_debug_csv(payload: RowsPayload) -> Response:
+    start = time.perf_counter()
     df = build_programa_debug_dataframe(payload.rows)
+    content = export_programa_csv(df)
     return Response(
-        content=export_programa_csv(df),
+        content=content,
         media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="programa-import-debug.csv"'},
+        headers={
+            "Content-Disposition": 'attachment; filename="programa-import-debug.csv"',
+            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": _elapsed_ms(start)}),
+        },
     )

@@ -76,7 +76,57 @@ def test_upload_image_endpoint_returns_secure_url(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert response.json() == {"secure_url": "https://res.cloudinary.com/demo/image/upload/handmade-doll.jpg"}
+    data = response.json()
+    assert data["secure_url"] == "https://res.cloudinary.com/demo/image/upload/handmade-doll.jpg"
+    assert "cloudinary_ms" in data["stage_timings"]
+
+
+def test_intake_generate_uses_local_parse_only(monkeypatch):
+    def fail_ai(*args, **kwargs):
+        raise AssertionError("AI extraction must not run during PDF parsing")
+
+    def fail_enrich(*args, **kwargs):
+        raise AssertionError("enrichment must not run during PDF parsing")
+
+    def fake_parse_pdf_rows(pdf, project="", room="", supplier="", notes="", stage_timings=None):
+        if stage_timings is not None:
+            stage_timings.update(
+                {
+                    "pdf_text_extraction_ms": 1.0,
+                    "table_row_parsing_ms": 2.0,
+                    "normalization_ms": 0.5,
+                    "page_count": 1,
+                    "rows_returned": 1,
+                }
+            )
+        return [
+            {
+                "Product Name": "Panel Ready Icemaker",
+                "Brand": "Scotsman",
+                "Model/SKU": "SCN60PA1SU",
+                "Quantity": 1,
+                "Source Type": "PDF",
+            }
+        ]
+
+    monkeypatch.setattr("backend.main.extract_products_from_pdf_with_ai", fail_ai)
+    monkeypatch.setattr("backend.main.enrich_dataframe", fail_enrich)
+    monkeypatch.setattr("backend.main.recover_images_for_dataframe", fail_enrich)
+    monkeypatch.setattr("backend.main.parse_pdf_rows", fake_parse_pdf_rows)
+
+    response = client.post(
+        "/intake/generate",
+        data={"project": "1 Lily Pond", "room": "Kitchen", "use_ai_pdf": "true"},
+        files={"files": ("quote.pdf", b"%PDF fake", "application/pdf")},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["rows"][0]["Model/SKU"] == "SCN60PA1SU"
+    assert data["stage_timings"]["parse_mode"] == "local_deterministic"
+    assert data["stage_timings"]["enrichment_ms"] == 0.0
+    assert data["stage_timings"]["image_recovery_ms"] == 0.0
+    assert any("AI PDF extraction was skipped" in err for err in data["errors"])
 
 
 def test_upload_image_endpoint_rejects_missing_secure_url(monkeypatch):

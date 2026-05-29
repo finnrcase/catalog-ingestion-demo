@@ -12,6 +12,7 @@ parse_pdf_rows(pdf_file, project, room, supplier, notes) -> list[dict]
 """
 
 import re
+import time
 
 from src.intake_schema import IMPORTANT_FIELDS, SOURCE_PDF, make_base_row
 
@@ -223,6 +224,7 @@ def parse_pdf_rows(
     room: str = "",
     supplier: str = "",
     notes: str = "",
+    stage_timings: dict | None = None,
 ) -> list[dict]:
     """
     Extract structured product rows from a PDF using heuristic text/table parsing.
@@ -243,18 +245,37 @@ def parse_pdf_rows(
     except ImportError:
         raise ImportError("PyMuPDF is required. Run: pip install pymupdf")
 
+    total_start = time.perf_counter()
+    read_start = time.perf_counter()
     raw = pdf_file.read()
     pdf_file.seek(0)
+    if stage_timings is not None:
+        stage_timings["pdf_file_read_ms"] = stage_timings.get("pdf_file_read_ms", 0.0) + (
+            time.perf_counter() - read_start
+        ) * 1000
 
+    open_start = time.perf_counter()
     doc = fitz.open(stream=raw, filetype="pdf")
+    if stage_timings is not None:
+        stage_timings["pdf_open_ms"] = stage_timings.get("pdf_open_ms", 0.0) + (
+            time.perf_counter() - open_start
+        ) * 1000
+        stage_timings["page_count"] = stage_timings.get("page_count", 0) + len(doc)
+
     all_rows: list[dict] = []
     seen_keys: set[tuple[str, str]] = set()
 
     for page in doc:
         # 1. Try table extraction first
+        table_start = time.perf_counter()
         table_rows = _parse_table_rows(page, project, room, supplier, notes)
+        if stage_timings is not None:
+            stage_timings["table_row_parsing_ms"] = stage_timings.get("table_row_parsing_ms", 0.0) + (
+                time.perf_counter() - table_start
+            ) * 1000
         if table_rows:
             for r in table_rows:
+                norm_start = time.perf_counter()
                 key = (
                     str(r.get("Product Name", "")).lower().strip(),
                     str(r.get("Model/SKU", "")).lower().strip(),
@@ -262,10 +283,21 @@ def parse_pdf_rows(
                 if key not in seen_keys:
                     seen_keys.add(key)
                     all_rows.append(r)
+                if stage_timings is not None:
+                    stage_timings["normalization_ms"] = stage_timings.get("normalization_ms", 0.0) + (
+                        time.perf_counter() - norm_start
+                    ) * 1000
             continue
 
         # 2. Fall back to line-by-line text parsing
+        text_start = time.perf_counter()
         text = page.get_text("text")
+        if stage_timings is not None:
+            stage_timings["pdf_text_extraction_ms"] = stage_timings.get("pdf_text_extraction_ms", 0.0) + (
+                time.perf_counter() - text_start
+            ) * 1000
+
+        line_start = time.perf_counter()
         for line in text.splitlines():
             line = line.strip()
             if len(line) < 3:
@@ -280,6 +312,15 @@ def parse_pdf_rows(
             if key not in seen_keys:
                 seen_keys.add(key)
                 all_rows.append(row)
+        if stage_timings is not None:
+            stage_timings["table_row_parsing_ms"] = stage_timings.get("table_row_parsing_ms", 0.0) + (
+                time.perf_counter() - line_start
+            ) * 1000
 
     doc.close()
+    if stage_timings is not None:
+        stage_timings["rows_returned"] = len(all_rows)
+        stage_timings["pdf_parse_total_ms"] = stage_timings.get("pdf_parse_total_ms", 0.0) + (
+            time.perf_counter() - total_start
+        ) * 1000
     return all_rows
