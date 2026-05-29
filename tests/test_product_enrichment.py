@@ -1082,6 +1082,21 @@ def test_apply_enrichment_partial_note_not_duplicated():
     assert updated["Notes"].count("[Partial dimension found:") == 1
 
 
+def test_apply_enrichment_two_axis_partial_dimensions_written_medium_confidence():
+    row = _base_row_for_apply()
+    extracted = {
+        "Product Name": "",
+        "Dimensions": '36"W x 24"D',
+        "Finish / Color": "",
+        "Product Category": "",
+        "materials": "",
+    }
+    updated = _apply_enrichment(row, extracted, "https://example.com/product", 85)
+    assert updated["Dimensions"] == '36"W x 24"D'
+    assert updated["Dimension Confidence"] == "medium"
+    assert updated["Dimension Source URL"] == "https://example.com/product"
+
+
 def test_apply_enrichment_no_dim_extracted_blank_row_unchanged():
     """No dimensions extracted and row has blank dims → Dimensions stays blank."""
     row = _base_row_for_apply()

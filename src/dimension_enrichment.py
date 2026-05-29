@@ -84,6 +84,7 @@ class DimensionResult:
     urls_checked: list[str] = field(default_factory=list)
     evidence_text: str = ""
     failure_reason: str = ""
+    debug: dict = field(default_factory=dict)
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -132,6 +133,10 @@ _SPEC_LABEL_KEYWORDS = frozenset({
     "width", "height", "depth", "dimensions", "overall dimensions",
     "product dimensions", "w×h×d", "w x h x d",
 })
+_SPEC_PDF_KEYWORDS = re.compile(
+    r"spec|specification|dimension|install|installation|manual|guide|product[-_ ]?sheet|submittal|technical",
+    re.IGNORECASE,
+)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -391,6 +396,36 @@ def _find_dimension_candidates(
     return candidates
 
 
+def _dimension_parts(dimensions: str) -> dict[str, str]:
+    from src.dimensions import extract_labeled_dimensions
+
+    return extract_labeled_dimensions(dimensions)
+
+
+def _dimension_part_count(dimensions: str) -> int:
+    parts = _dimension_parts(dimensions)
+    return sum(1 for key in ("width", "height", "depth") if parts.get(key))
+
+
+def _format_dimension_parts(parts: dict[str, str]) -> str:
+    labels = (("width", "W"), ("height", "H"), ("depth", "D"), ("length", "L"))
+    bits = [f"{parts[key]} {label}" for key, label in labels if parts.get(key)]
+    return " x ".join(bits)
+
+
+def _best_dimension_candidate(candidates: list[str]) -> str | None:
+    best = ""
+    best_score = 0
+    for candidate in candidates:
+        count = _dimension_part_count(candidate)
+        if count > best_score:
+            best = candidate
+            best_score = count
+        if count >= 3:
+            break
+    return best or None
+
+
 def _collect_json_strings(obj) -> list[str]:
     """Recursively collect all string leaf values from a parsed JSON object."""
     if isinstance(obj, str):
@@ -406,19 +441,25 @@ def _parse_html_for_dimensions(
     html: str,
     *,
     is_appliance: bool = False,
+    debug: dict | None = None,
 ) -> tuple[str | None, str | None]:
     """
     Extract (product_dimensions, cutout_dimensions) from an HTML page.
     Three passes: JSON-LD → spec tables/dl → visible text.
     Returns (None, None) if no complete 3D dimensions found.
     """
-    from src.dimensions import has_complete_3d_dimensions
-
     product_dims: str | None = None
     cutout_dims: str | None = None
 
     soup = _BeautifulSoup(html, "html.parser") if _BeautifulSoup else None
     page_text: str | None = None  # lazily computed once
+    candidates_seen: list[str] = []
+
+    if debug is not None:
+        debug.setdefault("json_ld_found", False)
+        debug.setdefault("spec_table_found", False)
+        debug.setdefault("next_data_found", False)
+        debug.setdefault("shopify_json_found", False)
 
     def _get_page_text() -> str:
         nonlocal page_text
@@ -426,19 +467,47 @@ def _parse_html_for_dimensions(
             page_text = soup.get_text(" ") if soup else re.sub(r"<[^>]+>", " ", html)
         return page_text
 
+    def _remember(candidates: list[str]) -> str | None:
+        candidates_seen.extend(candidates)
+        return _best_dimension_candidate(candidates)
+
     # ── Pass 1: JSON-LD ────────────────────────────────────────────────────────
     if soup:
         for script in soup.find_all("script", type="application/ld+json"):
+            if debug is not None:
+                debug["json_ld_found"] = True
             try:
                 data = _json.loads(script.string or "")
                 blob = "\n".join(_collect_json_strings(data))
             except Exception:
                 continue
             candidates = _find_dimension_candidates(blob, include_cutout=is_appliance)
-            for c in candidates:
-                if has_complete_3d_dimensions(c):
-                    product_dims = c
-                    break
+            product_dims = _remember(candidates)
+            if product_dims:
+                break
+
+    # ── Pass 1b: embedded app JSON such as Next.js / Shopify ──────────────────
+    if not product_dims and soup:
+        for script in soup.find_all("script"):
+            script_id = str(script.get("id") or "")
+            text = script.string or script.get_text(" ") or ""
+            if not text:
+                continue
+            is_next = script_id == "__NEXT_DATA__"
+            is_shopify = "Shopify" in text or "shopify" in text
+            if is_next and debug is not None:
+                debug["next_data_found"] = True
+            if is_shopify and debug is not None:
+                debug["shopify_json_found"] = True
+            if not is_next and not is_shopify and not any(k in text.lower() for k in ("dimension", "width", "height", "depth")):
+                continue
+            try:
+                parsed = _json.loads(text)
+                blob = "\n".join(_collect_json_strings(parsed))
+            except Exception:
+                blob = text
+            candidates = _find_dimension_candidates(blob, include_cutout=is_appliance)
+            product_dims = _remember(candidates)
             if product_dims:
                 break
 
@@ -448,6 +517,8 @@ def _parse_html_for_dimensions(
         # dl elements
         assembled: dict[str, str] = {}
         for dl in soup.find_all("dl"):
+            if debug is not None:
+                debug["spec_table_found"] = True
             items = dl.find_all(["dt", "dd"])
             label = ""
             for item in items:
@@ -460,8 +531,8 @@ def _parse_html_for_dimensions(
                         # Check if the dd value itself is a complete 3D string
                         if label in ("dimensions", "overall dimensions", "product dimensions"):
                             val = item.get_text(strip=True)
-                            if has_complete_3d_dimensions(val):
-                                product_dims = val
+                            product_dims = _remember([val])
+                            if product_dims:
                                 break
                     label = ""  # always reset after consuming a dd
             if product_dims:
@@ -472,22 +543,30 @@ def _parse_html_for_dimensions(
             w = assembled.get("width", "")
             h = assembled.get("height", "")
             d = assembled.get("depth", "")
-            if w and h and d:
-                candidate = f"{w} W x {h} H x {d} D"
-                if has_complete_3d_dimensions(candidate):
-                    product_dims = candidate
+            candidate = _format_dimension_parts({"width": w, "height": h, "depth": d})
+            if candidate:
+                product_dims = _remember([candidate])
 
         if not product_dims:
             # table th→td or td→td pairs
             for table in soup.find_all("table"):
+                if debug is not None:
+                    debug["spec_table_found"] = True
+                table_parts: dict[str, str] = {}
                 for row in table.find_all("tr"):
                     cells = row.find_all(["th", "td"])
                     if len(cells) >= 2:
                         label = cells[0].get_text(strip=True).lower()
                         value = cells[1].get_text(strip=True)
-                        if label in _SPEC_LABEL_KEYWORDS and has_complete_3d_dimensions(value):
-                            product_dims = value
-                            break
+                        if label in _SPEC_LABEL_KEYWORDS:
+                            if label in ("width", "height", "depth"):
+                                table_parts[label] = value
+                            else:
+                                product_dims = _remember([value])
+                            if product_dims:
+                                break
+                if not product_dims and table_parts:
+                    product_dims = _remember([_format_dimension_parts(table_parts)])
                 if product_dims:
                     break
 
@@ -495,22 +574,29 @@ def _parse_html_for_dimensions(
     if not product_dims:
         text = _get_page_text()
         candidates = _find_dimension_candidates(text, include_cutout=is_appliance)
-        for c in candidates:
-            if has_complete_3d_dimensions(c):
-                product_dims = c
-                break
+        product_dims = _remember(candidates)
+        if not product_dims:
+            parts = _dimension_parts(text)
+            candidate = _format_dimension_parts(parts)
+            if candidate:
+                product_dims = _remember([candidate])
 
     # ── Cutout pass (appliances only) ──────────────────────────────────────────
     if is_appliance and product_dims:
         text = _get_page_text()
         cutout_candidates = _find_dimension_candidates(text, include_cutout=True)
         for c in cutout_candidates:
-            if c == product_dims or not has_complete_3d_dimensions(c):
+            if c == product_dims or _dimension_part_count(c) < 2:
                 continue
             pos = text.find(c)
             if pos >= 0 and "cutout" in text[max(0, pos - 30): pos].lower():
                 cutout_dims = c
                 break
+
+    if debug is not None:
+        debug["dimensions_extracted"] = product_dims or ""
+        debug["dimension_part_count"] = _dimension_part_count(product_dims or "")
+        debug["dimension_candidates_seen"] = candidates_seen[:8]
 
     return product_dims, cutout_dims
 
@@ -526,8 +612,6 @@ def _parse_text_pages_for_dimensions(
     Stops at first page yielding a complete 3D result.
     Returns (product_dims, cutout_dims).
     """
-    from src.dimensions import has_complete_3d_dimensions
-
     product_dims: str | None = None
     cutout_dims: str | None = None
     shipping_fallback: str | None = None
@@ -536,10 +620,7 @@ def _parse_text_pages_for_dimensions(
         candidates = _find_dimension_candidates(
             page_text, include_cutout=is_appliance
         )
-        for c in candidates:
-            if has_complete_3d_dimensions(c):
-                product_dims = c
-                break
+        product_dims = _best_dimension_candidate(candidates)
 
         if product_dims:
             # Look for cutout on same page if appliance
@@ -548,7 +629,7 @@ def _parse_text_pages_for_dimensions(
                     page_text, include_cutout=True
                 )
                 for c in cutout_candidates:
-                    if c == product_dims or not has_complete_3d_dimensions(c):
+                    if c == product_dims or _dimension_part_count(c) < 2:
                         continue
                     pos = page_text.find(c)
                     if pos >= 0 and "cutout" in page_text[max(0, pos - 30): pos].lower():
@@ -561,10 +642,7 @@ def _parse_text_pages_for_dimensions(
             shipping_candidates = _find_dimension_candidates(
                 page_text, include_shipping=True
             )
-            for c in shipping_candidates:
-                if has_complete_3d_dimensions(c):
-                    shipping_fallback = c
-                    break
+            shipping_fallback = _best_dimension_candidate(shipping_candidates)
 
     # Use shipping fallback only when nothing better found
     if not product_dims and include_shipping_fallback and shipping_fallback:
@@ -595,7 +673,7 @@ def _parse_pdf_for_dimensions(
     return _parse_text_pages_for_dimensions(
         pages,
         is_appliance=is_appliance,
-        include_shipping_fallback=True,
+        include_shipping_fallback=False,
     )
 
 
@@ -610,6 +688,7 @@ def _fetch_and_parse_url(
     url: str,
     *,
     is_appliance: bool = False,
+    debug: dict | None = None,
 ) -> tuple[str | None, str | None, str]:
     """
     Fetch a URL and route to the correct parser.
@@ -630,13 +709,138 @@ def _fetch_and_parse_url(
         content_type = resp.headers.get("content-type", "").lower()
         if "pdf" in content_type:
             suffix = "pdf"
+            if debug is not None:
+                debug["spec_pdf_fetched"] = True
             return (*_parse_pdf_for_dimensions(resp.content, is_appliance=is_appliance), suffix)
         if "html" not in content_type and suffix == "pdf":
             # No HTML signal from content-type; URL extension suggests PDF
+            if debug is not None:
+                debug["spec_pdf_fetched"] = True
             return (*_parse_pdf_for_dimensions(resp.content, is_appliance=is_appliance), suffix)
-        return (*_parse_html_for_dimensions(resp.text, is_appliance=is_appliance), suffix)
+        return (*_parse_html_for_dimensions(resp.text, is_appliance=is_appliance, debug=debug), suffix)
     except Exception:  # network errors, redirects, and parser failures all return no-result
         return None, None, suffix
+
+
+def _extract_spec_pdf_links(html: str, base_url: str, model: str = "") -> list[str]:
+    """Return product/spec/install/dimension PDF links from an already verified product page."""
+    if not html:
+        return []
+    links: list[tuple[int, str]] = []
+    seen: set[str] = set()
+
+    def _add(raw_url: str, label: str = "") -> None:
+        if not raw_url:
+            return
+        resolved = _urlparse.urljoin(base_url, raw_url.strip())
+        parsed = _urlparse.urlparse(resolved)
+        haystack = f"{resolved} {label}".lower()
+        if ".pdf" not in parsed.path.lower() and ".pdf" not in haystack:
+            return
+        if not _SPEC_PDF_KEYWORDS.search(haystack):
+            return
+        model_norm = re.sub(r"[^a-z0-9]+", "", model.lower())
+        haystack_norm = re.sub(r"[^a-z0-9]+", "", haystack)
+        score = 1 + (2 if model_norm and model_norm in haystack_norm else 0)
+        key = resolved.split("#")[0]
+        if key not in seen:
+            seen.add(key)
+            links.append((score, key))
+
+    if _BeautifulSoup:
+        soup = _BeautifulSoup(html, "html.parser")
+        for tag in soup.find_all(["a", "link"]):
+            href = tag.get("href") or tag.get("src") or ""
+            label = tag.get_text(" ") if hasattr(tag, "get_text") else ""
+            _add(str(href), label)
+    else:
+        for href in re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE):
+            _add(href)
+
+    ranked = sorted(links, key=lambda item: item[0], reverse=True)
+    return [url for _score, url in ranked]
+
+
+def _domain_matches(url: str, domain: str | None) -> bool:
+    if not domain:
+        return False
+    netloc = _urlparse.urlparse(url).netloc.lower()
+    domain = domain.lower().lstrip(".")
+    return bool(netloc == domain or netloc.endswith(f".{domain}"))
+
+
+def _model_in_url(url: str, model: str) -> bool:
+    model_norm = re.sub(r"[^a-z0-9]+", "", model.lower())
+    url_norm = re.sub(r"[^a-z0-9]+", "", url.lower())
+    return bool(model_norm and model_norm in url_norm)
+
+
+def _confidence_for_dimension(
+    dimensions: str,
+    *,
+    is_manufacturer: bool,
+    exact_model_evidence: bool,
+) -> str:
+    part_count = _dimension_part_count(dimensions)
+    if part_count >= 3:
+        if is_manufacturer and exact_model_evidence:
+            return "high"
+        return "medium"
+    if part_count == 2:
+        return "medium"
+    if part_count == 1:
+        return "low"
+    return "none"
+
+
+def _build_dimension_result(
+    *,
+    dimensions: str,
+    cutout_dims: str | None,
+    source_url: str,
+    source_type: str,
+    confidence: str,
+    queries_tried: list[str],
+    urls_checked: list[str],
+    debug: dict,
+) -> DimensionResult:
+    from src.dimensions import extract_labeled_dimensions
+
+    parts = extract_labeled_dimensions(dimensions)
+    evidence = dimensions
+    if cutout_dims:
+        evidence += f" | Cutout: {cutout_dims}"
+    return DimensionResult(
+        dimensions=dimensions,
+        width=_fraction_to_decimal(parts.get("width", "")),
+        height=_fraction_to_decimal(parts.get("height", "")),
+        depth=_fraction_to_decimal(parts.get("depth", "")),
+        length=_fraction_to_decimal(parts.get("length", "")),
+        source_url=source_url,
+        confidence=confidence,
+        source_type=source_type,
+        status="found" if confidence in ("high", "medium") else "low_confidence_skipped",
+        queries_tried=list(queries_tried),
+        urls_checked=list(urls_checked),
+        evidence_text=evidence,
+        failure_reason="",
+        debug=dict(debug),
+    )
+
+
+def _fetch_and_parse_url_with_debug(
+    url: str,
+    *,
+    is_appliance: bool = False,
+    debug: dict | None = None,
+) -> tuple[str | None, str | None, str]:
+    """Call _fetch_and_parse_url with debug while staying compatible with older test doubles."""
+    try:
+        return _fetch_and_parse_url(url, is_appliance=is_appliance, debug=debug)
+    except TypeError as exc:
+        if "debug" not in str(exc):
+            raise
+        return _fetch_and_parse_url(url, is_appliance=is_appliance)
 
 
 # ── Confidence assignment ──────────────────────────────────────────────────────
@@ -689,21 +893,48 @@ def find_dimensions(
     Returns DimensionResult with status "found", "not_found", or "low_confidence_skipped".
     Only rows with Brand + Model/SKU that are missing complete 3D dimensions are processed.
     """
-    from src.dimensions import has_complete_3d_dimensions, extract_labeled_dimensions
+    from src.dimensions import has_complete_3d_dimensions
 
     brand = (row.get("Brand") or "").strip()
     model = (row.get("Model/SKU") or "").strip()
     product_name = (row.get("Product Name") or "").strip()
     category = (row.get("Product Category") or "").strip()
     current_dims = (row.get("Dimensions") or "").strip()
+    product_url = (row.get("Product URL") or "").strip()
     is_appliance = category in _APPLIANCE_CATEGORIES
+    debug: dict = {
+        "product_url": product_url,
+        "product_url_confidence": "",
+        "page_fetch_attempted": False,
+        "page_fetch_success": False,
+        "spec_table_found": False,
+        "json_ld_found": False,
+        "next_data_found": False,
+        "shopify_json_found": False,
+        "spec_pdf_links_found": 0,
+        "spec_pdf_fetched": False,
+        "dimensions_before_enrichment": current_dims,
+        "dimensions_extracted": "",
+        "dimension_confidence": "none",
+        "dimension_source": "",
+        "final_dimensions": current_dims,
+        "final_dimension_writeback_success": False,
+        "skipped_reason": "",
+        "budget_blocked": False,
+    }
 
     if has_complete_3d_dimensions(current_dims):
-        return _make_not_found_result(failure_reason="dimensions already complete")
+        result = _make_not_found_result(failure_reason="dimensions already complete")
+        result.debug = {**debug, "skipped_reason": "dimensions already complete"}
+        return result
     if not brand:
-        return _make_not_found_result(failure_reason="brand required for dimension lookup")
+        result = _make_not_found_result(failure_reason="brand required for dimension lookup")
+        result.debug = {**debug, "skipped_reason": "brand required for dimension lookup"}
+        return result
     if not model:
-        return _make_not_found_result(failure_reason="model/sku required for dimension lookup")
+        result = _make_not_found_result(failure_reason="model/sku required for dimension lookup")
+        result.debug = {**debug, "skipped_reason": "model/sku required for dimension lookup"}
+        return result
 
     domain = _get_manufacturer_domain(
         brand,
@@ -715,21 +946,166 @@ def find_dimensions(
     urls_checked: list[str] = []
     low_confidence_result: DimensionResult | None = None
 
-    def _try_queries(query_list: list[str], is_manufacturer: bool) -> DimensionResult | None:
+    def _accept_or_remember(result: DimensionResult) -> DimensionResult | None:
         nonlocal low_confidence_result
+        result.debug.setdefault("dimensions_before_enrichment", current_dims)
+        result.debug["dimensions_extracted"] = result.dimensions
+        result.debug["dimension_confidence"] = result.confidence
+        result.debug["dimension_source"] = result.source_url
+        result.debug["final_dimensions"] = result.dimensions if result.status == "found" else current_dims
+        result.debug["final_dimension_writeback_success"] = result.status == "found"
+        if result.confidence == "low":
+            if low_confidence_result is None:
+                low_confidence_result = result
+            return None
+        if result.status == "found":
+            return result
+        return None
+
+    def _try_verified_product_url() -> DimensionResult | None:
+        """Exploit an existing product URL and linked spec PDFs before any search."""
+        if not product_url:
+            return None
+        local_debug = dict(debug)
+        local_debug["page_fetch_attempted"] = True
+        urls_checked.append(product_url)
+        page_html = ""
+        source_suffix = "page"
+
+        cached_content = session_cache.urls.get(product_url) if session_cache is not None else None
+        if cached_content:
+            page_html = str(cached_content)
+            local_debug["page_fetch_success"] = True
+            product_dims, cutout_dims = _parse_html_for_dimensions(
+                page_html, is_appliance=is_appliance, debug=local_debug
+            )
+        else:
+            if budget is not None and not budget.can_fetch():
+                local_debug["budget_blocked"] = True
+                local_debug["skipped_reason"] = "budget blocked product URL fetch"
+                return None
+            product_dims = None
+            cutout_dims = None
+            if _httpx is not None:
+                try:
+                    resp = _httpx.get(
+                        product_url,
+                        headers=_REQUEST_HEADERS,
+                        timeout=_REQUEST_TIMEOUT_S,
+                        follow_redirects=True,
+                    )
+                    resp.raise_for_status()
+                    content_type = resp.headers.get("content-type", "").lower()
+                    if "pdf" in content_type or _urlparse.urlparse(product_url).path.lower().endswith(tuple(_PDF_EXTENSIONS)):
+                        source_suffix = "pdf"
+                        local_debug["spec_pdf_fetched"] = True
+                        product_dims, cutout_dims = _parse_pdf_for_dimensions(
+                            resp.content,
+                            is_appliance=is_appliance,
+                        )
+                    else:
+                        page_html = resp.text
+                        if session_cache is not None:
+                            session_cache.urls[product_url] = page_html
+                        product_dims, cutout_dims = _parse_html_for_dimensions(
+                            page_html,
+                            is_appliance=is_appliance,
+                            debug=local_debug,
+                        )
+                    local_debug["page_fetch_success"] = True
+                except Exception:
+                    local_debug["page_fetch_success"] = False
+            if budget is not None:
+                budget.consume_fetch()
+
+        is_manufacturer = _domain_matches(product_url, domain)
+        exact_evidence = _model_in_url(product_url, model)
+        source_type = f"{'manufacturer' if is_manufacturer else 'retailer'}_{source_suffix}"
+        if product_dims:
+            confidence = _confidence_for_dimension(
+                product_dims,
+                is_manufacturer=is_manufacturer,
+                exact_model_evidence=exact_evidence,
+            )
+            local_debug["product_url_confidence"] = "high" if is_manufacturer and exact_evidence else "medium"
+            result = _build_dimension_result(
+                dimensions=product_dims,
+                cutout_dims=cutout_dims,
+                source_url=product_url,
+                source_type=source_type,
+                confidence=confidence,
+                queries_tried=queries_tried,
+                urls_checked=urls_checked,
+                debug=local_debug,
+            )
+            accepted = _accept_or_remember(result)
+            if accepted:
+                return accepted
+
+        # If we have the product page HTML, inspect linked spec/install PDFs.
+        if not page_html and session_cache is not None and product_url in session_cache.urls:
+            page_html = str(session_cache.urls.get(product_url) or "")
+        if page_html:
+            pdf_links = _extract_spec_pdf_links(page_html, product_url, model)
+            local_debug["spec_pdf_links_found"] = len(pdf_links)
+            for pdf_url in pdf_links[:3]:
+                if budget is not None and not budget.can_fetch():
+                    local_debug["budget_blocked"] = True
+                    local_debug["skipped_reason"] = "budget blocked spec PDF fetch"
+                    break
+                urls_checked.append(pdf_url)
+                pdf_debug = dict(local_debug)
+                pdf_debug["spec_pdf_fetched"] = True
+                pdf_dims, pdf_cutout, pdf_suffix = _fetch_and_parse_url_with_debug(
+                    pdf_url, is_appliance=is_appliance, debug=pdf_debug
+                )
+                if budget is not None:
+                    budget.consume_fetch()
+                if not pdf_dims:
+                    continue
+                confidence = _confidence_for_dimension(
+                    pdf_dims,
+                    is_manufacturer=is_manufacturer,
+                    exact_model_evidence=_model_in_url(pdf_url, model) or exact_evidence,
+                )
+                result = _build_dimension_result(
+                    dimensions=pdf_dims,
+                    cutout_dims=pdf_cutout,
+                    source_url=pdf_url,
+                    source_type=f"{'manufacturer' if is_manufacturer else 'retailer'}_{pdf_suffix}",
+                    confidence=confidence,
+                    queries_tried=queries_tried,
+                    urls_checked=urls_checked,
+                    debug=pdf_debug,
+                )
+                accepted = _accept_or_remember(result)
+                if accepted:
+                    return accepted
+        return None
+
+    direct_result = _try_verified_product_url()
+    if direct_result:
+        return direct_result
+
+    def _try_queries(query_list: list[str], is_manufacturer: bool) -> DimensionResult | None:
         for query in query_list:
             queries_tried.append(query)
             search_urls = _brave_search_urls(query, limit=5, brand=brand, session_cache=session_cache, budget=budget)
             for url in search_urls:
                 urls_checked.append(url)
                 if budget is not None and not budget.can_fetch():
+                    debug["budget_blocked"] = True
+                    debug["skipped_reason"] = "budget blocked page/spec fetch"
                     break
-                product_dims, cutout_dims, src_suffix = _fetch_and_parse_url(
-                    url, is_appliance=is_appliance
+                url_debug = dict(debug)
+                url_debug["page_fetch_attempted"] = True
+                product_dims, cutout_dims, src_suffix = _fetch_and_parse_url_with_debug(
+                    url, is_appliance=is_appliance, debug=url_debug
                 )
                 if budget is not None:
                     budget.consume_fetch()
-                if not product_dims or not has_complete_3d_dimensions(product_dims):
+                url_debug["page_fetch_success"] = bool(product_dims or cutout_dims)
+                if not product_dims or _dimension_part_count(product_dims) == 0:
                     continue
                 matched_variant = None
                 for v in model_variants:
@@ -746,30 +1122,25 @@ def find_dimensions(
                         model,
                         is_manufacturer=is_manufacturer,
                     )
-                parts = extract_labeled_dimensions(product_dims)
-                evidence = product_dims
-                if cutout_dims:
-                    evidence += f" | Cutout: {cutout_dims}"
-                result = DimensionResult(
+                part_count = _dimension_part_count(product_dims)
+                if part_count == 2 and conf == "high":
+                    conf = "medium"
+                elif part_count == 1:
+                    conf = "low"
+                result = _build_dimension_result(
                     dimensions=product_dims,
-                    width=_fraction_to_decimal(parts.get("width", "")),
-                    height=_fraction_to_decimal(parts.get("height", "")),
-                    depth=_fraction_to_decimal(parts.get("depth", "")),
-                    length=_fraction_to_decimal(parts.get("length", "")),
+                    cutout_dims=cutout_dims,
                     source_url=url,
-                    confidence=conf,
                     source_type=source_type,
-                    status="found" if conf in ("high", "medium") else "low_confidence_skipped",
-                    queries_tried=list(queries_tried),
-                    urls_checked=list(urls_checked),
-                    evidence_text=evidence,
-                    failure_reason="",
+                    confidence=conf,
+                    queries_tried=queries_tried,
+                    urls_checked=urls_checked,
+                    debug=url_debug,
                 )
-                if conf == "low":
-                    if low_confidence_result is None:
-                        low_confidence_result = result
+                accepted = _accept_or_remember(result)
+                if accepted is None:
                     continue
-                return result
+                return accepted
         return None
 
     for i, variant in enumerate(model_variants):
@@ -794,10 +1165,20 @@ def find_dimensions(
         low_confidence_result.height = ""
         low_confidence_result.depth = ""
         low_confidence_result.length = ""
+        low_confidence_result.debug["final_dimensions"] = current_dims
+        low_confidence_result.debug["final_dimension_writeback_success"] = False
         return low_confidence_result
 
-    return _make_not_found_result(
+    result = _make_not_found_result(
         queries_tried=queries_tried,
         urls_checked=urls_checked,
         failure_reason=f"no dimensions found after {len(queries_tried)} queries and {len(urls_checked)} URLs checked",
     )
+    result.debug = {
+        **debug,
+        "queries_tried": list(queries_tried),
+        "urls_checked": list(urls_checked),
+        "final_dimensions": current_dims,
+        "skipped_reason": debug.get("skipped_reason", ""),
+    }
+    return result

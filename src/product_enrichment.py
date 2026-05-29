@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 from src.brave_search import BRAVE_API_KEY, search_product_candidates
 from src.category_ai import _normalise_category
 from src.dimension_enrichment import DimensionResult as _DimensionResult, find_dimensions as _find_dimensions
-from src.dimensions import has_complete_3d_dimensions
+from src.dimensions import extract_labeled_dimensions, has_complete_3d_dimensions
 from src.manufacturer_domains import get_domain_for_brand, record_discovered_domain
 
 try:
@@ -77,6 +77,27 @@ _ENRICHABLE_FIELDS: list = [
     "Product URL",
 ]
 
+_ENRICHMENT_DEBUG_FIELDS: list[str] = [
+    "product_url",
+    "product_url_confidence",
+    "page_fetch_attempted",
+    "page_fetch_success",
+    "spec_table_found",
+    "json_ld_found",
+    "next_data_found",
+    "shopify_json_found",
+    "spec_pdf_links_found",
+    "spec_pdf_fetched",
+    "dimensions_before_enrichment",
+    "dimensions_extracted",
+    "dimension_confidence",
+    "dimension_source",
+    "final_dimensions",
+    "final_dimension_writeback_success",
+    "skipped_reason",
+    "budget_blocked",
+]
+
 MIN_USE_SCORE = 40   # below this: skip entirely, note in Notes
 MIN_CONF_SCORE = 60  # 40–59: fill fields but force Review Required = True
 
@@ -86,6 +107,22 @@ def _str_val(v) -> str:
     if v is None:
         return ""
     return str(v).strip()
+
+
+def _dimension_part_count(value: object) -> int:
+    parts = extract_labeled_dimensions(value)
+    return sum(1 for key in ("width", "height", "depth") if parts.get(key))
+
+
+def _dimension_confidence_from_parts(value: object, domain_score: int) -> str:
+    count = _dimension_part_count(value)
+    if count >= 3:
+        return "high" if domain_score >= 80 else "medium"
+    if count == 2:
+        return "medium"
+    if count == 1:
+        return "low"
+    return ""
 
 
 def _qualifies(row: dict) -> bool:
@@ -153,11 +190,24 @@ def _apply_enrichment(
         if field == "Dimensions":
             dim_extracted = _str_val(extracted.get("Dimensions"))
             if dim_extracted:
-                if has_complete_3d_dimensions(dim_extracted):
-                    # Always accept complete 3D, even if row already had partial dims
+                extracted_part_count = _dimension_part_count(dim_extracted)
+                existing_part_count = _dimension_part_count(updated.get("Dimensions"))
+                if extracted_part_count >= 3:
+                    # Always accept complete 3D, even if row already had partial dims.
                     updated["Dimensions"] = dim_extracted
+                    updated["Dimension Confidence"] = _dimension_confidence_from_parts(dim_extracted, domain_score)
+                    updated["Dimension Source URL"] = source_url
+                    updated["Dimension Lookup Status"] = "found"
+                elif extracted_part_count >= 2 and existing_part_count < extracted_part_count:
+                    # Useful partial dimensions should not be lost just because
+                    # one axis is missing. Store them as medium confidence.
+                    updated["Dimensions"] = dim_extracted
+                    updated["Dimension Confidence"] = "medium"
+                    updated["Dimension Source URL"] = source_url
+                    updated["Dimension Lookup Status"] = "found"
                 else:
-                    # Partial found — note it, but do not fill
+                    # Ambiguous/single-axis partial found — note it, but do not
+                    # fill the primary dimensions field.
                     existing_notes = _str_val(updated.get("Notes"))
                     partial_note = (
                         f"[Partial dimension found: {dim_extracted}; "
@@ -553,6 +603,40 @@ def _apply_cache_to_row(
     return updated, filled, missing
 
 
+def _dimension_debug_defaults(row: dict) -> dict:
+    dims_before = _str_val(row.get("Dimensions"))
+    product_url = _str_val(row.get("Product URL"))
+    return {
+        "product_url": product_url,
+        "product_url_confidence": "",
+        "page_fetch_attempted": False,
+        "page_fetch_success": False,
+        "spec_table_found": False,
+        "json_ld_found": False,
+        "next_data_found": False,
+        "shopify_json_found": False,
+        "spec_pdf_links_found": 0,
+        "spec_pdf_fetched": False,
+        "dimensions_before_enrichment": dims_before,
+        "dimensions_extracted": "",
+        "dimension_confidence": "",
+        "dimension_source": "",
+        "final_dimensions": dims_before,
+        "final_dimension_writeback_success": False,
+        "skipped_reason": "",
+        "budget_blocked": False,
+    }
+
+
+def _stamp_dimension_debug(row: dict, debug: dict) -> dict:
+    updated = row.copy()
+    merged = _dimension_debug_defaults(updated)
+    merged.update(debug or {})
+    for field in _ENRICHMENT_DEBUG_FIELDS:
+        updated[field] = merged.get(field, "")
+    return updated
+
+
 def enrich_row(
     row: dict,
     enrichment_mode: str = "standard",
@@ -608,7 +692,7 @@ def enrich_row(
                             img = _try_image_from_url(product_url, cache_key)
                             if img:
                                 updated["Image URL"] = img
-                    return updated, None, None
+                    return _stamp_dimension_debug(updated, {"skipped_reason": "full cache hit"}), None, None
                 else:
                     product_cache_hit = "partial"
                     fields_searched.extend(still_missing)
@@ -643,6 +727,8 @@ def enrich_row(
             if parsed_domain and not domain_match:
                 record_discovered_domain(brand, parsed_domain)
             raw_html = _fetch_page_html(best.url)
+            if raw_html and session_cache is not None:
+                session_cache.urls[best.url] = raw_html
             page_text = _html_to_text(raw_html)
 
             if not raw_html:
@@ -735,10 +821,19 @@ def enrich_row(
             updated["Dimension Confidence"] = dim_result.confidence if dim_result.confidence not in ("", "none", None) else ""
             updated["Dimension Source Type"] = dim_result.source_type if dim_result.source_type not in ("", "none", None) else ""
             updated["Dimension Lookup Status"] = dim_result.status
+            updated = _stamp_dimension_debug(updated, dim_result.debug)
+        else:
+            updated = _stamp_dimension_debug(
+                updated,
+                {
+                    "skipped_reason": "dimensions already complete or missing brand/model",
+                    "final_dimensions": _str_val(updated.get("Dimensions")),
+                },
+            )
 
         return updated, None, dim_result
     except Exception as exc:
-        return row, str(exc), None
+        return _stamp_dimension_debug(row, {"skipped_reason": str(exc)}), str(exc), None
 
 
 def enrich_dataframe(
@@ -758,12 +853,23 @@ def enrich_dataframe(
     if not use_web_enrichment:
         return df, errors, dimension_diagnostics
 
+    for field in _ENRICHMENT_DEBUG_FIELDS:
+        if field not in df.columns:
+            df[field] = pd.Series([None] * len(df), index=df.index, dtype=object)
+        else:
+            df[field] = df[field].astype(object)
+
     from src.enrichment_cache import SessionCache as _SC
     _session = _SC(force_refresh=force_refresh)
 
     for idx, row in df.iterrows():
         r = row.to_dict()
         if not _qualifies(r):
+            debug = _dimension_debug_defaults(r)
+            debug["skipped_reason"] = "row does not qualify for enrichment"
+            for col, val in debug.items():
+                if col in df.columns:
+                    df.at[idx, col] = val
             continue
 
         try:
@@ -800,6 +906,7 @@ def enrich_dataframe(
                         "status": dim_result.status,
                         "source_url": dim_result.source_url,
                         "failure_reason": dim_result.failure_reason,
+                        **{field: dim_result.debug.get(field, "") for field in _ENRICHMENT_DEBUG_FIELDS},
                     })
         except Exception as exc:
             label = _str_val(r.get("Product Name")) or _str_val(r.get("Brand")) or _str_val(r.get("Model/SKU")) or str(idx)

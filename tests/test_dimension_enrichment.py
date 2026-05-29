@@ -826,6 +826,68 @@ def test_find_dimensions_accepts_session_cache_and_budget():
     assert budget.urls_used == 0  # zero-budget should have fetched nothing
 
 
+def test_find_dimensions_uses_existing_product_url_before_search():
+    from src.enrichment_cache import SessionCache, SearchBudget
+    from src.dimension_enrichment import find_dimensions
+
+    row = _scotsman_row()
+    row["Product URL"] = "https://scotsman-ice.com/products/scn60pa1su"
+    sc = SessionCache()
+    sc.urls[row["Product URL"]] = """
+    <html><body>
+      <table>
+        <tr><th>Width</th><td>14 7/8 in</td></tr>
+        <tr><th>Depth</th><td>22 in</td></tr>
+      </table>
+    </body></html>
+    """
+    budget = SearchBudget(max_searches=0, max_urls=0)
+
+    with patch("src.dimension_enrichment._brave_search_urls") as mock_search:
+        result = find_dimensions(row, session_cache=sc, budget=budget)
+
+    mock_search.assert_not_called()
+    assert result.status == "found"
+    assert result.confidence == "medium"
+    assert "14 7/8" in result.dimensions
+    assert "22" in result.dimensions
+    assert result.debug["page_fetch_attempted"] is True
+    assert result.debug["spec_table_found"] is True
+    assert budget.searches_used == 0
+    assert budget.urls_used == 0
+
+
+def test_find_dimensions_fetches_spec_pdf_link_from_verified_product_page():
+    from src.enrichment_cache import SessionCache, SearchBudget
+    from src.dimension_enrichment import find_dimensions
+
+    row = _scotsman_row()
+    row["Product URL"] = "https://scotsman-ice.com/products/scn60pa1su"
+    sc = SessionCache()
+    sc.urls[row["Product URL"]] = """
+    <html><body>
+      <a href="/docs/scn60pa1su-spec-sheet.pdf">Specification sheet</a>
+    </body></html>
+    """
+    budget = SearchBudget(max_searches=0, max_urls=1)
+
+    def _mock_fetch(url, *, is_appliance=False):
+        assert url == "https://scotsman-ice.com/docs/scn60pa1su-spec-sheet.pdf"
+        return ('14 7/8"W x 22"D x 33 3/8"H', None, "pdf")
+
+    with patch("src.dimension_enrichment._brave_search_urls") as mock_search:
+        with patch("src.dimension_enrichment._fetch_and_parse_url", side_effect=_mock_fetch):
+            result = find_dimensions(row, session_cache=sc, budget=budget)
+
+    mock_search.assert_not_called()
+    assert result.status == "found"
+    assert result.confidence == "high"
+    assert result.source_url.endswith("scn60pa1su-spec-sheet.pdf")
+    assert result.debug["spec_pdf_links_found"] == 1
+    assert result.debug["spec_pdf_fetched"] is True
+    assert budget.urls_used == 1
+
+
 def test_brave_search_urls_respects_session_cache():
     """_brave_search_urls returns session cache hit without consuming budget."""
     from src.dimension_enrichment import _brave_search_urls
