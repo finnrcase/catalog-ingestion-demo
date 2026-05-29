@@ -1,0 +1,11 @@
+{
+  "remoteName": "origin",
+  "projects": [
+    {
+      "id": "prj_mEWi3niMHkmjawpZDcigPTEbZzqA",
+      "name": "catalog-ingestion-demo",
+      "directory": ".",
+      "orgId": "team_XEJQaxHGddUtJHpDPTd5ZO1g"
+    }
+  ]
+}
