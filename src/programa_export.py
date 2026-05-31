@@ -33,7 +33,11 @@ import zipfile
 
 import pandas as pd
 
-from src.dimensions import extract_labeled_dimensions, has_complete_3d_dimensions
+from src.dimensions import (
+    dimension_sanity_reason,
+    extract_labeled_dimensions,
+    has_complete_3d_dimensions,
+)
 from src.notes import remove_notes_row_prefix
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -91,6 +95,10 @@ _DEBUG_EXTRA_COLUMNS: list[str] = [
 _MATERIAL_TAG_RE = re.compile(r"\[Materials:\s*([^\]]+)\]", re.IGNORECASE)
 _SYSTEM_TAG_RE = re.compile(r"\[[^\]]*\]")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_URL_WEAK_PAGE_RE = re.compile(
+    r"(^|/)(?:sitemap|product-sitemap|search|category|categories|collections?|browse|tag|blog|support)(?:/|$)",
+    re.IGNORECASE,
+)
 
 _SECTION_ALIASES: dict[str, str] = {
     "": "General",
@@ -284,6 +292,222 @@ def _is_exportable(row: dict) -> bool:
     return True
 
 
+def _norm_dedupe_token(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _str_val(value).lower())
+
+
+def _product_identity_key(row: dict) -> tuple[str, str] | None:
+    brand = _norm_dedupe_token(row.get("Brand"))
+    sku = _norm_dedupe_token(row.get("Model/SKU") or row.get("SKU") or row.get("Model"))
+    if brand and sku:
+        return brand, sku
+    return None
+
+
+def _room_key(row: dict) -> str:
+    return _section_key(_str_val(row.get("Room") or row.get("Location")))
+
+
+def _is_pdf_url(url: object) -> bool:
+    path = _str_val(url).split("?", 1)[0].split("#", 1)[0].lower()
+    return path.endswith(".pdf")
+
+
+def _product_url_rejection_reason(url: object, row: dict | None = None) -> str:
+    raw = _str_val(url)
+    if not raw:
+        return ""
+    try:
+        parsed = re.sub(r"^www\.", "", raw.strip(), flags=re.IGNORECASE)
+        from urllib.parse import parse_qs, urlparse
+
+        url_parts = urlparse(parsed)
+        path = url_parts.path.lower().strip("/")
+        query = parse_qs(url_parts.query)
+    except Exception:
+        return "invalid product URL"
+
+    model_norm = _norm_dedupe_token((row or {}).get("Model/SKU"))
+    url_norm = _norm_dedupe_token(raw)
+    if "sitemap" in path:
+        return "sitemap/category URL rejected"
+    if "search" in path or any(key.lower() in {"q", "query", "search"} for key in query):
+        return "search URL rejected"
+    if _URL_WEAK_PAGE_RE.search(f"/{path}/") and not (model_norm and model_norm in url_norm):
+        return "category/browse URL rejected"
+    return ""
+
+
+def _dimension_rejection_reason(row: dict) -> str:
+    return dimension_sanity_reason(
+        row.get("Dimensions"),
+        row.get("Product Category") or row.get("Section"),
+    )
+
+
+def _row_richness_score(row: dict) -> int:
+    score = 0
+    product_name = _str_val(row.get("Product Name"))
+    source_type = _str_val(row.get("Source Type")).lower()
+    if product_name:
+        score += min(20, len(product_name))
+        if product_name == product_name.title():
+            score += 3
+    for field, weight in (
+        ("Brand", 10),
+        ("Model/SKU", 10),
+        ("Room", 10),
+        ("Supplier", 8),
+        ("Product Category", 8),
+        ("Finish / Color", 6),
+        ("Material", 6),
+        ("Notes", 3),
+    ):
+        if _str_val(row.get(field)):
+            score += weight
+    if _str_val(row.get("Dimensions")) and not _dimension_rejection_reason(row):
+        score += 16 if has_complete_3d_dimensions(_str_val(row.get("Dimensions"))) else 7
+    if _is_public_https_image_url(row.get("Image URL")):
+        score += 14
+    if _str_val(row.get("Product URL")) and not _product_url_rejection_reason(row.get("Product URL"), row):
+        score += 10
+    if "enrich" in source_type or "ai" in source_type:
+        score += 6
+    return score
+
+
+def _dedupe_rows_for_export(row_list: list[dict]) -> tuple[list[dict], list[dict]]:
+    groups: dict[tuple[str, str], list[tuple[int, dict]]] = {}
+    passthrough: list[tuple[int, dict]] = []
+    for idx, row in enumerate(row_list):
+        if not _is_included(row):
+            passthrough.append((idx, row))
+            continue
+        key = _product_identity_key(row)
+        if not key:
+            passthrough.append((idx, row))
+            continue
+        groups.setdefault(key, []).append((idx, row))
+
+    kept: list[tuple[int, dict]] = list(passthrough)
+    removed: list[dict] = []
+    for group_rows in groups.values():
+        if len(group_rows) == 1:
+            kept.extend(group_rows)
+            continue
+        nonblank_rooms = sorted({_room_key(row) for _, row in group_rows if _room_key(row)})
+        buckets: dict[str, list[tuple[int, dict]]] = {}
+        if len(nonblank_rooms) > 1:
+            for idx, row in group_rows:
+                room = _room_key(row)
+                if not room:
+                    best_room = max(
+                        nonblank_rooms,
+                        key=lambda key: max(
+                            _row_richness_score(r)
+                            for _, r in group_rows
+                            if _room_key(r) == key
+                        ),
+                    )
+                    room = best_room
+                buckets.setdefault(room, []).append((idx, row))
+        else:
+            buckets.setdefault("", []).extend(group_rows)
+
+        for bucket_rows in buckets.values():
+            scored_rows = [
+                (idx, row, _row_richness_score(row))
+                for idx, row in bucket_rows
+            ]
+            best_score = max(score for _, _, score in scored_rows)
+            best_rows = [(idx, row) for idx, row, score in scored_rows if score == best_score]
+
+            # Preserve equally rich duplicate rows because they may represent intentional
+            # repeated products and the ZIP exporter has long supported unique filenames
+            # for that case. Only suppress weaker fallback/raw rows.
+            if len(best_rows) == len(bucket_rows):
+                kept.extend((idx, row) for idx, row, _ in scored_rows)
+                continue
+
+            best_idx, best_row = min(best_rows, key=lambda item: item[0])
+            kept.append((best_idx, best_row))
+            for idx, row, score in scored_rows:
+                if idx == best_idx:
+                    continue
+                if score == best_score:
+                    kept.append((idx, row))
+                    continue
+                removed.append({
+                    "index": idx,
+                    "product_name": _str_val(row.get("Product Name")) or "(unnamed)",
+                    "brand": _str_val(row.get("Brand")),
+                    "sku": _str_val(row.get("Model/SKU")),
+                    "kept_index": best_idx,
+                    "reason": "duplicate brand/SKU/location; kept richer row",
+                })
+
+    return [row for _, row in sorted(kept, key=lambda item: item[0])], removed
+
+
+def _prepare_rows_for_programa_export(rows) -> tuple[list[dict], dict]:
+    row_list = _to_row_list(rows)
+    deduped, duplicates_removed = _dedupe_rows_for_export(row_list)
+    suspicious_dimensions_rejected: list[dict] = []
+    rejected_product_urls: list[dict] = []
+    pdf_product_urls: list[dict] = []
+    cleaned: list[dict] = []
+
+    for idx, row in enumerate(deduped):
+        next_row = dict(row)
+        dim_reason = _dimension_rejection_reason(next_row)
+        if dim_reason:
+            suspicious_dimensions_rejected.append({
+                "index": idx,
+                "product_name": _str_val(next_row.get("Product Name")) or "(unnamed)",
+                "brand": _str_val(next_row.get("Brand")),
+                "sku": _str_val(next_row.get("Model/SKU")),
+                "dimensions": _str_val(next_row.get("Dimensions")),
+                "reason": dim_reason,
+            })
+            next_row["Dimensions"] = ""
+            next_row["Width (in)"] = ""
+            next_row["Height (in)"] = ""
+            next_row["Depth (in)"] = ""
+            next_row["Length (in)"] = ""
+            next_row["rejected_dimensions_reason"] = dim_reason
+
+        product_url = _str_val(next_row.get("Product URL"))
+        url_reason = _product_url_rejection_reason(product_url, next_row)
+        if url_reason:
+            rejected_product_urls.append({
+                "index": idx,
+                "product_name": _str_val(next_row.get("Product Name")) or "(unnamed)",
+                "brand": _str_val(next_row.get("Brand")),
+                "sku": _str_val(next_row.get("Model/SKU")),
+                "url": product_url,
+                "reason": url_reason,
+            })
+            next_row["Product URL"] = ""
+        elif _is_pdf_url(product_url):
+            pdf_product_urls.append({
+                "index": idx,
+                "product_name": _str_val(next_row.get("Product Name")) or "(unnamed)",
+                "brand": _str_val(next_row.get("Brand")),
+                "sku": _str_val(next_row.get("Model/SKU")),
+                "url": product_url,
+                "reason": "raw PDF/spec sheet used as Product URL",
+            })
+        cleaned.append(next_row)
+
+    diagnostics = {
+        "duplicates_removed": duplicates_removed,
+        "suspicious_dimensions_rejected": suspicious_dimensions_rejected,
+        "rejected_product_urls": rejected_product_urls,
+        "pdf_product_urls": pdf_product_urls,
+    }
+    return cleaned, diagnostics
+
+
 def _quantity_value(value):
     text = _str_val(value)
     if not text:
@@ -297,7 +521,7 @@ def _quantity_value(value):
 
 def _row_to_programa_dict(row: dict) -> dict:
     """Map one internal intake row to Programa's import columns."""
-    dimensions = _str_val(row.get("Dimensions"))
+    dimensions = "" if _dimension_rejection_reason(row) else _str_val(row.get("Dimensions"))
     parts = extract_labeled_dimensions(dimensions)
     finish_color = _str_val(row.get("Finish / Color"))
     color = _str_val(row.get("Color"))
@@ -317,7 +541,7 @@ def _row_to_programa_dict(row: dict) -> dict:
         "Quantity": _quantity_value(row.get("Quantity")),
         "Price": _str_val(row.get("Price")),
         "Supplier": _str_val(row.get("Supplier")),
-        "Product URL": _str_val(row.get("Product URL")),
+        "Product URL": "" if _product_url_rejection_reason(row.get("Product URL"), row) else _str_val(row.get("Product URL")),
         "Image URL": _str_val(row.get("Image URL")) if _is_public_https_image_url(row.get("Image URL")) else "",
         "Finish": finish_color,
         "Color": color,
@@ -335,7 +559,7 @@ def validate_for_export(rows) -> dict:
     Photo-only rows require Product Name, Product Category/Section, and Image URL.
     Standard rows require Product Name to appear in the export.
     """
-    row_list = _to_row_list(rows)
+    row_list, export_diagnostics = _prepare_rows_for_programa_export(rows)
     included = [r for r in row_list if _is_included(r)]
 
     skipped: list[dict] = []
@@ -397,14 +621,20 @@ def validate_for_export(rows) -> dict:
         "section_too_long": section_too_long,
         "too_many_unique_sections": len(section_counts) > len(CANONICAL_SECTIONS),
         "canonical_sections": CANONICAL_SECTIONS,
+        "duplicates_removed": export_diagnostics["duplicates_removed"],
+        "duplicate_rows_removed": len(export_diagnostics["duplicates_removed"]),
+        "suspicious_dimensions_rejected": export_diagnostics["suspicious_dimensions_rejected"],
+        "rejected_product_urls": export_diagnostics["rejected_product_urls"],
+        "pdf_product_urls": export_diagnostics["pdf_product_urls"],
     }
 
 
 def build_programa_import_dataframe(rows) -> pd.DataFrame:
     """Transform included intake rows with Product Name into a Programa import DataFrame."""
+    row_list, _diagnostics = _prepare_rows_for_programa_export(rows)
     records = [
         _row_to_programa_dict(r)
-        for r in _to_row_list(rows)
+        for r in row_list
         if _is_exportable(r)
     ]
     if not records:
@@ -414,8 +644,9 @@ def build_programa_import_dataframe(rows) -> pd.DataFrame:
 
 def build_programa_debug_dataframe(rows) -> pd.DataFrame:
     """Build Programa import rows with debug/confidence columns appended."""
+    row_list, _diagnostics = _prepare_rows_for_programa_export(rows)
     records = []
-    for r in _to_row_list(rows):
+    for r in row_list:
         if not _is_exportable(r):
             continue
         mapped = _row_to_programa_dict(r)
@@ -482,7 +713,8 @@ def export_programa_zip(
     from src.image_assets import download_and_convert_image as _download_convert, build_image_filename
 
     manual_images = manual_images or {}
-    row_list = _to_row_list(rows)
+    source_row_list = _to_row_list(rows)
+    row_list, _diagnostics = _prepare_rows_for_programa_export(source_row_list)
 
     df = build_programa_import_dataframe(rows)
     csv_bytes = export_programa_csv(df)

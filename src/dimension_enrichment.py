@@ -35,6 +35,7 @@ try:
 except ImportError:
     _brave_candidates = None
 
+from src.dimensions import dimension_sanity_reason
 from src.enrichment_cache import ManufacturerDomainCache, SessionCache, SearchBudget
 
 
@@ -1011,11 +1012,16 @@ def _build_dimension_result(
     queries_tried: list[str],
     urls_checked: list[str],
     debug: dict,
+    is_appliance: bool = False,
 ) -> DimensionResult:
     from src.dimensions import extract_labeled_dimensions
 
     parts = extract_labeled_dimensions(dimensions)
     evidence = dimensions
+    sanity_reason = dimension_sanity_reason(dimensions, "Appliances" if is_appliance else "")
+    if sanity_reason:
+        confidence = "none"
+        debug["rejected_dimensions_reason"] = sanity_reason
     if cutout_dims:
         evidence += f" | Cutout: {cutout_dims}"
     debug = dict(debug)
@@ -1259,6 +1265,7 @@ def find_dimensions(
                 queries_tried=queries_tried,
                 urls_checked=urls_checked,
                 debug=local_debug,
+                is_appliance=is_appliance,
             )
             accepted = _accept_or_remember(result)
             if accepted:
@@ -1299,6 +1306,7 @@ def find_dimensions(
                     queries_tried=queries_tried,
                     urls_checked=urls_checked,
                     debug=pdf_debug,
+                    is_appliance=is_appliance,
                 )
                 accepted = _accept_or_remember(result)
                 if accepted:
@@ -1358,6 +1366,7 @@ def find_dimensions(
                     queries_tried=queries_tried,
                     urls_checked=urls_checked,
                     debug=url_debug,
+                    is_appliance=is_appliance,
                 )
                 accepted = _accept_or_remember(result)
                 if accepted is None:

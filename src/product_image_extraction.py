@@ -24,6 +24,9 @@ _BAD_IMAGE_TERMS = (
     "transparent",
     "pixel",
     "tracking",
+    "generic_product_promo_overlay",
+    "promo_overlay",
+    "promotional_overlay",
 )
 _PRODUCT_CONTEXT_TERMS = (
     "gallery",

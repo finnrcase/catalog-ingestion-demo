@@ -425,6 +425,9 @@ def test_validate_result_keys():
         "image_url_total", "export_count",
         "unique_sections", "section_counts", "section_equals_product_name",
         "section_too_long", "too_many_unique_sections", "canonical_sections",
+        "duplicates_removed", "duplicate_rows_removed",
+        "suspicious_dimensions_rejected", "rejected_product_urls",
+        "pdf_product_urls",
     }
 
 
@@ -534,6 +537,97 @@ def test_build_empty_input_returns_empty_dataframe():
     assert isinstance(df, pd.DataFrame)
     assert list(df.columns) == PROGRAMA_COLUMNS
     assert len(df) == 0
+
+
+def test_build_dedupes_brand_sku_and_keeps_richer_row():
+    rows = _make_rows([
+        {
+            "Product Name": "Lynx Built-In Grill",
+            "Brand": "Lynx",
+            "Model/SKU": "L42TR",
+            "Room": "Outdoor Kitchen",
+            "Supplier": "PC Richard",
+            "Product URL": "https://lynxgrills.com/products/l42tr",
+            "Image URL": "https://lynxgrills.com/images/l42tr.jpg",
+        },
+        {
+            "Product Name": "lynx l42tr",
+            "Brand": "lynx",
+            "Model/SKU": "L42TR",
+            "Room": "",
+            "Supplier": "",
+            "Product URL": "",
+            "Image URL": "",
+        },
+    ])
+
+    df = build_programa_import_dataframe(rows)
+    summary = validate_for_export(rows)
+
+    assert len(df) == 1
+    assert df.iloc[0]["Product Name"] == "Lynx Built-In Grill"
+    assert df.iloc[0]["Location"] == "Outdoor Kitchen"
+    assert summary["duplicate_rows_removed"] == 1
+
+
+def test_build_preserves_same_sku_in_different_rooms():
+    rows = _make_rows([
+        {"Brand": "Wolf", "Model/SKU": "WWD30", "Room": "Kitchen"},
+        {"Brand": "Wolf", "Model/SKU": "WWD30", "Room": "Pantry"},
+    ])
+
+    df = build_programa_import_dataframe(rows)
+
+    assert len(df) == 2
+    assert set(df["Location"]) == {"Kitchen", "Pantry"}
+
+
+def test_build_rejects_implausible_appliance_dimensions():
+    rows = _make_rows([
+        {
+            "Product Category": "Appliances",
+            "Brand": "Miele",
+            "Model/SKU": "G7986SCVIK20",
+            "Dimensions": '2752"H x 4"D x 67.7881"L',
+        }
+    ])
+
+    df = build_programa_import_dataframe(rows)
+    summary = validate_for_export(rows)
+
+    assert df.iloc[0]["Dimensions"] == ""
+    assert df.iloc[0]["Height (in)"] == ""
+    assert summary["suspicious_dimensions_rejected"][0]["sku"] == "G7986SCVIK20"
+
+
+def test_build_blanks_sitemap_product_url_and_warns():
+    rows = _make_rows([
+        {
+            "Brand": "Sub-Zero",
+            "Model/SKU": "DEC3650RID/R",
+            "Product URL": "https://www.subzero-wolf.com/product-sitemap/sub-zero",
+        }
+    ])
+
+    df = build_programa_import_dataframe(rows)
+    summary = validate_for_export(rows)
+
+    assert df.iloc[0]["Product URL"] == ""
+    assert summary["rejected_product_urls"][0]["reason"] == "sitemap/category URL rejected"
+
+
+def test_validate_warns_when_product_url_is_pdf():
+    rows = _make_rows([
+        {
+            "Brand": "Wolf",
+            "Model/SKU": "WWD30",
+            "Product URL": "https://subzero-wolf.com/specs/wwd30-spec.pdf",
+        }
+    ])
+
+    summary = validate_for_export(rows)
+
+    assert summary["pdf_product_urls"][0]["sku"] == "WWD30"
 
 
 # ── build_programa_debug_dataframe ────────────────────────────────────────────

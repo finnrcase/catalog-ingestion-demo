@@ -171,6 +171,15 @@ with version_col:
         "</div>",
         unsafe_allow_html=True,
     )
+    with st.popover("⚙ Settings", use_container_width=True):
+        st.markdown("**Settings**")
+        st.caption("Internal controls are still available on this page.")
+        st.markdown(
+            "- PDF AI parsing: in the Upload card\n"
+            "- Web enrichment and cache refresh: below intake sources\n"
+            "- Manufacturer overrides: below intake sources\n"
+            "- Debug and export diagnostics: below results"
+        )
 
 st.markdown(
     "<hr style='border-top:1.5px solid #D8CFC4; margin:0.5rem 0 1.75rem 0;'>",
@@ -817,6 +826,7 @@ if generate:
         st.session_state.automation_results = None
         st.session_state.pending_enrichment = False
         st.session_state.enrichment_errors = []
+        st.session_state.show_product_details_after_results = False
         st.success(
             f"Parsed {len(st.session_state.intake_df)} row{'s' if len(st.session_state.intake_df) != 1 else ''}. "
             "Review the rows, then run enrichment only if needed."
@@ -992,6 +1002,7 @@ if st.session_state.intake_df is not None:
                 st.session_state.intake_df = apply_confidence_checks(_enriched_df)
                 st.session_state.enrichment_errors = _enrich_errors
                 st.session_state.pending_enrichment = False
+                st.session_state.show_product_details_after_results = False
             st.rerun()
         else:
             st.session_state.pending_enrichment = False
@@ -1007,6 +1018,125 @@ if st.session_state.intake_df is not None:
     def _has_valid_image(v) -> bool:
         s = str(v or "").strip()
         return bool(s) and s.lower() not in {"nan", "none", ""}
+
+    def _has_any_dimension(v) -> bool:
+        s = str(v or "").strip()
+        return bool(s) and s.lower() not in {"nan", "none", ""}
+
+    def _format_summary_cost(source_df: pd.DataFrame) -> str:
+        timing_cost_keys = [
+            "estimated_total_cost_usd",
+            "total_enrichment_cost_usd",
+            "bravi_cost_usd",
+            "brave_cost_usd",
+        ]
+        for key in timing_cost_keys:
+            value = st.session_state.pipeline_stage_timings.get(key)
+            if isinstance(value, (int, float)):
+                return f"${float(value):.2f}"
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        cost_cols = [
+            "estimated_total_cost_usd",
+            "total_enrichment_cost_usd",
+            "bravi_cost_usd",
+            "brave_cost_usd",
+            "cost_usd",
+        ]
+        total = 0.0
+        found = False
+        for col in cost_cols:
+            if col in source_df.columns:
+                numeric = pd.to_numeric(source_df[col], errors="coerce")
+                if numeric.notna().any():
+                    total += float(numeric.fillna(0).sum())
+                    found = True
+        return f"${total:.2f}" if found else "—"
+
+    _summary_include_mask = (
+        df.get("Include", pd.Series([True] * len(df), index=df.index)) != False
+    )
+    _summary_df = df[_summary_include_mask].copy()
+    _summary_products = len(_summary_df)
+    _summary_source = (
+        _summary_df.get("Source Type", pd.Series([""] * _summary_products, index=_summary_df.index))
+        .fillna("")
+        .astype(str)
+    )
+    _summary_enriched = int(_summary_source.str.contains("enrich", case=False, regex=False).sum())
+    _summary_images = (
+        int(_summary_df["Image URL"].apply(_has_valid_image).sum())
+        if "Image URL" in _summary_df.columns else 0
+    )
+    _summary_dimensions = (
+        int(_summary_df["Dimensions"].apply(_has_any_dimension).sum())
+        if "Dimensions" in _summary_df.columns else 0
+    )
+    _summary_needs_review = int(
+        _summary_df.apply(lambda r: bool(_missing_required_fields(r)), axis=1).sum()
+    ) if _summary_products else 0
+    _summary_cost = _format_summary_cost(_summary_df)
+    _summary_today = datetime.date.today().isoformat()
+    _summary_programa_df = build_programa_import_dataframe(_summary_df)
+
+    with st.container(border=True):
+        section_label("Results Summary")
+        _r1, _r2, _r3, _r4, _r5 = st.columns(5)
+        _r1.metric("Products found", _summary_products)
+        _r2.metric("Enriched", _summary_enriched)
+        _r3.metric("With images", _summary_images)
+        _r4.metric("With dimensions", _summary_dimensions)
+        _r5.metric("Est. cost", _summary_cost)
+
+        _summary_warnings = []
+        if st.session_state.enrichment_errors:
+            _summary_warnings.append(f"{len(st.session_state.enrichment_errors)} enrichment issue(s)")
+        if _summary_needs_review:
+            _summary_warnings.append(f"{_summary_needs_review} need review")
+        if _summary_products and _summary_images < _summary_products:
+            _summary_warnings.append(f"{_summary_products - _summary_images} missing images")
+        if _summary_products and _summary_dimensions < _summary_products:
+            _summary_warnings.append(f"{_summary_products - _summary_dimensions} missing dimensions")
+        if _summary_warnings:
+            st.warning(" · ".join(_summary_warnings), icon="⚠️")
+
+        _summary_export_col1, _summary_export_col2 = st.columns(2)
+        with _summary_export_col1:
+            st.download_button(
+                label="Download Excel for Programa",
+                data=export_programa_xlsx(_summary_programa_df),
+                file_name=f"programa_import_{_summary_today}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                disabled=_summary_programa_df.empty,
+                type="primary",
+                key="summary_programa_xlsx_download",
+            )
+        with _summary_export_col2:
+            st.download_button(
+                label="Download Programa CSV",
+                data=export_programa_csv(_summary_programa_df),
+                file_name=f"programa_import_{_summary_today}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                disabled=_summary_programa_df.empty,
+                type="secondary",
+                key="summary_programa_csv_download",
+            )
+
+    show_product_details = st.toggle(
+        "View parsed/enriched products",
+        value=False,
+        key="show_product_details_after_results",
+        help="Expand to review, edit, or inspect every product row.",
+    )
+    if not show_product_details:
+        st.caption(
+            f"{_summary_products} product{'s' if _summary_products != 1 else ''} found · "
+            f"{_summary_images} with image{'s' if _summary_images != 1 else ''} · "
+            f"{_summary_dimensions} with dimension{'s' if _summary_dimensions != 1 else ''}"
+        )
 
     if "Image URL" in df.columns:
         _total_n = len(df[df.get("Include", pd.Series([True] * len(df))) != False])
@@ -1038,6 +1168,7 @@ if st.session_state.intake_df is not None:
                         st.session_state.pipeline_stage_timings = timings
                         st.session_state.intake_df = apply_confidence_checks(_recovered_df)
                         st.session_state.manual_image_uploads = {}
+                        st.session_state.show_product_details_after_results = False
                     _found = sum(1 for d in _img_diagnostics if d["status"] == "found")
                     if _found:
                         st.success(f"Recovered {_found} of {len(_img_diagnostics)} missing images.")
@@ -1630,116 +1761,123 @@ if st.session_state.intake_df is not None:
         if log_path:
             st.caption(f"Full log saved → {log_path}")
 
-    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
-    st.divider()
+    if show_product_details:
+        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+        st.divider()
 
-    # ── Review Table ───────────────────────────────────────────────────────────
-    row_count = len(df)
-    section_label(f"Review Table · {row_count} item{'s' if row_count != 1 else ''}")
+        # ── Review Table ───────────────────────────────────────────────────────────
+        row_count = len(df)
+        section_label(f"Review Table · {row_count} item{'s' if row_count != 1 else ''}")
 
-    if "Product Category" in df.columns:
-        _blank_cat_preview = int(
-            (df["Include"] == True).values.sum()
-            if "Include" in df.columns else len(df)
-        )
-        _blank_cat_preview = int(
-            ((df.get("Include", pd.Series([True]*len(df))) == True)
-             & (df["Product Category"].isna() | (df["Product Category"].str.strip() == ""))).sum()
-        )
-        if _blank_cat_preview > 0:
-            st.caption(
-                f"ℹ️  {_blank_cat_preview} row{'s' if _blank_cat_preview != 1 else ''} with blank "
-                "category — suggestions available in AI-Assisted Cleanup below."
+        if "Product Category" in df.columns:
+            _blank_cat_preview = int(
+                (df["Include"] == True).values.sum()
+                if "Include" in df.columns else len(df)
             )
+            _blank_cat_preview = int(
+                ((df.get("Include", pd.Series([True]*len(df))) == True)
+                 & (df["Product Category"].isna() | (df["Product Category"].str.strip() == ""))).sum()
+            )
+            if _blank_cat_preview > 0:
+                st.caption(
+                    f"ℹ️  {_blank_cat_preview} row{'s' if _blank_cat_preview != 1 else ''} with blank "
+                    "category — suggestions available in AI-Assisted Cleanup below."
+                )
 
-    edited_df = st.data_editor(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        column_order=[c for c in DISPLAY_COLUMNS if c in df.columns],
-        column_config={
-            # ── Confidence / status columns ──
-            "Include": st.column_config.CheckboxColumn(
-                "Include", default=True, width="small"
-            ),
-            "Confidence Score": st.column_config.NumberColumn(
-                "Confidence", width="small", disabled=True,
-                min_value=0, max_value=100, format="%d %%"
-            ),
-            "Review Required": st.column_config.CheckboxColumn(
-                "Review Req.", width="small",
-                help="Uncheck after you have manually reviewed this row."
-            ),
-            "Suggested Action": st.column_config.TextColumn(
-                "Suggested Action", width="large", disabled=True
-            ),
-            # ── Core product fields ──
-            "Project": st.column_config.TextColumn("Project", width="medium"),
-            "Room": st.column_config.TextColumn("Location", width="medium"),
-            "Product Name": st.column_config.TextColumn("Name of Product", width="large"),
-            "Brand": st.column_config.TextColumn("Brand", width="medium"),
-            "Dimensions": st.column_config.TextColumn("Dimensions", width="medium"),
-            "Finish / Color": st.column_config.TextColumn("Finish / Color", width="medium"),
-            "Color": st.column_config.TextColumn("Color", width="medium"),
-            "Material": st.column_config.TextColumn("Material", width="medium"),
-            "Model/SKU": st.column_config.TextColumn(
-                "Serial / Model Number", width="medium"
-            ),
-            "Product Category": st.column_config.SelectboxColumn(
-                "Category", options=CATEGORIES, width="medium"
-            ),
-            "Quantity": st.column_config.NumberColumn(
-                "Qty", min_value=1, step=1, width="small"
-            ),
-            "Price": st.column_config.TextColumn("Price", width="small"),
-            "Supplier": st.column_config.TextColumn(
-                "Who We Bought It From", width="medium"
-            ),
-            "Product URL": st.column_config.LinkColumn("Product URL", width="medium"),
-            "Notes": st.column_config.TextColumn("Notes", width="large"),
-            # ── Meta columns ──
-            "Source Type": st.column_config.TextColumn(
-                "Source", width="small", disabled=True
-            ),
-            "Import Type": st.column_config.TextColumn(
-                "Import Type", width="small", disabled=True
-            ),
-            "Status": st.column_config.SelectboxColumn(
-                "Status", options=STATUSES, width="medium"
-            ),
-            "Missing Fields": st.column_config.TextColumn(
-                "Missing Fields", width="large", disabled=True
-            ),
-            "AI Category Confidence": st.column_config.NumberColumn(
-                "Cat. AI Confidence", width="small", disabled=True,
-                min_value=0, max_value=100, format="%d %%"
-            ),
-            "Category Source": st.column_config.TextColumn(
-                "Category Source", width="small", disabled=True
-            ),
-            "Image Filename": st.column_config.TextColumn(
-                "Image Filename", width="medium", disabled=True
-            ),
-            "Image Upload Status": st.column_config.TextColumn(
-                "Image Status", width="small", disabled=True
-            ),
-            "Image URL": st.column_config.LinkColumn("Image URL", width="medium"),
-            "Local Image Path": None,
-            "photo_only": None,
-        },
-    )
-    for _hidden_col in INTERNAL_IMAGE_COLUMNS:
-        if _hidden_col in df.columns and _hidden_col not in edited_df.columns:
-            edited_df[_hidden_col] = df[_hidden_col]
+        edited_df = st.data_editor(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            column_order=[c for c in DISPLAY_COLUMNS if c in df.columns],
+            column_config={
+                # ── Confidence / status columns ──
+                "Include": st.column_config.CheckboxColumn(
+                    "Include", default=True, width="small"
+                ),
+                "Confidence Score": st.column_config.NumberColumn(
+                    "Confidence", width="small", disabled=True,
+                    min_value=0, max_value=100, format="%d %%"
+                ),
+                "Review Required": st.column_config.CheckboxColumn(
+                    "Review Req.", width="small",
+                    help="Uncheck after you have manually reviewed this row."
+                ),
+                "Suggested Action": st.column_config.TextColumn(
+                    "Suggested Action", width="large", disabled=True
+                ),
+                # ── Core product fields ──
+                "Project": st.column_config.TextColumn("Project", width="medium"),
+                "Room": st.column_config.TextColumn("Location", width="medium"),
+                "Product Name": st.column_config.TextColumn("Name of Product", width="large"),
+                "Brand": st.column_config.TextColumn("Brand", width="medium"),
+                "Dimensions": st.column_config.TextColumn("Dimensions", width="medium"),
+                "Finish / Color": st.column_config.TextColumn("Finish / Color", width="medium"),
+                "Color": st.column_config.TextColumn("Color", width="medium"),
+                "Material": st.column_config.TextColumn("Material", width="medium"),
+                "Model/SKU": st.column_config.TextColumn(
+                    "Serial / Model Number", width="medium"
+                ),
+                "Product Category": st.column_config.SelectboxColumn(
+                    "Category", options=CATEGORIES, width="medium"
+                ),
+                "Quantity": st.column_config.NumberColumn(
+                    "Qty", min_value=1, step=1, width="small"
+                ),
+                "Price": st.column_config.TextColumn("Price", width="small"),
+                "Supplier": st.column_config.TextColumn(
+                    "Who We Bought It From", width="medium"
+                ),
+                "Product URL": st.column_config.LinkColumn("Product URL", width="medium"),
+                "Notes": st.column_config.TextColumn("Notes", width="large"),
+                # ── Meta columns ──
+                "Source Type": st.column_config.TextColumn(
+                    "Source", width="small", disabled=True
+                ),
+                "Import Type": st.column_config.TextColumn(
+                    "Import Type", width="small", disabled=True
+                ),
+                "Status": st.column_config.SelectboxColumn(
+                    "Status", options=STATUSES, width="medium"
+                ),
+                "Missing Fields": st.column_config.TextColumn(
+                    "Missing Fields", width="large", disabled=True
+                ),
+                "AI Category Confidence": st.column_config.NumberColumn(
+                    "Cat. AI Confidence", width="small", disabled=True,
+                    min_value=0, max_value=100, format="%d %%"
+                ),
+                "Category Source": st.column_config.TextColumn(
+                    "Category Source", width="small", disabled=True
+                ),
+                "Image Filename": st.column_config.TextColumn(
+                    "Image Filename", width="medium", disabled=True
+                ),
+                "Image Upload Status": st.column_config.TextColumn(
+                    "Image Status", width="small", disabled=True
+                ),
+                "Image URL": st.column_config.LinkColumn("Image URL", width="medium"),
+                "Local Image Path": None,
+                "photo_only": None,
+            },
+        )
+        for _hidden_col in INTERNAL_IMAGE_COLUMNS:
+            if _hidden_col in df.columns and _hidden_col not in edited_df.columns:
+                edited_df[_hidden_col] = df[_hidden_col]
 
-    st.session_state.intake_df = edited_df
+        st.session_state.intake_df = edited_df
 
-    if rerun_check:
-        st.session_state.intake_df = apply_confidence_checks(edited_df)
-        st.rerun()
+        if rerun_check:
+            st.session_state.intake_df = apply_confidence_checks(edited_df)
+            st.rerun()
 
-    st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+    else:
+        edited_df = df
+        if rerun_check:
+            st.session_state.intake_df = apply_confidence_checks(edited_df)
+            st.rerun()
+
 
     # ── Export CSV ─────────────────────────────────────────────────────────────
     _export_col, _, __ = st.columns([2, 6, 2])
@@ -1775,6 +1913,10 @@ if st.session_state.intake_df is not None:
     _missing_img = _export_summary["missing_image_url"]
     _image_url_present = _export_summary["image_url_present"]
     _image_url_total = _export_summary["image_url_total"]
+    _duplicate_rows_removed = _export_summary.get("duplicate_rows_removed", 0)
+    _suspicious_dimensions_rejected = _export_summary.get("suspicious_dimensions_rejected", [])
+    _rejected_product_urls = _export_summary.get("rejected_product_urls", [])
+    _pdf_product_urls = _export_summary.get("pdf_product_urls", [])
 
     if _export_count > 0:
         st.success(
@@ -1796,6 +1938,22 @@ if st.session_state.intake_df is not None:
         st.warning(f"⚠  {_missing_url} row{'s' if _missing_url != 1 else ''} missing Product URL", icon=None)
     if _missing_img > 0:
         st.warning(f"⚠  {_missing_img} row{'s' if _missing_img != 1 else ''} missing Image URL", icon=None)
+    if _duplicate_rows_removed:
+        st.warning(f"⚠  {_duplicate_rows_removed} duplicate row{'s' if _duplicate_rows_removed != 1 else ''} removed before export", icon=None)
+    if _suspicious_dimensions_rejected:
+        st.warning(f"⚠  {len(_suspicious_dimensions_rejected)} suspicious dimension value{'s' if len(_suspicious_dimensions_rejected) != 1 else ''} rejected", icon=None)
+        with st.expander("Suspicious dimensions rejected"):
+            for item in _suspicious_dimensions_rejected[:12]:
+                st.markdown(
+                    f"- {item.get('product_name', 'Unnamed')}: `{item.get('dimensions', '')}` — {item.get('reason', '')}"
+                )
+    if _rejected_product_urls:
+        st.warning(f"⚠  {len(_rejected_product_urls)} sitemap/category/search Product URL{'s' if len(_rejected_product_urls) != 1 else ''} rejected", icon=None)
+        with st.expander("Rejected Product URLs"):
+            for item in _rejected_product_urls[:12]:
+                st.markdown(f"- {item.get('product_name', 'Unnamed')}: {item.get('url', '')} — {item.get('reason', '')}")
+    if _pdf_product_urls:
+        st.warning(f"⚠  {len(_pdf_product_urls)} row{'s' if len(_pdf_product_urls) != 1 else ''} use a PDF/spec sheet as Product URL", icon=None)
     st.info(f"Image URLs present: {_image_url_present} / {_image_url_total}", icon=None)
     if _skipped:
         with st.expander(f"✕  {len(_skipped)} row{'s' if len(_skipped) != 1 else ''} skipped"):
@@ -1806,20 +1964,22 @@ if st.session_state.intake_df is not None:
     _dl_col1, _dl_col2, _dl_col3 = st.columns(3)
     with _dl_col1:
         st.download_button(
+            label="Download Excel for Programa",
+            data=export_programa_xlsx(_programa_df),
+            file_name=f"programa_import_{_today}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            type="primary",
+            disabled=_programa_df.empty,
+        )
+    with _dl_col2:
+        st.download_button(
             label="Download Programa CSV",
             data=export_programa_csv(_programa_df),
             file_name=f"programa_import_{_today}.csv",
             mime="text/csv",
             use_container_width=True,
-            disabled=_programa_df.empty,
-        )
-    with _dl_col2:
-        st.download_button(
-            label="Download Programa XLSX",
-            data=export_programa_xlsx(_programa_df),
-            file_name=f"programa_import_{_today}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            type="secondary",
             disabled=_programa_df.empty,
         )
     with _dl_col3:
@@ -1837,7 +1997,7 @@ if st.session_state.intake_df is not None:
             file_name=f"programa_export_{_today}.zip",
             mime="application/zip",
             use_container_width=True,
-            disabled=not included,
+            disabled=included.empty,
             help="ZIP archive containing the Programa CSV, downloaded product images (JPG), and a per-product image manifest.",
         )
 
@@ -1860,7 +2020,7 @@ if st.session_state.intake_df is not None:
         _incl_mask_nr & edited_df.apply(lambda r: bool(_missing_required_fields(r)), axis=1)
     ]
 
-    if not _needs_review_rows.empty:
+    if show_product_details and not _needs_review_rows.empty:
         st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
         st.divider()
         section_label("Needs Review")

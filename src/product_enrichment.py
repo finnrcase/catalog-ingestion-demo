@@ -68,7 +68,11 @@ _product_cache = _ProductEnrichmentCache()
 # Cache field mappings: cache field name → row column name
 _CACHE_GENERAL_FIELDS: dict[str, str] = {
     "product_url": "Product URL",
+    "product_name": "Product Name",
+    "brand": "Brand",
     "finish": "Finish / Color",
+    "material": "Material",
+    "product_category": "Product Category",
     "image_url": "Image URL",
 }
 _CACHE_DIM_FIELDS: dict[str, str] = {
@@ -467,10 +471,12 @@ def _extract_meta_content(soup: BeautifulSoup, *keys: str) -> str:
 
 
 def _extract_finish_material_from_text(text: str) -> tuple[str, str]:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
     finish = ""
     material = ""
-    finish_match = re.search(r"\b(?:finish|color|colour)\s*[:\-]\s*([^\n|;,]{2,80})", text, re.IGNORECASE)
-    material_match = re.search(r"\bmaterials?\s*[:\-]\s*([^\n|;,]{2,100})", text, re.IGNORECASE)
+    boundary = r"(?=\s+(?:finish|color|colour|materials?|dimensions?|width|height|depth)\s*[:\-]|$|[|;,])"
+    finish_match = re.search(rf"\b(?:finish|color|colour)\s*[:\-]\s*(.+?){boundary}", text, re.IGNORECASE)
+    material_match = re.search(rf"\bmaterials?\s*[:\-]\s*(.+?){boundary}", text, re.IGNORECASE)
     if finish_match:
         finish = finish_match.group(1).strip()
     if material_match:
@@ -534,7 +540,8 @@ def _fill_blank_fields_from_verified_page(row: dict, fields: dict, page_url: str
     if description and not _str_val(updated.get("Notes")):
         updated["Notes"] = f"[Description: {description[:500]}]"
         filled.append("Notes")
-    if not _str_val(updated.get("Product URL")):
+    existing_product_url = _str_val(updated.get("Product URL"))
+    if not existing_product_url or _reject_weak_product_url(existing_product_url):
         updated["Product URL"] = page_url
         filled.append("Product URL")
     original = _str_val(updated.get("Source Type"))
@@ -649,6 +656,8 @@ def _reject_weak_product_url(url: str) -> str:
         return "homepage"
     if "sitemap" in path:
         return "sitemap page"
+    if path.endswith(".pdf"):
+        return "spec PDF, not product page"
     if "/search" in path or "search" in urllib.parse.parse_qs(parsed.query):
         return "search result page"
     if _WEAK_PAGE_RE.search(path):
@@ -900,6 +909,7 @@ def _try_image_from_url(
     product_url: str,
     cache_key: str = "",
     session_cache: "_SessionCache | None" = None,
+    budget: "_SearchBudget | None" = None,
     row: dict | None = None,
     return_debug: bool = False,
 ) -> str | tuple[str | None, dict] | None:
@@ -915,7 +925,14 @@ def _try_image_from_url(
     if session_cache is not None and product_url in session_cache.urls:
         raw_html = str(session_cache.urls.get(product_url) or "")
     if not raw_html:
+        if budget is not None and not budget.can_fetch():
+            debug = _image_debug_defaults()
+            debug["budget_blocked"] = True
+            debug["cloudinary_error"] = "budget blocked image page fetch"
+            return (None, debug) if return_debug else None
         raw_html = _fetch_page_html(product_url)
+        if budget is not None:
+            budget.consume_fetch()
         if raw_html and session_cache is not None:
             session_cache.urls[product_url] = raw_html
     if not raw_html:
@@ -1061,6 +1078,9 @@ def _apply_cache_to_row(
             if not force_refresh:
                 _log.debug("[CACHED NULL SKIPPED] field=%s", cache_field)
             continue  # null = searched before, no result; skip unless force_refresh
+        if cache_field == "product_url" and _reject_weak_product_url(_str_val(cached_val)):
+            _log.debug("[CACHED PRODUCT URL REJECTED] field=%s url=%s", cache_field, cached_val)
+            continue
         if not _confidence_ok(cache_entry, cache_field):
             continue
         if not _str_val(updated.get(row_col)):
@@ -1109,6 +1129,19 @@ def _dimension_debug_defaults(row: dict) -> dict:
         "final_dimension_writeback_success": False,
         "skipped_reason": "",
         "budget_blocked": False,
+        "sku_used_for_lookup": _str_val(row.get("Model/SKU")),
+        "manufacturer_domain_used": "",
+        "search_query_used": "",
+        "product_url_candidates": "",
+        "selected_product_url": "",
+        "selected_product_url_confidence": "",
+        "sku_match_location": "",
+        "page_fetched": False,
+        "dimensions_found": False,
+        "image_candidates_count": "",
+        "selected_image_url": "",
+        "fields_filled": "",
+        "budget_spent": "",
     }
     debug.update(_image_debug_defaults())
     return debug
@@ -1121,6 +1154,256 @@ def _stamp_dimension_debug(row: dict, debug: dict) -> dict:
     for field in _ENRICHMENT_DEBUG_FIELDS:
         updated[field] = merged.get(field, "")
     return updated
+
+
+def _budget_summary(budget: "_SearchBudget | None") -> str:
+    if budget is None:
+        return ""
+    return f"searches={budget.searches_used}/{budget.max_searches}; fetches={budget.urls_used}/{budget.max_urls}"
+
+
+def _search_sku_product_pages(
+    row: dict,
+    manufacturer_domain: str,
+    *,
+    session_cache: "_SessionCache | None",
+    budget: "_SearchBudget | None",
+    debug: dict,
+) -> list:
+    brand = _str_val(row.get("Brand"))
+    candidates = []
+    for query in _build_sku_lookup_queries(row, manufacturer_domain):
+        if budget is not None and not budget.can_search():
+            debug["budget_blocked"] = True
+            debug["skipped_reason"] = "budget blocked SKU product search"
+            break
+        debug["search_query_used"] = query
+        results = search_product_candidates(query, brand, session_cache=session_cache)
+        if budget is not None:
+            budget.consume_search()
+        candidates.extend(results or [])
+        if candidates:
+            # One targeted query is normally enough; avoid broadening unless the
+            # first query yielded nothing at all.
+            break
+    # Dedupe by URL.
+    seen: set[str] = set()
+    deduped = []
+    for result in candidates:
+        if result.url in seen:
+            continue
+        seen.add(result.url)
+        deduped.append(result)
+    debug["product_url_candidates"] = json.dumps(
+        [{"url": r.url, "title": r.title, "domain_score": r.domain_score} for r in deduped[:5]],
+        ensure_ascii=True,
+    )
+    return deduped
+
+
+def _verify_candidate_url(
+    row: dict,
+    url: str,
+    *,
+    manufacturer_domain: str,
+    session_cache: "_SessionCache | None",
+    budget: "_SearchBudget | None",
+    debug: dict,
+    title_hint: str = "",
+    description_hint: str = "",
+) -> tuple[str, dict]:
+    html = _fetch_page_html_budgeted(url, session_cache=session_cache, budget=budget, debug=debug)
+    if not html:
+        return "", {
+            "confidence": "none",
+            "score": 0,
+            "rejection_reason": debug.get("skipped_reason") or "page fetch failed",
+            "sku_match_location": "",
+        }
+    title, description = _page_title_and_description(html)
+    evidence = _score_verified_product_page(
+        row,
+        url,
+        html,
+        manufacturer_domain=manufacturer_domain,
+        title=title or title_hint,
+        description=description or description_hint,
+    )
+    return html, evidence
+
+
+def _write_verified_cache(
+    cache_key: str,
+    row: dict,
+    *,
+    manufacturer_domain: str,
+    page_url: str,
+    page_confidence: str,
+    fields: dict,
+    image_debug: dict,
+    dim_result: "_DimensionResult | None",
+) -> None:
+    if not cache_key:
+        return
+    cache_fields = {
+        "brand": _str_val(row.get("Brand")),
+        "sku": _str_val(row.get("Model/SKU")),
+        "product_name": _str_val(row.get("Product Name")),
+        "manufacturer_domain": manufacturer_domain,
+        "product_url": page_url,
+        "verified_product_url": page_url,
+        "product_url_confidence": page_confidence,
+        "source_timestamp": datetime.now(timezone.utc).isoformat(),
+        "general_confidence": "high" if page_confidence == "high" else "medium",
+    }
+    if _str_val(fields.get("Finish / Color")):
+        cache_fields["finish"] = _str_val(fields.get("Finish / Color"))
+    if _str_val(fields.get("Material")):
+        cache_fields["material"] = _str_val(fields.get("Material"))
+    if _str_val(fields.get("Product Category")):
+        cache_fields["product_category"] = _str_val(fields.get("Product Category"))
+    if _str_val(row.get("Image URL")):
+        cache_fields["image_url"] = _str_val(row.get("Image URL"))
+        cache_fields["cloudinary_url"] = _str_val(image_debug.get("cloudinary_url"))
+        cache_fields["original_image_url"] = _str_val(image_debug.get("original_image_url"))
+        cache_fields["image_confidence"] = _str_val(image_debug.get("image_confidence"))
+    if dim_result is not None and dim_result.status == "found":
+        cache_fields.update({
+            "dimensions": dim_result.dimensions,
+            "width_in": dim_result.width or None,
+            "height_in": dim_result.height or None,
+            "depth_in": dim_result.depth or None,
+            "length_in": dim_result.length or None,
+            "dimension_source_url": dim_result.source_url,
+            "dimension_confidence": dim_result.confidence,
+        })
+    _product_cache.update(cache_key, cache_fields)
+
+
+def _try_verified_page_enrichment(
+    row: dict,
+    *,
+    cache_key: str,
+    manufacturer_domain: str,
+    session_cache: "_SessionCache | None",
+    budget: "_SearchBudget | None",
+    debug: dict,
+) -> tuple[dict, _DimensionResult | None, dict]:
+    updated = row.copy()
+    debug["sku_used_for_lookup"] = _str_val(row.get("Model/SKU"))
+    debug["manufacturer_domain_used"] = manufacturer_domain
+    debug["budget_spent"] = _budget_summary(budget)
+    product_url = _str_val(updated.get("Product URL"))
+    candidates_to_check: list[tuple[str, str, str]] = []
+
+    if product_url:
+        candidates_to_check.append((product_url, "", ""))
+    if not product_url or _reject_weak_product_url(product_url):
+        for result in _search_sku_product_pages(
+            row,
+            manufacturer_domain,
+            session_cache=session_cache,
+            budget=budget,
+            debug=debug,
+        )[:5]:
+            candidates_to_check.append((result.url, result.title, result.description))
+
+    selected_url = ""
+    selected_html = ""
+    selected_evidence: dict = {}
+    candidate_debug: list[dict] = []
+    for url, title_hint, description_hint in candidates_to_check:
+        html, evidence = _verify_candidate_url(
+            row,
+            url,
+            manufacturer_domain=manufacturer_domain,
+            session_cache=session_cache,
+            budget=budget,
+            debug=debug,
+            title_hint=title_hint,
+            description_hint=description_hint,
+        )
+        candidate_debug.append({"url": url, **evidence})
+        if evidence.get("confidence") in {"high", "medium"}:
+            selected_url = url
+            selected_html = html
+            selected_evidence = evidence
+            break
+        if budget is not None and not budget.can_fetch():
+            debug["budget_blocked"] = True
+            break
+
+    if candidate_debug:
+        debug["product_url_candidates"] = json.dumps(candidate_debug[:5], ensure_ascii=True)
+    if not selected_url:
+        debug["selected_product_url_confidence"] = "none"
+        debug["sku_match_location"] = candidate_debug[0].get("sku_match_location", "") if candidate_debug else ""
+        debug["budget_spent"] = _budget_summary(budget)
+        return updated, None, debug
+
+    debug["selected_product_url"] = selected_url
+    debug["selected_product_url_confidence"] = _str_val(selected_evidence.get("confidence"))
+    debug["product_url_confidence"] = debug["selected_product_url_confidence"]
+    debug["sku_match_location"] = _str_val(selected_evidence.get("sku_match_location"))
+    debug["product_url"] = selected_url
+
+    fields = _extract_verified_page_fields(selected_html, updated, selected_url)
+    updated, fields_filled = _fill_blank_fields_from_verified_page(
+        updated,
+        fields,
+        selected_url,
+        debug["selected_product_url_confidence"],
+    )
+
+    image_debug: dict = {}
+    if _needs_image_recovery(updated):
+        image_url, image_debug = _extract_image_from_html(selected_html, selected_url, updated, cache_key)
+        debug.update(image_debug)
+        try:
+            debug["image_candidates_count"] = len(extract_product_image_candidates(selected_html, selected_url, updated))
+        except Exception:
+            debug["image_candidates_count"] = ""
+        if image_url:
+            updated["Image URL"] = image_url
+            updated.update(image_debug)
+            debug["selected_image_url"] = image_url
+            fields_filled.append("Image URL")
+
+    dim_result: _DimensionResult | None = None
+    if _needs_dimension_recovery(updated):
+        dim_result = _find_dimensions(updated, session_cache=session_cache, budget=budget)
+        debug.update(dim_result.debug or {})
+        if dim_result.status == "found" and dim_result.confidence in {"high", "medium"}:
+            updated["Dimensions"] = dim_result.dimensions
+            if dim_result.width:
+                updated["Width (in)"] = dim_result.width
+            if dim_result.height:
+                updated["Height (in)"] = dim_result.height
+            if dim_result.depth:
+                updated["Depth (in)"] = dim_result.depth
+            if dim_result.length:
+                updated["Length (in)"] = dim_result.length
+            fields_filled.append("Dimensions")
+        debug["dimensions_found"] = bool(dim_result.status == "found")
+        debug["dimension_confidence"] = dim_result.confidence if dim_result.confidence not in ("", "none", None) else ""
+        debug["dimension_source_url"] = dim_result.source_url
+        debug["Dimension Source URL"] = dim_result.source_url
+    else:
+        debug["dimensions_found"] = bool(_str_val(updated.get("Dimensions")))
+
+    debug["fields_filled"] = ", ".join(dict.fromkeys(fields_filled))
+    debug["budget_spent"] = _budget_summary(budget)
+    _write_verified_cache(
+        cache_key,
+        updated,
+        manufacturer_domain=manufacturer_domain,
+        page_url=selected_url,
+        page_confidence=debug["selected_product_url_confidence"],
+        fields=fields,
+        image_debug=image_debug,
+        dim_result=dim_result,
+    )
+    return updated, dim_result, debug
 
 
 def enrich_row(
@@ -1186,6 +1469,7 @@ def enrich_row(
                                     product_url,
                                     cache_key,
                                     session_cache=session_cache,
+                                    budget=budget,
                                     row=updated,
                                     return_debug=True,
                                 )
@@ -1194,6 +1478,33 @@ def enrich_row(
                             if img:
                                 updated["Image URL"] = img
                                 updated.update(image_debug)
+                    product_url = _str_val(updated.get("Product URL"))
+                    needs_cached_page_exploit = bool(product_url) and (
+                        _needs_dimension_recovery(updated)
+                        or _needs_image_recovery(updated)
+                    )
+                    if needs_cached_page_exploit:
+                        domain_match_for_cache = get_domain_for_brand(brand)
+                        verified_updated, verified_dim_result, verified_debug = _try_verified_page_enrichment(
+                            updated,
+                            cache_key=cache_key,
+                            manufacturer_domain=domain_match_for_cache[0] if domain_match_for_cache else "",
+                            session_cache=session_cache,
+                            budget=budget,
+                            debug=enrichment_debug,
+                        )
+                        enrichment_debug.update(verified_debug)
+                        if _str_val(enrichment_debug.get("selected_product_url")):
+                            if verified_dim_result is not None:
+                                verified_updated["Dimension Source URL"] = verified_dim_result.source_url
+                                verified_updated["Dimension Confidence"] = (
+                                    verified_dim_result.confidence if verified_dim_result.confidence not in ("", "none", None) else ""
+                                )
+                                verified_updated["Dimension Source Type"] = (
+                                    verified_dim_result.source_type if verified_dim_result.source_type not in ("", "none", None) else ""
+                                )
+                                verified_updated["Dimension Lookup Status"] = verified_dim_result.status
+                            return _stamp_dimension_debug(verified_updated, {**enrichment_debug, "skipped_reason": "full cache hit with product page refresh"}), None, verified_dim_result
                     return _stamp_dimension_debug(updated, {**enrichment_debug, "skipped_reason": "full cache hit"}), None, None
                 else:
                     product_cache_hit = "partial"
@@ -1207,10 +1518,48 @@ def enrich_row(
         else:
             enrichment_debug["cache_hit"] = "unavailable"
 
-        # If cache (or the row itself) gives us a Product URL but dimensions or
-        # image are still missing, force a deterministic page extraction path.
-        # This avoids stale null cache fields becoming permanent blockers.
+        domain_match = get_domain_for_brand(brand)
+        manufacturer_domain = domain_match[0] if domain_match else ""
         cached_or_existing_product_url = _str_val(row.get("Product URL"))
+        if cached_or_existing_product_url and (
+            _needs_dimension_recovery(row) or _needs_image_recovery(row)
+        ) and (
+            product_cache_hit in {"full", "partial"} or (
+                cache_entry is not None and (
+                    enrichment_debug["cache_had_blank_dimensions"]
+                    or enrichment_debug["cache_had_blank_image"]
+                )
+            )
+        ):
+            enrichment_debug["fresh_extraction_forced"] = True
+
+        # Verified product-page pass. This is the preferred low-cost path:
+        # Product URL if present, otherwise one SKU/model-anchored manufacturer
+        # lookup, then extract URL/image/dimensions/spec fields from that page.
+        verified_updated, verified_dim_result, verified_debug = _try_verified_page_enrichment(
+            row,
+            cache_key=cache_key,
+            manufacturer_domain=manufacturer_domain,
+            session_cache=session_cache,
+            budget=budget,
+            debug=enrichment_debug,
+        )
+        enrichment_debug.update(verified_debug)
+        if _str_val(enrichment_debug.get("selected_product_url")):
+            if verified_dim_result is not None:
+                verified_updated["Dimension Source URL"] = verified_dim_result.source_url
+                verified_updated["Dimension Confidence"] = (
+                    verified_dim_result.confidence if verified_dim_result.confidence not in ("", "none", None) else ""
+                )
+                verified_updated["Dimension Source Type"] = (
+                    verified_dim_result.source_type if verified_dim_result.source_type not in ("", "none", None) else ""
+                )
+                verified_updated["Dimension Lookup Status"] = verified_dim_result.status
+            return _stamp_dimension_debug(verified_updated, enrichment_debug), None, verified_dim_result
+
+        # Legacy fallback: If cache (or the row itself) gives us a Product URL but
+        # the verified-page pass could not accept it, still try the older
+        # deterministic image-only path before generic search.
         if cached_or_existing_product_url and (
             _needs_dimension_recovery(row) or _needs_image_recovery(row)
         ):
@@ -1227,6 +1576,7 @@ def enrich_row(
                         cached_or_existing_product_url,
                         cache_key,
                         session_cache=session_cache,
+                        budget=budget,
                         row=row,
                         return_debug=True,
                     )
@@ -1246,7 +1596,6 @@ def enrich_row(
         )
 
         query = _build_search_query(row)
-        domain_match = get_domain_for_brand(brand)
         results = []
         if not skip_general_search and budget.can_search():
             _log.info("[LIVE SEARCH] query=%s", query[:80])

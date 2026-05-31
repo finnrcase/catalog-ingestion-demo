@@ -49,6 +49,11 @@ export type ProgramaExportValidation = {
   section_too_long: { index: number; product_name: string; section: string }[];
   too_many_unique_sections: boolean;
   canonical_sections: string[];
+  duplicates_removed: { index: number; product_name: string; brand?: string; sku?: string; kept_index?: number; reason?: string }[];
+  duplicate_rows_removed: number;
+  suspicious_dimensions_rejected: { index: number; product_name: string; brand?: string; sku?: string; dimensions?: string; reason?: string }[];
+  rejected_product_urls: { index: number; product_name: string; brand?: string; sku?: string; url?: string; reason?: string }[];
+  pdf_product_urls: { index: number; product_name: string; brand?: string; sku?: string; url?: string; reason?: string }[];
 };
 
 export type VendorCallResponse = {

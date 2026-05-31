@@ -94,6 +94,23 @@ def test_select_best_rejects_invalid_content_type_and_uses_next_candidate():
     assert rejected.rejection_reason == "invalid image content-type"
 
 
+def test_select_best_rejects_promo_overlay_when_clean_candidate_exists():
+    html = """
+    <img src="https://assets.ajmadison.com/generic_product_promo_overlay.jpg" width="900" height="700" alt="Wolf appliance sale">
+    <div class="product-gallery">
+      <img src="https://wolfappliance.com/img/MDD30TS-clean.jpg" width="900" height="700" alt="Wolf MDD30TS drawer microwave">
+    </div>
+    """
+    candidates = extract_product_image_candidates(html, "https://wolfappliance.com/mdd30ts", _row())
+
+    selected = select_best_product_image(candidates, content_type_checker=lambda url: True)
+
+    assert selected is not None
+    assert selected.url.endswith("MDD30TS-clean.jpg")
+    rejected = [c for c in candidates if "generic_product_promo_overlay" in c.url][0]
+    assert "promo_overlay" in rejected.rejection_reason
+
+
 def test_top_candidate_diagnostics_keeps_three_candidates():
     html = "".join(
         f'<img src="https://wolfappliance.com/img/MDD30TS-{idx}.jpg" width="{800 + idx}" height="700" alt="Wolf MDD30TS">'

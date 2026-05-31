@@ -3,6 +3,8 @@ import pandas as pd
 from src.product_enrichment import (
     _qualifies,
     _build_search_query,
+    _build_sku_lookup_queries,
+    _score_verified_product_page,
     _apply_enrichment,
     enrich_row,
     enrich_dataframe,
@@ -165,6 +167,53 @@ def test_build_search_query_uses_manufacturer_override_domain(monkeypatch):
     row = {"Brand": "Scotsman", "Model/SKU": "SCN60PA1SU", "Product Name": "Ice Machine"}
 
     assert _build_search_query(row).startswith("site:scotsman-ice.com Scotsman SCN60PA1SU")
+
+
+def test_build_sku_lookup_queries_prioritizes_exact_model_and_domain():
+    row = {"Brand": "Scotsman", "Model/SKU": "SCN60PA1SU", "Product Name": "Panel Ready Icemaker"}
+
+    queries = _build_sku_lookup_queries(row, "scotsman-ice.com")
+
+    assert queries[0] == 'site:scotsman-ice.com "SCN60PA1SU"'
+    assert '"Scotsman" "SCN60PA1SU" product' in queries
+    assert '"Scotsman" "SCN60PA1SU" dimensions' in queries
+    assert '"Scotsman" "SCN60PA1SU" spec sheet' in queries
+
+
+def test_score_verified_product_page_rejects_sitemap_without_sku():
+    row = {"Brand": "Scotsman", "Model/SKU": "SCN60PA1SU", "Product Name": "Icemaker"}
+
+    evidence = _score_verified_product_page(
+        row,
+        "https://scotsman-ice.com/sitemap",
+        "<html>Scotsman products</html>",
+        manufacturer_domain="scotsman-ice.com",
+        title="Sitemap",
+    )
+
+    assert evidence["confidence"] == "none"
+    assert "sitemap" in evidence["rejection_reason"]
+
+
+def test_score_verified_product_page_accepts_official_exact_sku():
+    row = {"Brand": "Scotsman", "Model/SKU": "SCN60PA1SU", "Product Name": "Panel Ready Icemaker"}
+    html = """
+    <html><head><title>Scotsman SCN60PA1SU Panel Ready Icemaker</title>
+    <script type="application/ld+json">{"@type":"Product","name":"Scotsman SCN60PA1SU"}</script>
+    <meta property="og:image" content="https://scotsman-ice.com/img/SCN60PA1SU.jpg">
+    </head><body><table><tr><th>Dimensions</th><td>15"W x 34"H x 24"D</td></tr></table></body></html>
+    """
+
+    evidence = _score_verified_product_page(
+        row,
+        "https://scotsman-ice.com/products/SCN60PA1SU",
+        html,
+        manufacturer_domain="scotsman-ice.com",
+    )
+
+    assert evidence["confidence"] == "high"
+    assert evidence["matched_sku"] is True
+    assert "url" in evidence["sku_match_location"]
 
 
 # ── _apply_enrichment ──────────────────────────────────────────────────────────
@@ -753,6 +802,158 @@ def test_enrich_row_extracts_and_fills_image_url():
         updated, error, _ = enrich_row(_qualifying_row())
 
     assert updated.get("Image URL") == "https://wolfappliance.com/img/mdd30ts.jpg"
+
+
+def test_enrich_row_existing_product_url_is_verified_before_search(monkeypatch):
+    """Existing Product URL is fetched/exploited first; Brave/Claude are not needed."""
+    from unittest.mock import patch
+    from src.dimension_enrichment import DimensionResult
+
+    row = {
+        **_base_qualifying_row(),
+        "Product Name": "Drawer Microwave",
+        "Product URL": "https://wolfappliance.com/products/MDD30TS",
+    }
+    html = """
+    <html><head><title>Wolf MDD30TS Drawer Microwave</title>
+    <meta property="og:image" content="https://wolfappliance.com/img/MDD30TS.jpg">
+    </head><body>Wolf MDD30TS Drawer Microwave Finish: Stainless Steel Material: Stainless steel</body></html>
+    """
+    dim_result = DimensionResult(
+        dimensions='30"W x 15"H x 17"D',
+        width="30",
+        height="15",
+        depth="17",
+        source_url="https://wolfappliance.com/products/MDD30TS",
+        confidence="medium",
+        source_type="retailer_page",
+        status="found",
+        debug={"dimensions_extracted": '30"W x 15"H x 17"D'},
+    )
+
+    with patch("src.product_enrichment.search_product_candidates") as mock_search, \
+         patch("src.product_enrichment._fetch_page_html", return_value=html), \
+         patch("src.product_enrichment._check_image_content_type", return_value=True), \
+         patch("src.product_enrichment._find_dimensions", return_value=dim_result), \
+         patch("src.product_enrichment._extract_with_claude", side_effect=AssertionError("Claude should not run")):
+        updated, error, result = enrich_row(row, enrichment_mode="fast")
+
+    assert error is None
+    mock_search.assert_not_called()
+    assert result is dim_result
+    assert updated["Product URL"] == "https://wolfappliance.com/products/MDD30TS"
+    assert updated["Image URL"] == "https://wolfappliance.com/img/MDD30TS.jpg"
+    assert updated["Dimensions"] == '30"W x 15"H x 17"D'
+    assert updated["Finish / Color"] == "Stainless Steel"
+    assert updated["Material"] == "Stainless steel"
+    assert updated["sku_used_for_lookup"] == "MDD30TS"
+    assert updated["selected_product_url"] == "https://wolfappliance.com/products/MDD30TS"
+    assert updated["selected_product_url_confidence"] == "medium"
+    assert "Image URL" in updated["fields_filled"]
+
+
+def test_enrich_row_pdf_product_url_still_searches_for_product_page(monkeypatch):
+    """A spec PDF URL can support dimensions, but image/page enrichment should continue to product page lookup."""
+    from unittest.mock import patch
+    from src.brave_search import SearchResult
+    from src.dimension_enrichment import DimensionResult
+
+    monkeypatch.setattr(
+        "src.product_enrichment.get_domain_for_brand",
+        lambda brand: ("subzero-wolf.com", "hardcoded"),
+    )
+    row = {
+        **_base_qualifying_row(),
+        "Brand": "Wolf",
+        "Model/SKU": "WWD30",
+        "Product URL": "https://subzero-wolf.com/specs/wwd30-spec.pdf",
+    }
+    product_page = SearchResult(
+        "Wolf WWD30 Warming Drawer",
+        "https://www.subzero-wolf.com/wolf/warming-drawers/30-inch-warming-drawer",
+        "Wolf WWD30 product page",
+        100,
+    )
+    pdf_html = "%PDF-1.7 Wolf WWD30 spec sheet"
+    product_html = """
+    <html><head><title>Wolf WWD30 Warming Drawer</title>
+    <meta property="og:image" content="https://www.subzero-wolf.com/images/WWD30.jpg">
+    </head><body>Wolf WWD30 warming drawer</body></html>
+    """
+    dim_result = DimensionResult(
+        dimensions='30"W x 10"H x 24"D',
+        width="30",
+        height="10",
+        depth="24",
+        source_url=row["Product URL"],
+        confidence="high",
+        source_type="manufacturer_pdf",
+        status="found",
+        debug={"dimensions_extracted": '30"W x 10"H x 24"D'},
+    )
+
+    def fake_fetch(url):
+        return pdf_html if url.endswith(".pdf") else product_html
+
+    with patch("src.product_enrichment.search_product_candidates", return_value=[product_page]) as mock_search, \
+         patch("src.product_enrichment._fetch_page_html", side_effect=fake_fetch), \
+         patch("src.product_enrichment._check_image_content_type", return_value=True), \
+         patch("src.product_enrichment._find_dimensions", return_value=dim_result):
+        updated, error, _ = enrich_row(row, enrichment_mode="standard")
+
+    assert error is None
+    mock_search.assert_called()
+    assert updated["Product URL"] == product_page.url
+    assert updated["Image URL"] == "https://www.subzero-wolf.com/images/WWD30.jpg"
+    assert updated["Dimensions"] == '30"W x 10"H x 24"D'
+
+
+def test_enrich_row_sku_search_selects_official_verified_page(monkeypatch):
+    """When URL is missing, one SKU-heavy search can find and verify official page."""
+    from unittest.mock import patch
+    from src.brave_search import SearchResult
+    from src.dimension_enrichment import DimensionResult
+
+    monkeypatch.setattr(
+        "src.product_enrichment.get_domain_for_brand",
+        lambda brand: ("scotsman-ice.com", "hardcoded"),
+    )
+    official = SearchResult(
+        "Scotsman SCN60PA1SU",
+        "https://scotsman-ice.com/products/SCN60PA1SU",
+        "Panel Ready Icemaker",
+        100,
+    )
+    html = """
+    <html><head><title>Scotsman SCN60PA1SU Panel Ready Icemaker</title>
+    <meta property="og:image" content="https://scotsman-ice.com/img/SCN60PA1SU.jpg">
+    </head><body>Scotsman SCN60PA1SU Panel Ready Icemaker Finish: Panel Ready</body></html>
+    """
+    dim_result = DimensionResult(
+        dimensions='15"W x 34"H x 24"D',
+        width="15",
+        height="34",
+        depth="24",
+        source_url=official.url,
+        confidence="high",
+        source_type="manufacturer_page",
+        status="found",
+        debug={"dimensions_extracted": '15"W x 34"H x 24"D'},
+    )
+
+    with patch("src.product_enrichment.search_product_candidates", return_value=[official]) as mock_search, \
+         patch("src.product_enrichment._fetch_page_html", return_value=html), \
+         patch("src.product_enrichment._check_image_content_type", return_value=True), \
+         patch("src.product_enrichment._find_dimensions", return_value=dim_result):
+        updated, error, _ = enrich_row({**_base_qualifying_row(), "Brand": "Scotsman", "Model/SKU": "SCN60PA1SU"}, enrichment_mode="fast")
+
+    assert error is None
+    mock_search.assert_called_once()
+    assert mock_search.call_args.args[0] == 'site:scotsman-ice.com "SCN60PA1SU"'
+    assert updated["Product URL"] == official.url
+    assert updated["selected_product_url_confidence"] == "high"
+    assert updated["manufacturer_domain_used"] == "scotsman-ice.com"
+    assert updated["Dimensions"] == '15"W x 34"H x 24"D'
 
 
 def test_enrich_row_invalid_image_not_stored(monkeypatch, tmp_path):

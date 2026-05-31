@@ -7,6 +7,7 @@ import {
   ImageIcon,
   Loader2,
   Phone,
+  Settings,
   Upload,
   X,
 } from "lucide-react";
@@ -240,6 +241,7 @@ export function IntakeWorkspace() {
   const [sections, setSections] = useState<string[]>(fallbackSections);
   const [message, setMessage] = useState("");
   const [useWebEnrichment, setUseWebEnrichment] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [productImageUploads, setProductImageUploads] = useState<Record<number, string>>({});
   const [busy, setBusy] = useState<"generate" | "validate" | "vendorCall" | "export" | "photoBulk" | "">("");
   const [exportSummary, setExportSummary] = useState({
@@ -257,6 +259,11 @@ export function IntakeWorkspace() {
     section_too_long: [] as { index: number; product_name: string; section: string }[],
     too_many_unique_sections: false,
     canonical_sections: fallbackSections,
+    duplicates_removed: [] as { index: number; product_name: string; brand?: string; sku?: string; kept_index?: number; reason?: string }[],
+    duplicate_rows_removed: 0,
+    suspicious_dimensions_rejected: [] as { index: number; product_name: string; brand?: string; sku?: string; dimensions?: string; reason?: string }[],
+    rejected_product_urls: [] as { index: number; product_name: string; brand?: string; sku?: string; url?: string; reason?: string }[],
+    pdf_product_urls: [] as { index: number; product_name: string; brand?: string; sku?: string; url?: string; reason?: string }[],
   });
   const [errors, setErrors] = useState<string[]>([]);
   const [vendorCall, setVendorCall] = useState<{
@@ -331,6 +338,11 @@ export function IntakeWorkspace() {
         section_too_long: [],
         too_many_unique_sections: false,
         canonical_sections: sections,
+        duplicates_removed: [],
+        duplicate_rows_removed: 0,
+        suspicious_dimensions_rejected: [],
+        rejected_product_urls: [],
+        pdf_product_urls: [],
       });
       return;
     }
@@ -664,9 +676,19 @@ export function IntakeWorkspace() {
               Internal
             </span>
           </div>
-          <div className="flex flex-wrap gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <StatusBadge value={`${readyRows} Ready`} />
             <StatusBadge value={`${needsReview} Needs Review`} />
+            <button
+              type="button"
+              className="btn-secondary inline-flex h-10 items-center justify-center gap-2 rounded-xl px-3 text-sm font-semibold text-charcoal hover:border-orangeBorder hover:bg-orangeSoft/40"
+              onClick={() => setSettingsOpen(true)}
+              aria-label="Open settings"
+              title="Settings"
+            >
+              <Settings className="h-4 w-4" />
+              <span>Settings</span>
+            </button>
           </div>
         </header>
 
@@ -1014,25 +1036,51 @@ export function IntakeWorkspace() {
               <StatusBadge value={`${exportSummary.export_count} Export Ready`} />
               <StatusBadge value={`Images ${exportSummary.image_url_present}/${exportSummary.image_url_total}`} />
               <StatusBadge value={`${exportSummary.missing_section.length} Missing Section`} />
+              {exportSummary.duplicate_rows_removed ? <StatusBadge value={`${exportSummary.duplicate_rows_removed} Duplicates Removed`} /> : null}
+              {exportSummary.suspicious_dimensions_rejected.length ? (
+                <StatusBadge value={`${exportSummary.suspicious_dimensions_rejected.length} Dimensions Rejected`} />
+              ) : null}
+              {exportSummary.rejected_product_urls.length ? (
+                <StatusBadge value={`${exportSummary.rejected_product_urls.length} Product URLs Rejected`} />
+              ) : null}
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
               <button
                 className="btn-primary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
                 disabled={busy === "export" || exportSummary.export_count === 0}
-                onClick={() => handleProgramaExport("csv")}
+                onClick={() => handleProgramaExport("xlsx")}
               >
                 {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                Download CSV
+                Download Excel for Programa
               </button>
               <button
                 className="btn-secondary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
                 disabled={busy === "export" || exportSummary.export_count === 0}
-                onClick={() => handleProgramaExport("xlsx")}
+                onClick={() => handleProgramaExport("csv")}
               >
                 <Download className="h-4 w-4" />
-                Download XLSX
+                Download CSV
               </button>
             </div>
+            {exportSummary.missing_image_url ||
+            exportSummary.missing_dimensions ||
+            exportSummary.rejected_product_urls.length ||
+            exportSummary.pdf_product_urls.length ||
+            exportSummary.suspicious_dimensions_rejected.length ? (
+              <div className="rounded-xl border border-orangeBorder bg-orangeSoft/40 px-4 py-3 text-sm text-bronze">
+                {exportSummary.missing_image_url ? <div>{exportSummary.missing_image_url} row(s) missing image URLs.</div> : null}
+                {exportSummary.missing_dimensions ? <div>{exportSummary.missing_dimensions} row(s) missing dimensions.</div> : null}
+                {exportSummary.suspicious_dimensions_rejected.length ? (
+                  <div>{exportSummary.suspicious_dimensions_rejected.length} suspicious dimension value(s) rejected before export.</div>
+                ) : null}
+                {exportSummary.rejected_product_urls.length ? (
+                  <div>{exportSummary.rejected_product_urls.length} sitemap/category/search Product URL(s) rejected.</div>
+                ) : null}
+                {exportSummary.pdf_product_urls.length ? (
+                  <div>{exportSummary.pdf_product_urls.length} row(s) still use a PDF/spec sheet as Product URL.</div>
+                ) : null}
+              </div>
+            ) : null}
             <div className="border-t border-linen pt-4">
               <h3 className="text-base font-semibold text-charcoal">Review &amp; Complete Product Data</h3>
               {includedRows.length ? (
@@ -1098,15 +1146,24 @@ export function IntakeWorkspace() {
                 <button
                   className="btn-primary mt-4 inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
                   disabled={busy === "export" || exportSummary.export_count === 0}
-                  onClick={() => handleProgramaExport("csv")}
+                  onClick={() => handleProgramaExport("xlsx")}
                 >
                   {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                  Download Updated CSV
+                  Download Updated Excel
                 </button>
               ) : null}
             </div>
           </div>
         </Panel>
+        {settingsOpen ? (
+          <SettingsDialog
+            useAiPdf={useAiPdf}
+            useWebEnrichment={useWebEnrichment}
+            onUseAiPdfChange={setUseAiPdf}
+            onUseWebEnrichmentChange={setUseWebEnrichment}
+            onClose={() => setSettingsOpen(false)}
+          />
+        ) : null}
         {vendorCall ? (
           <VendorCallDialog
             state={vendorCall}
@@ -1142,6 +1199,63 @@ function StatusBadge({ value }: { value: string }) {
 
 function ReviewValue({ value }: { value: string }) {
   return value ? <span className="text-charcoal">{value}</span> : <span className="font-semibold text-clay">Missing</span>;
+}
+
+function SettingsDialog({
+  useAiPdf,
+  useWebEnrichment,
+  onUseAiPdfChange,
+  onUseWebEnrichmentChange,
+  onClose,
+}: {
+  useAiPdf: boolean;
+  useWebEnrichment: boolean;
+  onUseAiPdfChange: (value: boolean) => void;
+  onUseWebEnrichmentChange: (value: boolean) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-end bg-charcoal/28 px-4 py-5 backdrop-blur-sm sm:px-7">
+      <div className="w-full max-w-md origin-top-right rounded-2xl border border-linen bg-white p-5 shadow-xl">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <h2 className="text-base font-semibold text-charcoal">Settings</h2>
+            <p className="mt-1 text-sm text-taupe">Internal intake preferences.</p>
+          </div>
+          <button
+            type="button"
+            className="btn-secondary inline-flex h-9 w-9 items-center justify-center rounded-xl"
+            onClick={onClose}
+            aria-label="Close settings"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="mt-5 rounded-xl border border-linen bg-ivory/70 p-4">
+          <h3 className="text-sm font-semibold text-charcoal">Parsing &amp; Enrichment</h3>
+          <label className="mt-3 flex items-start gap-3 text-sm text-taupe">
+            <input
+              type="checkbox"
+              checked={useAiPdf}
+              onChange={(event) => onUseAiPdfChange(event.target.checked)}
+              className="mt-1 h-4 w-4 accent-bronze"
+            />
+            Use AI for PDFs when deterministic parsing is incomplete.
+          </label>
+          <label className="mt-3 flex items-start gap-3 text-sm text-taupe">
+            <input
+              type="checkbox"
+              checked={useWebEnrichment}
+              onChange={(event) => onUseWebEnrichmentChange(event.target.checked)}
+              className="mt-1 h-4 w-4 accent-bronze"
+            />
+            Use web enrichment for missing product data.
+          </label>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function Panel({
