@@ -1,7 +1,9 @@
 "use client";
 
 import {
+  Archive,
   CheckCircle2,
+  ChevronDown,
   Download,
   FileText,
   ImageIcon,
@@ -16,7 +18,11 @@ import type { ReactNode } from "react";
 
 import {
   exportProgramaCsv,
+  exportProgramaDebugCsv,
   exportProgramaXlsx,
+  exportProgramaZip,
+  formatApiError,
+  API_BASE,
   fetchHealth,
   fetchSchema,
   fetchVendorCallStatus,
@@ -24,6 +30,7 @@ import {
   generateIntakeTable,
   generateVendorCallScript,
   refreshVendorCall,
+  sendToPrograma,
   startVendorCall,
   uploadImage,
   validateProgramaExport,
@@ -98,6 +105,40 @@ const fallbackSections = [
 
 function rowText(row: IntakeRow, key: string) {
   return String(row[key] ?? "");
+}
+
+function hasValue(row: IntakeRow, key: string) {
+  return Boolean(rowText(row, key).trim());
+}
+
+function hasImage(row: IntakeRow) {
+  return hasValue(row, "Image URL");
+}
+
+function hasSku(row: IntakeRow) {
+  return hasValue(row, "Model/SKU");
+}
+
+function hasSupplier(row: IntakeRow) {
+  return hasValue(row, "Supplier");
+}
+
+function countRows(rows: IntakeRow[], predicate: (row: IntakeRow) => boolean) {
+  return rows.filter(predicate).length;
+}
+
+function getEstimatedCost(response?: { estimated_cost?: unknown; cost_estimate?: unknown; stage_timings?: Record<string, unknown> }) {
+  const raw =
+    response?.estimated_cost ??
+    response?.cost_estimate ??
+    response?.stage_timings?.estimated_cost ??
+    response?.stage_timings?.cost_estimate ??
+    response?.stage_timings?.estimated_cost_usd ??
+    response?.stage_timings?.cost_usd;
+
+  if (raw === undefined || raw === null || raw === "") return "Not reported";
+  if (typeof raw === "number") return `$${raw.toFixed(raw < 1 ? 4 : 2)}`;
+  return String(raw);
 }
 
 function isPhotoOnlyRow(row: IntakeRow) {
@@ -242,8 +283,23 @@ export function IntakeWorkspace() {
   const [message, setMessage] = useState("");
   const [useWebEnrichment, setUseWebEnrichment] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [parsedProductsOpen, setParsedProductsOpen] = useState(false);
+  const [enrichedProductsOpen, setEnrichedProductsOpen] = useState(false);
+  const [parseStatus, setParseStatus] = useState("Ready for upload.");
+  const [enrichmentStatus, setEnrichmentStatus] = useState("Not started.");
+  const [apiStatus, setApiStatus] = useState<"checking" | "online" | "offline">("checking");
+  const [apiStatusText, setApiStatusText] = useState("Checking backend...");
+  const [lastEndpoint, setLastEndpoint] = useState("");
+  const [estimatedCost, setEstimatedCost] = useState("Not reported");
+  const [enrichmentStats, setEnrichmentStats] = useState({
+    filledImages: 0,
+    filledDimensions: 0,
+    unresolved: 0,
+  });
+  const [scheduleUrl, setScheduleUrl] = useState("");
+  const [programaMessage, setProgramaMessage] = useState("");
   const [productImageUploads, setProductImageUploads] = useState<Record<number, string>>({});
-  const [busy, setBusy] = useState<"generate" | "validate" | "vendorCall" | "export" | "photoBulk" | "">("");
+  const [busy, setBusy] = useState<"generate" | "validate" | "vendorCall" | "export" | "photoBulk" | "programa" | "">("");
   const [exportSummary, setExportSummary] = useState({
     skipped: [] as { index: number; product_name: string }[],
     missing_section: [] as { index: number; product_name: string }[],
@@ -277,9 +333,17 @@ export function IntakeWorkspace() {
   const bulkImageInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    fetchHealth().catch(() => {
-      setMessage("Backend is offline or not configured.");
-    });
+    setApiStatus("checking");
+    fetchHealth()
+      .then((health) => {
+        setApiStatus("online");
+        setApiStatusText(`Connected${health.status ? `: ${health.status}` : ""}`);
+      })
+      .catch((error) => {
+        setApiStatus("offline");
+        setApiStatusText(formatApiError(error));
+        setMessage(formatApiError(error));
+      });
     fetchSchema()
       .then((schema) => {
         setCategories(schema.categories);
@@ -290,7 +354,6 @@ export function IntakeWorkspace() {
         setCategories([]);
         setSections(fallbackSections);
         setPhotoBulkSection("Decor");
-        setMessage("Backend is offline or not configured.");
       });
   }, []);
 
@@ -320,6 +383,21 @@ export function IntakeWorkspace() {
     [includedRows],
   );
   const ignored = useMemo(() => rows.filter((row) => row.Include === false || row.Status === "Ignored").length, [rows]);
+  const missingSkuCount = useMemo(() => countRows(includedRows, (row) => !hasSku(row)), [includedRows]);
+  const missingDimensionsCount = useMemo(
+    () => countRows(includedRows, (row) => !hasComplete3dDimensions(row.Dimensions)),
+    [includedRows],
+  );
+  const missingImageCount = useMemo(() => countRows(includedRows, (row) => !hasImage(row)), [includedRows]);
+  const missingSupplierCount = useMemo(() => countRows(includedRows, (row) => !hasSupplier(row)), [includedRows]);
+  const imagesFoundCount = useMemo(() => countRows(includedRows, hasImage), [includedRows]);
+  const dimensionsFoundCount = useMemo(
+    () => countRows(includedRows, (row) => hasComplete3dDimensions(row.Dimensions)),
+    [includedRows],
+  );
+  const unresolvedCount = missingInputRows.length;
+  const parseInputCount = files.length + bulkImages.length + urls.split(/\r?\n/).filter((url) => url.trim()).length;
+  const programaSendEnabled = process.env.NEXT_PUBLIC_PROGRAMA_SEND_ENABLED === "true";
 
   useEffect(() => {
     if (includedRows.length === 0) {
@@ -584,13 +662,21 @@ export function IntakeWorkspace() {
     setBusy("generate");
     setMessage("");
     setErrors([]);
+    setParseStatus("Parsing uploaded files and links...");
+    setLastEndpoint(`${API_BASE || "not configured"}/intake/generate`);
     try {
       const response = await generateIntakeTable({ project, room, urls, useAiPdf, files });
       setRows(response.rows);
       setErrors(response.errors);
-      setMessage("Intake table is ready for review.");
+      setParseStatus(`Parse complete: ${response.rows.length} product${response.rows.length === 1 ? "" : "s"} found.`);
+      setParsedProductsOpen(false);
+      setEnrichedProductsOpen(false);
+      setEstimatedCost(getEstimatedCost(response));
+      setMessage("Parsed products are ready for review.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not generate the intake table.");
+      const formatted = formatApiError(error);
+      setParseStatus("Parse failed.");
+      setMessage(formatted);
     } finally {
       setBusy("");
     }
@@ -598,13 +684,32 @@ export function IntakeWorkspace() {
 
   async function handleValidate() {
     setBusy("validate");
+    setMessage("");
+    setEnrichmentStatus("Enriching missing product data...");
+    const beforeImages = countRows(includedRows, hasImage);
+    const beforeDimensions = countRows(includedRows, (row) => hasComplete3dDimensions(row.Dimensions));
+    setLastEndpoint(`${API_BASE || "not configured"}/intake/enrich`);
     try {
       const response = await enrichRows({ rows, useWebEnrichment });
       setRows(response.rows);
       setErrors(response.errors);
+      const enrichedRows = response.rows.filter((row) => row.Include !== false);
+      const afterImages = countRows(enrichedRows, hasImage);
+      const afterDimensions = countRows(enrichedRows, (row) => hasComplete3dDimensions(row.Dimensions));
+      const unresolved = countRows(enrichedRows, (row) => missingFieldsForRow(row).length > 0);
+      setEnrichmentStats({
+        filledImages: Math.max(0, afterImages - beforeImages),
+        filledDimensions: Math.max(0, afterDimensions - beforeDimensions),
+        unresolved,
+      });
+      setEstimatedCost(getEstimatedCost(response));
+      setEnrichmentStatus(useWebEnrichment ? "Enrichment complete." : "Input updates saved without web enrichment.");
+      setEnrichedProductsOpen(false);
       setMessage(useWebEnrichment ? "Missing info search complete." : "Input updates saved without web search.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not save input updates.");
+      const formatted = formatApiError(error);
+      setEnrichmentStatus("Enrichment failed.");
+      setMessage(formatted);
     } finally {
       setBusy("");
     }
@@ -619,20 +724,45 @@ export function IntakeWorkspace() {
     URL.revokeObjectURL(url);
   }
 
-  async function handleProgramaExport(format: "csv" | "xlsx") {
+  async function handleProgramaExport(format: "csv" | "xlsx" | "zip" | "debug") {
     setBusy("export");
+    setMessage("");
     try {
       const blob =
         format === "xlsx"
           ? await exportProgramaXlsx(includedRows)
-          : await exportProgramaCsv(includedRows);
-      const suffix = format === "xlsx" ? "xlsx" : "csv";
+          : format === "zip"
+            ? await exportProgramaZip(includedRows)
+            : format === "debug"
+              ? await exportProgramaDebugCsv(includedRows)
+              : await exportProgramaCsv(includedRows);
+      const suffix = format === "xlsx" ? "xlsx" : format === "zip" ? "zip" : "csv";
       const today = new Date().toISOString().slice(0, 10);
-      const filename = `programa_import_${today}.${suffix}`;
+      const filename = format === "debug" ? `programa_debug_${today}.${suffix}` : `programa_import_${today}.${suffix}`;
       downloadBlob(blob, filename);
       setMessage("Use this file for Programa Import Products.");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Could not export Programa import file.");
+      setMessage(formatApiError(error));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function handleSendToPrograma() {
+    setBusy("programa");
+    setProgramaMessage("");
+    setMessage("");
+    try {
+      const response = await sendToPrograma({
+        projectName: project,
+        scheduleUrl,
+        rows: includedRows,
+        allowBlankFields: false,
+        uploadProductImages: true,
+      });
+      setProgramaMessage(response.message || `Programa send status: ${response.status}`);
+    } catch (error) {
+      setProgramaMessage(formatApiError(error));
     } finally {
       setBusy("");
     }
@@ -676,15 +806,12 @@ export function IntakeWorkspace() {
               Internal
             </span>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <StatusBadge value={`${readyRows} Ready`} />
-            <StatusBadge value={`${needsReview} Needs Review`} />
+          <div className="flex flex-wrap items-center gap-3">
+            <ApiConnectionBadge status={apiStatus} label={apiStatusText} apiBase={API_BASE} />
             <button
               type="button"
               className="btn-secondary inline-flex h-10 items-center justify-center gap-2 rounded-xl px-3 text-sm font-semibold text-charcoal hover:border-orangeBorder hover:bg-orangeSoft/40"
               onClick={() => setSettingsOpen(true)}
-              aria-label="Open settings"
-              title="Settings"
             >
               <Settings className="h-4 w-4" />
               <span>Settings</span>
@@ -692,10 +819,29 @@ export function IntakeWorkspace() {
           </div>
         </header>
 
-        <Panel step="1" title="Upload" subtitle="Upload PDFs, links, or photos to create product entries.">
-          <div className="grid gap-4">
+        <div className="grid gap-2 rounded-2xl border border-linen bg-white/72 p-3 sm:grid-cols-6">
+          {["Upload", "Parse", "Review", "Enrich", "Review", "Export"].map((label, index) => (
+            <div key={label} className="flex items-center gap-2 rounded-xl bg-ivory/70 px-3 py-2">
+              <span className="grid h-6 w-6 place-items-center rounded-full bg-orangeSoft text-xs font-semibold text-bronze">
+                {index + 1}
+              </span>
+              <span className="text-xs font-semibold uppercase tracking-[0.08em] text-charcoal/60">{label}</span>
+            </div>
+          ))}
+        </div>
+
+        <Panel step="1" title="Upload / Input" subtitle="Add vendor PDFs, quote sheets, tear sheets, receipts, product links, and mass photo uploads.">
+          <div className="grid gap-5">
             <div className="grid gap-3 sm:grid-cols-2">
-              <Field label="Room / Location">
+              <Field label="Existing Programa Project / Property">
+                <input
+                  className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
+                  value={project}
+                  onChange={(event) => setProject(event.target.value)}
+                  placeholder="1 Lily Pond Ln"
+                />
+              </Field>
+              <Field label="Default Room / Location">
                 <input
                   className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
                   value={room}
@@ -703,80 +849,81 @@ export function IntakeWorkspace() {
                   placeholder="Kitchen"
                 />
               </Field>
-              <Field label="Project Name">
-                <input
-                  className="input-surface h-11 w-full rounded-xl px-3 text-sm text-charcoal"
-                  value={project}
-                  onChange={(event) => setProject(event.target.value)}
-                  placeholder="Optional"
-                />
-              </Field>
             </div>
 
-            <textarea
-              className="input-surface min-h-28 w-full resize-none rounded-xl p-3 text-sm leading-6 text-charcoal"
-              value={urls}
-              onChange={(event) => setUrls(event.target.value)}
-              placeholder={"Paste product links, one per line"}
-            />
-
-            <div className="grid gap-3 md:grid-cols-2">
-              <label className="flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed border-linen bg-white/70 px-4 py-4 transition hover:border-orangeBorder hover:bg-orangeSoft/40">
-                <span className="flex items-center gap-3">
-                  <Upload className="h-5 w-5 text-bronze" />
-                  <span>
-                    <span className="block text-sm font-semibold text-charcoal">PDFs</span>
-                    <span className="text-xs text-taupe">{files.length ? `${files.length} selected` : "Choose files"}</span>
-                  </span>
-                </span>
-                <input
-                  ref={fileInputRef}
-                  className="hidden"
-                  type="file"
-                  accept="application/pdf"
-                  multiple
-                  onChange={(event) => handleFileSelection(event.target.files)}
-                />
-              </label>
-
-              <label
-                className={`flex cursor-pointer items-center justify-between gap-3 rounded-xl border border-dashed px-4 py-4 transition ${
-                  isImageDragActive ? "border-orangeBorder bg-orangeSoft" : "border-linen bg-white/70 hover:border-orangeBorder hover:bg-orangeSoft/40"
-                }`}
-                onDragEnter={(event) => {
-                  event.preventDefault();
-                  setIsImageDragActive(true);
-                }}
-                onDragOver={(event) => {
-                  event.preventDefault();
-                  setIsImageDragActive(true);
-                }}
-                onDragLeave={(event) => {
-                  event.preventDefault();
-                  setIsImageDragActive(false);
-                }}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  setIsImageDragActive(false);
-                  handleBulkImageSelection(event.dataTransfer.files);
-                }}
+            <div className="grid gap-4 lg:grid-cols-3">
+              <InputCard
+                icon={<Upload className="h-5 w-5 text-bronze" />}
+                title="PDFs, quote sheets, tear sheets, receipts"
+                description="Upload vendor PDFs or document captures for parser extraction."
+                meta={files.length ? `${files.length} PDF${files.length === 1 ? "" : "s"} selected` : "No PDFs selected"}
               >
-                <span className="flex items-center gap-3">
-                  <ImageIcon className="h-5 w-5 text-bronze" />
-                  <span>
-                    <span className="block text-sm font-semibold text-charcoal">Photos</span>
-                    <span className="text-xs text-taupe">{bulkImages.length ? `${bulkImages.length} selected` : "Choose images"}</span>
-                  </span>
-                </span>
-                <input
-                  ref={bulkImageInputRef}
-                  className="hidden"
-                  type="file"
-                  accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
-                  multiple
-                  onChange={(event) => handleBulkImageSelection(event.target.files)}
+                <label className="btn-secondary inline-flex h-10 cursor-pointer items-center justify-center rounded-xl px-4 text-sm font-semibold">
+                  Choose PDFs
+                  <input
+                    ref={fileInputRef}
+                    className="hidden"
+                    type="file"
+                    accept="application/pdf"
+                    multiple
+                    onChange={(event) => handleFileSelection(event.target.files)}
+                  />
+                </label>
+              </InputCard>
+
+              <InputCard
+                icon={<ImageIcon className="h-5 w-5 text-bronze" />}
+                title="Mass photo upload"
+                description="Create photo-only inventory rows with uploaded product images."
+                meta={bulkImages.length ? `${bulkImages.length} image${bulkImages.length === 1 ? "" : "s"} selected` : "No photos selected"}
+              >
+                <label
+                  className={`btn-secondary inline-flex h-10 cursor-pointer items-center justify-center rounded-xl px-4 text-sm font-semibold ${
+                    isImageDragActive ? "border-orangeBorder bg-orangeSoft" : ""
+                  }`}
+                  onDragEnter={(event) => {
+                    event.preventDefault();
+                    setIsImageDragActive(true);
+                  }}
+                  onDragOver={(event) => {
+                    event.preventDefault();
+                    setIsImageDragActive(true);
+                  }}
+                  onDragLeave={(event) => {
+                    event.preventDefault();
+                    setIsImageDragActive(false);
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    setIsImageDragActive(false);
+                    handleBulkImageSelection(event.dataTransfer.files);
+                  }}
+                >
+                  Choose Photos
+                  <input
+                    ref={bulkImageInputRef}
+                    className="hidden"
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+                    multiple
+                    onChange={(event) => handleBulkImageSelection(event.target.files)}
+                  />
+                </label>
+              </InputCard>
+
+              <InputCard
+                icon={<FileText className="h-5 w-5 text-bronze" />}
+                title="Product URLs / links"
+                description="Paste product pages, vendor links, or source URLs one per line."
+                meta={`${urls.split(/\r?\n/).filter((url) => url.trim()).length} link${urls.split(/\r?\n/).filter((url) => url.trim()).length === 1 ? "" : "s"} entered`}
+              >
+                <textarea
+                  className="input-surface min-h-28 w-full resize-none rounded-xl p-3 text-sm leading-6 text-charcoal"
+                  value={urls}
+                  onChange={(event) => setUrls(event.target.value)}
+                  placeholder={"https://www.vendor.com/product\nhttps://www.vendor.com/quote"}
                 />
-              </label>
+              </InputCard>
             </div>
 
             {uploadError || bulkImageError ? (
@@ -800,6 +947,21 @@ export function IntakeWorkspace() {
                 ))}
               </div>
             ) : null}
+
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="flex items-center gap-2 text-sm text-taupe">
+                <input
+                  type="checkbox"
+                  checked={useAiPdf}
+                  onChange={(event) => setUseAiPdf(event.target.checked)}
+                  className="h-4 w-4 accent-bronze"
+                />
+                Use AI to interpret uploaded PDFs
+              </label>
+              <div className="text-sm text-taupe">
+                Input count: <span className="font-semibold text-charcoal">{parseInputCount}</span>
+              </div>
+            </div>
 
             {bulkImages.length > 0 ? (
               <div className="grid gap-3 border-t border-linen pt-4">
@@ -865,116 +1027,84 @@ export function IntakeWorkspace() {
                   onClick={handlePhotoBulkCreate}
                 >
                   {busy === "photoBulk" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageIcon className="h-4 w-4" />}
-                  Upload Photos
+                  Add Photo Rows
                 </button>
               </div>
             ) : null}
-
-            <label className="flex items-center gap-2 text-sm text-taupe">
-              <input
-                type="checkbox"
-                checked={useAiPdf}
-                onChange={(event) => setUseAiPdf(event.target.checked)}
-                className="h-4 w-4 accent-bronze"
-              />
-              Use AI for PDFs
-            </label>
-
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-              <button
-                className="btn-primary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-6 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze disabled:shadow-none"
-                disabled={busy === "generate"}
-                onClick={handleGenerate}
-              >
-                {busy === "generate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-                Upload
-              </button>
-              {message ? <p className="text-sm text-charcoal/65">{message}</p> : null}
-            </div>
           </div>
         </Panel>
 
-        {errors.length ? (
-          <div className="rounded-xl border border-clay/20 bg-clay/10 px-4 py-3 text-sm text-clay">
-            {errors.map((error) => (
-              <div key={error}>{error}</div>
-            ))}
-          </div>
-        ) : null}
-
-        <Panel step="2" title="Review" subtitle="Check and edit product entries.">
-          {rows.length > 0 ? (
-            <>
-              <div className="mb-3 flex flex-wrap gap-2">
-                <StatusBadge value={`${readyRows} Ready`} />
-                <StatusBadge value={`${missingInputRows.length} Needs Review`} />
-              </div>
-              <div className="overflow-x-auto rounded-xl border border-linen bg-white">
-                <table className="min-w-[1180px] w-full border-separate border-spacing-0 text-left text-sm">
-                  <thead>
-                    <tr>
-                      {reviewColumns.map((column) => (
-                        <th key={column} className="sticky top-0 border-b border-linen bg-ivory px-3 py-3 text-xs font-semibold text-charcoal/60">
-                          {column === "Room"
-                            ? "Location"
-                            : column === "Quantity"
-                              ? "Qty"
-                              : column === "Supplier"
-                                ? "Supplier / Who Bought From"
-                                : column === "Finish / Color"
-                                  ? "Finish"
-                                  : column === "Product Category"
-                                    ? "Category"
-                                    : column === "Confidence Score"
-                                      ? "Confidence"
-                                      : column === "Review Required"
-                                        ? "Needs Review"
-                                        : column === "Status"
-                                          ? "Status / Needs Review"
-                                          : column}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rows.map((row, index) => (
-                      <tr key={index} className="align-top transition-colors hover:bg-orangeSoft/30">
-                        {reviewColumns.map((column) => (
-                          <td key={column} className="border-b border-linen/70 px-3 py-3">
-                            <Cell
-                              row={row}
-                              column={column}
-                              categories={categories}
-                              sections={sections}
-                              onChange={(value) => updateRow(index, column, value)}
-                              onVendorCall={(fields) => openVendorCall(row, fields)}
-                            />
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          ) : (
-            <div className="rounded-xl border border-dashed border-linen bg-white/60 px-5 py-10 text-center">
-              <p className="text-sm text-taupe">Uploaded products will appear here.</p>
-            </div>
-          )}
-        </Panel>
-
-        <Panel step="3" title="Enrich" subtitle="Fill missing product details automatically.">
+        <Panel step="2" title="Parse" subtitle="Run the parsing system on uploaded PDFs and product links. Enrichment stays off until Step 4.">
           <div className="grid gap-4">
-            <label className="flex items-start gap-3 text-sm text-taupe">
-              <input
-                type="checkbox"
-                checked={useWebEnrichment}
-                onChange={(event) => setUseWebEnrichment(event.target.checked)}
-                className="mt-1 h-4 w-4 accent-bronze"
-              />
-              Use web search
-            </label>
+            <div className="rounded-xl border border-linen bg-ivory/70 p-4">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <div className="text-sm font-semibold text-charcoal">{parseStatus}</div>
+                  <div className="mt-1 text-xs text-taupe">Endpoint: {lastEndpoint || `${API_BASE || "not configured"}/intake/generate`}</div>
+                </div>
+                <button
+                  className="btn-primary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-6 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze disabled:shadow-none"
+                  disabled={busy === "generate" || (!files.length && !urls.trim())}
+                  onClick={handleGenerate}
+                >
+                  {busy === "generate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
+                  Parse Uploaded Files
+                </button>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <StatusBadge value={`${files.length} PDFs`} />
+                <StatusBadge value={`${urls.split(/\r?\n/).filter((url) => url.trim()).length} URLs`} />
+                <StatusBadge value={useAiPdf ? "AI PDF parsing on" : "AI PDF parsing off"} />
+                <StatusBadge value={`${rows.length} products found`} />
+              </div>
+            </div>
+            {message ? <p className="whitespace-pre-wrap rounded-xl border border-linen bg-white px-4 py-3 text-sm text-charcoal/70">{message}</p> : null}
+            {errors.length ? <ErrorList errors={errors} /> : null}
+          </div>
+        </Panel>
+
+        <Panel step="3" title="Review Parsed Products" subtitle="Start with the summary, then expand the parsed product table only when needed.">
+          <div className="grid gap-4">
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+              <SummaryCard label="Products found" value={rows.length} />
+              <SummaryCard label="Missing SKU" value={missingSkuCount} tone={missingSkuCount ? "warning" : "ok"} />
+              <SummaryCard label="Missing dimensions" value={missingDimensionsCount} tone={missingDimensionsCount ? "warning" : "ok"} />
+              <SummaryCard label="Missing image" value={missingImageCount} tone={missingImageCount ? "warning" : "ok"} />
+              <SummaryCard label="Missing supplier" value={missingSupplierCount} tone={missingSupplierCount ? "warning" : "ok"} />
+            </div>
+            <DisclosureButton open={parsedProductsOpen} onClick={() => setParsedProductsOpen((open) => !open)}>
+              View parsed products
+            </DisclosureButton>
+            {parsedProductsOpen ? (
+              <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} />
+            ) : null}
+          </div>
+        </Panel>
+
+        <Panel step="4" title="Enrich Missing Data" subtitle="Use the backend enrichment route only when you choose to search for missing fields.">
+          <div className="grid gap-4">
+            <div className="rounded-xl border border-linen bg-ivory/70 p-4">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <div className="text-sm font-semibold text-charcoal">{enrichmentStatus}</div>
+                  <div className="mt-1 text-xs text-taupe">Estimated cost: {estimatedCost}</div>
+                </div>
+                <button
+                  className="btn-primary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
+                  disabled={busy === "validate" || rows.length === 0}
+                  onClick={handleValidate}
+                >
+                  {busy === "validate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                  Enrich Products
+                </button>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <StatusBadge value={`${enrichmentStats.filledImages} images filled`} />
+                <StatusBadge value={`${enrichmentStats.filledDimensions} dimensions filled`} />
+                <StatusBadge value={`${enrichmentStats.unresolved || unresolvedCount} unresolved`} />
+                <StatusBadge value={useWebEnrichment ? "Web enrichment on" : "Web enrichment off"} />
+              </div>
+            </div>
 
             {rows.length > 0 && missingInputRows.length ? (
               <div className="divide-y divide-linen rounded-xl border border-linen bg-white">
@@ -1019,49 +1149,83 @@ export function IntakeWorkspace() {
             ) : (
               <p className="text-sm text-taupe">Create product entries first.</p>
             )}
-            <button
-              className="btn-primary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
-              disabled={busy === "validate" || rows.length === 0}
-              onClick={handleValidate}
-            >
-              {busy === "validate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-              Run Enrichment
-            </button>
+            {errors.length ? <ErrorList errors={errors} /> : null}
           </div>
         </Panel>
 
-        <Panel step="4" title="Export" subtitle="Download a file ready for Programa.">
+        <Panel step="5" title="Review Enriched Products" subtitle="Confirm readiness after enrichment before exporting.">
           <div className="grid gap-4">
-            <div className="flex flex-wrap gap-2">
-              <StatusBadge value={`${exportSummary.export_count} Export Ready`} />
-              <StatusBadge value={`Images ${exportSummary.image_url_present}/${exportSummary.image_url_total}`} />
-              <StatusBadge value={`${exportSummary.missing_section.length} Missing Section`} />
-              {exportSummary.duplicate_rows_removed ? <StatusBadge value={`${exportSummary.duplicate_rows_removed} Duplicates Removed`} /> : null}
-              {exportSummary.suspicious_dimensions_rejected.length ? (
-                <StatusBadge value={`${exportSummary.suspicious_dimensions_rejected.length} Dimensions Rejected`} />
-              ) : null}
-              {exportSummary.rejected_product_urls.length ? (
-                <StatusBadge value={`${exportSummary.rejected_product_urls.length} Product URLs Rejected`} />
-              ) : null}
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
+              <SummaryCard label="Products ready" value={readyRows} tone={readyRows ? "ok" : "neutral"} />
+              <SummaryCard label="Needs review" value={needsReview} tone={needsReview ? "warning" : "ok"} />
+              <SummaryCard label="Ignored" value={ignored} />
+              <SummaryCard label="Images found" value={imagesFoundCount} />
+              <SummaryCard label="Dimensions found" value={dimensionsFoundCount} />
+              <SummaryCard label="Est. cost" value={estimatedCost} />
             </div>
-            <div className="grid gap-3 sm:grid-cols-2">
+            <DisclosureButton open={enrichedProductsOpen} onClick={() => setEnrichedProductsOpen((open) => !open)}>
+              View enriched products
+            </DisclosureButton>
+            {enrichedProductsOpen ? (
+              <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} />
+            ) : null}
+          </div>
+        </Panel>
+
+        <Panel step="6" title="Export" subtitle="Download the Programa-ready workbook first. CSV, ZIP, debug, and direct send are secondary.">
+          <div className="grid gap-4">
+            <div className="grid gap-3 lg:grid-cols-[1.2fr_1fr]">
               <button
-                className="btn-primary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
+                className="btn-primary inline-flex h-14 items-center justify-center gap-2 rounded-xl px-6 text-base font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
                 disabled={busy === "export" || exportSummary.export_count === 0}
                 onClick={() => handleProgramaExport("xlsx")}
               >
                 {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
                 Download Excel for Programa
               </button>
-              <button
-                className="btn-secondary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
-                disabled={busy === "export" || exportSummary.export_count === 0}
-                onClick={() => handleProgramaExport("csv")}
-              >
-                <Download className="h-4 w-4" />
-                Download CSV
-              </button>
+              <div className="grid gap-2 sm:grid-cols-2">
+                <button
+                  className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                  disabled={busy === "export" || exportSummary.export_count === 0}
+                  onClick={() => handleProgramaExport("csv")}
+                >
+                  <Download className="h-4 w-4" />
+                  Download CSV
+                </button>
+                <button
+                  className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                  disabled={busy === "export" || exportSummary.export_count === 0}
+                  onClick={() => handleProgramaExport("zip")}
+                >
+                  <Archive className="h-4 w-4" />
+                  Download ZIP with Images
+                </button>
+                <button
+                  className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                  disabled={busy === "export" || rows.length === 0}
+                  onClick={() => handleProgramaExport("debug")}
+                >
+                  <FileText className="h-4 w-4" />
+                  Export Debug Report
+                </button>
+                <button
+                  className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold text-taupe hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                  disabled={!programaSendEnabled || busy === "programa" || exportSummary.export_count === 0 || !scheduleUrl.trim()}
+                  onClick={handleSendToPrograma}
+                  title={programaSendEnabled ? "Send approved rows to Programa" : "Direct Programa send is disabled unless the integration is configured."}
+                >
+                  {busy === "programa" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                  Send to Programa
+                </button>
+              </div>
             </div>
+            <div className="flex flex-wrap gap-2">
+              <StatusBadge value={`${exportSummary.export_count} export-ready`} />
+              <StatusBadge value={`Images ${exportSummary.image_url_present}/${exportSummary.image_url_total}`} />
+              <StatusBadge value={`${exportSummary.missing_section.length} missing section`} />
+              {programaSendEnabled ? <StatusBadge value="Programa send configured" /> : <StatusBadge value="Programa send not configured" />}
+            </div>
+            {programaMessage ? <p className="whitespace-pre-wrap rounded-xl border border-linen bg-white px-4 py-3 text-sm text-charcoal/70">{programaMessage}</p> : null}
             {exportSummary.missing_image_url ||
             exportSummary.missing_dimensions ||
             exportSummary.rejected_product_urls.length ||
@@ -1081,86 +1245,16 @@ export function IntakeWorkspace() {
                 ) : null}
               </div>
             ) : null}
-            <div className="border-t border-linen pt-4">
-              <h3 className="text-base font-semibold text-charcoal">Review &amp; Complete Product Data</h3>
-              {includedRows.length ? (
-                <div className="mt-3 divide-y divide-linen rounded-xl border border-linen bg-white">
-                  {rows.map((row, index) => {
-                    if (row.Include === false) return null;
-                    const productName = rowText(row, "Product Name");
-                    const brand = rowText(row, "Brand");
-                    const dimensions = rowText(row, "Dimensions");
-                    const productUrl = rowText(row, "Product URL");
-                    const imageUrl = rowText(row, "Image URL");
-                    const uploadStatus = productImageUploads[index] || "";
-                    return (
-                      <div key={index} className="grid gap-3 p-4 md:grid-cols-[1fr_1.2fr_auto] md:items-center">
-                        <div className="min-w-0">
-                          <div className={productName ? "truncate text-sm font-semibold text-charcoal" : "text-sm font-semibold text-clay"}>
-                            {productName || "Missing"}
-                          </div>
-                          <div className="mt-1 text-xs text-taupe">Brand: <ReviewValue value={brand} /></div>
-                        </div>
-                        <div className="grid gap-1 text-xs text-taupe sm:grid-cols-2">
-                          <div>Dimensions: <ReviewValue value={dimensions} /></div>
-                          <div>Product URL: <ReviewValue value={productUrl} /></div>
-                          <div className="sm:col-span-2">
-                            Image:{" "}
-                            {imageUrl ? (
-                              <span className="inline-flex max-w-full items-center gap-2 align-middle">
-                                <img src={imageUrl} alt={productName || "Product image"} className="h-8 w-8 rounded-lg object-cover" />
-                                <span className="truncate text-charcoal">{imageUrl}</span>
-                              </span>
-                            ) : (
-                              <span className="font-semibold text-clay">Missing</span>
-                            )}
-                          </div>
-                          {uploadStatus ? (
-                            <div className={`sm:col-span-2 ${uploadStatus === "Uploading..." ? "text-bronze" : "text-clay"}`}>
-                              {uploadStatus}
-                            </div>
-                          ) : null}
-                        </div>
-                        {!imageUrl ? (
-                          <label className="btn-secondary inline-flex h-10 cursor-pointer items-center justify-center rounded-xl px-4 text-sm font-semibold">
-                            Upload Image
-                            <input
-                              className="hidden"
-                              type="file"
-                              accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
-                              onChange={(event) => {
-                                void handleProductImageUpload(index, event.target.files?.[0]);
-                                event.currentTarget.value = "";
-                              }}
-                            />
-                          </label>
-                        ) : null}
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : (
-                <p className="mt-2 text-sm text-taupe">Create product entries first.</p>
-              )}
-              {includedRows.length ? (
-                <button
-                  className="btn-primary mt-4 inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
-                  disabled={busy === "export" || exportSummary.export_count === 0}
-                  onClick={() => handleProgramaExport("xlsx")}
-                >
-                  {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                  Download Updated Excel
-                </button>
-              ) : null}
-            </div>
           </div>
         </Panel>
         {settingsOpen ? (
           <SettingsDialog
             useAiPdf={useAiPdf}
             useWebEnrichment={useWebEnrichment}
+            scheduleUrl={scheduleUrl}
             onUseAiPdfChange={setUseAiPdf}
             onUseWebEnrichmentChange={setUseWebEnrichment}
+            onScheduleUrlChange={setScheduleUrl}
             onClose={() => setSettingsOpen(false)}
           />
         ) : null}
@@ -1197,6 +1291,187 @@ function StatusBadge({ value }: { value: string }) {
   );
 }
 
+function ApiConnectionBadge({
+  status,
+  label,
+  apiBase,
+}: {
+  status: "checking" | "online" | "offline";
+  label: string;
+  apiBase: string;
+}) {
+  const tone =
+    status === "online"
+      ? "border-sage/20 bg-sage/10 text-sage"
+      : status === "offline"
+        ? "border-clay/20 bg-clay/10 text-clay"
+        : "border-orangeBorder bg-orangeSoft text-bronze";
+
+  return (
+    <div className={`max-w-full rounded-xl border px-3 py-2 text-xs ${tone}`} title={apiBase || "API base URL not configured"}>
+      <div className="font-semibold">{status === "online" ? "Backend connected" : status === "offline" ? "Backend offline" : "Checking backend"}</div>
+      <div className="max-w-[280px] truncate opacity-80">{label}</div>
+    </div>
+  );
+}
+
+function InputCard({
+  icon,
+  title,
+  description,
+  meta,
+  children,
+}: {
+  icon: ReactNode;
+  title: string;
+  description: string;
+  meta: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className="grid gap-4 rounded-2xl border border-linen bg-white/78 p-4">
+      <div className="flex items-start gap-3">
+        <div className="grid h-10 w-10 place-items-center rounded-xl border border-orangeBorder bg-orangeSoft">
+          {icon}
+        </div>
+        <div>
+          <h3 className="text-sm font-semibold text-charcoal">{title}</h3>
+          <p className="mt-1 text-sm leading-5 text-taupe">{description}</p>
+          <p className="mt-2 text-xs font-semibold uppercase tracking-[0.08em] text-bronze">{meta}</p>
+        </div>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function SummaryCard({
+  label,
+  value,
+  tone = "neutral",
+}: {
+  label: string;
+  value: ReactNode;
+  tone?: "neutral" | "ok" | "warning";
+}) {
+  const toneClass =
+    tone === "ok"
+      ? "border-sage/20 bg-sage/10 text-sage"
+      : tone === "warning"
+        ? "border-orangeBorder bg-orangeSoft text-bronze"
+        : "border-linen bg-white text-charcoal";
+
+  return (
+    <div className={`rounded-2xl border p-4 ${toneClass}`}>
+      <div className="text-2xl font-semibold leading-none">{value}</div>
+      <div className="mt-2 text-xs font-semibold uppercase tracking-[0.08em] opacity-75">{label}</div>
+    </div>
+  );
+}
+
+function DisclosureButton({
+  open,
+  onClick,
+  children,
+}: {
+  open: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      className="btn-secondary inline-flex h-11 w-fit items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-ivory"
+      onClick={onClick}
+    >
+      <ChevronDown className={`h-4 w-4 transition ${open ? "rotate-180" : ""}`} />
+      {children}
+    </button>
+  );
+}
+
+function ErrorList({ errors }: { errors: string[] }) {
+  return (
+    <div className="rounded-xl border border-clay/20 bg-clay/10 px-4 py-3 text-sm text-clay">
+      {errors.map((error) => (
+        <div key={error}>{error}</div>
+      ))}
+    </div>
+  );
+}
+
+function ProductTable({
+  rows,
+  categories,
+  sections,
+  updateRow,
+  openVendorCall,
+}: {
+  rows: IntakeRow[];
+  categories: string[];
+  sections: string[];
+  updateRow: (index: number, key: string, value: unknown) => void;
+  openVendorCall: (row: IntakeRow, missingFields: string[]) => void;
+}) {
+  if (rows.length === 0) {
+    return (
+      <div className="rounded-xl border border-dashed border-linen bg-white/60 px-5 py-10 text-center">
+        <p className="text-sm text-taupe">Parsed products will appear here.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="overflow-x-auto rounded-xl border border-linen bg-white">
+      <table className="min-w-[1180px] w-full border-separate border-spacing-0 text-left text-sm">
+        <thead>
+          <tr>
+            {reviewColumns.map((column) => (
+              <th key={column} className="sticky top-0 border-b border-linen bg-ivory px-3 py-3 text-xs font-semibold text-charcoal/60">
+                {column === "Room"
+                  ? "Location"
+                  : column === "Quantity"
+                    ? "Qty"
+                    : column === "Supplier"
+                      ? "Supplier / Who Bought From"
+                      : column === "Finish / Color"
+                        ? "Finish"
+                        : column === "Product Category"
+                          ? "Category"
+                          : column === "Confidence Score"
+                            ? "Confidence"
+                            : column === "Review Required"
+                              ? "Needs Review"
+                              : column === "Status"
+                                ? "Status / Needs Review"
+                                : column}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, index) => (
+            <tr key={index} className="align-top transition-colors hover:bg-orangeSoft/30">
+              {reviewColumns.map((column) => (
+                <td key={column} className="border-b border-linen/70 px-3 py-3">
+                  <Cell
+                    row={row}
+                    column={column}
+                    categories={categories}
+                    sections={sections}
+                    onChange={(value) => updateRow(index, column, value)}
+                    onVendorCall={(fields) => openVendorCall(row, fields)}
+                  />
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function ReviewValue({ value }: { value: string }) {
   return value ? <span className="text-charcoal">{value}</span> : <span className="font-semibold text-clay">Missing</span>;
 }
@@ -1204,14 +1479,18 @@ function ReviewValue({ value }: { value: string }) {
 function SettingsDialog({
   useAiPdf,
   useWebEnrichment,
+  scheduleUrl,
   onUseAiPdfChange,
   onUseWebEnrichmentChange,
+  onScheduleUrlChange,
   onClose,
 }: {
   useAiPdf: boolean;
   useWebEnrichment: boolean;
+  scheduleUrl: string;
   onUseAiPdfChange: (value: boolean) => void;
   onUseWebEnrichmentChange: (value: boolean) => void;
+  onScheduleUrlChange: (value: string) => void;
   onClose: () => void;
 }) {
   return (
@@ -1252,6 +1531,14 @@ function SettingsDialog({
             />
             Use web enrichment for missing product data.
           </label>
+          <Field label="Programa Schedule URL">
+            <input
+              className="input-surface mt-3 h-10 w-full rounded-xl px-3 text-sm text-charcoal"
+              value={scheduleUrl}
+              onChange={(event) => onScheduleUrlChange(event.target.value)}
+              placeholder="https://app.programa.design/schedules2/schedules/..."
+            />
+          </Field>
         </div>
       </div>
     </div>

@@ -25,6 +25,9 @@ export type IntakeResponse = {
   errors: string[];
   eligible_count: number;
   blocked_count: number;
+  stage_timings?: Record<string, unknown>;
+  estimated_cost?: number | string;
+  cost_estimate?: number | string;
 };
 
 export type SchemaResponse = {

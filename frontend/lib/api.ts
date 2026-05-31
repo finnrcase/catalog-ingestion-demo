@@ -9,7 +9,7 @@ import type {
   VendorCallStatus,
 } from "./types";
 
-const RAW_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "";
+export const RAW_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "";
 const BACKEND_UNAVAILABLE = "Backend is offline or not configured.";
 
 function resolveApiBase(rawUrl: string) {
@@ -23,38 +23,113 @@ function resolveApiBase(rawUrl: string) {
   }
 }
 
-const API_BASE = resolveApiBase(RAW_API_BASE);
+export const API_BASE = resolveApiBase(RAW_API_BASE);
 
 if (typeof window !== "undefined") {
   console.info(`[API BASE URL] ${API_BASE || "not configured"}`);
 }
 
-function apiUrl(path: string) {
+export function apiUrl(path: string) {
   if (!API_BASE) throw new Error(BACKEND_UNAVAILABLE);
   return `${API_BASE}${path}`;
 }
 
+type ApiDebugDetails = {
+  apiBase: string;
+  endpoint: string;
+  status?: number;
+  responseText?: string;
+  kind: "config" | "network-or-cors" | "http";
+};
+
+export class ApiRequestError extends Error {
+  details: ApiDebugDetails;
+
+  constructor(message: string, details: ApiDebugDetails) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.details = details;
+  }
+}
+
 async function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
+  const endpoint =
+    typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+
   try {
     return await fetch(input, init);
   } catch (error) {
-    if (error instanceof Error && error.message === BACKEND_UNAVAILABLE) throw error;
-    throw new Error(BACKEND_UNAVAILABLE);
+    if (error instanceof Error && error.message === BACKEND_UNAVAILABLE) {
+      throw new ApiRequestError(BACKEND_UNAVAILABLE, {
+        apiBase: API_BASE || RAW_API_BASE || "not configured",
+        endpoint,
+        kind: "config",
+      });
+    }
+
+    throw new ApiRequestError(
+      error instanceof Error ? error.message : "Network request failed.",
+      {
+        apiBase: API_BASE || RAW_API_BASE || "not configured",
+        endpoint,
+        kind: "network-or-cors",
+      },
+    );
   }
 }
 
 async function parseJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
-    const fallback = `Request failed with status ${response.status}`;
-    try {
-      const body = await response.json();
-      throw new Error(body.detail || fallback);
-    } catch (error) {
-      if (error instanceof Error && error.message !== fallback) throw error;
-      throw new Error(fallback);
-    }
+    await throwResponseError(response, `Request failed with status ${response.status}`);
   }
   return response.json() as Promise<T>;
+}
+
+async function throwResponseError(response: Response, fallback: string): Promise<never> {
+  const responseText = await response.text();
+  let message = fallback;
+
+  try {
+    const body = JSON.parse(responseText);
+    if (body.detail) message = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+  } catch {
+    if (responseText) message = fallback;
+  }
+
+  throw new ApiRequestError(message, {
+    apiBase: API_BASE || RAW_API_BASE || "not configured",
+    endpoint: response.url,
+    status: response.status,
+    responseText,
+    kind: "http",
+  });
+}
+
+export function formatApiError(error: unknown) {
+  if (!(error instanceof ApiRequestError)) {
+    return error instanceof Error ? error.message : "Request failed.";
+  }
+
+  const { apiBase, endpoint, status, responseText, kind } = error.details;
+  const cause =
+    kind === "network-or-cors"
+      ? "Network/CORS/preflight or browser-blocked request"
+      : kind === "config"
+        ? "Missing or invalid frontend API base URL"
+        : status === 404
+          ? "Backend route not found"
+          : status && status >= 500
+            ? "Backend server error"
+            : "Backend returned a non-OK response";
+
+  return [
+    error.message,
+    `API base URL: ${apiBase}`,
+    `Endpoint called: ${endpoint}`,
+    `Status: ${status ?? "unavailable"}`,
+    `Failure type: ${cause}`,
+    `Response text: ${responseText || "unavailable"}`,
+  ].join("\n");
 }
 
 export async function fetchSchema(): Promise<SchemaResponse> {
@@ -116,19 +191,6 @@ export async function enrichRows(input: {
         rows: input.rows,
         use_web_enrichment: input.useWebEnrichment,
       }),
-    }),
-  );
-}
-
-export async function saveManufacturerOverride(input: {
-  brand: string;
-  website: string;
-}): Promise<{ status: string; override: { brand: string; domain: string; source: string; last_verified: string } }> {
-  return parseJson<{ status: string; override: { brand: string; domain: string; source: string; last_verified: string } }>(
-    await apiFetch(apiUrl("/manufacturer-override"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(input),
     }),
   );
 }
@@ -239,7 +301,7 @@ export async function exportReviewCsv(rows: IntakeRow[]): Promise<Blob> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ rows }),
   });
-  if (!response.ok) throw new Error("Could not export CSV.");
+  if (!response.ok) await throwResponseError(response, "Could not export CSV.");
   return response.blob();
 }
 
@@ -261,7 +323,7 @@ async function exportProgramaFile(rows: IntakeRow[], path: string, fallbackMessa
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ rows }),
   });
-  if (!response.ok) throw new Error(fallbackMessage);
+  if (!response.ok) await throwResponseError(response, fallbackMessage);
   return response.blob();
 }
 
@@ -275,4 +337,8 @@ export async function exportProgramaXlsx(rows: IntakeRow[]): Promise<Blob> {
 
 export async function exportProgramaDebugCsv(rows: IntakeRow[]): Promise<Blob> {
   return exportProgramaFile(rows, "/export/programa/debug-csv", "Could not export Debug CSV.");
+}
+
+export async function exportProgramaZip(rows: IntakeRow[]): Promise<Blob> {
+  return exportProgramaFile(rows, "/export/programa/zip", "Could not export Programa ZIP.");
 }
