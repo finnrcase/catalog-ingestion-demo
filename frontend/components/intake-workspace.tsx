@@ -103,6 +103,13 @@ const fallbackSections = [
   "General",
 ];
 
+type BuildInfo = {
+  commit: string;
+  builtAt: string;
+  version: string;
+  deploymentUrl?: string;
+};
+
 function rowText(row: IntakeRow, key: string) {
   return String(row[key] ?? "");
 }
@@ -256,7 +263,26 @@ function LogoMark() {
   );
 }
 
-export function IntakeWorkspace() {
+const fallbackBuildInfo: BuildInfo = {
+  commit: "local",
+  builtAt: "local",
+  version: "0.1.0",
+  deploymentUrl: "",
+};
+
+function formatBuildTime(value: string) {
+  if (!value || value === "local") return "local";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?: BuildInfo }) {
   const [project, setProject] = useState("");
   const [room, setRoom] = useState("");
   const [urls, setUrls] = useState("");
@@ -819,8 +845,8 @@ export function IntakeWorkspace() {
           </div>
         </header>
 
-        <div className="grid gap-2 rounded-2xl border border-linen bg-white/72 p-3 sm:grid-cols-6">
-          {["Upload", "Parse", "Review", "Enrich", "Review", "Export"].map((label, index) => (
+        <div className="grid gap-2 rounded-2xl border border-linen bg-white/72 p-3 sm:grid-cols-5">
+          {["Upload", "Parse", "Review", "Enrich", "Export"].map((label, index) => (
             <div key={label} className="flex items-center gap-2 rounded-xl bg-ivory/70 px-3 py-2">
               <span className="grid h-6 w-6 place-items-center rounded-full bg-orangeSoft text-xs font-semibold text-bronze">
                 {index + 1}
@@ -1249,6 +1275,7 @@ export function IntakeWorkspace() {
         </Panel>
         {settingsOpen ? (
           <SettingsDialog
+            buildInfo={buildInfo}
             useAiPdf={useAiPdf}
             useWebEnrichment={useWebEnrichment}
             scheduleUrl={scheduleUrl}
@@ -1267,6 +1294,11 @@ export function IntakeWorkspace() {
             onGenerateScript={handleGenerateCallScript}
           />
         ) : null}
+        <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-linen pt-4 text-[11px] font-medium uppercase tracking-[0.12em] text-taupe">
+          <span>Frontend v{buildInfo.version}</span>
+          <span>Commit {buildInfo.commit}</span>
+          <span>Built {formatBuildTime(buildInfo.builtAt)}</span>
+        </footer>
       </div>
     </main>
   );
@@ -1477,6 +1509,7 @@ function ReviewValue({ value }: { value: string }) {
 }
 
 function SettingsDialog({
+  buildInfo,
   useAiPdf,
   useWebEnrichment,
   scheduleUrl,
@@ -1485,6 +1518,7 @@ function SettingsDialog({
   onScheduleUrlChange,
   onClose,
 }: {
+  buildInfo: BuildInfo;
   useAiPdf: boolean;
   useWebEnrichment: boolean;
   scheduleUrl: string;
@@ -1539,6 +1573,30 @@ function SettingsDialog({
               placeholder="https://app.programa.design/schedules2/schedules/..."
             />
           </Field>
+        </div>
+
+        <div className="mt-4 rounded-xl border border-linen bg-white p-4">
+          <h3 className="text-sm font-semibold text-charcoal">Build Version</h3>
+          <dl className="mt-3 grid gap-2 text-xs text-taupe">
+            <div className="flex items-center justify-between gap-3">
+              <dt>Frontend</dt>
+              <dd className="font-mono text-charcoal">v{buildInfo.version}</dd>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <dt>Commit</dt>
+              <dd className="font-mono text-charcoal">{buildInfo.commit}</dd>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <dt>Built</dt>
+              <dd className="text-right font-mono text-charcoal">{formatBuildTime(buildInfo.builtAt)}</dd>
+            </div>
+            {buildInfo.deploymentUrl ? (
+              <div className="grid gap-1">
+                <dt>Deployment</dt>
+                <dd className="break-all font-mono text-charcoal">{buildInfo.deploymentUrl}</dd>
+              </div>
+            ) : null}
+          </dl>
         </div>
       </div>
     </div>
