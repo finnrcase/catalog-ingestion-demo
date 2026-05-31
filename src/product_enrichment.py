@@ -17,9 +17,11 @@ import os
 import re
 import time
 import urllib.parse
+from datetime import datetime, timezone
 
 import httpx
 import pandas as pd
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from src.brave_search import BRAVE_API_KEY, search_product_candidates
@@ -124,6 +126,19 @@ _ENRICHMENT_DEBUG_FIELDS: list[str] = [
     "cloudinary_status",
     "cloudinary_error",
     "programa_image_ready",
+    "sku_used_for_lookup",
+    "manufacturer_domain_used",
+    "search_query_used",
+    "product_url_candidates",
+    "selected_product_url",
+    "selected_product_url_confidence",
+    "sku_match_location",
+    "page_fetched",
+    "dimensions_found",
+    "image_candidates_count",
+    "selected_image_url",
+    "fields_filled",
+    "budget_spent",
 ]
 
 MIN_USE_SCORE = 40   # below this: skip entirely, note in Notes
@@ -135,6 +150,24 @@ def _str_val(v) -> str:
     if v is None:
         return ""
     return str(v).strip()
+
+
+def _norm_token(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _str_val(value).lower())
+
+
+def _domain_of(url: str) -> str:
+    try:
+        domain = urllib.parse.urlparse(url).netloc.lower()
+        return domain[4:] if domain.startswith("www.") else domain
+    except Exception:
+        return ""
+
+
+def _domain_matches(candidate_domain: str, official_domain: str) -> bool:
+    domain = str(candidate_domain or "").lower()
+    official = str(official_domain or "").lower()
+    return bool(domain and official and (domain == official or domain.endswith("." + official)))
 
 
 def _dimension_part_count(value: object) -> int:
@@ -232,6 +265,31 @@ def _build_search_query(row: dict) -> str:
         domain, _source = domain_match
         return f"site:{domain} {query}"
     return query
+
+
+def _build_sku_lookup_queries(row: dict, manufacturer_domain: str = "") -> list[str]:
+    brand = _str_val(row.get("Brand"))
+    model = _str_val(row.get("Model/SKU"))
+    product_name = _str_val(row.get("Product Name"))
+    queries: list[str] = []
+    if manufacturer_domain and model:
+        queries.append(f'site:{manufacturer_domain} "{model}"')
+    if brand and model:
+        queries.extend([
+            f'"{brand}" "{model}" product',
+            f'"{brand}" "{model}" dimensions',
+            f'"{brand}" "{model}" spec sheet',
+        ])
+    if brand and model and product_name:
+        queries.append(f'"{brand}" "{model}" "{product_name}"')
+    # Dedupe while preserving order.
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for query in queries:
+        if query not in seen:
+            seen.add(query)
+            deduped.append(query)
+    return deduped
 
 
 def _apply_enrichment(
@@ -337,6 +395,35 @@ def _fetch_page_html(url: str) -> str:
         return ""
 
 
+def _fetch_page_html_budgeted(
+    url: str,
+    *,
+    session_cache: "_SessionCache | None" = None,
+    budget: "_SearchBudget | None" = None,
+    debug: dict | None = None,
+) -> str:
+    if session_cache is not None and url in session_cache.urls:
+        if debug is not None:
+            debug["page_fetch_success"] = bool(session_cache.urls.get(url))
+            debug["page_fetched"] = bool(session_cache.urls.get(url))
+        return str(session_cache.urls.get(url) or "")
+    if budget is not None and not budget.can_fetch():
+        if debug is not None:
+            debug["budget_blocked"] = True
+            debug["skipped_reason"] = "budget blocked product page fetch"
+        return ""
+    html = _fetch_page_html(url)
+    if budget is not None:
+        budget.consume_fetch()
+    if html and session_cache is not None:
+        session_cache.urls[url] = html
+    if debug is not None:
+        debug["page_fetch_attempted"] = True
+        debug["page_fetch_success"] = bool(html)
+        debug["page_fetched"] = bool(html)
+    return html
+
+
 def _html_to_text(html: str) -> str:
     """Convert raw HTML to plain text (max 6 000 chars). Returns empty string for empty input."""
     if not html:
@@ -350,6 +437,114 @@ def _html_to_text(html: str) -> str:
         text = re.sub(r"<[^>]+>", " ", html)
         text = re.sub(r"\s{2,}", " ", text)
     return text[:6000].strip()
+
+
+def _first_json_ld_product(html: str) -> dict:
+    soup = BeautifulSoup(html or "", "html.parser")
+    for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        text = script.string or script.get_text() or ""
+        if not text.strip():
+            continue
+        try:
+            data = json.loads(text)
+        except Exception:
+            continue
+        nodes = data if isinstance(data, list) else [data]
+        for node in nodes:
+            if isinstance(node, dict) and isinstance(node.get("@graph"), list):
+                nodes.extend(node["@graph"])
+            if isinstance(node, dict) and "product" in str(node.get("@type", "")).lower():
+                return node
+    return {}
+
+
+def _extract_meta_content(soup: BeautifulSoup, *keys: str) -> str:
+    for key in keys:
+        tag = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key})
+        if tag and _str_val(tag.get("content")):
+            return _str_val(tag.get("content"))
+    return ""
+
+
+def _extract_finish_material_from_text(text: str) -> tuple[str, str]:
+    finish = ""
+    material = ""
+    finish_match = re.search(r"\b(?:finish|color|colour)\s*[:\-]\s*([^\n|;,]{2,80})", text, re.IGNORECASE)
+    material_match = re.search(r"\bmaterials?\s*[:\-]\s*([^\n|;,]{2,100})", text, re.IGNORECASE)
+    if finish_match:
+        finish = finish_match.group(1).strip()
+    if material_match:
+        material = material_match.group(1).strip()
+    return finish, material
+
+
+def _extract_verified_page_fields(html: str, row: dict, page_url: str) -> dict:
+    soup = BeautifulSoup(html or "", "html.parser")
+    product = _first_json_ld_product(html)
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    og_title = _extract_meta_content(soup, "og:title", "twitter:title")
+    description = _extract_meta_content(soup, "description", "og:description", "twitter:description")
+    visible_text = _html_to_text(html)
+    finish, material = _extract_finish_material_from_text(visible_text)
+    brand_value = ""
+    product_brand = product.get("brand") if isinstance(product, dict) else ""
+    if isinstance(product_brand, dict):
+        brand_value = _str_val(product_brand.get("name"))
+    elif product_brand:
+        brand_value = _str_val(product_brand)
+
+    name = _str_val(product.get("name") if isinstance(product, dict) else "") or og_title or title
+    if name and "|" in name:
+        name = name.split("|", 1)[0].strip()
+
+    category = _str_val(product.get("category") if isinstance(product, dict) else "")
+    if not category and _str_val(row.get("Product Category")):
+        category = _str_val(row.get("Product Category"))
+
+    fields = {
+        "Product Name": name,
+        "Brand": brand_value,
+        "Finish / Color": finish,
+        "Material": material,
+        "Product Category": _normalise_category(category) if category else "",
+        "Description": description,
+    }
+    # Avoid writing generic title-only names when they do not contain any row token.
+    if fields["Product Name"] and _str_val(row.get("Product Name")):
+        page_name_norm = _norm_token(fields["Product Name"])
+        row_tokens = [
+            _norm_token(t)
+            for t in re.findall(r"[A-Za-z0-9]{4,}", _str_val(row.get("Product Name")))
+        ]
+        if row_tokens and not any(t and t in page_name_norm for t in row_tokens):
+            fields["Product Name"] = ""
+    return fields
+
+
+def _fill_blank_fields_from_verified_page(row: dict, fields: dict, page_url: str, confidence: str) -> tuple[dict, list[str]]:
+    updated = row.copy()
+    filled: list[str] = []
+    for column in ("Product Name", "Brand", "Finish / Color", "Material", "Product Category"):
+        value = _str_val(fields.get(column))
+        if not value or _str_val(updated.get(column)):
+            continue
+        updated[column] = value
+        filled.append(column)
+    description = _str_val(fields.get("Description"))
+    if description and not _str_val(updated.get("Notes")):
+        updated["Notes"] = f"[Description: {description[:500]}]"
+        filled.append("Notes")
+    if not _str_val(updated.get("Product URL")):
+        updated["Product URL"] = page_url
+        filled.append("Product URL")
+    original = _str_val(updated.get("Source Type"))
+    if original and not original.endswith("_Enriched"):
+        updated["Source Type"] = f"{original}_Enriched"
+    elif not original:
+        updated["Source Type"] = "Enriched"
+    if confidence == "medium":
+        updated["Review Required"] = True
+    return updated, filled
 
 
 def _fetch_page_text(url: str) -> str:
@@ -404,6 +599,140 @@ def _check_image_content_type(url: str) -> bool:
         return False
     except Exception:
         return False
+
+
+_WEAK_PAGE_RE = re.compile(r"\b(sitemap|search|category|collections?|browse|tag|blog|support)$", re.IGNORECASE)
+
+
+def _page_title_and_description(html: str) -> tuple[str, str]:
+    if not html:
+        return "", ""
+    soup = BeautifulSoup(html, "html.parser")
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    description = ""
+    meta = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+    if meta:
+        description = _str_val(meta.get("content"))
+    return title, description
+
+
+def _model_match_locations(model: str, url: str, html: str, title: str = "", description: str = "") -> list[str]:
+    model_norm = _norm_token(model)
+    if not model_norm:
+        return []
+    locations: list[str] = []
+    checks = {
+        "url": url,
+        "title": title,
+        "description": description,
+        "html": html[:250_000],
+    }
+    for name, value in checks.items():
+        if model_norm in _norm_token(value):
+            locations.append(name)
+    return locations
+
+
+def _product_name_similarity_score(row_name: str, page_text: str) -> int:
+    tokens = [t for t in re.findall(r"[a-z0-9]{4,}", row_name.lower()) if t not in {"with", "and", "the", "product"}]
+    if not tokens:
+        return 0
+    haystack = page_text.lower()
+    hits = sum(1 for token in tokens if token in haystack)
+    return int((hits / max(1, len(tokens))) * 15)
+
+
+def _reject_weak_product_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.strip("/").lower()
+    if not path:
+        return "homepage"
+    if "sitemap" in path:
+        return "sitemap page"
+    if "/search" in path or "search" in urllib.parse.parse_qs(parsed.query):
+        return "search result page"
+    if _WEAK_PAGE_RE.search(path):
+        return "category/browse page"
+    return ""
+
+
+def _score_verified_product_page(
+    row: dict,
+    url: str,
+    html: str,
+    *,
+    manufacturer_domain: str = "",
+    title: str = "",
+    description: str = "",
+) -> dict:
+    brand = _str_val(row.get("Brand"))
+    model = _str_val(row.get("Model/SKU"))
+    page_domain = _domain_of(url)
+    weak_reason = _reject_weak_product_url(url)
+    if weak_reason:
+        return {
+            "score": 0,
+            "confidence": "none",
+            "official_domain": False,
+            "matched_sku": False,
+            "matched_brand": False,
+            "sku_match_location": "",
+            "rejection_reason": weak_reason,
+        }
+
+    locations = _model_match_locations(model, url, html, title, description)
+    matched_sku = bool(locations)
+    brand_norm = _norm_token(brand)
+    brand_text = _norm_token(" ".join([url, title, description, html[:80_000]]))
+    matched_brand = bool(brand_norm and brand_norm in brand_text)
+    official = _domain_matches(page_domain, manufacturer_domain)
+
+    if brand and not matched_brand and not official:
+        return {
+            "score": 0,
+            "confidence": "none",
+            "official_domain": official,
+            "matched_sku": matched_sku,
+            "matched_brand": False,
+            "sku_match_location": ",".join(locations),
+            "rejection_reason": "brand not found on candidate page",
+        }
+    if model and not matched_sku:
+        return {
+            "score": 20 if official and matched_brand else 0,
+            "confidence": "low",
+            "official_domain": official,
+            "matched_sku": False,
+            "matched_brand": matched_brand,
+            "sku_match_location": "",
+            "rejection_reason": "exact SKU/model not found",
+        }
+
+    score = 0
+    if matched_sku:
+        score += 50
+    if matched_brand:
+        score += 15
+    if official:
+        score += 25
+    score += _product_name_similarity_score(_str_val(row.get("Product Name")), " ".join([title, description, html[:80_000]]))
+    if re.search(r'application/ld\+json|@type["\']?\s*:\s*["\']Product', html, re.IGNORECASE):
+        score += 10
+    if re.search(r"<table|<dl|dimensions?|specifications?|width|height|depth", html, re.IGNORECASE):
+        score += 10
+    if extract_product_image_candidates(html, url, row):
+        score += 10
+    score = min(100, score)
+    confidence = "high" if official and matched_sku and score >= 80 else ("medium" if matched_sku and score >= 60 else "low")
+    return {
+        "score": score,
+        "confidence": confidence,
+        "official_domain": official,
+        "matched_sku": matched_sku,
+        "matched_brand": matched_brand,
+        "sku_match_location": ",".join(locations),
+        "rejection_reason": "",
+    }
 
 
 def extract_image_url(html: str) -> str | None:
