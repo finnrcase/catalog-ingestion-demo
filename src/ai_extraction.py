@@ -22,6 +22,7 @@ ANTHROPIC_API_KEY   Required. Add to .env and restart the app.
 import json
 import os
 import re
+import time
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -46,6 +47,8 @@ _FIELD_MAP: dict[str, str] = {
     "brand":            "Brand",
     "dimensions":       "Dimensions",
     "finish_color":     "Finish / Color",
+    "color":            "Color",
+    "material":         "Material",
     "model_sku":        "Model/SKU",
     "quantity":         "Quantity",
     "price":            "Price",
@@ -71,6 +74,8 @@ _OUTPUT_COLUMNS: list[str] = [
     "Brand",
     "Dimensions",
     "Finish / Color",
+    "Color",
+    "Material",
     "Model/SKU",
     "Product Category",
     "Quantity",
@@ -84,6 +89,51 @@ _OUTPUT_COLUMNS: list[str] = [
     "AI Category Confidence",
     "Category Source",
 ]
+
+_PARSE_DEBUG_FIELDS: list[str] = [
+    "deterministic_product_name",
+    "ai_product_name",
+    "final_product_name",
+    "deterministic_supplier",
+    "ai_supplier",
+    "final_supplier",
+    "deterministic_model_sku",
+    "ai_model_sku",
+    "final_model_sku",
+    "deterministic_dimensions",
+    "ai_dimensions",
+    "final_dimensions",
+    "ai_used",
+    "ai_skipped_reason",
+    "parse_confidence",
+    "missing_critical_fields_before_ai",
+    "missing_critical_fields_after_ai",
+]
+
+_CRITICAL_PARSE_FIELDS: tuple[str, ...] = (
+    "Product Name",
+    "Brand",
+    "Model/SKU",
+    "Dimensions",
+    "Supplier",
+    "Product Category",
+)
+_MERGE_FIELDS: tuple[str, ...] = (
+    "Project",
+    "Room",
+    "Product Name",
+    "Brand",
+    "Dimensions",
+    "Finish / Color",
+    "Color",
+    "Material",
+    "Model/SKU",
+    "Product Category",
+    "Quantity",
+    "Price",
+    "Supplier",
+    "Notes",
+)
 
 
 # ── PDF text extraction ────────────────────────────────────────────────────────
@@ -130,6 +180,11 @@ def _build_prompt(
                 "product_name": r.get("Product Name", ""),
                 "brand": r.get("Brand", ""),
                 "model_sku": r.get("Model/SKU", ""),
+                "dimensions": r.get("Dimensions", ""),
+                "finish_color": r.get("Finish / Color", ""),
+                "material": r.get("Material", ""),
+                "supplier": r.get("Supplier", ""),
+                "product_category": r.get("Product Category", ""),
                 "quantity": r.get("Quantity", 1),
                 "price": r.get("Price", ""),
                 "notes": r.get("Notes", ""),
@@ -166,7 +221,7 @@ EXTRACTION RULES
 3. Brand = manufacturer name only (e.g. "Wolf", "Sub-Zero", "Miele").
 4. Model/SKU = the model or part number from the quote line. Accept any of: serial number, model number, SKU, item number, product code, part number, manufacturer number.
 5. Dimensions: extract ONLY if the exact product dimensions are explicitly stated in a specification, table, or labelled field in the document (e.g. '30"W × 18"D × 16"H'). Do NOT infer dimensions from product names — a name like "36-inch refrigerator" or "30\\" range" does not give you H×W×D. Leave empty string "" if dimensions are not explicitly stated — the enrichment step will fill this from the manufacturer spec sheet. If dimensions are partially or ambiguously stated, leave empty string and include "Verify dimensions from spec sheet" in suggested_action.
-6. Finish / Color: extract finish or colour if stated (e.g. "Matte Black", "Stainless Steel"). Leave empty string if not stated.
+6. Finish / Color and Material: extract finish, colour, and material if stated (e.g. "Matte Black", "Stainless Steel", "Brass"). Leave empty string if not stated.
 7. Quantity: if the line description says "qty 2" or similar, use 2. If no quantity is shown, default to 1.
 8. Price: use the line price exactly as shown on the quote. If the price appears to be a total for multiple units, keep it as shown and add a note: "Price appears to reflect quoted line total."
 9. Room / Location: Location may appear ANYWHERE near the product row — in a separate column, as a handwritten-style annotation, in red text beside the description, or as an informal phrase. Examples: "Bar - if we can fit it", "laundry room floor 2", "exterior", "primary", "mudroom", "nanny vestibule", "gym", "Nanny Vestibule", "Exterior".
@@ -197,6 +252,8 @@ Return ONLY a raw JSON array. No prose before it. No prose after it. No markdown
     "brand": "<manufacturer>",
     "dimensions": "<dimensions string or empty string>",
     "finish_color": "<finish or colour or empty string>",
+    "color": "<colour only if separately stated or empty string>",
+    "material": "<material only if separately stated or empty string>",
     "model_sku": "<model number or empty string>",
     "quantity": <integer>,
     "price": "<price string as shown on quote>",
@@ -353,6 +410,178 @@ def _item_to_row(
     return row
 
 
+def _str_val(value) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _norm(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _str_val(value).lower())
+
+
+def _missing_critical_fields(row: dict) -> list[str]:
+    missing: list[str] = []
+    for field in _CRITICAL_PARSE_FIELDS:
+        value = _str_val(row.get(field))
+        if not value:
+            missing.append(field)
+    qty = row.get("Quantity")
+    try:
+        if int(qty or 0) < 1:
+            missing.append("Quantity")
+    except Exception:
+        missing.append("Quantity")
+    return missing
+
+
+def _parse_confidence(row: dict) -> int:
+    penalties = {
+        "Product Name": 20,
+        "Brand": 15,
+        "Model/SKU": 20,
+        "Dimensions": 10,
+        "Supplier": 10,
+        "Product Category": 10,
+        "Quantity": 10,
+    }
+    score = 100
+    for field in _missing_critical_fields(row):
+        score -= penalties.get(field, 5)
+    return max(0, min(100, score))
+
+
+def _debug_string(fields: list[str]) -> str:
+    return ", ".join(fields)
+
+
+def _stamp_parse_debug(
+    row: dict,
+    deterministic_row: dict | None = None,
+    ai_row: dict | None = None,
+    *,
+    ai_used: bool = False,
+    ai_skipped_reason: str = "",
+) -> dict:
+    deterministic_row = deterministic_row or {}
+    ai_row = ai_row or {}
+    stamped = dict(row)
+    before = _missing_critical_fields(deterministic_row or row)
+    after = _missing_critical_fields(stamped)
+    stamped.update({
+        "deterministic_product_name": _str_val(deterministic_row.get("Product Name")),
+        "ai_product_name": _str_val(ai_row.get("Product Name")),
+        "final_product_name": _str_val(stamped.get("Product Name")),
+        "deterministic_supplier": _str_val(deterministic_row.get("Supplier")),
+        "ai_supplier": _str_val(ai_row.get("Supplier")),
+        "final_supplier": _str_val(stamped.get("Supplier")),
+        "deterministic_model_sku": _str_val(deterministic_row.get("Model/SKU")),
+        "ai_model_sku": _str_val(ai_row.get("Model/SKU")),
+        "final_model_sku": _str_val(stamped.get("Model/SKU")),
+        "deterministic_dimensions": _str_val(deterministic_row.get("Dimensions")),
+        "ai_dimensions": _str_val(ai_row.get("Dimensions")),
+        "final_dimensions": _str_val(stamped.get("Dimensions")),
+        "ai_used": bool(ai_used),
+        "ai_skipped_reason": ai_skipped_reason,
+        "parse_confidence": _parse_confidence(stamped),
+        "missing_critical_fields_before_ai": _debug_string(before),
+        "missing_critical_fields_after_ai": _debug_string(after),
+    })
+    return stamped
+
+
+def stamp_deterministic_parse_debug(rows: list[dict], reason: str = "AI not requested") -> list[dict]:
+    return [
+        _stamp_parse_debug(row, row, None, ai_used=False, ai_skipped_reason=reason)
+        for row in rows
+    ]
+
+
+def _choose_final_value(field: str, deterministic_value, ai_value):
+    det = _str_val(deterministic_value)
+    ai = _str_val(ai_value)
+    if field == "Quantity":
+        try:
+            det_qty = int(deterministic_value or 0)
+        except Exception:
+            det_qty = 0
+        try:
+            ai_qty = int(ai_value or 0)
+        except Exception:
+            ai_qty = 0
+        if det_qty > 1 and ai_qty <= 1:
+            return det_qty
+        return ai_qty if ai_qty > 0 else (det_qty if det_qty > 0 else 1)
+    if field == "Notes":
+        if det and ai and ai not in det:
+            return f"{det} {ai}".strip()
+        return ai or det
+    if ai:
+        return ai
+    return det
+
+
+def _find_matching_ai_row(det_row: dict, ai_rows: list[dict], used: set[int], index: int) -> tuple[int | None, dict | None]:
+    det_model = _norm(det_row.get("Model/SKU"))
+    if det_model:
+        for i, ai_row in enumerate(ai_rows):
+            if i in used:
+                continue
+            if _norm(ai_row.get("Model/SKU")) == det_model:
+                return i, ai_row
+    if index < len(ai_rows) and index not in used:
+        return index, ai_rows[index]
+    det_name = _norm(det_row.get("Product Name"))
+    if det_name:
+        for i, ai_row in enumerate(ai_rows):
+            if i in used:
+                continue
+            ai_name = _norm(ai_row.get("Product Name"))
+            if ai_name and (det_name in ai_name or ai_name in det_name):
+                return i, ai_row
+    return None, None
+
+
+def merge_ai_rows_with_deterministic(deterministic_rows: list[dict], ai_rows: list[dict]) -> list[dict]:
+    merged_rows: list[dict] = []
+    used_ai: set[int] = set()
+    for index, det_row in enumerate(deterministic_rows):
+        ai_index, ai_row = _find_matching_ai_row(det_row, ai_rows, used_ai, index)
+        if ai_index is not None:
+            used_ai.add(ai_index)
+        if not ai_row:
+            merged_rows.append(_stamp_parse_debug(det_row, det_row, None, ai_used=False, ai_skipped_reason="AI returned no matching row"))
+            continue
+
+        merged = dict(det_row)
+        for field in _MERGE_FIELDS:
+            if field in ai_row or field in det_row:
+                merged[field] = _choose_final_value(field, det_row.get(field), ai_row.get(field))
+
+        for field in ("Confidence Score", "Review Required", "Missing Fields", "Suggested Action", "AI Category Confidence", "Category Source"):
+            if field in ai_row and _str_val(ai_row.get(field)) != "":
+                merged[field] = ai_row.get(field)
+        merged["Source Type"] = "PDF_AI"
+        merged["parse_confidence"] = _parse_confidence(merged)
+        if not _str_val(merged.get("Status")) or _parse_confidence(merged) >= 75:
+            merged["Status"] = "Ready for Review" if _parse_confidence(merged) >= 75 else "Needs Review"
+        merged_rows.append(_stamp_parse_debug(merged, det_row, ai_row, ai_used=True))
+
+    for i, ai_row in enumerate(ai_rows):
+        if i in used_ai:
+            continue
+        merged_rows.append(_stamp_parse_debug(ai_row, None, ai_row, ai_used=True))
+
+    return merged_rows
+
+
+def should_run_ai_parse(deterministic_rows: list[dict]) -> tuple[bool, str]:
+    if not deterministic_rows:
+        return True, "deterministic parser returned no rows"
+    low_conf = [row for row in deterministic_rows if _parse_confidence(row) < 90]
+    if low_conf:
+        return True, "deterministic parse missing critical fields"
+    return False, "deterministic parse complete"
+
+
 # ── Public entry point ─────────────────────────────────────────────────────────
 
 
@@ -361,6 +590,8 @@ def extract_products_from_pdf_with_ai(
     project_name: str,
     default_room: str,
     supplier: str,
+    structured_rows: list[dict] | None = None,
+    stage_timings: dict | None = None,
 ) -> tuple[pd.DataFrame, str | None]:
     """
     Send a PDF quote sheet to Claude and return extracted product rows.
@@ -400,11 +631,12 @@ def extract_products_from_pdf_with_ai(
             "The file may be image-based (scanned). AI extraction requires a text-layer PDF."
         )
 
-    # ── 1b. Run heuristic parser for structured context ────────────────────────
-    try:
-        structured_rows = parse_pdf_rows(pdf_file, project_name, default_room, supplier)
-    except Exception:
-        structured_rows = []
+    # ── 1b. Use heuristic parser output for structured context ─────────────────
+    if structured_rows is None:
+        try:
+            structured_rows = parse_pdf_rows(pdf_file, project_name, default_room, supplier)
+        except Exception:
+            structured_rows = []
 
     # ── 2. Call Claude ─────────────────────────────────────────────────────────
     try:
@@ -415,6 +647,7 @@ def extract_products_from_pdf_with_ai(
         )
 
     try:
+        ai_start = time.perf_counter()
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         message = client.messages.create(
             model="claude-sonnet-4-6",
@@ -427,6 +660,10 @@ def extract_products_from_pdf_with_ai(
             ],
         )
         response_text = message.content[0].text
+        if stage_timings is not None:
+            stage_timings["ai_extraction_ms"] = stage_timings.get("ai_extraction_ms", 0.0) + (
+                time.perf_counter() - ai_start
+            ) * 1000
     except Exception as exc:
         return pd.DataFrame(), f"AI API call failed for '{pdf_file.name}': {exc}"
 
@@ -461,4 +698,41 @@ def extract_products_from_pdf_with_ai(
         if col not in df.columns:
             df[col] = _defaults.get(col, "")
 
-    return df[_OUTPUT_COLUMNS], None
+    for col in _PARSE_DEBUG_FIELDS:
+        if col not in df.columns:
+            df[col] = ""
+
+    return df[[*_OUTPUT_COLUMNS, *_PARSE_DEBUG_FIELDS]], None
+
+
+def augment_pdf_rows_with_ai(
+    pdf_file,
+    deterministic_rows: list[dict],
+    project_name: str,
+    default_room: str,
+    supplier: str = "",
+    stage_timings: dict | None = None,
+) -> tuple[list[dict], str | None]:
+    """Run AI source-document extraction only when deterministic parsing is incomplete."""
+    should_run, reason = should_run_ai_parse(deterministic_rows)
+    if not should_run:
+        return stamp_deterministic_parse_debug(deterministic_rows, reason), None
+
+    df, error = extract_products_from_pdf_with_ai(
+        pdf_file,
+        project_name,
+        default_room,
+        supplier,
+        structured_rows=deterministic_rows,
+        stage_timings=stage_timings,
+    )
+    if error:
+        return stamp_deterministic_parse_debug(deterministic_rows, error), error
+
+    ai_rows = df.to_dict("records")
+    if not deterministic_rows:
+        return [
+            _stamp_parse_debug(row, None, row, ai_used=True)
+            for row in ai_rows
+        ], None
+    return merge_ai_rows_with_deterministic(deterministic_rows, ai_rows), None

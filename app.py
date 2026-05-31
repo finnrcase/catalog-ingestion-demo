@@ -43,7 +43,7 @@ from src.programa_automation import (
     run_programa_field_diagnostic,
 )
 from src.confidence import apply_confidence_checks
-from src.ai_extraction import extract_products_from_pdf_with_ai
+from src.ai_extraction import augment_pdf_rows_with_ai, stamp_deterministic_parse_debug
 from src.document_parser import parse_pdf_rows
 from src.category_ai import suggest_categories_batch
 from src.notes import remove_notes_row_prefix
@@ -388,14 +388,14 @@ with left_col:
             "Use AI to interpret uploaded PDFs",
             value=False,
             help=(
-                "Kept off for fast parsing. The upload parse step is local-only; "
-                "run enrichment separately after rows load."
+                "When checked, AI reads the uploaded PDF text/table output and fills "
+                "source-document fields that deterministic parsing missed before enrichment."
             ),
         )
         if use_ai_pdf:
             st.caption(
-                "AI PDF extraction no longer runs during upload parsing. "
-                "Generate the table first, then use enrichment tools after review."
+                "AI will run only when the local parser is missing or uncertain about "
+                "important source fields. Web enrichment still runs separately."
             )
 
 with right_col:
@@ -724,12 +724,6 @@ if generate:
     url_rows = create_url_rows(raw_urls, selected_project, room, "", "")
     st.session_state.ai_errors = []
 
-    if use_ai_pdf and uploaded_files:
-        st.info(
-            "Fast parse mode is local-only, so AI PDF extraction was skipped. "
-            "Use enrichment after review if fields need more data."
-        )
-
     # ── Standard path — parser runs first, no AI/enrichment/network calls ─────
     parsed_pdf_rows = []
     for pdf_file in (uploaded_files or []):
@@ -745,14 +739,64 @@ if generate:
             )
             _merge_timing(stage_timings, parse_timings)
             if rows:
-                parsed_pdf_rows.extend(rows)
+                if use_ai_pdf:
+                    ai_rows, ai_error = augment_pdf_rows_with_ai(
+                        pdf_file,
+                        rows,
+                        selected_project,
+                        room,
+                        "",
+                        stage_timings=stage_timings,
+                    )
+                    if ai_error:
+                        st.session_state.ai_errors.append(ai_error)
+                    parsed_pdf_rows.extend(ai_rows)
+                    stage_timings["parse_mode"] = "deterministic_plus_ai"
+                else:
+                    parsed_pdf_rows.extend(stamp_deterministic_parse_debug(rows, "AI not requested"))
             else:
-                # Parser found nothing — fall back to filename-only row
-                fallback = create_pdf_rows([pdf_file], selected_project, room, "", "")
-                parsed_pdf_rows.extend(fallback)
+                if use_ai_pdf:
+                    ai_rows, ai_error = augment_pdf_rows_with_ai(
+                        pdf_file,
+                        [],
+                        selected_project,
+                        room,
+                        "",
+                        stage_timings=stage_timings,
+                    )
+                    if ai_error:
+                        st.session_state.ai_errors.append(ai_error)
+                    if ai_rows:
+                        parsed_pdf_rows.extend(ai_rows)
+                        stage_timings["parse_mode"] = "ai_from_source_document"
+                    else:
+                        fallback = create_pdf_rows([pdf_file], selected_project, room, "", "")
+                        parsed_pdf_rows.extend(stamp_deterministic_parse_debug(fallback, ai_error or "deterministic parser returned no rows"))
+                else:
+                    # Parser found nothing — fall back to filename-only row
+                    fallback = create_pdf_rows([pdf_file], selected_project, room, "", "")
+                    parsed_pdf_rows.extend(stamp_deterministic_parse_debug(fallback, "AI not requested"))
         except Exception as exc:
-            fallback = create_pdf_rows([pdf_file], selected_project, room, "", "")
-            parsed_pdf_rows.extend(fallback)
+            if use_ai_pdf:
+                ai_rows, ai_error = augment_pdf_rows_with_ai(
+                    pdf_file,
+                    [],
+                    selected_project,
+                    room,
+                    "",
+                    stage_timings=stage_timings,
+                )
+                if ai_error:
+                    st.session_state.ai_errors.append(ai_error)
+                if ai_rows:
+                    parsed_pdf_rows.extend(ai_rows)
+                    stage_timings["parse_mode"] = "ai_from_source_document"
+                else:
+                    fallback = create_pdf_rows([pdf_file], selected_project, room, "", "")
+                    parsed_pdf_rows.extend(stamp_deterministic_parse_debug(fallback, str(exc)))
+            else:
+                fallback = create_pdf_rows([pdf_file], selected_project, room, "", "")
+                parsed_pdf_rows.extend(stamp_deterministic_parse_debug(fallback, str(exc)))
             st.warning(f"Could not parse '{pdf_file.name}': {exc}", icon="⚠️")
 
     if not url_rows and not parsed_pdf_rows:

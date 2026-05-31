@@ -7,6 +7,7 @@ from src.document_parser import (
     _extract_model_sku,
     _extract_quantity,
     _extract_price,
+    _row_from_line,
 )
 
 
@@ -90,3 +91,21 @@ def test_extract_price_decimal():
 
 def test_extract_price_none():
     assert _extract_price("Chair no price here") == ""
+
+
+def test_row_from_line_extracts_brand_model_dimensions_and_finish():
+    row = _row_from_line(
+        'Wolf MDD30TS Drawer Microwave Dimensions: 30"W x 15"H x 17"D Finish: Stainless Steel',
+        "1 Lily Pond",
+        "Kitchen",
+        "PC Richard",
+        "",
+    )
+
+    assert row is not None
+    assert row["Brand"] == "Wolf"
+    assert row["Model/SKU"] == "MDD30TS"
+    assert row["Dimensions"] == '30"W x 15"H x 17"D'
+    assert row["Finish / Color"] == "Stainless Steel"
+    assert row["Supplier"] == "PC Richard"
+    assert row["Product Category"] == "Appliances"

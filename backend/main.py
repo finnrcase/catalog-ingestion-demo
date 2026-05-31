@@ -19,7 +19,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.ai_extraction import extract_products_from_pdf_with_ai
+from src.ai_extraction import (
+    augment_pdf_rows_with_ai,
+    extract_products_from_pdf_with_ai,
+    stamp_deterministic_parse_debug,
+)
 from src.confidence import apply_confidence_checks
 from src.document_parser import parse_pdf_rows
 from src.eligibility import split_eligible_rows
@@ -263,12 +267,6 @@ async def generate_intake(
     pdf_rows: list[dict] = []
     errors: list[str] = []
 
-    if use_ai_pdf:
-        errors.append(
-            "AI PDF extraction was skipped during upload parsing. "
-            "The parse step is local-only; run enrichment separately after review."
-        )
-
     for upload in files:
         upload_start = time.perf_counter()
         content = await upload.read()
@@ -290,10 +288,58 @@ async def generate_intake(
             ):
                 if key in parse_timings:
                     stage_timings[key] = stage_timings.get(key, 0) + parse_timings[key]
-            pdf_rows.extend(parsed or create_pdf_rows([pdf], project, room, "", ""))
+            if parsed:
+                if use_ai_pdf:
+                    merged_rows, ai_error = augment_pdf_rows_with_ai(
+                        pdf,
+                        parsed,
+                        project,
+                        room,
+                        "",
+                        stage_timings=stage_timings,
+                    )
+                    if ai_error:
+                        errors.append(ai_error)
+                    pdf_rows.extend(merged_rows)
+                    stage_timings["parse_mode"] = "deterministic_plus_ai"
+                else:
+                    pdf_rows.extend(stamp_deterministic_parse_debug(parsed, "AI not requested"))
+            else:
+                if use_ai_pdf:
+                    ai_rows, ai_error = augment_pdf_rows_with_ai(
+                        pdf,
+                        [],
+                        project,
+                        room,
+                        "",
+                        stage_timings=stage_timings,
+                    )
+                    if ai_error:
+                        errors.append(ai_error)
+                    if ai_rows:
+                        pdf_rows.extend(ai_rows)
+                        stage_timings["parse_mode"] = "ai_from_source_document"
+                    else:
+                        fallback = create_pdf_rows([pdf], project, room, "", "")
+                        pdf_rows.extend(stamp_deterministic_parse_debug(fallback, ai_error or "deterministic parser returned no rows"))
+                else:
+                    pdf_rows.extend(stamp_deterministic_parse_debug(create_pdf_rows([pdf], project, room, "", ""), "AI not requested"))
         except Exception as exc:
             errors.append(f"{pdf.name}: {exc}")
-            pdf_rows.extend(create_pdf_rows([pdf], project, room, "", ""))
+            if use_ai_pdf:
+                ai_rows, ai_error = augment_pdf_rows_with_ai(
+                    pdf,
+                    [],
+                    project,
+                    room,
+                    "",
+                    stage_timings=stage_timings,
+                )
+                if ai_error:
+                    errors.append(ai_error)
+                pdf_rows.extend(ai_rows or stamp_deterministic_parse_debug(create_pdf_rows([pdf], project, room, "", ""), str(exc)))
+            else:
+                pdf_rows.extend(stamp_deterministic_parse_debug(create_pdf_rows([pdf], project, room, "", ""), str(exc)))
 
     if not url_rows and not pdf_rows:
         raise HTTPException(status_code=400, detail="Upload a PDF or paste at least one URL.")

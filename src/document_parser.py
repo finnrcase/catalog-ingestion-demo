@@ -15,6 +15,7 @@ import re
 import time
 
 from src.intake_schema import IMPORTANT_FIELDS, SOURCE_PDF, make_base_row
+from src.dimensions import extract_labeled_dimensions
 
 # ── Regex patterns ─────────────────────────────────────────────────────────────
 
@@ -53,6 +54,58 @@ _PRICE_RE = re.compile(r"\$[\d,]+(?:\.\d{2})?|\b\d{1,6}\.\d{2}\b")
 # Labels that are mundane enough not to need recording in Notes
 _COMMON_SKU_LABELS = frozenset({"model #", "model number", "model no", "sku", "serial number", "serial #"})
 
+_KNOWN_BRANDS = (
+    "Sub-Zero",
+    "Scotsman",
+    "Wolf",
+    "Miele",
+    "Bosch",
+    "GE",
+    "Monogram",
+    "Lynx",
+    "Fisher Paykel",
+    "Fisher & Paykel",
+    "Thermador",
+    "JennAir",
+    "KitchenAid",
+    "Viking",
+    "Dacor",
+    "Samsung",
+    "LG",
+    "Whirlpool",
+    "Frigidaire",
+    "Electrolux",
+    "Sharp",
+    "Zephyr",
+    "Kohler",
+    "Kallista",
+    "Waterworks",
+    "Rohl",
+    "Brizo",
+    "Moen",
+    "Toto",
+)
+_MODEL_TOKEN_RE = re.compile(r"\b(?=[A-Z0-9./-]{4,}\b)(?=[A-Z0-9./-]*\d)[A-Z0-9][A-Z0-9./-]{3,}\b")
+_FINISH_RE = re.compile(r"\b(?:finish|color|colour)\s*[:\-]\s*([^|;,]+)", re.IGNORECASE)
+_MATERIAL_RE = re.compile(r"\bmaterial\s*[:\-]\s*([^|;,]+)", re.IGNORECASE)
+_PROJECT_RE = re.compile(r"\bproject\s*[:\-]\s*(.+)", re.IGNORECASE)
+_SUPPLIER_RE = re.compile(r"\b(?:supplier|vendor|sold\s+by|dealer)\s*[:\-]\s*(.+)", re.IGNORECASE)
+
+_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
+    "Product Name": ("description", "product description", "product", "item description", "item name", "name"),
+    "Brand": ("manufacturer", "mfr", "brand", "vendor brand"),
+    "Model/SKU": ("model", "model #", "model no", "model number", "sku", "serial", "serial number", "item #", "item no", "part #", "part number", "mfr number"),
+    "Dimensions": ("dimensions", "dimension", "size", "measurements", "w x d x h", "width", "height", "depth"),
+    "Finish / Color": ("finish", "color", "colour", "finish/color", "finish colour"),
+    "Material": ("material", "materials"),
+    "Quantity": ("qty", "quantity", "qnty"),
+    "Price": ("price", "unit price", "amount", "extended", "line total", "total price"),
+    "Supplier": ("supplier", "vendor", "dealer", "sold by"),
+    "Room": ("room", "location", "area"),
+    "Product Category": ("category", "type"),
+    "Notes": ("notes", "comments", "remarks"),
+}
+
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
@@ -67,11 +120,19 @@ def _is_skip_line(line: str) -> bool:
 def _extract_model_sku(line: str) -> tuple[str, str]:
     """Return (value, original_label) or ('', '') if none found."""
     m = _SKU_LABEL_RE.search(line)
-    if not m:
-        return "", ""
-    label = m.group("label").strip().rstrip(":")
-    value = m.group("value").strip().rstrip(".,;")
-    return value, label
+    if m:
+        label = m.group("label").strip().rstrip(":")
+        value = m.group("value").strip().rstrip(".,;")
+        return value, label
+
+    for token in _MODEL_TOKEN_RE.findall(line or ""):
+        clean = token.strip().rstrip(".,;")
+        if clean.startswith("$"):
+            continue
+        if clean.upper() in {"PHONE", "EMAIL", "TOTAL", "QUOTE", "MODEL", "COLOR"}:
+            continue
+        return clean, "model token"
+    return "", ""
 
 
 def _extract_quantity(line: str) -> int:
@@ -90,13 +151,98 @@ def _extract_price(line: str) -> str:
     return m.group(0) if m else ""
 
 
-def _clean_product_name(line: str) -> str:
+def _clean_product_name(line: str, model_sku: str = "") -> str:
     """Strip labels, prices, and quantities from a line to get a product description."""
     text = _SKU_LABEL_RE.sub("", line)
+    if model_sku:
+        text = re.sub(rf"\b{re.escape(model_sku)}\b", " ", text, flags=re.IGNORECASE)
     text = _PRICE_RE.sub("", text)
     text = _QTY_RE.sub("", text)
+    text = _FINISH_RE.sub("", text)
+    text = _MATERIAL_RE.sub("", text)
     text = re.sub(r"\s{2,}", " ", text).strip(" .,;:-")
     return text
+
+
+def _extract_known_brand(text: str) -> str:
+    haystack = str(text or "")
+    for brand in _KNOWN_BRANDS:
+        if re.search(rf"\b{re.escape(brand)}\b", haystack, re.IGNORECASE):
+            return brand.replace("&", "and") if brand == "Fisher & Paykel" else brand
+    return ""
+
+
+def _format_dimensions_from_parts(text: str) -> str:
+    parts = extract_labeled_dimensions(text)
+    ordered = []
+    if parts.get("width"):
+        ordered.append(f'{parts["width"]}"W')
+    if parts.get("height"):
+        ordered.append(f'{parts["height"]}"H')
+    if parts.get("depth"):
+        ordered.append(f'{parts["depth"]}"D')
+    if parts.get("length"):
+        ordered.append(f'{parts["length"]}"L')
+    return " x ".join(ordered)
+
+
+def _extract_dimensions_from_text(text: str) -> str:
+    formatted = _format_dimensions_from_parts(text)
+    if formatted:
+        return formatted
+    m = re.search(
+        r"\b(?:dimensions?|size|measurements?)\s*[:\-]\s*"
+        r"(\d+(?:\.\d+)?(?:\s+\d+/\d+)?\s*(?:\"|in)?\s*[x×]\s*"
+        r"\d+(?:\.\d+)?(?:\s+\d+/\d+)?\s*(?:\"|in)?"
+        r"(?:\s*[x×]\s*\d+(?:\.\d+)?(?:\s+\d+/\d+)?\s*(?:\"|in)?)?)",
+        text,
+        re.IGNORECASE,
+    )
+    return m.group(1).strip() if m else ""
+
+
+def _extract_label_value(pattern: re.Pattern, text: str) -> str:
+    m = pattern.search(text or "")
+    return re.sub(r"\s{2,}", " ", m.group(1)).strip(" .,:;-") if m else ""
+
+
+def _normalise_header(text: str) -> str:
+    return re.sub(r"[^a-z0-9#]+", " ", str(text or "").lower()).strip()
+
+
+def _canonical_header(text: str) -> str:
+    normal = _normalise_header(text)
+    if not normal:
+        return ""
+    for canonical, aliases in _HEADER_ALIASES.items():
+        for alias in aliases:
+            alias_norm = _normalise_header(alias)
+            if normal == alias_norm or alias_norm in normal:
+                return canonical
+    return ""
+
+
+def _is_header_row(cells: list[str]) -> bool:
+    hits = {_canonical_header(c) for c in cells if c}
+    hits.discard("")
+    return len(hits) >= 2 and bool(hits & {"Product Name", "Model/SKU", "Brand"})
+
+
+def _extract_global_context(text: str, project: str, supplier: str) -> dict:
+    context = {"project": project, "supplier": supplier, "category": ""}
+    if not context["project"]:
+        m = _PROJECT_RE.search(text or "")
+        if m:
+            context["project"] = m.group(1).splitlines()[0].strip(" .,:;-")
+    if not context["supplier"]:
+        m = _SUPPLIER_RE.search(text or "")
+        if m:
+            context["supplier"] = m.group(1).splitlines()[0].strip(" .,:;-")
+        elif re.search(r"\bPC\s+Richard\b|\bP\.?C\.?\s+Richard\b", text or "", re.IGNORECASE):
+            context["supplier"] = "PC Richard"
+    if re.search(r"\bappliance(?:s)?\b", text or "", re.IGNORECASE):
+        context["category"] = "Appliances"
+    return context
 
 
 def _compute_status(row: dict) -> str:
@@ -117,7 +263,7 @@ def _row_from_line(
         return None
 
     model_sku, sku_label = _extract_model_sku(line)
-    name = _clean_product_name(line)
+    name = _clean_product_name(line, model_sku)
 
     # Require at least a name or a model number to treat as a product row
     if not name and not model_sku:
@@ -125,7 +271,13 @@ def _row_from_line(
 
     row = make_base_row(project=project, room=room, supplier=supplier, notes=notes)
     row["Product Name"] = name
+    row["Brand"] = _extract_known_brand(line)
     row["Model/SKU"] = model_sku
+    row["Dimensions"] = _extract_dimensions_from_text(line)
+    row["Finish / Color"] = _extract_label_value(_FINISH_RE, line)
+    row["Material"] = _extract_label_value(_MATERIAL_RE, line)
+    if row["Brand"] in {"Wolf", "Sub-Zero", "Scotsman", "Miele", "Bosch", "GE", "Monogram", "Lynx"}:
+        row["Product Category"] = "Appliances"
     row["Quantity"] = _extract_quantity(line)
     row["Price"] = _extract_price(line)
     row["Source Type"] = SOURCE_PDF
@@ -140,7 +292,7 @@ def _row_from_line(
 
 
 def _parse_table_rows(
-    page, project: str, room: str, supplier: str, notes: str
+    page, project: str, room: str, supplier: str, notes: str, category: str = ""
 ) -> list[dict]:
     """Extract product rows from PyMuPDF table structures on a single page."""
     rows = []
@@ -154,13 +306,13 @@ def _parse_table_rows(
         if not extracted:
             continue
 
-        header = None
+        header: list[str] | None = None
         for i, trow in enumerate(extracted):
             cells = [str(c or "").strip() for c in trow]
             joined = " | ".join(c for c in cells if c)
 
-            if i == 0:
-                header = [c.lower() for c in cells]
+            if _is_header_row(cells):
+                header = [_canonical_header(c) for c in cells]
                 continue
 
             if _is_skip_line(joined):
@@ -170,35 +322,47 @@ def _parse_table_rows(
             row["Source Type"] = SOURCE_PDF
 
             if header:
-                col_map = {name: idx for idx, name in enumerate(header)}
+                col_map = {name: idx for idx, name in enumerate(header) if name}
 
-                for key in ("description", "product", "item", "name"):
-                    if key in col_map and col_map[key] < len(cells):
-                        row["Product Name"] = cells[col_map[key]]
-                        break
+                for column in (
+                    "Product Name",
+                    "Brand",
+                    "Model/SKU",
+                    "Dimensions",
+                    "Finish / Color",
+                    "Material",
+                    "Supplier",
+                    "Room",
+                    "Product Category",
+                    "Notes",
+                ):
+                    idx = col_map.get(column)
+                    if idx is not None and idx < len(cells):
+                        row[column] = cells[idx]
 
-                for key in ("model", "sku", "model #", "model no", "item #", "part #", "serial"):
-                    if key in col_map and col_map[key] < len(cells):
-                        row["Model/SKU"] = cells[col_map[key]]
-                        break
+                qty_idx = col_map.get("Quantity")
+                if qty_idx is not None and qty_idx < len(cells):
+                    try:
+                        row["Quantity"] = max(1, int(re.sub(r"\D+", "", cells[qty_idx]) or "1"))
+                    except (ValueError, IndexError):
+                        row["Quantity"] = _extract_quantity(joined)
 
-                for key in ("qty", "quantity"):
-                    if key in col_map and col_map[key] < len(cells):
-                        try:
-                            row["Quantity"] = max(1, int(cells[col_map[key]]))
-                        except (ValueError, IndexError):
-                            pass
-                        break
+                price_idx = col_map.get("Price")
+                if price_idx is not None and price_idx < len(cells):
+                    row["Price"] = cells[price_idx]
 
-                for key in ("price", "unit price", "total", "amount"):
-                    if key in col_map and col_map[key] < len(cells):
-                        row["Price"] = cells[col_map[key]]
-                        break
-
-                for key in ("brand", "manufacturer", "mfr"):
-                    if key in col_map and col_map[key] < len(cells):
-                        row["Brand"] = cells[col_map[key]]
-                        break
+                if not row["Brand"]:
+                    row["Brand"] = _extract_known_brand(joined)
+                if not row["Model/SKU"]:
+                    row["Model/SKU"], _ = _extract_model_sku(joined)
+                if not row["Dimensions"]:
+                    row["Dimensions"] = _extract_dimensions_from_text(joined)
+                if not row["Finish / Color"]:
+                    row["Finish / Color"] = _extract_label_value(_FINISH_RE, joined)
+                if not row["Material"]:
+                    row["Material"] = _extract_label_value(_MATERIAL_RE, joined)
+                if not row["Product Category"] and category:
+                    row["Product Category"] = category
             else:
                 # No header — fall back to line parser on the joined string
                 parsed = _row_from_line(joined, project, room, supplier, notes)
@@ -262,13 +426,24 @@ def parse_pdf_rows(
         ) * 1000
         stage_timings["page_count"] = stage_timings.get("page_count", 0) + len(doc)
 
+    page_texts: list[str] = []
+    for page in doc:
+        try:
+            page_texts.append(page.get_text("text"))
+        except Exception:
+            page_texts.append("")
+    context = _extract_global_context("\n".join(page_texts), project, supplier)
+    project = context.get("project") or project
+    supplier = context.get("supplier") or supplier
+    category = context.get("category") or ""
+
     all_rows: list[dict] = []
     seen_keys: set[tuple[str, str]] = set()
 
-    for page in doc:
+    for page_index, page in enumerate(doc):
         # 1. Try table extraction first
         table_start = time.perf_counter()
-        table_rows = _parse_table_rows(page, project, room, supplier, notes)
+        table_rows = _parse_table_rows(page, project, room, supplier, notes, category)
         if stage_timings is not None:
             stage_timings["table_row_parsing_ms"] = stage_timings.get("table_row_parsing_ms", 0.0) + (
                 time.perf_counter() - table_start
@@ -291,7 +466,7 @@ def parse_pdf_rows(
 
         # 2. Fall back to line-by-line text parsing
         text_start = time.perf_counter()
-        text = page.get_text("text")
+        text = page_texts[page_index] if page_index < len(page_texts) else page.get_text("text")
         if stage_timings is not None:
             stage_timings["pdf_text_extraction_ms"] = stage_timings.get("pdf_text_extraction_ms", 0.0) + (
                 time.perf_counter() - text_start

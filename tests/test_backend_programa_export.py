@@ -81,10 +81,7 @@ def test_upload_image_endpoint_returns_secure_url(monkeypatch):
     assert "cloudinary_ms" in data["stage_timings"]
 
 
-def test_intake_generate_uses_local_parse_only(monkeypatch):
-    def fail_ai(*args, **kwargs):
-        raise AssertionError("AI extraction must not run during PDF parsing")
-
+def test_intake_generate_ai_fallback_keeps_deterministic_rows_when_key_missing(monkeypatch):
     def fail_enrich(*args, **kwargs):
         raise AssertionError("enrichment must not run during PDF parsing")
 
@@ -109,7 +106,7 @@ def test_intake_generate_uses_local_parse_only(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr("backend.main.extract_products_from_pdf_with_ai", fail_ai)
+    monkeypatch.setattr("src.ai_extraction.ANTHROPIC_API_KEY", "")
     monkeypatch.setattr("backend.main.enrich_dataframe", fail_enrich)
     monkeypatch.setattr("backend.main.recover_images_for_dataframe", fail_enrich)
     monkeypatch.setattr("backend.main.parse_pdf_rows", fake_parse_pdf_rows)
@@ -123,10 +120,12 @@ def test_intake_generate_uses_local_parse_only(monkeypatch):
     assert response.status_code == 200
     data = response.json()
     assert data["rows"][0]["Model/SKU"] == "SCN60PA1SU"
-    assert data["stage_timings"]["parse_mode"] == "local_deterministic"
+    assert data["rows"][0]["ai_used"] is False
+    assert "ANTHROPIC_API_KEY" in data["rows"][0]["ai_skipped_reason"]
+    assert data["stage_timings"]["parse_mode"] == "deterministic_plus_ai"
     assert data["stage_timings"]["enrichment_ms"] == 0.0
     assert data["stage_timings"]["image_recovery_ms"] == 0.0
-    assert any("AI PDF extraction was skipped" in err for err in data["errors"])
+    assert any("ANTHROPIC_API_KEY" in err for err in data["errors"])
 
 
 def test_upload_image_endpoint_rejects_missing_secure_url(monkeypatch):

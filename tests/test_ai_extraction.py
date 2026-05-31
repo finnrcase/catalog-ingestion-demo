@@ -1,5 +1,10 @@
 import pytest
-from src.ai_extraction import _item_to_row
+from src.ai_extraction import (
+    _item_to_row,
+    merge_ai_rows_with_deterministic,
+    should_run_ai_parse,
+    stamp_deterministic_parse_debug,
+)
 
 
 def _base_item(**overrides):
@@ -64,6 +69,75 @@ def test_item_to_row_empty_location_uses_default():
     item = _base_item(room="")
     row = _item_to_row(item, "Test Project", "Master Bedroom", "AEG")
     assert row["Room"] == "Master Bedroom"
+
+
+def test_should_run_ai_parse_when_core_source_fields_missing():
+    rows = [{
+        "Product Name": "Panel Ready Icemaker",
+        "Brand": "Scotsman",
+        "Model/SKU": "SCN60PA1SU",
+        "Quantity": 1,
+        "Supplier": "",
+        "Dimensions": "",
+        "Product Category": "",
+    }]
+
+    should_run, reason = should_run_ai_parse(rows)
+
+    assert should_run is True
+    assert "missing critical fields" in reason
+
+
+def test_merge_ai_rows_fills_missing_without_blank_overwrite_and_adds_debug():
+    deterministic = [{
+        "Project": "1 Lily Pond",
+        "Room": "Kitchen",
+        "Product Name": "SCN60PA1SU",
+        "Brand": "",
+        "Model/SKU": "SCN60PA1SU",
+        "Dimensions": "",
+        "Supplier": "",
+        "Quantity": 1,
+        "Source Type": "PDF",
+    }]
+    ai = [{
+        "Project": "1 Lily Pond",
+        "Room": "Kitchen",
+        "Product Name": "Scotsman Panel Ready Icemaker",
+        "Brand": "Scotsman",
+        "Model/SKU": "SCN60PA1SU",
+        "Dimensions": '14 7/8"W x 33 3/8"H x 22"D',
+        "Supplier": "PC Richard",
+        "Quantity": 1,
+        "Product Category": "Appliances",
+        "Confidence Score": 92,
+        "Source Type": "PDF_AI",
+    }]
+
+    merged = merge_ai_rows_with_deterministic(deterministic, ai)
+
+    assert len(merged) == 1
+    row = merged[0]
+    assert row["Product Name"] == "Scotsman Panel Ready Icemaker"
+    assert row["Brand"] == "Scotsman"
+    assert row["Supplier"] == "PC Richard"
+    assert row["Dimensions"] == '14 7/8"W x 33 3/8"H x 22"D'
+    assert row["ai_used"] is True
+    assert row["deterministic_product_name"] == "SCN60PA1SU"
+    assert row["ai_product_name"] == "Scotsman Panel Ready Icemaker"
+    assert row["final_product_name"] == "Scotsman Panel Ready Icemaker"
+    assert "Supplier" in row["missing_critical_fields_before_ai"]
+    assert row["missing_critical_fields_after_ai"] == ""
+
+
+def test_stamp_deterministic_parse_debug_when_ai_not_requested():
+    rows = [{"Product Name": "Wolf Microwave", "Model/SKU": "MDD30TS", "Quantity": 1}]
+
+    stamped = stamp_deterministic_parse_debug(rows, "AI not requested")
+
+    assert stamped[0]["ai_used"] is False
+    assert stamped[0]["ai_skipped_reason"] == "AI not requested"
+    assert stamped[0]["final_product_name"] == "Wolf Microwave"
 
 
 def test_item_to_row_location_note_not_duplicated():
