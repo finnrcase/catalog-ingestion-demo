@@ -53,8 +53,22 @@ def test_qualifies_url_row_skipped():
     assert not _qualifies(row)
 
 
-def test_qualifies_enriched_row_skipped():
+def test_qualifies_enriched_row_with_missing_dimensions_or_image():
     row = {**_base_qualifying_row(), "Source Type": "PDF_Enriched"}
+    assert _qualifies(row)
+
+
+def test_qualifies_enriched_complete_row_skipped():
+    row = {
+        **_base_qualifying_row(),
+        "Source Type": "PDF_Enriched",
+        "Product Name": "Wolf Microwave",
+        "Dimensions": '30"W x 15"H x 17"D',
+        "Finish / Color": "Stainless",
+        "Product Category": "Appliance",
+        "Product URL": "https://example.com",
+        "Image URL": "https://example.com/image.jpg",
+    }
     assert not _qualifies(row)
 
 
@@ -76,6 +90,7 @@ def test_qualifies_all_enrichable_fields_present_skipped():
         "Finish / Color": "Stainless",
         "Product Category": "Appliance",
         "Product URL": "https://example.com",
+        "Image URL": "https://example.com/image.jpg",
     }
     assert not _qualifies(row)
 
@@ -572,6 +587,9 @@ def test_enrich_row_image_from_product_url_on_full_cache_hit(monkeypatch, tmp_pa
 
     assert error is None
     assert updated.get("Image URL") == "https://wolfappliance.com/img/mdd30ts.jpg"
+    assert updated.get("cache_hit") == "full"
+    assert updated.get("cache_had_blank_image") is True
+    assert updated.get("fresh_extraction_forced") is True
 
 
 def test_enrich_row_full_cache_hit_no_extra_search_when_image_already_cached(monkeypatch, tmp_path):
@@ -597,6 +615,66 @@ def test_enrich_row_full_cache_hit_no_extra_search_when_image_already_cached(mon
 
     mock_fetch.assert_not_called()
     assert updated.get("Image URL") == "https://wolfappliance.com/img/cached.jpg"
+    assert updated.get("cache_hit") == "full"
+    assert updated.get("fresh_extraction_forced") is False
+
+
+def test_enrich_row_cached_blank_dimensions_force_fresh_product_url_extraction(monkeypatch, tmp_path):
+    """Cached null dimensions/image must not block deterministic extraction from cached Product URL."""
+    from src.dimension_enrichment import DimensionResult
+    from src.enrichment_cache import ProductEnrichmentCache, normalize_key
+    import src.product_enrichment as pe
+
+    cache = ProductEnrichmentCache()
+    cache._path = str(tmp_path / "c.json")
+    cache._data = {}
+    key = normalize_key("Wolf", "MDD30TS")
+    cache.update(key, {
+        "product_url": "https://wolfappliance.com/mdd30ts",
+        "dimensions": None,
+        "image_url": None,
+        "general_confidence": "high",
+        "dimension_confidence": "high",
+    })
+    monkeypatch.setattr(pe, "_product_cache", cache)
+
+    row = {
+        **_qualifying_row(),
+        "Product Name": "Wolf Drawer Microwave",
+        "Finish / Color": "Stainless",
+        "Product Category": "Appliance",
+    }
+    dim_result = DimensionResult(
+        dimensions='30"W x 15"H x 17"D',
+        width="30",
+        height="15",
+        depth="17",
+        source_url="https://wolfappliance.com/mdd30ts",
+        confidence="high",
+        source_type="manufacturer_page",
+        status="found",
+        debug={
+            "product_url": "https://wolfappliance.com/mdd30ts",
+            "page_fetch_attempted": True,
+            "page_fetch_success": True,
+            "dimensions_extracted": '30"W x 15"H x 17"D',
+        },
+    )
+
+    with patch("src.product_enrichment.search_product_candidates") as mock_search, \
+         patch("src.product_enrichment._try_image_from_url", return_value=None), \
+         patch("src.product_enrichment._find_dimensions", return_value=dim_result) as mock_dims:
+        updated, error, _ = enrich_row(row)
+
+    assert error is None
+    mock_search.assert_not_called()
+    mock_dims.assert_called_once()
+    assert updated["Product URL"] == "https://wolfappliance.com/mdd30ts"
+    assert updated["Dimensions"] == '30"W x 15"H x 17"D'
+    assert updated["cache_hit"] == "partial"
+    assert updated["cache_had_blank_dimensions"] is True
+    assert updated["cache_had_blank_image"] is True
+    assert updated["fresh_extraction_forced"] is True
 
 
 # ── recover_images_for_dataframe ──────────────────────────────────────────────
@@ -993,6 +1071,7 @@ def test_qualifies_complete_3d_dimension_does_not_qualify():
         "Finish / Color": "Stainless",
         "Product Category": "Appliance",
         "Product URL": "https://example.com",
+        "Image URL": "https://example.com/image.jpg",
     }
     assert not _qualifies(row)
 
@@ -1226,11 +1305,14 @@ def test_enrich_row_returns_early_on_full_cache_hit(monkeypatch, tmp_path):
         "Review Required": False, "Suggested Action": "",
     }
     sc = SessionCache()
-    updated, err, _ = enrich_row(row, enrichment_mode="standard", session_cache=sc)
+    with patch("src.product_enrichment._fetch_page_html", return_value=""):
+        updated, err, _ = enrich_row(row, enrichment_mode="standard", session_cache=sc)
     assert call_count["n"] == 0  # no Brave calls made
     assert updated["Dimensions"] == '30"W x 15"H x 17"D'
     assert updated["Product URL"] == "https://wolf.com/mdd30ts"
     assert updated["Source Type"] == "PDF_Enriched"
+    assert updated["cache_hit"] == "full"
+    assert updated["fresh_extraction_forced"] is True
 
 
 def test_enrich_dataframe_creates_session_cache_once(monkeypatch):

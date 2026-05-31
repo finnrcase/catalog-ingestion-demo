@@ -282,6 +282,7 @@ def _generate_retailer_queries(brand: str, model: str) -> list[str]:
 
 # ── Dimension text patterns ────────────────────────────────────────────────────
 
+_NUM = r"\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?"
 _PRODUCT_DIM_LABELS = re.compile(
     r"(?:product|overall)\s+dimensions?\s*[:\-]\s*([^\n]{5,100})",
     re.IGNORECASE,
@@ -296,12 +297,29 @@ _SHIPPING_DIM_LABEL = re.compile(
 )
 # Bare "Dimensions:" — matched after the priority labels above exclude their ranges
 _DIM_LABEL = re.compile(
-    r"\bdimensions?\s*[:\-]\s*([^\n]{5,100})",
+    r"\b(?:dimensions?|size|measurements?|appliance\s+dimensions?)\s*[:\-]\s*([^\n]{5,120})",
     re.IGNORECASE,
 )
 # Inline W×H×D — supports fractions, decimals, integers; × or x or X or space
 _INLINE_DIM = re.compile(
     r"[\d][\d ./]*\"?\s*[WwHhDd]\b[\s×xX]+[\d][\d ./]*\"?\s*[WwHhDd]\b[\s×xX]+[\d][\d ./]*\"?\s*[WwHhDd]\b",
+)
+_UNIT = r"(?:[\"“”″']|\bin(?:ches)?\b|\bcm\b|\bmm\b)"
+_UNLABELED_TRIPLE = re.compile(
+    rf"(?<![\w/])(?P<a>{_NUM})\s*(?P<ua>{_UNIT})?\s*[×xX]\s*"
+    rf"(?P<b>{_NUM})\s*(?P<ub>{_UNIT})?\s*[×xX]\s*"
+    rf"(?P<c>{_NUM})\s*(?P<uc>{_UNIT})?(?![\w/])",
+    re.IGNORECASE,
+)
+_DIMENSION_CONTEXT = re.compile(
+    r"\b(dimensions?|size|measurements?|measures|overall|product|appliance|"
+    r"width|height|depth|specifications?|w\s*[×x]\s*d\s*[×x]\s*h|"
+    r"w\s*[×x]\s*h\s*[×x]\s*d)\b",
+    re.IGNORECASE,
+)
+_REJECTED_DIMENSION_CONTEXT = re.compile(
+    r"\b(shipping|package|packaged|carton|box|cutout|rough[- ]?in|opening)\b",
+    re.IGNORECASE,
 )
 
 
@@ -336,6 +354,86 @@ def _fraction_to_decimal(s: str) -> str:
         return s
     except ValueError:
         return s
+
+
+def _number_to_float(s: str) -> float | None:
+    text = _fraction_to_decimal(str(s or "").strip())
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _format_decimal(value: float) -> str:
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def _normalize_unit(unit: str | None) -> str:
+    unit = str(unit or "").strip().lower()
+    if unit in {"cm", "mm"}:
+        return unit
+    if unit in {'"', "“", "”", "″", "'", "in", "inch", "inches"}:
+        return "in"
+    return ""
+
+
+def _value_to_inches_text(value: str, unit: str | None = None) -> str:
+    """Return a compact inch value string, converting cm/mm when explicit."""
+    unit_norm = _normalize_unit(unit)
+    if not unit_norm:
+        unit_m = re.search(rf"(?P<num>{_NUM})\s*(?P<unit>{_UNIT})", str(value or ""), re.IGNORECASE)
+        if unit_m:
+            unit_norm = _normalize_unit(unit_m.group("unit"))
+            value = unit_m.group("num")
+    num = _number_to_float(value)
+    if num is None:
+        return str(value or "").strip()
+    if unit_norm == "cm":
+        return _format_decimal(num / 2.54)
+    if unit_norm == "mm":
+        return _format_decimal(num / 25.4)
+    return str(value).strip()
+
+
+def _format_labeled_value(value: str, label: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    unit_m = re.search(rf"(?P<num>{_NUM})\s*(?P<unit>{_UNIT})?", text, re.IGNORECASE)
+    if not unit_m:
+        return f"{text} {label}"
+    number = _value_to_inches_text(unit_m.group("num"), unit_m.group("unit"))
+    return f'{number}"{label}'
+
+
+def _format_unlabeled_triple(match: re.Match) -> str:
+    """Interpret verified-source unlabeled triples as W x D x H."""
+    unit = match.group("ua") or match.group("ub") or match.group("uc") or "in"
+    w = _value_to_inches_text(match.group("a"), unit)
+    d = _value_to_inches_text(match.group("b"), unit)
+    h = _value_to_inches_text(match.group("c"), unit)
+    return f'{w}"W x {d}"D x {h}"H'
+
+
+def _spec_label_key(label: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", " ", str(label or "").lower()).strip()
+    if not text:
+        return ""
+    if any(word in text for word in ("shipping", "package", "packaged", "carton", "box")):
+        return "shipping"
+    if any(word in text for word in ("cutout", "rough in", "opening")):
+        return "cutout"
+    if "width" in text or text in {"w"} or text.endswith(" w"):
+        return "width"
+    if "height" in text or text in {"h"} or text.endswith(" h"):
+        return "height"
+    if "depth" in text or text in {"d"} or text.endswith(" d"):
+        return "depth"
+    if any(word in text for word in ("dimension", "measurement", "measurements", "size")):
+        return "dimensions"
+    if "w x d x h" in text or "w x h x d" in text:
+        return "dimensions"
+    return ""
 
 
 def _find_dimension_candidates(
@@ -383,6 +481,19 @@ def _find_dimension_candidates(
         if not in_excluded:
             _add(m.group(0))
 
+    # Priority 3b: verified-source unlabeled triples near dimension context.
+    # These remain local to enrichment; has_complete_3d_dimensions stays strict.
+    for m in _UNLABELED_TRIPLE.finditer(text):
+        in_excluded = any(r_start <= m.start() < r_end for r_start, r_end in excluded_ranges)
+        if in_excluded:
+            continue
+        context = text[max(0, m.start() - 70): min(len(text), m.end() + 30)]
+        if not _DIMENSION_CONTEXT.search(context):
+            continue
+        if _REJECTED_DIMENSION_CONTEXT.search(context):
+            continue
+        _add(_format_unlabeled_triple(m))
+
     # Priority 4: cutout (optional)
     if include_cutout:
         for m in _CUTOUT_DIM_LABEL.finditer(text):
@@ -399,7 +510,33 @@ def _find_dimension_candidates(
 def _dimension_parts(dimensions: str) -> dict[str, str]:
     from src.dimensions import extract_labeled_dimensions
 
-    return extract_labeled_dimensions(dimensions)
+    text = str(dimensions or "")
+    parts = extract_labeled_dimensions(text)
+
+    before_label = re.compile(
+        rf"\b(?P<label>width|wide|w|height|high|h|depth|deep|d|length|long|l)\b"
+        rf"\s*(?:[:=]|is|of)?\s*(?P<num>{_NUM})\s*(?P<unit>{_UNIT})?",
+        re.IGNORECASE,
+    )
+    after_label = re.compile(
+        rf"(?P<num>{_NUM})\s*(?P<unit>{_UNIT})?\s*(?P<label>[WwHhDdLl])(?![a-zA-Z])",
+        re.IGNORECASE,
+    )
+    key_map = {
+        "w": "width", "wide": "width", "width": "width",
+        "h": "height", "high": "height", "height": "height",
+        "d": "depth", "deep": "depth", "depth": "depth",
+        "l": "length", "long": "length", "length": "length",
+    }
+    for pattern in (before_label, after_label):
+        for match in pattern.finditer(text):
+            key = key_map.get(match.group("label").lower())
+            if not key:
+                continue
+            value = _value_to_inches_text(match.group("num"), match.group("unit"))
+            if value and (not parts.get(key) or _normalize_unit(match.group("unit")) in {"cm", "mm"}):
+                parts[key] = value
+    return parts
 
 
 def _dimension_part_count(dimensions: str) -> int:
@@ -409,7 +546,7 @@ def _dimension_part_count(dimensions: str) -> int:
 
 def _format_dimension_parts(parts: dict[str, str]) -> str:
     labels = (("width", "W"), ("height", "H"), ("depth", "D"), ("length", "L"))
-    bits = [f"{parts[key]} {label}" for key, label in labels if parts.get(key)]
+    bits = [_format_labeled_value(parts[key], label) for key, label in labels if parts.get(key)]
     return " x ".join(bits)
 
 
@@ -437,6 +574,37 @@ def _collect_json_strings(obj) -> list[str]:
     return []
 
 
+def _collect_json_dimension_strings(obj) -> list[str]:
+    """Collect key-aware dimension strings from JSON so labels are preserved."""
+    collected: list[str] = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            label_key = _spec_label_key(str(key))
+            if label_key in {"width", "height", "depth", "dimensions", "cutout", "shipping"}:
+                if isinstance(value, (str, int, float)):
+                    collected.append(f"{key}: {value}")
+                elif isinstance(value, dict):
+                    strings = _collect_json_strings(value)
+                    if strings:
+                        collected.append(f"{key}: {' '.join(strings)}")
+            collected.extend(_collect_json_dimension_strings(value))
+    elif isinstance(obj, list):
+        for value in obj:
+            collected.extend(_collect_json_dimension_strings(value))
+    return collected
+
+
+def _candidate_strings_from_text(text: str, *, include_cutout: bool = False) -> list[str]:
+    candidates = _find_dimension_candidates(text, include_cutout=include_cutout)
+    if candidates:
+        return candidates
+    parts = _dimension_parts(text)
+    candidate = _format_dimension_parts(parts)
+    if candidate and _DIMENSION_CONTEXT.search(text) and not _REJECTED_DIMENSION_CONTEXT.search(text):
+        return [candidate]
+    return []
+
+
 def _parse_html_for_dimensions(
     html: str,
     *,
@@ -460,6 +628,10 @@ def _parse_html_for_dimensions(
         debug.setdefault("spec_table_found", False)
         debug.setdefault("next_data_found", False)
         debug.setdefault("shopify_json_found", False)
+        debug.setdefault("embedded_json_found", False)
+        debug.setdefault("dimension_parse_method", "")
+        debug.setdefault("partial_dimensions_found", "")
+        debug.setdefault("rejected_dimensions_reason", "")
 
     def _get_page_text() -> str:
         nonlocal page_text
@@ -467,9 +639,15 @@ def _parse_html_for_dimensions(
             page_text = soup.get_text(" ") if soup else re.sub(r"<[^>]+>", " ", html)
         return page_text
 
-    def _remember(candidates: list[str]) -> str | None:
+    def _remember(candidates: list[str], method: str) -> str | None:
         candidates_seen.extend(candidates)
-        return _best_dimension_candidate(candidates)
+        best = _best_dimension_candidate(candidates)
+        if best and debug is not None:
+            if not debug.get("dimension_parse_method"):
+                debug["dimension_parse_method"] = method
+            if 0 < _dimension_part_count(best) < 3 and not debug.get("partial_dimensions_found"):
+                debug["partial_dimensions_found"] = best
+        return best
 
     # ── Pass 1: JSON-LD ────────────────────────────────────────────────────────
     if soup:
@@ -478,15 +656,15 @@ def _parse_html_for_dimensions(
                 debug["json_ld_found"] = True
             try:
                 data = _json.loads(script.string or "")
-                blob = "\n".join(_collect_json_strings(data))
+                blob = "\n".join(_collect_json_dimension_strings(data) + _collect_json_strings(data))
             except Exception:
                 continue
-            candidates = _find_dimension_candidates(blob, include_cutout=is_appliance)
-            product_dims = _remember(candidates)
+            candidates = _candidate_strings_from_text(blob, include_cutout=is_appliance)
+            product_dims = _remember(candidates, "json_ld")
             if product_dims:
                 break
 
-    # ── Pass 1b: embedded app JSON such as Next.js / Shopify ──────────────────
+    # ── Pass 1b: embedded app JSON such as Next.js / Shopify / window config ───
     if not product_dims and soup:
         for script in soup.find_all("script"):
             script_id = str(script.get("id") or "")
@@ -495,19 +673,26 @@ def _parse_html_for_dimensions(
                 continue
             is_next = script_id == "__NEXT_DATA__"
             is_shopify = "Shopify" in text or "shopify" in text
+            is_embedded_product_json = bool(
+                re.search(r"\b(window|product|config|__INITIAL_STATE__|__APOLLO_STATE__)\b", text)
+                and any(k in text.lower() for k in ("dimension", "width", "height", "depth", "size"))
+            )
             if is_next and debug is not None:
                 debug["next_data_found"] = True
             if is_shopify and debug is not None:
                 debug["shopify_json_found"] = True
-            if not is_next and not is_shopify and not any(k in text.lower() for k in ("dimension", "width", "height", "depth")):
+            if is_embedded_product_json and debug is not None:
+                debug["embedded_json_found"] = True
+            if not is_next and not is_shopify and not is_embedded_product_json and not any(k in text.lower() for k in ("dimension", "width", "height", "depth", "size")):
                 continue
             try:
                 parsed = _json.loads(text)
-                blob = "\n".join(_collect_json_strings(parsed))
+                blob = "\n".join(_collect_json_dimension_strings(parsed) + _collect_json_strings(parsed))
             except Exception:
                 blob = text
-            candidates = _find_dimension_candidates(blob, include_cutout=is_appliance)
-            product_dims = _remember(candidates)
+            candidates = _candidate_strings_from_text(blob, include_cutout=is_appliance)
+            method = "next_data" if is_next else "shopify_json" if is_shopify else "embedded_json"
+            product_dims = _remember(candidates, method)
             if product_dims:
                 break
 
@@ -526,12 +711,16 @@ def _parse_html_for_dimensions(
                 if item.name == "dt":
                     label = text
                 elif item.name == "dd":
-                    if label in _SPEC_LABEL_KEYWORDS:
-                        assembled[label] = item.get_text(strip=True)
+                    label_key = _spec_label_key(label)
+                    if label_key in {"shipping", "cutout"}:
+                        if debug is not None and not debug.get("rejected_dimensions_reason"):
+                            debug["rejected_dimensions_reason"] = f"rejected {label_key} dimensions"
+                    if label_key in {"width", "height", "depth", "dimensions"}:
+                        assembled[label_key] = item.get_text(strip=True)
                         # Check if the dd value itself is a complete 3D string
-                        if label in ("dimensions", "overall dimensions", "product dimensions"):
+                        if label_key == "dimensions":
                             val = item.get_text(strip=True)
-                            product_dims = _remember([val])
+                            product_dims = _remember([val], "definition_list")
                             if product_dims:
                                 break
                     label = ""  # always reset after consuming a dd
@@ -545,7 +734,7 @@ def _parse_html_for_dimensions(
             d = assembled.get("depth", "")
             candidate = _format_dimension_parts({"width": w, "height": h, "depth": d})
             if candidate:
-                product_dims = _remember([candidate])
+                product_dims = _remember([candidate], "definition_list_parts")
 
         if not product_dims:
             # table th→td or td→td pairs
@@ -558,28 +747,33 @@ def _parse_html_for_dimensions(
                     if len(cells) >= 2:
                         label = cells[0].get_text(strip=True).lower()
                         value = cells[1].get_text(strip=True)
-                        if label in _SPEC_LABEL_KEYWORDS:
-                            if label in ("width", "height", "depth"):
-                                table_parts[label] = value
+                        label_key = _spec_label_key(label)
+                        if label_key in {"shipping", "cutout"}:
+                            if debug is not None and not debug.get("rejected_dimensions_reason"):
+                                debug["rejected_dimensions_reason"] = f"rejected {label_key} dimensions"
+                            continue
+                        if label_key in {"width", "height", "depth", "dimensions"}:
+                            if label_key in ("width", "height", "depth"):
+                                table_parts[label_key] = value
                             else:
-                                product_dims = _remember([value])
+                                product_dims = _remember([value], "spec_table")
                             if product_dims:
                                 break
                 if not product_dims and table_parts:
-                    product_dims = _remember([_format_dimension_parts(table_parts)])
+                    product_dims = _remember([_format_dimension_parts(table_parts)], "spec_table_parts")
                 if product_dims:
                     break
 
     # ── Pass 3: visible text ───────────────────────────────────────────────────
     if not product_dims:
         text = _get_page_text()
-        candidates = _find_dimension_candidates(text, include_cutout=is_appliance)
-        product_dims = _remember(candidates)
-        if not product_dims:
-            parts = _dimension_parts(text)
-            candidate = _format_dimension_parts(parts)
-            if candidate:
-                product_dims = _remember([candidate])
+        candidates = _candidate_strings_from_text(text, include_cutout=is_appliance)
+        product_dims = _remember(candidates, "visible_text")
+        if not product_dims and debug is not None:
+            if _find_dimension_candidates(text, include_shipping=True):
+                debug["rejected_dimensions_reason"] = debug.get("rejected_dimensions_reason") or "shipping/package dimensions only"
+            elif _find_dimension_candidates(text, include_cutout=True):
+                debug["rejected_dimensions_reason"] = debug.get("rejected_dimensions_reason") or "cutout/opening dimensions only"
 
     # ── Cutout pass (appliances only) ──────────────────────────────────────────
     if is_appliance and product_dims:
@@ -597,6 +791,8 @@ def _parse_html_for_dimensions(
         debug["dimensions_extracted"] = product_dims or ""
         debug["dimension_part_count"] = _dimension_part_count(product_dims or "")
         debug["dimension_candidates_seen"] = candidates_seen[:8]
+        if product_dims and 0 < _dimension_part_count(product_dims) < 3:
+            debug["partial_dimensions_found"] = product_dims
 
     return product_dims, cutout_dims
 
@@ -606,6 +802,7 @@ def _parse_text_pages_for_dimensions(
     *,
     is_appliance: bool = False,
     include_shipping_fallback: bool = False,
+    debug: dict | None = None,
 ) -> tuple[str | None, str | None]:
     """
     Find dimensions in a list of page text strings (from PDF extraction).
@@ -617,12 +814,14 @@ def _parse_text_pages_for_dimensions(
     shipping_fallback: str | None = None
 
     for page_text in pages:
-        candidates = _find_dimension_candidates(
-            page_text, include_cutout=is_appliance
-        )
+        candidates = _candidate_strings_from_text(page_text, include_cutout=is_appliance)
         product_dims = _best_dimension_candidate(candidates)
 
         if product_dims:
+            if debug is not None:
+                debug["dimension_parse_method"] = debug.get("dimension_parse_method") or "pdf_text"
+                if 0 < _dimension_part_count(product_dims) < 3:
+                    debug["partial_dimensions_found"] = product_dims
             # Look for cutout on same page if appliance
             if is_appliance:
                 cutout_candidates = _find_dimension_candidates(
@@ -643,10 +842,17 @@ def _parse_text_pages_for_dimensions(
                 page_text, include_shipping=True
             )
             shipping_fallback = _best_dimension_candidate(shipping_candidates)
+        elif debug is not None and not debug.get("rejected_dimensions_reason"):
+            if _find_dimension_candidates(page_text, include_shipping=True):
+                debug["rejected_dimensions_reason"] = "shipping/package dimensions only"
+            elif _find_dimension_candidates(page_text, include_cutout=True):
+                debug["rejected_dimensions_reason"] = "cutout/opening dimensions only"
 
     # Use shipping fallback only when nothing better found
     if not product_dims and include_shipping_fallback and shipping_fallback:
         product_dims = shipping_fallback
+        if debug is not None:
+            debug["dimension_parse_method"] = debug.get("dimension_parse_method") or "shipping_fallback"
 
     return product_dims, cutout_dims
 
@@ -655,6 +861,7 @@ def _parse_pdf_for_dimensions(
     pdf_bytes: bytes,
     *,
     is_appliance: bool = False,
+    debug: dict | None = None,
 ) -> tuple[str | None, str | None]:
     """
     Extract dimension text from a PDF using PyMuPDF. Scans first 10 pages.
@@ -674,6 +881,7 @@ def _parse_pdf_for_dimensions(
         pages,
         is_appliance=is_appliance,
         include_shipping_fallback=False,
+        debug=debug,
     )
 
 
@@ -711,12 +919,12 @@ def _fetch_and_parse_url(
             suffix = "pdf"
             if debug is not None:
                 debug["spec_pdf_fetched"] = True
-            return (*_parse_pdf_for_dimensions(resp.content, is_appliance=is_appliance), suffix)
+            return (*_parse_pdf_for_dimensions(resp.content, is_appliance=is_appliance, debug=debug), suffix)
         if "html" not in content_type and suffix == "pdf":
             # No HTML signal from content-type; URL extension suggests PDF
             if debug is not None:
                 debug["spec_pdf_fetched"] = True
-            return (*_parse_pdf_for_dimensions(resp.content, is_appliance=is_appliance), suffix)
+            return (*_parse_pdf_for_dimensions(resp.content, is_appliance=is_appliance, debug=debug), suffix)
         return (*_parse_html_for_dimensions(resp.text, is_appliance=is_appliance, debug=debug), suffix)
     except Exception:  # network errors, redirects, and parser failures all return no-result
         return None, None, suffix
@@ -810,6 +1018,12 @@ def _build_dimension_result(
     evidence = dimensions
     if cutout_dims:
         evidence += f" | Cutout: {cutout_dims}"
+    debug = dict(debug)
+    debug["dimension_source_url"] = source_url
+    debug["dimension_confidence"] = confidence
+    debug["dimensions_extracted"] = dimensions
+    if 0 < _dimension_part_count(dimensions) < 3:
+        debug["partial_dimensions_found"] = dimensions
     return DimensionResult(
         dimensions=dimensions,
         width=_fraction_to_decimal(parts.get("width", "")),
@@ -824,7 +1038,7 @@ def _build_dimension_result(
         urls_checked=list(urls_checked),
         evidence_text=evidence,
         failure_reason="",
-        debug=dict(debug),
+        debug=debug,
     )
 
 
@@ -917,6 +1131,10 @@ def find_dimensions(
         "dimensions_extracted": "",
         "dimension_confidence": "none",
         "dimension_source": "",
+        "dimension_source_url": "",
+        "dimension_parse_method": "",
+        "partial_dimensions_found": "",
+        "rejected_dimensions_reason": "",
         "final_dimensions": current_dims,
         "final_dimension_writeback_success": False,
         "skipped_reason": "",
@@ -952,6 +1170,9 @@ def find_dimensions(
         result.debug["dimensions_extracted"] = result.dimensions
         result.debug["dimension_confidence"] = result.confidence
         result.debug["dimension_source"] = result.source_url
+        result.debug["dimension_source_url"] = result.source_url
+        if 0 < _dimension_part_count(result.dimensions) < 3:
+            result.debug["partial_dimensions_found"] = result.dimensions
         result.debug["final_dimensions"] = result.dimensions if result.status == "found" else current_dims
         result.debug["final_dimension_writeback_success"] = result.status == "found"
         if result.confidence == "low":
@@ -1002,6 +1223,7 @@ def find_dimensions(
                         product_dims, cutout_dims = _parse_pdf_for_dimensions(
                             resp.content,
                             is_appliance=is_appliance,
+                            debug=local_debug,
                         )
                     else:
                         page_html = resp.text
@@ -1165,6 +1387,10 @@ def find_dimensions(
         low_confidence_result.height = ""
         low_confidence_result.depth = ""
         low_confidence_result.length = ""
+        low_confidence_result.debug["partial_dimensions_found"] = (
+            low_confidence_result.debug.get("partial_dimensions_found")
+            or low_confidence_result.evidence_text
+        )
         low_confidence_result.debug["final_dimensions"] = current_dims
         low_confidence_result.debug["final_dimension_writeback_success"] = False
         return low_confidence_result
@@ -1180,5 +1406,6 @@ def find_dimensions(
         "urls_checked": list(urls_checked),
         "final_dimensions": current_dims,
         "skipped_reason": debug.get("skipped_reason", ""),
+        "rejected_dimensions_reason": debug.get("rejected_dimensions_reason", ""),
     }
     return result

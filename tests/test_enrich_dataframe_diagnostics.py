@@ -125,3 +125,16 @@ def test_enrich_dataframe_diagnostics_failure_reason_on_not_found():
     assert diagnostics[0]["queries_tried"] == ["query1"]
     assert diagnostics[0]["urls_checked"] == ["https://example.com"]
     assert diagnostics[0]["domain_used"] == ""  # no source URL for not_found
+
+
+def test_enrich_dataframe_skip_debug_fields_for_missing_brand():
+    df = _make_df(brand="")
+
+    enriched, errors, diagnostics = enrich_dataframe(df)
+
+    assert errors == []
+    assert diagnostics == []
+    assert bool(enriched.at[0, "skipped_by_missing_brand"]) is True
+    assert bool(enriched.at[0, "skipped_by_missing_model"]) is False
+    assert bool(enriched.at[0, "skipped_by_source_type"]) is False
+    assert enriched.at[0, "skipped_reason"] == "row does not qualify for enrichment"

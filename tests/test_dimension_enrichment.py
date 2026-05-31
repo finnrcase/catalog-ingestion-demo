@@ -395,6 +395,76 @@ def test_parse_html_visible_text_inline():
     assert "35.75" in product_dims
 
 
+def test_parse_html_visible_text_unlabeled_triple_from_dimension_context():
+    html = """
+    <html><body>
+    <p>Dimensions: 30 x 24 x 12</p>
+    </body></html>
+    """
+    debug = {}
+    product_dims, _ = _parse_html_for_dimensions(html, debug=debug)
+    assert product_dims == '30"W x 24"D x 12"H'
+    assert debug["dimension_parse_method"] == "visible_text"
+
+
+def test_parse_html_next_data_metric_dimensions_converted_to_inches():
+    html = """
+    <html><body>
+    <script id="__NEXT_DATA__" type="application/json">
+    {"props":{"pageProps":{"product":{"specs":{"dimensions":"Dimensions: 762 mm x 610 mm x 305 mm"}}}}}
+    </script>
+    </body></html>
+    """
+    debug = {}
+    product_dims, _ = _parse_html_for_dimensions(html, debug=debug)
+    assert product_dims == '30"W x 24.016"D x 12.008"H'
+    assert debug["next_data_found"] is True
+    assert debug["dimension_parse_method"] == "next_data"
+
+
+def test_parse_html_json_ld_width_height_depth_keys_preserve_labels():
+    html = """
+    <html><body>
+    <script type="application/ld+json">
+    {"@type":"Product","width":"762 mm","height":"305 mm","depth":"610 mm"}
+    </script>
+    </body></html>
+    """
+    debug = {}
+    product_dims, _ = _parse_html_for_dimensions(html, debug=debug)
+    assert product_dims == '30"W x 12.008"H x 24.016"D'
+    assert debug["json_ld_found"] is True
+    assert debug["dimension_parse_method"] == "json_ld"
+
+
+def test_parse_html_definition_list_two_axis_partial_kept():
+    html = """
+    <html><body>
+    <dl>
+      <dt>Product Width</dt><dd>30 in</dd>
+      <dt>Product Depth</dt><dd>24 in</dd>
+    </dl>
+    </body></html>
+    """
+    debug = {}
+    product_dims, _ = _parse_html_for_dimensions(html, debug=debug)
+    assert product_dims == '30"W x 24"D'
+    assert debug["partial_dimensions_found"] == '30"W x 24"D'
+    assert debug["dimension_parse_method"] == "definition_list_parts"
+
+
+def test_parse_html_rejects_shipping_only_dimensions():
+    html = """
+    <html><body>
+    <p>Shipping Dimensions: 40"W x 30"D x 20"H</p>
+    </body></html>
+    """
+    debug = {}
+    product_dims, _ = _parse_html_for_dimensions(html, debug=debug)
+    assert product_dims is None
+    assert "shipping" in debug["rejected_dimensions_reason"]
+
+
 def test_parse_html_appliance_cutout_stored_separately():
     html = """
     <html><body>

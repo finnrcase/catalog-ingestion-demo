@@ -12,6 +12,7 @@ enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[dict]]
 """
 
 import json
+import io
 import os
 import re
 import time
@@ -25,7 +26,15 @@ from src.brave_search import BRAVE_API_KEY, search_product_candidates
 from src.category_ai import _normalise_category
 from src.dimension_enrichment import DimensionResult as _DimensionResult, find_dimensions as _find_dimensions
 from src.dimensions import extract_labeled_dimensions, has_complete_3d_dimensions
+from src.image_assets import download_and_convert_image
+from src.image_uploader import upload_image as _upload_image_to_cloudinary
 from src.manufacturer_domains import get_domain_for_brand, record_discovered_domain
+from src.product_image_extraction import (
+    ImageCandidate,
+    extract_product_image_candidates,
+    select_best_product_image,
+    top_candidate_diagnostics,
+)
 
 try:
     import html2text as _html2text
@@ -78,6 +87,13 @@ _ENRICHABLE_FIELDS: list = [
 ]
 
 _ENRICHMENT_DEBUG_FIELDS: list[str] = [
+    "skipped_by_source_type",
+    "skipped_by_missing_brand",
+    "skipped_by_missing_model",
+    "cache_hit",
+    "cache_had_blank_dimensions",
+    "cache_had_blank_image",
+    "fresh_extraction_forced",
     "product_url",
     "product_url_confidence",
     "page_fetch_attempted",
@@ -92,10 +108,22 @@ _ENRICHMENT_DEBUG_FIELDS: list[str] = [
     "dimensions_extracted",
     "dimension_confidence",
     "dimension_source",
+    "dimension_source_url",
+    "dimension_parse_method",
+    "partial_dimensions_found",
+    "rejected_dimensions_reason",
     "final_dimensions",
     "final_dimension_writeback_success",
     "skipped_reason",
     "budget_blocked",
+    "original_image_url",
+    "cloudinary_url",
+    "image_confidence",
+    "image_source_url",
+    "image_candidate_diagnostics",
+    "cloudinary_status",
+    "cloudinary_error",
+    "programa_image_ready",
 ]
 
 MIN_USE_SCORE = 40   # below this: skip entirely, note in Notes
@@ -125,25 +153,62 @@ def _dimension_confidence_from_parts(value: object, domain_score: int) -> str:
     return ""
 
 
+def _has_good_image(row: dict) -> bool:
+    """True when the row already has a usable hosted image URL."""
+    return _is_absolute_https(_str_val(row.get("Image URL")))
+
+
+def _needs_dimension_recovery(row: dict) -> bool:
+    dims = _str_val(row.get("Dimensions"))
+    return not dims or not has_complete_3d_dimensions(dims)
+
+
+def _needs_image_recovery(row: dict) -> bool:
+    return not _has_good_image(row)
+
+
+def _missing_enrichment_fields(row: dict) -> list[str]:
+    missing: list[str] = []
+    for field in _ENRICHABLE_FIELDS:
+        if field == "Dimensions":
+            if _needs_dimension_recovery(row):
+                missing.append(field)
+        elif not _str_val(row.get(field)):
+            missing.append(field)
+    if _needs_image_recovery(row):
+        missing.append("Image URL")
+    return missing
+
+
 def _qualifies(row: dict) -> bool:
     """True if this row should be sent through enrichment."""
     source = _str_val(row.get("Source Type", ""))
     if source == "URL":
         return False
-    if source.endswith("_Enriched"):
-        return False
     if not _str_val(row.get("Brand")):
         return False
     if not _str_val(row.get("Model/SKU")):
         return False
-    # Qualify if any enrichable field is blank, OR if Dimensions exists but is
-    # not full W×H×D (a partial dimension still needs enrichment).
-    blank_or_incomplete = [
-        f for f in _ENRICHABLE_FIELDS
-        if not _str_val(row.get(f))
-        or (f == "Dimensions" and not has_complete_3d_dimensions(_str_val(row.get(f))))
-    ]
-    return bool(blank_or_incomplete)
+    # Previously enriched rows should still get another deterministic pass when
+    # dimensions or images are missing. They should not keep re-running only for
+    # cosmetic/general blanks.
+    if source.endswith("_Enriched"):
+        return _needs_dimension_recovery(row) or _needs_image_recovery(row)
+    return bool(_missing_enrichment_fields(row))
+
+
+def _skip_debug(row: dict) -> dict:
+    source = _str_val(row.get("Source Type", ""))
+    brand_missing = not _str_val(row.get("Brand"))
+    model_missing = not _str_val(row.get("Model/SKU"))
+    source_blocked = source == "URL"
+    if source.endswith("_Enriched") and not (_needs_dimension_recovery(row) or _needs_image_recovery(row)):
+        source_blocked = True
+    return {
+        "skipped_by_source_type": source_blocked,
+        "skipped_by_missing_brand": brand_missing,
+        "skipped_by_missing_model": model_missing,
+    }
 
 
 def _build_search_query(row: dict) -> str:
@@ -343,118 +408,172 @@ def _check_image_content_type(url: str) -> bool:
 
 def extract_image_url(html: str) -> str | None:
     """
-    Extract the best image URL from raw HTML using a multi-source fallback pipeline.
+    Compatibility wrapper: return the top scored image candidate URL.
 
-    Priority order:
-      1. og:image meta tag (structured, authoritative)
-      2. twitter:image meta tag (structured)
-      3. JSON-LD Product "image" field (structured schema.org)
-      4. Largest <img> by pixel area — checks src, srcset, data-src, data-original
-
-    For structured sources (og/twitter/JSON-LD): accepts any absolute https URL;
-    content-type validation happens later in enrich_row via _check_image_content_type.
-
-    For <img> tags: applies extension pre-filter (_is_valid_image_url) and rejects
-    tiny images (both dimensions < 100px) to skip icons and tracking pixels.
+    The enrichment path uses the richer candidate/scoring API below so it can
+    keep diagnostics and Cloudinary upload status. This wrapper preserves the
+    older public test surface and simple callers.
     """
-    import logging as _logging
-    _log = _logging.getLogger(__name__)
-
-    if not html:
-        return None
-
-    # Priority 1: og:image (either attribute order)
-    for pattern in (
-        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-    ):
-        m = re.search(pattern, html, re.IGNORECASE)
-        if m:
-            candidate = m.group(1).strip()
-            if _is_absolute_https(candidate):
-                return candidate
-            _log.info("[IMAGE INVALID — skipped] source=og:image url=%s (not absolute https)", candidate[:120])
-            break
-
-    # Priority 2: twitter:image (either attribute order)
-    for pattern in (
-        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
-        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
-    ):
-        m = re.search(pattern, html, re.IGNORECASE)
-        if m:
-            candidate = m.group(1).strip()
-            if _is_absolute_https(candidate):
-                return candidate
-            _log.info("[IMAGE INVALID — skipped] source=twitter:image url=%s (not absolute https)", candidate[:120])
-            break
-
-    # Priority 3: JSON-LD Product "image" field
-    for ld_m in re.finditer(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html, re.IGNORECASE | re.DOTALL,
-    ):
-        try:
-            data = json.loads(ld_m.group(1))
-            if isinstance(data, list):
-                data = data[0] if data else {}
-            candidate = data.get("image", "")
-            if isinstance(candidate, list):
-                candidate = candidate[0] if candidate else ""
-            if isinstance(candidate, dict):
-                candidate = candidate.get("url", "")
-            candidate = str(candidate).strip()
-            if candidate:
-                if _is_absolute_https(candidate):
-                    return candidate
-                _log.info("[IMAGE INVALID — skipped] source=json-ld url=%s (not absolute https)", candidate[:120])
-        except Exception:
-            pass
-
-    # Priority 4: largest <img> by pixel area.
-    # Checks src, then srcset (last/largest descriptor), then data-src / data-original.
-    best_url: str | None = None
-    best_area = -1
-    for img_m in re.finditer(r"<img([^>]+?)>", html, re.IGNORECASE):
-        attrs = img_m.group(1)
-
-        # Determine the candidate URL.
-        # srcset wins when present (contains multiple resolutions; we take the highest).
-        # Fall back to standard src, then lazy-load attributes.
-        src: str | None = None
-        srcset_m = re.search(r'\bsrcset=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
-        if srcset_m:
-            # "url1 320w, url2 768w, url3 1200w" — last entry is highest-res
-            parts = [p.strip().split() for p in srcset_m.group(1).split(",") if p.strip()]
-            if parts and parts[-1]:
-                src = parts[-1][0]
-        if not src:
-            for attr in ("src", "data-src", "data-original", "data-image"):
-                src_m = re.search(rf'\b{attr}=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
-                if src_m:
-                    src = src_m.group(1).strip()
-                    break
-
-        if not src or not _is_valid_image_url(src):
-            continue
-
-        # Reject tiny images: icons, tracking pixels, sprites (< 100px on longest side)
-        w_m = re.search(r'\bwidth=["\']?(\d+)', attrs, re.IGNORECASE)
-        h_m = re.search(r'\bheight=["\']?(\d+)', attrs, re.IGNORECASE)
-        w = int(w_m.group(1)) if w_m else None
-        h = int(h_m.group(1)) if h_m else None
-        if w is not None and h is not None and max(w, h) < 100:
-            continue
-
-        area = (w or 1) * (h or 1)
-        if area > best_area:
-            best_area = area
-            best_url = src
-
-    return best_url
+    candidates = extract_product_image_candidates(html, "", {})
+    for source_type in ("og:image", "twitter:image", "json_ld_image"):
+        for candidate in candidates:
+            if candidate.source_type == source_type and not candidate.rejection_reason:
+                return candidate.url
+    for candidate in candidates:
+        if not candidate.rejection_reason:
+            return candidate.url
+    return None
 
 
-def _try_image_from_url(product_url: str, cache_key: str = "") -> str | None:
+def _cloudinary_configured() -> bool:
+    return bool(
+        os.getenv("CLOUDINARY_CLOUD_NAME")
+        and os.getenv("CLOUDINARY_API_KEY")
+        and os.getenv("CLOUDINARY_API_SECRET")
+    )
+
+
+def _image_debug_defaults() -> dict:
+    return {
+        "original_image_url": "",
+        "cloudinary_url": "",
+        "image_confidence": "",
+        "image_source_url": "",
+        "image_candidate_diagnostics": "",
+        "cloudinary_status": "",
+        "cloudinary_error": "",
+        "programa_image_ready": False,
+        "Image Upload Status": "",
+    }
+
+
+def _candidate_debug_json(candidates: list[ImageCandidate]) -> str:
+    try:
+        return json.dumps(top_candidate_diagnostics(candidates, limit=3), ensure_ascii=True)
+    except Exception:
+        return "[]"
+
+
+def _upload_candidate_image(candidate: ImageCandidate, row: dict) -> tuple[str | None, dict]:
+    """
+    Convert/upload the accepted candidate through Cloudinary when configured.
+
+    If Cloudinary is unavailable or fails, the caller can still keep the original
+    validated HTTPS image URL and gets explicit debug fields explaining why.
+    """
+    debug = {
+        "original_image_url": candidate.url,
+        "cloudinary_url": "",
+        "cloudinary_status": "skipped_unconfigured",
+        "cloudinary_error": "",
+        "programa_image_ready": False,
+    }
+
+    if not _cloudinary_configured():
+        debug["cloudinary_error"] = "Cloudinary env vars are not configured."
+        return None, debug
+
+    converted = download_and_convert_image(
+        candidate.url,
+        brand=_str_val(row.get("Brand")),
+        model_sku=_str_val(row.get("Model/SKU")),
+        product_name=_str_val(row.get("Product Name")),
+    )
+    if converted.get("image_status") != "downloaded":
+        debug["cloudinary_status"] = converted.get("image_status") or "conversion_failed"
+        debug["cloudinary_error"] = converted.get("error") or "Image conversion failed."
+        return None, debug
+
+    try:
+        upload_file = io.BytesIO(converted.get("jpeg_bytes") or b"")
+        upload_file.name = converted.get("local_image_filename") or "product.jpg"
+        cloudinary_url = _upload_image_to_cloudinary(upload_file)
+    except Exception as exc:
+        cloudinary_url = None
+        debug["cloudinary_error"] = str(exc)
+
+    if cloudinary_url and _is_absolute_https(cloudinary_url):
+        debug["cloudinary_url"] = cloudinary_url
+        debug["cloudinary_status"] = "uploaded"
+        debug["programa_image_ready"] = True
+        return cloudinary_url, debug
+
+    debug["cloudinary_status"] = "failed"
+    debug["cloudinary_error"] = debug["cloudinary_error"] or "Cloudinary upload failed or returned no secure_url."
+    return None, debug
+
+
+def _extract_image_from_html(
+    raw_html: str,
+    product_url: str,
+    row: dict,
+    cache_key: str = "",
+) -> tuple[str | None, dict]:
+    debug = _image_debug_defaults()
+    debug["image_source_url"] = product_url
+    candidates = extract_product_image_candidates(raw_html, product_url, row)
+    debug["image_candidate_diagnostics"] = _candidate_debug_json(candidates)
+
+    if not candidates:
+        debug["cloudinary_status"] = "not_attempted"
+        debug["cloudinary_error"] = "No image candidates found on verified product page."
+        if cache_key:
+            existing_entry = _product_cache.get(cache_key) or {}
+            if not existing_entry.get("image_url"):
+                _product_cache.update(cache_key, {"image_url": None, "image_url__reason": "no image candidates found on page"})
+        return None, debug
+
+    selected = select_best_product_image(
+        candidates,
+        content_type_checker=_check_image_content_type,
+    )
+    debug["image_candidate_diagnostics"] = _candidate_debug_json(candidates)
+    if selected is None:
+        debug["cloudinary_status"] = "not_attempted"
+        debug["cloudinary_error"] = "No HIGH/MEDIUM image candidate passed validation."
+        if cache_key:
+            existing_entry = _product_cache.get(cache_key) or {}
+            if not existing_entry.get("image_url"):
+                _product_cache.update(cache_key, {"image_url": None, "image_url__reason": debug["cloudinary_error"]})
+        return None, debug
+
+    debug["original_image_url"] = selected.url
+    debug["image_confidence"] = selected.confidence
+
+    cloudinary_url, upload_debug = _upload_candidate_image(selected, row)
+    debug.update(upload_debug)
+    final_url = cloudinary_url or selected.url
+    debug["programa_image_ready"] = bool(_is_absolute_https(final_url))
+    debug["Image Upload Status"] = (
+        "cloudinary_uploaded"
+        if cloudinary_url
+        else f"using_original_url:{debug.get('cloudinary_status') or 'not_uploaded'}"
+    )
+
+    if cache_key:
+        existing_entry = _product_cache.get(cache_key) or {}
+        if not existing_entry.get("image_url"):
+            _product_cache.update(
+                cache_key,
+                {
+                    "image_url": final_url,
+                    "original_image_url": selected.url,
+                    "image_confidence": selected.confidence,
+                    "image_source_url": product_url,
+                    "cloudinary_url": cloudinary_url or "",
+                    "general_confidence": "medium",
+                },
+            )
+    return final_url, debug
+
+
+def _try_image_from_url(
+    product_url: str,
+    cache_key: str = "",
+    session_cache: "_SessionCache | None" = None,
+    row: dict | None = None,
+    return_debug: bool = False,
+) -> str | tuple[str | None, dict] | None:
     """Fetch product_url, extract the best image candidate, and validate via content-type.
 
     On success, updates the persistent cache so future cache hits carry the image.
@@ -463,26 +582,51 @@ def _try_image_from_url(product_url: str, cache_key: str = "") -> str | None:
     import logging as _logging
     _log = _logging.getLogger(__name__)
 
-    raw_html = _fetch_page_html(product_url)
+    raw_html = ""
+    if session_cache is not None and product_url in session_cache.urls:
+        raw_html = str(session_cache.urls.get(product_url) or "")
+    if not raw_html:
+        raw_html = _fetch_page_html(product_url)
+        if raw_html and session_cache is not None:
+            session_cache.urls[product_url] = raw_html
     if not raw_html:
         _log.info("[IMAGE PIPELINE] fetch failed url=%s", product_url[:80])
-        return None
+        return (None, _image_debug_defaults()) if return_debug else None
 
-    candidate = extract_image_url(raw_html)
-    if not candidate:
-        _log.info("[IMAGE PIPELINE] no candidate found url=%s", product_url[:80])
-        return None
+    final_url, debug = _extract_image_from_html(raw_html, product_url, row or {}, cache_key)
+    if final_url:
+        _log.info("[IMAGE PIPELINE] found url=%s img=%s", product_url[:60], final_url[:80])
+    else:
+        _log.info("[IMAGE PIPELINE] no accepted candidate url=%s", product_url[:80])
+    return (final_url, debug) if return_debug else final_url
 
-    if not _check_image_content_type(candidate):
-        _log.info("[IMAGE PIPELINE] content-type rejected candidate=%s", candidate[:80])
-        if cache_key:
-            _product_cache.update(cache_key, {"image_url": None})
-        return None
 
-    _log.info("[IMAGE PIPELINE] found url=%s img=%s", product_url[:60], candidate[:80])
-    if cache_key:
-        _product_cache.update(cache_key, {"image_url": candidate, "general_confidence": "medium"})
-    return candidate
+def _unpack_image_result(result) -> tuple[str | None, dict]:
+    if isinstance(result, tuple):
+        image_url = result[0] if result else None
+        debug = result[1] if len(result) > 1 and isinstance(result[1], dict) else {}
+        return image_url, debug
+    return result, {}
+
+
+def _cache_has_blank_dimension(cache_entry: dict | None) -> bool:
+    if not cache_entry:
+        return False
+    null_fields = cache_entry.get("null_fields") or {}
+    return (
+        ("dimensions" in cache_entry and not _str_val(cache_entry.get("dimensions")))
+        or "dimensions" in null_fields
+    )
+
+
+def _cache_has_blank_image(cache_entry: dict | None) -> bool:
+    if not cache_entry:
+        return False
+    null_fields = cache_entry.get("null_fields") or {}
+    return (
+        ("image_url" in cache_entry and not _str_val(cache_entry.get("image_url")))
+        or "image_url" in null_fields
+    )
 
 
 def _build_extraction_prompt(page_text: str, row: dict) -> str:
@@ -606,7 +750,14 @@ def _apply_cache_to_row(
 def _dimension_debug_defaults(row: dict) -> dict:
     dims_before = _str_val(row.get("Dimensions"))
     product_url = _str_val(row.get("Product URL"))
-    return {
+    debug = {
+        "skipped_by_source_type": False,
+        "skipped_by_missing_brand": False,
+        "skipped_by_missing_model": False,
+        "cache_hit": "",
+        "cache_had_blank_dimensions": False,
+        "cache_had_blank_image": False,
+        "fresh_extraction_forced": False,
         "product_url": product_url,
         "product_url_confidence": "",
         "page_fetch_attempted": False,
@@ -621,11 +772,17 @@ def _dimension_debug_defaults(row: dict) -> dict:
         "dimensions_extracted": "",
         "dimension_confidence": "",
         "dimension_source": "",
+        "dimension_source_url": "",
+        "dimension_parse_method": "",
+        "partial_dimensions_found": "",
+        "rejected_dimensions_reason": "",
         "final_dimensions": dims_before,
         "final_dimension_writeback_success": False,
         "skipped_reason": "",
         "budget_blocked": False,
     }
+    debug.update(_image_debug_defaults())
+    return debug
 
 
 def _stamp_dimension_debug(row: dict, debug: dict) -> dict:
@@ -664,46 +821,100 @@ def enrich_row(
         model_sku = _str_val(row.get("Model/SKU"))
         cache_key = _normalize_key(brand, model_sku) if brand and model_sku else ""
         force_refresh = session_cache.force_refresh if session_cache else False
+        enrichment_debug = _dimension_debug_defaults(row)
 
         # ── Cache check ────────────────────────────────────────────────────────
         cache_fields_filled: list[str] = []
         fields_searched: list[str] = []
         product_cache_hit = "miss"
+        cache_entry: dict | None = None
 
         if cache_key:
             cache_entry = _product_cache.get(cache_key)
             if cache_entry is not None:
+                enrichment_debug["cache_had_blank_dimensions"] = _cache_has_blank_dimension(cache_entry)
+                enrichment_debug["cache_had_blank_image"] = _cache_has_blank_image(cache_entry)
                 row, cache_fields_filled, still_missing = _apply_cache_to_row(
                     row, cache_entry, force_refresh
                 )
                 if not still_missing:
                     _log.info("[CACHE HIT: full] key=%s", cache_key)
                     product_cache_hit = "full"
+                    enrichment_debug["cache_hit"] = "full"
                     updated = row.copy()
                     original = _str_val(updated.get("Source Type", ""))
                     if not original.endswith("_Enriched"):
                         updated["Source Type"] = f"{original}_Enriched" if original else "Enriched"
-                    # Image is not an essential cache field; try recovering it when
-                    # the cache explicitly has null (tried before, but now extraction
-                    # logic is improved / CDN URLs were previously rejected by extension filter).
-                    if not _str_val(updated.get("Image URL")) and "image_url" in cache_entry and cache_entry["image_url"] is None:
+                    # Image is not an essential cache field. If it is missing,
+                    # exploit the known product URL deterministically instead of
+                    # letting a full cache hit block fresh image recovery.
+                    if _needs_image_recovery(updated):
                         product_url = _str_val(updated.get("Product URL"))
                         if product_url:
-                            img = _try_image_from_url(product_url, cache_key)
+                            enrichment_debug["fresh_extraction_forced"] = True
+                            img, image_debug = _unpack_image_result(
+                                _try_image_from_url(
+                                    product_url,
+                                    cache_key,
+                                    session_cache=session_cache,
+                                    row=updated,
+                                    return_debug=True,
+                                )
+                            )
+                            enrichment_debug.update(image_debug)
                             if img:
                                 updated["Image URL"] = img
-                    return _stamp_dimension_debug(updated, {"skipped_reason": "full cache hit"}), None, None
+                                updated.update(image_debug)
+                    return _stamp_dimension_debug(updated, {**enrichment_debug, "skipped_reason": "full cache hit"}), None, None
                 else:
                     product_cache_hit = "partial"
+                    enrichment_debug["cache_hit"] = "partial"
                     fields_searched.extend(still_missing)
                     _log.info("[CACHE HIT: partial] key=%s still_missing=%s", cache_key, still_missing)
             else:
+                enrichment_debug["cache_hit"] = "miss"
                 fields_searched.extend(_ESSENTIAL_CACHE_FIELDS)
                 _log.info("[CACHE MISS] key=%s", cache_key)
+        else:
+            enrichment_debug["cache_hit"] = "unavailable"
+
+        # If cache (or the row itself) gives us a Product URL but dimensions or
+        # image are still missing, force a deterministic page extraction path.
+        # This avoids stale null cache fields becoming permanent blockers.
+        cached_or_existing_product_url = _str_val(row.get("Product URL"))
+        if cached_or_existing_product_url and (
+            _needs_dimension_recovery(row) or _needs_image_recovery(row)
+        ):
+            if product_cache_hit in {"full", "partial"} or (
+                cache_entry is not None and (
+                    enrichment_debug["cache_had_blank_dimensions"]
+                    or enrichment_debug["cache_had_blank_image"]
+                )
+            ):
+                enrichment_debug["fresh_extraction_forced"] = True
+            if _needs_image_recovery(row):
+                img, image_debug = _unpack_image_result(
+                    _try_image_from_url(
+                        cached_or_existing_product_url,
+                        cache_key,
+                        session_cache=session_cache,
+                        row=row,
+                        return_debug=True,
+                    )
+                )
+                enrichment_debug.update(image_debug)
+                if img:
+                    row = {**row, **image_debug, "Image URL": img}
 
         # Fast mode: if manufacturer domain is known, skip general Brave search
         # (dimension lookup will handle targeted search via the known domain)
-        skip_general_search = (mode == "fast")
+        needs_general_fields = any(
+            not _str_val(row.get(f))
+            for f in ("Product Name", "Finish / Color", "Product Category")
+        )
+        skip_general_search = (mode == "fast") or (
+            bool(cached_or_existing_product_url) and not needs_general_fields
+        )
 
         query = _build_search_query(row)
         domain_match = get_domain_for_brand(brand)
@@ -743,19 +954,13 @@ def enrich_row(
                 updated = _apply_enrichment(row, extracted, best.url, best.domain_score)
 
                 # ── Image extraction (opportunistic — no extra Brave call) ─────
-                image_url_candidate = extract_image_url(raw_html)
-                image_url_found: str | None = None
-                if image_url_candidate:
-                    if _check_image_content_type(image_url_candidate):
-                        image_url_found = image_url_candidate
-                        _log.info("[IMAGE FOUND] key=%s url=%s", cache_key, image_url_found[:80])
-                        if not _str_val(updated.get("Image URL")):
-                            updated["Image URL"] = image_url_found
-                    else:
-                        _log.info(
-                            "[IMAGE INVALID — skipped] url=%s failed content-type check",
-                            image_url_candidate[:80],
-                        )
+                image_url_found, image_debug = _extract_image_from_html(raw_html, best.url, updated, cache_key)
+                enrichment_debug.update(image_debug)
+                if image_url_found:
+                    _log.info("[IMAGE FOUND] key=%s url=%s", cache_key, image_url_found[:80])
+                    if not _str_val(updated.get("Image URL")):
+                        updated["Image URL"] = image_url_found
+                        updated.update(image_debug)
                 else:
                     _log.info("[IMAGE MISSING] key=%s", cache_key)
 
@@ -773,7 +978,14 @@ def enrich_row(
                     existing_entry = _product_cache.get(cache_key) or {}
                     if not existing_entry.get("image_url"):
                         if image_url_found:
-                            _product_cache.update(cache_key, {"image_url": image_url_found, "general_confidence": "medium"})
+                            _product_cache.update(cache_key, {
+                                "image_url": image_url_found,
+                                "original_image_url": image_debug.get("original_image_url") or image_url_found,
+                                "image_confidence": image_debug.get("image_confidence") or "medium",
+                                "image_source_url": best.url,
+                                "cloudinary_url": image_debug.get("cloudinary_url") or "",
+                                "general_confidence": "medium",
+                            })
                         else:
                             _product_cache.update(cache_key, {"image_url": None, "image_url__reason": "not found on page"})
 
@@ -821,11 +1033,12 @@ def enrich_row(
             updated["Dimension Confidence"] = dim_result.confidence if dim_result.confidence not in ("", "none", None) else ""
             updated["Dimension Source Type"] = dim_result.source_type if dim_result.source_type not in ("", "none", None) else ""
             updated["Dimension Lookup Status"] = dim_result.status
-            updated = _stamp_dimension_debug(updated, dim_result.debug)
+            updated = _stamp_dimension_debug(updated, {**enrichment_debug, **dim_result.debug})
         else:
             updated = _stamp_dimension_debug(
                 updated,
                 {
+                    **enrichment_debug,
                     "skipped_reason": "dimensions already complete or missing brand/model",
                     "final_dimensions": _str_val(updated.get("Dimensions")),
                 },
@@ -866,6 +1079,7 @@ def enrich_dataframe(
         r = row.to_dict()
         if not _qualifies(r):
             debug = _dimension_debug_defaults(r)
+            debug.update(_skip_debug(r))
             debug["skipped_reason"] = "row does not qualify for enrichment"
             for col, val in debug.items():
                 if col in df.columns:
@@ -936,6 +1150,11 @@ def recover_images_for_dataframe(
     df = df.copy()
     if "Image URL" not in df.columns:
         df["Image URL"] = ""
+    for field in _image_debug_defaults():
+        if field not in df.columns:
+            df[field] = pd.Series([None] * len(df), index=df.index, dtype=object)
+        else:
+            df[field] = df[field].astype(object)
     diagnostics: list[dict] = []
 
     for idx, row in df.iterrows():
@@ -955,9 +1174,18 @@ def recover_images_for_dataframe(
         product_url = _str_val(r.get("Product URL"))
         if product_url:
             _log.info("[RECOVER] row=%s trying product_url=%s", idx, product_url[:80])
-            image_url = _try_image_from_url(product_url, cache_key)
+            image_url, image_debug = _unpack_image_result(
+                _try_image_from_url(
+                    product_url,
+                    cache_key,
+                    row=r,
+                    return_debug=True,
+                )
+            )
             if image_url:
                 source = "product_url"
+        else:
+            image_debug = _image_debug_defaults()
 
         diagnostics.append({
             "row_index": int(idx),
@@ -968,10 +1196,14 @@ def recover_images_for_dataframe(
             "status": "found" if image_url else "not_found",
             "source": source,
             "image_url": image_url or "",
+            **{k: image_debug.get(k, "") for k in _image_debug_defaults()},
         })
 
         if image_url and "Image URL" in df.columns:
             df.at[idx, "Image URL"] = image_url
+            for field, value in image_debug.items():
+                if field in df.columns:
+                    df.at[idx, field] = value
 
         time.sleep(0.3)
 
