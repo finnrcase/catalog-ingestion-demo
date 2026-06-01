@@ -3,9 +3,12 @@ from __future__ import annotations
 import datetime
 import io
 import json
+import logging
 import os
+import re
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +46,7 @@ from src.programa_export import (
     export_programa_zip,
     validate_for_export,
 )
+from src.runtime_storage import consume_storage_warnings
 from src.programa_automation import open_programa_login_window, run_programa_automation
 from src.vendor_call_agent import (
     build_call_script,
@@ -57,6 +61,8 @@ from src.vendor_call_agent import (
     start_custom_retell_test_call,
     start_vendor_call,
 )
+
+_log = logging.getLogger(__name__)
 
 
 class UploadedPDF:
@@ -210,6 +216,80 @@ def _round_timing_values(stage_timings: dict) -> dict:
     return rounded
 
 
+def _log_stage(stage: str, **details: Any) -> None:
+    if details:
+        _log.info("[%s] %s", stage, details)
+    else:
+        _log.info("[%s]", stage)
+
+
+def _text_value(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() in {"nan", "none", "null"} else text
+
+
+def _enrichment_summary(df: pd.DataFrame, elapsed_ms: float) -> dict:
+    rows = df.fillna("").to_dict("records")
+    included = [row for row in rows if str(row.get("Include", True)).lower() not in {"false", "0", "no"}]
+
+    def _confidence_value(row: dict) -> float | None:
+        for key in ("selected_product_url_confidence", "Dimension Confidence", "dimension_confidence", "image_confidence"):
+            value = _text_value(row.get(key)).lower()
+            if value == "high":
+                return 0.95
+            if value == "medium":
+                return 0.72
+            if value == "low":
+                return 0.35
+            if value in {"none", ""}:
+                continue
+            try:
+                number = float(value)
+                return number / 100 if number > 1 else number
+            except ValueError:
+                continue
+        return None
+
+    searches_used = 0
+    fetches_used = 0
+    for row in included:
+        budget_text = _text_value(row.get("budget_spent"))
+        match = re.search(r"searches=(\d+)/\d+;\s*fetches=(\d+)/\d+", budget_text)
+        if match:
+            searches_used += int(match.group(1))
+            fetches_used += int(match.group(2))
+
+    brave_cost = float(os.getenv("BRAVE_SEARCH_COST_USD", "0.006") or "0.006")
+    confidences = [value for row in included if (value := _confidence_value(row)) is not None]
+    rows_enriched = sum(
+        1
+        for row in included
+        if _text_value(row.get("fields_filled"))
+        or _text_value(row.get("selected_product_url"))
+        or _text_value(row.get("Product URL"))
+        or _text_value(row.get("Dimensions"))
+        or _text_value(row.get("Image URL"))
+    )
+    missing_dimensions = sum(1 for row in included if not _text_value(row.get("Dimensions")))
+    missing_images = sum(1 for row in included if not _text_value(row.get("Image URL")))
+
+    estimated_cost = searches_used * brave_cost
+    return {
+        "enrichment_ms": elapsed_ms,
+        "rows_considered": len(included),
+        "rows_enriched": rows_enriched,
+        "rows_missing_dimensions": missing_dimensions,
+        "rows_missing_images": missing_images,
+        "average_confidence": round(sum(confidences) / len(confidences), 3) if confidences else 0,
+        "brave_searches_used": searches_used,
+        "page_fetches_used": fetches_used,
+        "estimated_bravi_api_cost": round(estimated_cost, 4),
+        "estimated_cost_usd": round(estimated_cost, 4),
+    }
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -250,6 +330,7 @@ async def generate_intake(
     files: list[UploadFile] = File(default=[]),
 ) -> IntakeResponse:
     total_start = time.perf_counter()
+    _log_stage("PARSE_STARTED", files=len(files), urls=bool(urls.strip()), use_ai_pdf=use_ai_pdf)
     stage_timings = {
         "file_upload_ms": 0.0,
         "pdf_text_extraction_ms": 0.0,
@@ -349,6 +430,10 @@ async def generate_intake(
     df = apply_confidence_checks(df)
     stage_timings["normalization_ms"] += _elapsed_ms(normalize_start)
     stage_timings["total_request_ms"] = _elapsed_ms(total_start)
+    storage_warnings = consume_storage_warnings()
+    if storage_warnings:
+        stage_timings["storage_warnings"] = storage_warnings
+    _log_stage("PARSE_COMPLETE", rows=len(df), errors=len(errors), elapsed_ms=stage_timings["total_request_ms"])
     return _df_response(df, errors, stage_timings=_round_timing_values(stage_timings))
 
 
@@ -387,23 +472,84 @@ def validate_intake(payload: RowsPayload) -> IntakeResponse:
 @app.post("/intake/enrich", response_model=IntakeResponse)
 def enrich_intake(payload: RowsPayload) -> IntakeResponse:
     start = time.perf_counter()
-    df, errors, dimension_diagnostics = enrich_dataframe(
-        pd.DataFrame(payload.rows),
-        enrichment_mode=payload.enrichment_mode,
+    _log_stage(
+        "ENRICHMENT_STARTED",
+        rows=len(payload.rows),
+        mode=payload.enrichment_mode,
         force_refresh=payload.force_refresh,
         use_web_enrichment=payload.use_web_enrichment,
     )
-    df = apply_confidence_checks(df)
-    return _df_response(
-        df,
-        errors,
-        dimension_diagnostics,
-        stage_timings={
-            "enrichment_ms": _elapsed_ms(start),
-            "image_recovery_ms": 0.0,
-            "cloudinary_ms": 0.0,
-        },
-    )
+    try:
+        df, errors, dimension_diagnostics = enrich_dataframe(
+            pd.DataFrame(payload.rows),
+            enrichment_mode=payload.enrichment_mode,
+            force_refresh=payload.force_refresh,
+            use_web_enrichment=payload.use_web_enrichment,
+        )
+        df = apply_confidence_checks(df)
+        elapsed_ms = _elapsed_ms(start)
+        summary = _enrichment_summary(df, elapsed_ms)
+        storage_warnings = consume_storage_warnings()
+        if storage_warnings:
+            summary["storage_warnings"] = storage_warnings
+        _log_stage("ENRICHMENT_COMPLETE", rows=len(df), errors=len(errors), elapsed_ms=elapsed_ms)
+        return _df_response(
+            df,
+            errors,
+            dimension_diagnostics,
+            stage_timings={
+                **summary,
+                "image_recovery_ms": 0.0,
+                "cloudinary_ms": 0.0,
+                "stage_log": "ENRICHMENT_STARTED; ENRICHMENT_COMPLETE",
+            },
+        )
+    except Exception as exc:
+        tb = traceback.format_exc()
+        message = f"Enrichment failed before completion: {exc}"
+        _log.exception("ENRICHMENT_FAILED_BEFORE_COMPLETION")
+        df = pd.DataFrame(payload.rows).copy()
+        for col in ("enrichment_status", "enrichment_error", "debug_traceback", "stage_log"):
+            if col not in df.columns:
+                df[col] = ""
+        if len(df) == 0:
+            df = pd.DataFrame(
+                [
+                    {
+                        "Product Name": "",
+                        "enrichment_status": "failed",
+                        "enrichment_error": message,
+                        "debug_traceback": tb,
+                        "stage_log": "ENRICHMENT_STARTED; ENRICHMENT_COMPLETE",
+                    }
+                ]
+            )
+        else:
+            df["enrichment_status"] = "failed"
+            df["enrichment_error"] = message
+            df["debug_traceback"] = tb
+            df["stage_log"] = "ENRICHMENT_STARTED; ENRICHMENT_COMPLETE"
+        elapsed_ms = _elapsed_ms(start)
+        storage_warnings = consume_storage_warnings()
+        diagnostics = [
+            {
+                "stage": "ENRICHMENT_FAILED",
+                "failure_reason": message,
+                "traceback": tb,
+                "storage_warnings": storage_warnings,
+            }
+        ]
+        return _df_response(
+            df,
+            [message],
+            diagnostics,
+            stage_timings={
+                "enrichment_ms": elapsed_ms,
+                "total_request_ms": elapsed_ms,
+                "stage_log": "ENRICHMENT_STARTED; ENRICHMENT_COMPLETE",
+                "storage_warnings": storage_warnings,
+            },
+        )
 
 
 @app.post("/intake/recover-images", response_model=IntakeResponse)
@@ -415,8 +561,10 @@ def recover_images(payload: RowsPayload) -> IntakeResponse:
     dimension_diagnostics field for now — the contract may be extended later.
     """
     start = time.perf_counter()
+    _log_stage("SEARCHING_IMAGES", rows=len(payload.rows))
     df, diagnostics = recover_images_for_dataframe(pd.DataFrame(payload.rows))
     df = apply_confidence_checks(df)
+    _log_stage("ENRICHMENT_COMPLETE", rows=len(df), image_recovery_ms=_elapsed_ms(start))
     return _df_response(
         df,
         dimension_diagnostics=diagnostics,
@@ -651,12 +799,14 @@ def export_csv(payload: RowsPayload) -> Response:
     df = pd.DataFrame(payload.rows)
     today = datetime.date.today().isoformat()
     content = get_csv_bytes(df)
+    elapsed = _elapsed_ms(start)
+    _log_stage("EXPORT_COMPLETE", format="internal_csv", rows=len(df), elapsed_ms=elapsed)
     return Response(
         content=content,
         media_type="text/csv",
         headers={
             "Content-Disposition": f'attachment; filename="internal_intake_not_for_programa_{today}.csv"',
-            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": _elapsed_ms(start)}),
+            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": elapsed}),
         },
     )
 
@@ -672,12 +822,14 @@ def export_programa_import_csv(payload: RowsPayload) -> Response:
     df = build_programa_import_dataframe(payload.rows)
     today = datetime.date.today().isoformat()
     content = export_programa_csv(df)
+    elapsed = _elapsed_ms(start)
+    _log_stage("EXPORT_COMPLETE", format="programa_csv", rows=len(df), elapsed_ms=elapsed)
     return Response(
         content=content,
         media_type="text/csv",
         headers={
             "Content-Disposition": f'attachment; filename="programa_import_{today}.csv"',
-            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": _elapsed_ms(start)}),
+            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": elapsed}),
         },
     )
 
@@ -688,12 +840,14 @@ def export_programa_import_xlsx(payload: RowsPayload) -> Response:
     df = build_programa_import_dataframe(payload.rows)
     today = datetime.date.today().isoformat()
     content = export_programa_xlsx(df)
+    elapsed = _elapsed_ms(start)
+    _log_stage("EXPORT_COMPLETE", format="programa_xlsx", rows=len(df), elapsed_ms=elapsed)
     return Response(
         content=content,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
             "Content-Disposition": f'attachment; filename="programa_import_{today}.xlsx"',
-            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": _elapsed_ms(start)}),
+            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": elapsed}),
         },
     )
 
@@ -704,12 +858,14 @@ def export_programa_import_zip(payload: RowsPayload) -> Response:
     start = time.perf_counter()
     today = datetime.date.today().isoformat()
     zip_bytes = export_programa_zip(payload.rows)
+    elapsed = _elapsed_ms(start)
+    _log_stage("EXPORT_COMPLETE", format="programa_zip", rows=len(payload.rows), elapsed_ms=elapsed)
     return Response(
         content=zip_bytes,
         media_type="application/zip",
         headers={
             "Content-Disposition": f'attachment; filename="programa_export_{today}.zip"',
-            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": _elapsed_ms(start)}),
+            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": elapsed}),
         },
     )
 
@@ -719,11 +875,13 @@ def export_programa_import_debug_csv(payload: RowsPayload) -> Response:
     start = time.perf_counter()
     df = build_programa_debug_dataframe(payload.rows)
     content = export_programa_csv(df)
+    elapsed = _elapsed_ms(start)
+    _log_stage("EXPORT_COMPLETE", format="programa_debug_csv", rows=len(df), elapsed_ms=elapsed)
     return Response(
         content=content,
         media_type="text/csv",
         headers={
             "Content-Disposition": 'attachment; filename="programa-import-debug.csv"',
-            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": _elapsed_ms(start)}),
+            "X-SCH-Stage-Timings": json.dumps({"export_generation_ms": elapsed}),
         },
     )

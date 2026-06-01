@@ -78,7 +78,7 @@ Copy `.env.example` to `.env` for local Python/Streamlit/backend development.
 
 ```env
 PROGRAMA_URL=https://app.programa.design/
-PROGRAMA_BROWSER_PROFILE=data/browser_profiles/programa_assistant
+PROGRAMA_BROWSER_PROFILE=/tmp/sch-data/browser_profiles/programa_assistant
 ANTHROPIC_API_KEY=your_anthropic_api_key_here
 BRAVE_API_KEY=your_brave_api_key_here
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8000

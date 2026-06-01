@@ -3,11 +3,13 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.document_parser import (
+    _extract_red_room_annotations,
     _is_skip_line,
     _extract_model_sku,
     _extract_quantity,
     _extract_price,
     _row_from_line,
+    _parse_table_rows,
 )
 
 
@@ -109,3 +111,83 @@ def test_row_from_line_extracts_brand_model_dimensions_and_finish():
     assert row["Finish / Color"] == "Stainless Steel"
     assert row["Supplier"] == "PC Richard"
     assert row["Product Category"] == "Appliances"
+
+
+def test_red_room_annotation_moves_to_room_not_description():
+    row = _row_from_line(
+        "Miele G7986SCVIK20 Fully Integrated Dishwasher Kitchen PNL",
+        "1 Lily Pond",
+        "",
+        "PC Richard",
+        "",
+        room_annotations=["Kitchen"],
+    )
+
+    assert row is not None
+    assert row["Brand"] == "Miele"
+    assert row["Model/SKU"] == "G7986SCVIK20"
+    assert row["Room"] == "Kitchen"
+    assert "Kitchen" not in row["Product Name"]
+
+
+def test_red_room_span_detection():
+    class FakePage:
+        def get_text(self, mode):
+            assert mode == "dict"
+            return {
+                "blocks": [
+                    {
+                        "lines": [
+                            {
+                                "spans": [
+                                    {"text": "Kitchen", "color": 0xD00000},
+                                    {"text": "Not A Room", "color": 0x000000},
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+
+    assert _extract_red_room_annotations(FakePage()) == ["Kitchen"]
+
+
+def test_pc_richard_room_annotations_preserve_late_quote_models():
+    class FakeTable:
+        def extract(self):
+            return [
+                ["Item", "Manufacturer", "Model", "Description", "Color", "Qty"],
+                ["26", "Miele", "G7986SCVIK20", "Fully Integrated Dishwasher Kitchen", "PNL", "1"],
+                ["27", "Wolf", "WWD30", "Warming Drawer Kitchen", "SS", "1"],
+                ["28", "Bosch", "SPV68C73UC", "Dishwasher Mudroom", "Panel Ready", "1"],
+                ["29", "Wolf", "PL522212", "Liner Exterior", "Stainless", "1"],
+                ["30", "Wolf", "829155", "Outdoor Grill Accessory Bar", "Stainless", "1"],
+            ]
+
+    class FakePage:
+        def find_tables(self):
+            return [FakeTable()]
+
+    rows = _parse_table_rows(
+        FakePage(),
+        project="1 Lily Pond",
+        room="",
+        supplier="PC Richard",
+        notes="",
+        category="Appliances",
+        room_annotations=["Kitchen", "Mudroom", "Exterior", "Bar"],
+    )
+
+    by_model = {row["Model/SKU"]: row for row in rows}
+    assert set(by_model) == {"G7986SCVIK20", "WWD30", "SPV68C73UC", "PL522212", "829155"}
+    assert by_model["G7986SCVIK20"]["Brand"] == "Miele"
+    assert by_model["WWD30"]["Brand"] == "Wolf"
+    assert by_model["SPV68C73UC"]["Brand"] == "Bosch"
+    assert by_model["PL522212"]["Brand"] == "Wolf"
+    assert by_model["829155"]["Brand"] == "Wolf"
+    assert by_model["G7986SCVIK20"]["Room"] == "Kitchen"
+    assert by_model["SPV68C73UC"]["Room"] == "Mudroom"
+    assert by_model["PL522212"]["Room"] == "Exterior"
+    assert by_model["829155"]["Room"] == "Bar"
+    for row in rows:
+        assert row["Room"] not in row["Product Name"]

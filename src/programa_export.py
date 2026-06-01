@@ -90,6 +90,10 @@ _DEBUG_EXTRA_COLUMNS: list[str] = [
     "Dimension Confidence",
     "Dimension Source Type",
     "Dimension Lookup Status",
+    "enrichment_status",
+    "enrichment_error",
+    "stage_log",
+    "debug_traceback",
 ]
 
 _MATERIAL_TAG_RE = re.compile(r"\[Materials:\s*([^\]]+)\]", re.IGNORECASE)

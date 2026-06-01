@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-DATA_DIR = Path("data")
+from src.runtime_storage import runtime_data_path, write_json_best_effort
+
+_log = logging.getLogger(__name__)
+
+DATA_DIR = runtime_data_path()
 CACHE_PATH = DATA_DIR / "manufacturer_domain_cache.json"
 
 HARDCODED_DOMAINS: dict[str, str] = {
@@ -55,13 +60,18 @@ def load_domain_cache(path: Path | None = None) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
+        _log.warning("Could not read manufacturer domain cache at %s", path, exc_info=True)
         return {}
 
 
 def save_domain_cache(cache: dict, path: Path | None = None) -> None:
     path = _cache_path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_json_best_effort(
+        path,
+        cache,
+        description="manufacturer domain cache",
+        sort_keys=True,
+    )
 
 
 def save_manufacturer_override(brand: str, website: str, path: Path | None = None) -> dict:

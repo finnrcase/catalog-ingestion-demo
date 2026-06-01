@@ -14,6 +14,8 @@ from typing import Any
 import requests
 from dotenv import load_dotenv
 
+from src.runtime_storage import runtime_data_path, write_json_best_effort
+
 load_dotenv()
 
 _logger = logging.getLogger("sch_intake.vendor_call")
@@ -30,7 +32,7 @@ FIELD_PROMPTS = {
 }
 
 FUTURE_CALL_PROVIDERS = ["Retell", "Vapi", "Bland", "Twilio/OpenAI Realtime"]
-CALL_RECORD_DIR = Path("data/vendor_calls")
+CALL_RECORD_DIR = runtime_data_path("vendor_calls")
 BLAND_CALL_URL = "https://us.api.bland.ai/v1/calls"
 BLAND_CALL_DETAIL_URL = "https://us.api.bland.ai/v1/calls/{call_id}"
 BLAND_ACCOUNT_URL = "https://us.api.bland.ai/v1/me"
@@ -429,13 +431,14 @@ def build_minimal_call_task(row: dict[str, Any], missing_fields: list[str], cust
 
 
 def _write_call_record(record: dict[str, Any]) -> str:
-    CALL_RECORD_DIR.mkdir(parents=True, exist_ok=True)
     safe_record = make_json_safe(record)
     timestamp = str(safe_record.get("timestamp") or datetime.now(timezone.utc).isoformat()).replace(":", "").replace("-", "")
     product = re.sub(r"[^a-zA-Z0-9]+", "_", str(record.get("product_name") or "product")).strip("_")[:40]
     path = CALL_RECORD_DIR / f"{timestamp}_{product or 'product'}.json"
-    path.write_text(json.dumps(safe_record, indent=2), encoding="utf-8")
-    return str(path)
+    if write_json_best_effort(path, safe_record, description="vendor call record"):
+        return str(path)
+    _logger.warning("Vendor call record was not persisted: %s", path)
+    return ""
 
 
 def _read_response_body(response) -> tuple[str, dict[str, Any] | str]:

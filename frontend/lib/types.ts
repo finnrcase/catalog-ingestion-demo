@@ -25,6 +25,7 @@ export type IntakeResponse = {
   errors: string[];
   eligible_count: number;
   blocked_count: number;
+  dimension_diagnostics?: Record<string, unknown>[];
   stage_timings?: Record<string, unknown>;
   estimated_cost?: number | string;
   cost_estimate?: number | string;

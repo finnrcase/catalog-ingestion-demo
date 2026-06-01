@@ -7,6 +7,7 @@ from src.manufacturer_domains import (
     get_domain_for_brand,
     normalize_brand,
     record_discovered_domain,
+    save_domain_cache,
     save_manufacturer_override,
 )
 
@@ -50,3 +51,12 @@ def test_discovered_domain_does_not_replace_user_override(tmp_path):
     record_discovered_domain("Scotsman", "example-discovered.com", path=path)
 
     assert get_domain_for_brand("Scotsman", path=path) == ("scotsman-ice.com", "user")
+
+
+def test_save_domain_cache_storage_failure_is_best_effort(monkeypatch, tmp_path):
+    def fail_mkdir(self, *args, **kwargs):
+        raise OSError(30, "Read-only file system", str(self))
+
+    monkeypatch.setattr("pathlib.Path.mkdir", fail_mkdir)
+
+    save_domain_cache({"wolf": {"domain": "subzero-wolf.com"}}, path=tmp_path / "data" / "cache.json")

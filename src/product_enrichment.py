@@ -13,9 +13,11 @@ enrich_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[dict]]
 
 import json
 import io
+import logging
 import os
 import re
 import time
+import traceback
 import urllib.parse
 from datetime import datetime, timezone
 
@@ -64,6 +66,7 @@ from src.enrichment_cache import (
 
 # Module-level singleton — lazy-loads on first access
 _product_cache = _ProductEnrichmentCache()
+_log = logging.getLogger(__name__)
 
 # Cache field mappings: cache field name → row column name
 _CACHE_GENERAL_FIELDS: dict[str, str] = {
@@ -122,6 +125,10 @@ _ENRICHMENT_DEBUG_FIELDS: list[str] = [
     "final_dimension_writeback_success",
     "skipped_reason",
     "budget_blocked",
+    "enrichment_status",
+    "enrichment_error",
+    "stage_log",
+    "debug_traceback",
     "original_image_url",
     "cloudinary_url",
     "image_confidence",
@@ -132,6 +139,7 @@ _ENRICHMENT_DEBUG_FIELDS: list[str] = [
     "programa_image_ready",
     "sku_used_for_lookup",
     "manufacturer_domain_used",
+    "search_provider",
     "search_query_used",
     "product_url_candidates",
     "selected_product_url",
@@ -204,6 +212,20 @@ def _needs_image_recovery(row: dict) -> bool:
     return not _has_good_image(row)
 
 
+def _append_stage(debug: dict, stage: str) -> None:
+    if not stage:
+        return
+    existing = [
+        part.strip()
+        for part in _str_val(debug.get("stage_log")).split(";")
+        if part.strip()
+    ]
+    if stage not in existing:
+        existing.append(stage)
+        debug["stage_log"] = "; ".join(existing)
+    _log.info("[%s]", stage)
+
+
 def _missing_enrichment_fields(row: dict) -> list[str]:
     missing: list[str] = []
     for field in _ENRICHABLE_FIELDS:
@@ -220,8 +242,6 @@ def _missing_enrichment_fields(row: dict) -> list[str]:
 def _qualifies(row: dict) -> bool:
     """True if this row should be sent through enrichment."""
     source = _str_val(row.get("Source Type", ""))
-    if source == "URL":
-        return False
     if not _str_val(row.get("Brand")):
         return False
     if not _str_val(row.get("Model/SKU")):
@@ -238,7 +258,7 @@ def _skip_debug(row: dict) -> dict:
     source = _str_val(row.get("Source Type", ""))
     brand_missing = not _str_val(row.get("Brand"))
     model_missing = not _str_val(row.get("Model/SKU"))
-    source_blocked = source == "URL"
+    source_blocked = False
     if source.endswith("_Enriched") and not (_needs_dimension_recovery(row) or _needs_image_recovery(row)):
         source_blocked = True
     return {
@@ -276,16 +296,26 @@ def _build_sku_lookup_queries(row: dict, manufacturer_domain: str = "") -> list[
     model = _str_val(row.get("Model/SKU"))
     product_name = _str_val(row.get("Product Name"))
     queries: list[str] = []
-    if manufacturer_domain and model:
-        queries.append(f'site:{manufacturer_domain} "{model}"')
     if brand and model:
         queries.extend([
+            f'"{brand}" "{model}" dimensions image product page',
             f'"{brand}" "{model}" product',
-            f'"{brand}" "{model}" dimensions',
-            f'"{brand}" "{model}" spec sheet',
+        ])
+    if manufacturer_domain and model:
+        queries.extend([
+            f'site:{manufacturer_domain} "{model}" dimensions image product page',
+            f'site:{manufacturer_domain} "{model}" specifications',
+            f'site:{manufacturer_domain} "{model}" spec sheet PDF',
+            f'site:{manufacturer_domain} "{model}" product',
+        ])
+    if brand and model:
+        queries.extend([
+            f'"{brand}" "{model}" specifications',
+            f'"{brand}" "{model}" spec sheet PDF',
         ])
     if brand and model and product_name:
         queries.append(f'"{brand}" "{model}" "{product_name}"')
+        queries.append(f'"{brand}" "{product_name}"')
     # Dedupe while preserving order.
     seen: set[str] = set()
     deduped: list[str] = []
@@ -848,6 +878,7 @@ def _extract_image_from_html(
     cache_key: str = "",
 ) -> tuple[str | None, dict]:
     debug = _image_debug_defaults()
+    _append_stage(debug, "SEARCHING_IMAGES")
     debug["image_source_url"] = product_url
     candidates = extract_product_image_candidates(raw_html, product_url, row)
     debug["image_candidate_diagnostics"] = _candidate_debug_json(candidates)
@@ -1129,8 +1160,13 @@ def _dimension_debug_defaults(row: dict) -> dict:
         "final_dimension_writeback_success": False,
         "skipped_reason": "",
         "budget_blocked": False,
+        "enrichment_status": "",
+        "enrichment_error": "",
+        "stage_log": "",
+        "debug_traceback": "",
         "sku_used_for_lookup": _str_val(row.get("Model/SKU")),
         "manufacturer_domain_used": "",
+        "search_provider": "",
         "search_query_used": "",
         "product_url_candidates": "",
         "selected_product_url": "",
@@ -1156,6 +1192,60 @@ def _stamp_dimension_debug(row: dict, debug: dict) -> dict:
     return updated
 
 
+def _merge_preserved_debug(row: dict, debug: dict) -> dict:
+    merged = dict(debug or {})
+    for field in _ENRICHMENT_DEBUG_FIELDS:
+        if not _str_val(merged.get(field)) and _str_val(row.get(field)):
+            merged[field] = row.get(field)
+    return merged
+
+
+def _mark_enrichment_failed(row: dict, debug: dict, reason: str) -> dict:
+    """Mark an attempted enrichment as an explicit reviewable failure."""
+    updated = row.copy()
+    reason = _str_val(reason) or "no verified product match"
+    _append_stage(debug, "ENRICHMENT_COMPLETE")
+    existing_notes = _str_val(updated.get("Notes"))
+    failure_tag = f"[ENRICHMENT_FAILED: {reason}]"
+    legacy_tag = "[Enrichment: no confident source found]"
+    notes_to_add = [failure_tag]
+    if "no confident source" in reason.lower():
+        notes_to_add.append(legacy_tag)
+    for note in notes_to_add:
+        if note not in existing_notes:
+            existing_notes = f"{existing_notes} {note}".strip() if existing_notes else note
+    updated["Notes"] = existing_notes
+    updated["Review Required"] = True
+    updated["Suggested Action"] = f"ENRICHMENT_FAILED: {reason}"
+    if not _str_val(updated.get("Status")):
+        updated["Status"] = "Needs Review"
+    return _stamp_dimension_debug(
+        updated,
+        {
+            **(debug or {}),
+            "skipped_reason": reason,
+            "enrichment_status": "failed",
+            "enrichment_error": reason,
+        },
+    )
+
+
+def _log_enrichment_outcome(row: dict) -> None:
+    """Structured per-row enrichment log for debugging production quote runs."""
+    import logging as _logging
+
+    _logging.getLogger(__name__).info(
+        "[ENRICHMENT ROW] manufacturer=%s model=%s query=%s matched_url=%s image_extracted=%s dimensions_extracted=%s failure_reason=%s",
+        _str_val(row.get("Brand")),
+        _str_val(row.get("Model/SKU")),
+        _str_val(row.get("search_query_used")),
+        _str_val(row.get("selected_product_url")) or _str_val(row.get("Product URL")),
+        bool(_str_val(row.get("Image URL")) or _str_val(row.get("selected_image_url"))),
+        bool(_str_val(row.get("Dimensions")) or _str_val(row.get("dimensions_extracted"))),
+        _str_val(row.get("skipped_reason")) or _str_val(row.get("Suggested Action")),
+    )
+
+
 def _budget_summary(budget: "_SearchBudget | None") -> str:
     if budget is None:
         return ""
@@ -1171,21 +1261,25 @@ def _search_sku_product_pages(
     debug: dict,
 ) -> list:
     brand = _str_val(row.get("Brand"))
+    model = _str_val(row.get("Model/SKU"))
     candidates = []
+    queries_used: list[str] = []
     for query in _build_sku_lookup_queries(row, manufacturer_domain):
         if budget is not None and not budget.can_search():
             debug["budget_blocked"] = True
             debug["skipped_reason"] = "budget blocked SKU product search"
             break
-        debug["search_query_used"] = query
+        queries_used.append(query)
+        debug["search_provider"] = "brave"
+        debug["search_query_used"] = " | ".join(queries_used)
         results = search_product_candidates(query, brand, session_cache=session_cache)
         if budget is not None:
             budget.consume_search()
         candidates.extend(results or [])
-        if candidates:
-            # One targeted query is normally enough; avoid broadening unless the
-            # first query yielded nothing at all.
-            break
+        # Keep walking the SKU-specific fallbacks until the per-row search
+        # budget is exhausted. Verification happens after results are fetched;
+        # stopping at the first search-result page is what caused valid late
+        # quote rows to export with blank URLs/images/dimensions.
     # Dedupe by URL.
     seen: set[str] = set()
     deduped = []
@@ -1194,6 +1288,25 @@ def _search_sku_product_pages(
             continue
         seen.add(result.url)
         deduped.append(result)
+
+    model_norm = _norm_token(model)
+
+    def _candidate_rank(result) -> tuple[int, int, int, int]:
+        url = _str_val(getattr(result, "url", ""))
+        title = _str_val(getattr(result, "title", ""))
+        description = _str_val(getattr(result, "description", ""))
+        domain = _domain_of(url)
+        sku_hit = 1 if model_norm and model_norm in _norm_token(" ".join([url, title, description])) else 0
+        official_hit = 1 if _domain_matches(domain, manufacturer_domain) else 0
+        weak_penalty = -1 if _reject_weak_product_url(url) else 0
+        return (
+            sku_hit,
+            official_hit,
+            int(getattr(result, "domain_score", 0) or 0),
+            weak_penalty,
+        )
+
+    deduped.sort(key=_candidate_rank, reverse=True)
     debug["product_url_candidates"] = json.dumps(
         [{"url": r.url, "title": r.title, "domain_score": r.domain_score} for r in deduped[:5]],
         ensure_ascii=True,
@@ -1217,7 +1330,7 @@ def _verify_candidate_url(
         return "", {
             "confidence": "none",
             "score": 0,
-            "rejection_reason": debug.get("skipped_reason") or "page fetch failed",
+            "rejection_reason": debug.get("skipped_reason") or "could not fetch product page",
             "sku_match_location": "",
         }
     title, description = _page_title_and_description(html)
@@ -1299,19 +1412,21 @@ def _try_verified_page_enrichment(
     if product_url:
         candidates_to_check.append((product_url, "", ""))
     if not product_url or _reject_weak_product_url(product_url):
+        candidate_limit = max(5, getattr(budget, "max_urls", 5) if budget is not None else 5)
         for result in _search_sku_product_pages(
             row,
             manufacturer_domain,
             session_cache=session_cache,
             budget=budget,
             debug=debug,
-        )[:5]:
+        )[:candidate_limit]:
             candidates_to_check.append((result.url, result.title, result.description))
 
     selected_url = ""
     selected_html = ""
     selected_evidence: dict = {}
     candidate_debug: list[dict] = []
+    best_rank: tuple[int, int, int] | None = None
     for url, title_hint, description_hint in candidates_to_check:
         html, evidence = _verify_candidate_url(
             row,
@@ -1325,10 +1440,17 @@ def _try_verified_page_enrichment(
         )
         candidate_debug.append({"url": url, **evidence})
         if evidence.get("confidence") in {"high", "medium"}:
-            selected_url = url
-            selected_html = html
-            selected_evidence = evidence
-            break
+            confidence_rank = 2 if evidence.get("confidence") == "high" else 1
+            official_rank = 1 if evidence.get("official_domain") else 0
+            evidence_rank = int(evidence.get("score") or 0)
+            rank = (confidence_rank, official_rank, evidence_rank)
+            if best_rank is None or rank > best_rank:
+                best_rank = rank
+                selected_url = url
+                selected_html = html
+                selected_evidence = evidence
+            if evidence.get("confidence") == "high" and evidence.get("official_domain"):
+                break
         if budget is not None and not budget.can_fetch():
             debug["budget_blocked"] = True
             break
@@ -1338,6 +1460,8 @@ def _try_verified_page_enrichment(
     if not selected_url:
         debug["selected_product_url_confidence"] = "none"
         debug["sku_match_location"] = candidate_debug[0].get("sku_match_location", "") if candidate_debug else ""
+        if candidate_debug and not debug.get("skipped_reason"):
+            debug["skipped_reason"] = candidate_debug[0].get("rejection_reason", "")
         debug["budget_spent"] = _budget_summary(budget)
         return updated, None, debug
 
@@ -1371,6 +1495,7 @@ def _try_verified_page_enrichment(
 
     dim_result: _DimensionResult | None = None
     if _needs_dimension_recovery(updated):
+        _append_stage(debug, "SEARCHING_DIMENSIONS")
         dim_result = _find_dimensions(updated, session_cache=session_cache, budget=budget)
         debug.update(dim_result.debug or {})
         if dim_result.status == "found" and dim_result.confidence in {"high", "medium"}:
@@ -1434,6 +1559,7 @@ def enrich_row(
         cache_key = _normalize_key(brand, model_sku) if brand and model_sku else ""
         force_refresh = session_cache.force_refresh if session_cache else False
         enrichment_debug = _dimension_debug_defaults(row)
+        _append_stage(enrichment_debug, "ENRICHMENT_STARTED")
 
         # ── Cache check ────────────────────────────────────────────────────────
         cache_fields_filled: list[str] = []
@@ -1504,8 +1630,26 @@ def enrich_row(
                                     verified_dim_result.source_type if verified_dim_result.source_type not in ("", "none", None) else ""
                                 )
                                 verified_updated["Dimension Lookup Status"] = verified_dim_result.status
-                            return _stamp_dimension_debug(verified_updated, {**enrichment_debug, "skipped_reason": "full cache hit with product page refresh"}), None, verified_dim_result
-                    return _stamp_dimension_debug(updated, {**enrichment_debug, "skipped_reason": "full cache hit"}), None, None
+                            _append_stage(enrichment_debug, "ENRICHMENT_COMPLETE")
+                            return _stamp_dimension_debug(
+                                verified_updated,
+                                {
+                                    **enrichment_debug,
+                                    "skipped_reason": "full cache hit with product page refresh",
+                                    "enrichment_status": "complete",
+                                    "enrichment_error": "",
+                                },
+                            ), None, verified_dim_result
+                    _append_stage(enrichment_debug, "ENRICHMENT_COMPLETE")
+                    return _stamp_dimension_debug(
+                        updated,
+                        {
+                            **enrichment_debug,
+                            "skipped_reason": "full cache hit",
+                            "enrichment_status": "complete",
+                            "enrichment_error": "",
+                        },
+                    ), None, None
                 else:
                     product_cache_hit = "partial"
                     enrichment_debug["cache_hit"] = "partial"
@@ -1555,7 +1699,11 @@ def enrich_row(
                     verified_dim_result.source_type if verified_dim_result.source_type not in ("", "none", None) else ""
                 )
                 verified_updated["Dimension Lookup Status"] = verified_dim_result.status
-            return _stamp_dimension_debug(verified_updated, enrichment_debug), None, verified_dim_result
+            _append_stage(enrichment_debug, "ENRICHMENT_COMPLETE")
+            return _stamp_dimension_debug(
+                verified_updated,
+                {**enrichment_debug, "enrichment_status": "complete", "enrichment_error": ""},
+            ), None, verified_dim_result
 
         # Legacy fallback: If cache (or the row itself) gives us a Product URL but
         # the verified-page pass could not accept it, still try the older
@@ -1605,11 +1753,12 @@ def enrich_row(
             _log.info("[BUDGET EXHAUSTED] skipping general search for key=%s", cache_key)
 
         if not results or results[0].domain_score < MIN_USE_SCORE:
-            updated = row.copy()
-            existing = _str_val(updated.get("Notes"))
-            note = "[Enrichment: no confident source found]"
-            if note not in existing:
-                updated["Notes"] = f"{existing} {note}".strip() if existing else note
+            failure_reason = _str_val(enrichment_debug.get("skipped_reason")) or "no confident source found"
+            updated = _mark_enrichment_failed(
+                row,
+                enrichment_debug,
+                failure_reason,
+            )
         else:
             best = results[0]
             parsed_domain = urllib.parse.urlparse(best.url).netloc
@@ -1621,12 +1770,12 @@ def enrich_row(
             page_text = _html_to_text(raw_html)
 
             if not raw_html:
-                updated = row.copy()
-                existing = _str_val(updated.get("Notes"))
                 domain = urllib.parse.urlparse(best.url).netloc or best.url[:50]
-                note = f"[Enrichment: could not fetch {domain}]"
-                if note not in existing:
-                    updated["Notes"] = f"{existing} {note}".strip() if existing else note
+                updated = _mark_enrichment_failed(
+                    row,
+                    enrichment_debug,
+                    f"could not fetch {domain}",
+                )
             else:
                 extracted = _extract_with_claude(page_text, row)
                 updated = _apply_enrichment(row, extracted, best.url, best.domain_score)
@@ -1673,6 +1822,7 @@ def enrich_row(
         dims_val = _str_val(updated.get("Dimensions"))
         dim_result: _DimensionResult | None = None
         if brand_val and model_val and not has_complete_3d_dimensions(dims_val):
+            _append_stage(enrichment_debug, "SEARCHING_DIMENSIONS")
             dim_result = _find_dimensions(updated, session_cache=session_cache, budget=budget)
             if dim_result.status == "found" and dim_result.confidence in ("high", "medium"):
                 updated["Dimensions"] = dim_result.dimensions
@@ -1722,9 +1872,27 @@ def enrich_row(
                 },
             )
 
-        return updated, None, dim_result
+        _append_stage(enrichment_debug, "ENRICHMENT_COMPLETE")
+        return _stamp_dimension_debug(
+            updated,
+            _merge_preserved_debug(
+                updated,
+                {**enrichment_debug, "enrichment_status": "complete", "enrichment_error": ""},
+            ),
+        ), None, dim_result
     except Exception as exc:
-        return _stamp_dimension_debug(row, {"skipped_reason": str(exc)}), str(exc), None
+        tb = traceback.format_exc()
+        _log.exception("Enrichment failed for row brand=%s model=%s", _str_val(row.get("Brand")), _str_val(row.get("Model/SKU")))
+        return _stamp_dimension_debug(
+            row,
+            {
+                "skipped_reason": str(exc),
+                "enrichment_status": "failed",
+                "enrichment_error": str(exc),
+                "debug_traceback": tb,
+                "stage_log": "ENRICHMENT_STARTED; ENRICHMENT_COMPLETE",
+            },
+        ), str(exc), None
 
 
 def enrich_dataframe(
@@ -1757,8 +1925,12 @@ def enrich_dataframe(
         r = row.to_dict()
         if not _qualifies(r):
             debug = _dimension_debug_defaults(r)
+            _append_stage(debug, "ENRICHMENT_STARTED")
             debug.update(_skip_debug(r))
             debug["skipped_reason"] = "row does not qualify for enrichment"
+            debug["enrichment_status"] = "skipped"
+            debug["enrichment_error"] = debug["skipped_reason"]
+            _append_stage(debug, "ENRICHMENT_COMPLETE")
             for col, val in debug.items():
                 if col in df.columns:
                     df.at[idx, col] = val
@@ -1772,13 +1944,21 @@ def enrich_dataframe(
             )
             if error:
                 errors.append(error)
-            else:
-                # Only write back columns that already exist in the DataFrame.
-                # The intake schema guarantees all expected columns are present;
-                # this guard prevents accidental column creation mid-iteration.
-                for col, val in updated.items():
-                    if col in df.columns:
-                        df.at[idx, col] = val
+                updated["enrichment_status"] = "failed"
+                updated["enrichment_error"] = error
+            elif not _str_val(updated.get("enrichment_status")):
+                updated["enrichment_status"] = "complete"
+                updated["enrichment_error"] = ""
+
+            # Only write back columns that already exist in the DataFrame.
+            # The intake schema guarantees all expected columns are present;
+            # this guard prevents accidental column creation mid-iteration.
+            for col, val in updated.items():
+                if col in df.columns:
+                    df.at[idx, col] = val
+
+            if not error:
+                _log_enrichment_outcome(updated)
 
                 # Collect dimension diagnostics if lookup ran.
                 # Diagnostic is built from DimensionResult directly (not from row dict),
@@ -1801,8 +1981,21 @@ def enrich_dataframe(
                         **{field: dim_result.debug.get(field, "") for field in _ENRICHMENT_DEBUG_FIELDS},
                     })
         except Exception as exc:
+            tb = traceback.format_exc()
             label = _str_val(r.get("Product Name")) or _str_val(r.get("Brand")) or _str_val(r.get("Model/SKU")) or str(idx)
             errors.append(f"Row '{label}': {exc}")
+            failed_debug = _dimension_debug_defaults(r)
+            _append_stage(failed_debug, "ENRICHMENT_STARTED")
+            _append_stage(failed_debug, "ENRICHMENT_COMPLETE")
+            failed_debug.update({
+                "enrichment_status": "failed",
+                "enrichment_error": str(exc),
+                "debug_traceback": tb,
+                "skipped_reason": str(exc),
+            })
+            for col, val in failed_debug.items():
+                if col in df.columns:
+                    df.at[idx, col] = val
 
         time.sleep(0.5)
 

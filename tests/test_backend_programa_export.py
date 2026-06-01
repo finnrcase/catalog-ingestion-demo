@@ -187,6 +187,25 @@ def test_intake_enrich_endpoint_passes_web_enrichment_flag(monkeypatch):
     assert captured["use_web_enrichment"] is False
 
 
+def test_intake_enrich_endpoint_reports_pre_completion_failure(monkeypatch):
+    def fail_enrich_dataframe(*args, **kwargs):
+        raise OSError(30, "Read-only file system", "data")
+
+    monkeypatch.setattr("backend.main.enrich_dataframe", fail_enrich_dataframe)
+
+    response = client.post(
+        "/intake/enrich",
+        json={"rows": [{"Product Name": "Lamp", "Brand": "Wolf", "Model/SKU": "WWD30"}]},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "Enrichment failed before completion" in data["errors"][0]
+    assert data["rows"][0]["enrichment_status"] == "failed"
+    assert "Read-only file system" in data["rows"][0]["enrichment_error"]
+    assert "OSError" in data["rows"][0]["debug_traceback"]
+
+
 def test_programa_export_csv_endpoint_uses_programa_columns():
     response = client.post("/export/programa/csv", json=_rows())
     today = datetime.date.today().isoformat()
@@ -220,3 +239,5 @@ def test_programa_export_debug_csv_endpoint_includes_debug_columns():
     text = response.content.decode("utf-8")
     assert "Confidence Score" in text
     assert "Local Image Path" in text
+    assert "enrichment_status" in text
+    assert "enrichment_error" in text

@@ -127,7 +127,7 @@ _APPLIANCE_CATEGORIES: frozenset[str] = frozenset({
     "Kitchen Appliance", "Built-in Appliances",
 })
 
-# Persistent manufacturer domain cache (lazy-loads from data/manufacturer_domain_cache.json)
+# Best-effort manufacturer domain cache (lazy-loads from runtime storage).
 _mfr_cache = ManufacturerDomainCache()
 
 _SPEC_LABEL_KEYWORDS = frozenset({

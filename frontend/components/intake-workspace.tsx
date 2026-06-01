@@ -13,10 +13,11 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import {
+  ApiRequestError,
   exportProgramaCsv,
   exportProgramaDebugCsv,
   exportProgramaXlsx,
@@ -114,6 +115,169 @@ type BuildInfo = {
 
 type WorkflowStage = "upload" | "parse" | "reviewParsed" | "enrich" | "reviewEnriched" | "export";
 type EnrichmentMode = "fast" | "standard" | "deep";
+type AccentThemeId =
+  | "orange"
+  | "sage"
+  | "blue"
+  | "plum"
+  | "mustard"
+  | "terracotta"
+  | "slateBlue"
+  | "sand"
+  | "forest"
+  | "ocean"
+  | "clay"
+  | "rosewood";
+
+type DebugTrace = {
+  timestamp: string;
+  route: string;
+  action: string;
+  stage: string;
+  endpoint?: string;
+  statusCode?: number;
+  message?: string;
+  itemId?: string;
+  lastSuccessfulStage?: string;
+  fallback?: string;
+};
+
+type AccentTheme = {
+  id: AccentThemeId;
+  label: string;
+  accent: string;
+  hover: string;
+  soft: string;
+  ring: string;
+  foreground: string;
+  text: string;
+};
+
+const DEBUG_MODE_STORAGE_KEY = "sch-intake-debug-mode";
+const ACCENT_THEME_STORAGE_KEY = "sch-intake-accent-theme";
+
+const accentThemes: AccentTheme[] = [
+  {
+    id: "orange",
+    label: "Orange",
+    accent: "#f97316",
+    hover: "#ea580c",
+    soft: "#fff3e8",
+    ring: "#fdba74",
+    foreground: "#ffffff",
+    text: "#c2410c",
+  },
+  {
+    id: "sage",
+    label: "Sage",
+    accent: "#5f7a65",
+    hover: "#4d6653",
+    soft: "#edf3ee",
+    ring: "#a8b9ad",
+    foreground: "#ffffff",
+    text: "#405846",
+  },
+  {
+    id: "blue",
+    label: "Blue",
+    accent: "#3f6f8f",
+    hover: "#315b75",
+    soft: "#edf5f9",
+    ring: "#9ebbd0",
+    foreground: "#ffffff",
+    text: "#294e67",
+  },
+  {
+    id: "plum",
+    label: "Plum",
+    accent: "#7d5266",
+    hover: "#684354",
+    soft: "#f6eef2",
+    ring: "#c9aabb",
+    foreground: "#ffffff",
+    text: "#5a3948",
+  },
+  {
+    id: "mustard",
+    label: "Mustard",
+    accent: "#a87a22",
+    hover: "#8c651b",
+    soft: "#fbf4e3",
+    ring: "#d9bd72",
+    foreground: "#ffffff",
+    text: "#795817",
+  },
+  {
+    id: "terracotta",
+    label: "Terracotta",
+    accent: "#a65f43",
+    hover: "#8c4f38",
+    soft: "#f8eee9",
+    ring: "#d2a08c",
+    foreground: "#ffffff",
+    text: "#794532",
+  },
+  {
+    id: "slateBlue",
+    label: "Slate Blue",
+    accent: "#56657f",
+    hover: "#46536a",
+    soft: "#eef1f5",
+    ring: "#a8b1c0",
+    foreground: "#ffffff",
+    text: "#3c485c",
+  },
+  {
+    id: "sand",
+    label: "Sand",
+    accent: "#967f5c",
+    hover: "#7d6a4c",
+    soft: "#f6f1e9",
+    ring: "#cab892",
+    foreground: "#ffffff",
+    text: "#6d5b41",
+  },
+  {
+    id: "forest",
+    label: "Forest",
+    accent: "#3f604b",
+    hover: "#344f3e",
+    soft: "#edf3ef",
+    ring: "#94ad9d",
+    foreground: "#ffffff",
+    text: "#304838",
+  },
+  {
+    id: "ocean",
+    label: "Ocean",
+    accent: "#2f7780",
+    hover: "#28636a",
+    soft: "#eaf5f6",
+    ring: "#91c0c5",
+    foreground: "#ffffff",
+    text: "#235960",
+  },
+  {
+    id: "clay",
+    label: "Clay",
+    accent: "#9a5a48",
+    hover: "#824c3d",
+    soft: "#f7eeeb",
+    ring: "#c89b8e",
+    foreground: "#ffffff",
+    text: "#704235",
+  },
+  {
+    id: "rosewood",
+    label: "Rosewood",
+    accent: "#854f55",
+    hover: "#704248",
+    soft: "#f7eef0",
+    ring: "#c79da3",
+    foreground: "#ffffff",
+    text: "#623a40",
+  },
+];
 
 const frontendRouteWiring = [
   {
@@ -238,6 +402,82 @@ function getEstimatedCost(response?: { estimated_cost?: unknown; cost_estimate?:
   if (raw === undefined || raw === null || raw === "") return "Not reported";
   if (typeof raw === "number") return `$${raw.toFixed(raw < 1 ? 4 : 2)}`;
   return String(raw);
+}
+
+function stageNumber(response: { stage_timings?: Record<string, unknown> } | undefined, key: string) {
+  const raw = response?.stage_timings?.[key];
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  if (typeof raw === "string") {
+    const parsed = Number.parseFloat(raw);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function getAccentTheme(themeId: string | null | undefined) {
+  return accentThemes.find((theme) => theme.id === themeId) || accentThemes[0];
+}
+
+function hexToRgbTriplet(hex: string) {
+  const normalized = hex.replace("#", "");
+  const value = normalized.length === 3
+    ? normalized.split("").map((char) => char + char).join("")
+    : normalized;
+  const intValue = Number.parseInt(value, 16);
+  if (!Number.isFinite(intValue)) return "249 115 22";
+  return `${(intValue >> 16) & 255} ${(intValue >> 8) & 255} ${intValue & 255}`;
+}
+
+function applyAccentTheme(theme: AccentTheme) {
+  if (typeof document === "undefined") return;
+  const root = document.documentElement;
+  root.style.setProperty("--accent", theme.accent);
+  root.style.setProperty("--accent-rgb", hexToRgbTriplet(theme.accent));
+  root.style.setProperty("--accent-hover", theme.hover);
+  root.style.setProperty("--accent-hover-rgb", hexToRgbTriplet(theme.hover));
+  root.style.setProperty("--accent-soft", theme.soft);
+  root.style.setProperty("--accent-soft-rgb", hexToRgbTriplet(theme.soft));
+  root.style.setProperty("--accent-ring", theme.ring);
+  root.style.setProperty("--accent-ring-rgb", hexToRgbTriplet(theme.ring));
+  root.style.setProperty("--accent-foreground", theme.foreground);
+  root.style.setProperty("--accent-text", theme.text);
+}
+
+function safeEndpointPath(value: string | undefined) {
+  if (!value) return undefined;
+  try {
+    const parsed = new URL(value);
+    return `${parsed.pathname}${parsed.search ? "?..." : ""}`;
+  } catch {
+    return value.replace(/^https?:\/\/[^/]+/i, "") || value;
+  }
+}
+
+function sanitizedErrorMessage(error: unknown) {
+  const raw = error instanceof Error ? error.message : String(error ?? "Unknown error");
+  return raw
+    .replace(/(api[_-]?key|token|secret|password|authorization)=([^&\s]+)/gi, "$1=[redacted]")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer [redacted]")
+    .slice(0, 500);
+}
+
+function sanitizedDebugText(value: unknown, limit = 5000) {
+  return String(value ?? "")
+    .replace(/(api[_-]?key|token|secret|password|authorization)=([^&\s]+)/gi, "$1=[redacted]")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, "Bearer [redacted]")
+    .slice(0, limit);
+}
+
+function debugDetailsFromError(error: unknown) {
+  if (error instanceof ApiRequestError) {
+    const responseText = sanitizedDebugText(error.details.responseText, 5000);
+    return {
+      endpoint: safeEndpointPath(error.details.endpoint),
+      statusCode: error.details.status,
+      message: responseText ? `${sanitizedErrorMessage(error)}\n${responseText}` : sanitizedErrorMessage(error),
+    };
+  }
+  return { message: sanitizedErrorMessage(error) };
 }
 
 function isPhotoOnlyRow(row: IntakeRow) {
@@ -411,6 +651,12 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const [useWebEnrichment, setUseWebEnrichment] = useState(true);
   const [enrichmentMode, setEnrichmentMode] = useState<EnrichmentMode>("standard");
   const [forceRefreshEnrichment, setForceRefreshEnrichment] = useState(false);
+  const [debugMode, setDebugMode] = useState(false);
+  const [accentThemeId, setAccentThemeId] = useState<AccentThemeId>("orange");
+  const [settingsHydrated, setSettingsHydrated] = useState(false);
+  const [debugTraces, setDebugTraces] = useState<DebugTrace[]>([]);
+  const [debugCopyStatus, setDebugCopyStatus] = useState("");
+  const [lastSuccessfulStage, setLastSuccessfulStage] = useState("App loaded");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [workflowStage, setWorkflowStage] = useState<WorkflowStage>("upload");
   const [parsedProductsOpen, setParsedProductsOpen] = useState(false);
@@ -425,6 +671,10 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     filledImages: 0,
     filledDimensions: 0,
     unresolved: 0,
+    rowsEnriched: 0,
+    missingDimensions: 0,
+    missingImages: 0,
+    averageConfidence: "Not reported",
   });
   const [scheduleUrl, setScheduleUrl] = useState("");
   const [programaMessage, setProgramaMessage] = useState("");
@@ -468,24 +718,84 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       .then((health) => {
         setApiStatus("online");
         setApiStatusText(`Connected${health.status ? `: ${health.status}` : ""}`);
+        setLastSuccessfulStage("Backend health check");
+        recordDebugTrace({
+          action: "backend health",
+          stage: "success",
+          endpoint: "/health",
+          message: health.status || "ok",
+        });
       })
       .catch((error) => {
         setApiStatus("offline");
         setApiStatusText(formatApiError(error));
         setMessage(formatApiError(error));
+        recordDebugTrace({
+          action: "backend health",
+          stage: "failed",
+          endpoint: "/health",
+          ...debugDetailsFromError(error),
+        });
       });
     fetchSchema()
       .then((schema) => {
         setCategories(schema.categories);
         setSections(schema.sections?.length ? schema.sections : fallbackSections);
         setPhotoBulkSection(schema.sections?.includes("Decor") ? "Decor" : schema.sections?.[0] || "General");
+        setLastSuccessfulStage("Schema loaded");
+        recordDebugTrace({
+          action: "load schema",
+          stage: "success",
+          endpoint: "/schema",
+          message: `${schema.categories?.length || 0} categories`,
+        });
       })
       .catch(() => {
         setCategories([]);
         setSections(fallbackSections);
         setPhotoBulkSection("Decor");
+        recordDebugTrace({
+          action: "load schema",
+          stage: "fallback",
+          endpoint: "/schema",
+          message: "Using local fallback sections.",
+          fallback: "local fallback sections",
+        });
       });
   }, []);
+
+  useEffect(() => {
+    try {
+      const storedDebugMode = window.localStorage.getItem(DEBUG_MODE_STORAGE_KEY);
+      const storedAccentTheme = window.localStorage.getItem(ACCENT_THEME_STORAGE_KEY);
+      setDebugMode(storedDebugMode === "true");
+      setAccentThemeId(getAccentTheme(storedAccentTheme).id);
+    } catch {
+      setDebugMode(false);
+      setAccentThemeId("orange");
+    }
+    setSettingsHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!settingsHydrated) return;
+    const theme = getAccentTheme(accentThemeId);
+    applyAccentTheme(theme);
+    try {
+      window.localStorage.setItem(ACCENT_THEME_STORAGE_KEY, theme.id);
+    } catch {
+      // Local persistence is best-effort only.
+    }
+  }, [accentThemeId, settingsHydrated]);
+
+  useEffect(() => {
+    if (!settingsHydrated) return;
+    try {
+      window.localStorage.setItem(DEBUG_MODE_STORAGE_KEY, String(debugMode));
+    } catch {
+      // Local persistence is best-effort only.
+    }
+  }, [debugMode, settingsHydrated]);
 
   const bulkImagePreviews = useMemo(
     () =>
@@ -587,6 +897,62 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     setRows((current) => current.map((row, i) => (i === index ? { ...row, [key]: value } : row)));
   }
 
+  function recordDebugTrace(event: Omit<DebugTrace, "timestamp" | "route" | "lastSuccessfulStage">) {
+    const trace: DebugTrace = {
+      ...event,
+      timestamp: new Date().toISOString(),
+      route: typeof window !== "undefined" ? window.location.pathname : "/",
+      endpoint: safeEndpointPath(event.endpoint),
+      message: event.message ? sanitizedDebugText(event.message, 5000) : undefined,
+      lastSuccessfulStage,
+    };
+    setDebugTraces((current) => [...current.slice(-39), trace]);
+  }
+
+  function buildDebugReport() {
+    return {
+      generatedAt: new Date().toISOString(),
+      route: typeof window !== "undefined" ? window.location.pathname : "/",
+      workflowStage,
+      lastSuccessfulStage,
+      api: {
+        status: apiConnectionStatus,
+        baseConfigured: Boolean(API_BASE),
+        resolvedBase: displayApiBase,
+        lastEndpoint: safeEndpointPath(lastEndpoint),
+      },
+      settings: {
+        debugMode,
+        accentTheme: accentThemeId,
+        useAiPdf,
+        useWebEnrichment,
+        enrichmentMode,
+        forceRefreshEnrichment,
+      },
+      counts: {
+        rows: rows.length,
+        includedRows: includedRows.length,
+        missingSku: missingSkuCount,
+        missingDimensions: missingDimensionsCount,
+        missingImages: missingImageCount,
+        exportReady: exportSummary.export_count,
+      },
+      lastMessage: message ? sanitizedErrorMessage(message) : "",
+      errors: errors.slice(0, 8).map(sanitizedErrorMessage),
+      traces: debugTraces,
+    };
+  }
+
+  async function copyDebugReport() {
+    const report = JSON.stringify(buildDebugReport(), null, 2);
+    try {
+      await navigator.clipboard.writeText(report);
+      setDebugCopyStatus("Debug report copied.");
+    } catch {
+      setDebugCopyStatus("Could not copy automatically. Select the debug text manually.");
+    }
+  }
+
   function handleFileSelection(selectedFiles: FileList | null) {
     setUploadError("");
     try {
@@ -597,14 +963,29 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       if (invalidFile) {
         setFiles([]);
         setUploadError("Only PDF files can be uploaded.");
+        recordDebugTrace({
+          action: "pdf upload",
+          stage: "validation failed",
+          message: `Rejected unsupported file type: ${invalidFile.name}`,
+        });
         if (fileInputRef.current) fileInputRef.current.value = "";
         return;
       }
       setFiles(nextFiles);
       setWorkflowStage("upload");
+      recordDebugTrace({
+        action: "pdf upload",
+        stage: "selected",
+        message: `${nextFiles.length} PDF file(s) selected`,
+      });
     } catch {
       setFiles([]);
       setUploadError("Upload failed. Please choose the PDF again.");
+      recordDebugTrace({
+        action: "pdf upload",
+        stage: "failed",
+        message: "File selection failed in browser.",
+      });
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   }
@@ -628,12 +1009,22 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     });
     if (invalidFile) {
       setBulkImageError("Only JPG, PNG, and WebP images can be uploaded.");
+      recordDebugTrace({
+        action: "bulk photo upload",
+        stage: "validation failed",
+        message: `Rejected unsupported image type: ${invalidFile.name}`,
+      });
       return;
     }
     setBulkImages(nextFiles);
     setPhotoBulkResults({});
     setPhotoBulkSummary({ success: 0, failed: 0 });
     setWorkflowStage("upload");
+    recordDebugTrace({
+      action: "bulk photo upload",
+      stage: "selected",
+      message: `${nextFiles.length} image file(s) selected`,
+    });
   }
 
   function clearBulkImages() {
@@ -690,6 +1081,14 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         createdRows.push(row);
         nextResults[key] = { status: "uploaded", url: secureUrl, rowIndex: startIndex + createdRows.length - 1 };
         success += 1;
+        setLastSuccessfulStage("Cloudinary image upload");
+        recordDebugTrace({
+          action: "cloudinary image upload",
+          stage: "success",
+          endpoint: "/api/upload-image",
+          itemId: String(startIndex + createdRows.length - 1),
+          message: `${file.name} uploaded`,
+        });
       } catch (error) {
         const row = createPhotoOnlyRow(file, index, "", "Missing Image");
         createdRows.push(row);
@@ -699,6 +1098,13 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           rowIndex: startIndex + createdRows.length - 1,
         };
         failed += 1;
+        recordDebugTrace({
+          action: "cloudinary image upload",
+          stage: "failed",
+          endpoint: "/api/upload-image",
+          itemId: String(startIndex + createdRows.length - 1),
+          ...debugDetailsFromError(error),
+        });
       }
       setPhotoBulkResults({ ...nextResults });
       setPhotoBulkSummary({ success, failed });
@@ -770,6 +1176,14 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         success: current.success + 1,
         failed: Math.max(0, current.failed - 1),
       }));
+      setLastSuccessfulStage("Cloudinary image retry");
+      recordDebugTrace({
+        action: "cloudinary image retry",
+        stage: "success",
+        endpoint: "/api/upload-image",
+        itemId: String(result.rowIndex),
+        message: `${file.name} uploaded on retry`,
+      });
     } catch (error) {
       setPhotoBulkResults((current) => ({
         ...current,
@@ -779,6 +1193,13 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           rowIndex: result.rowIndex,
         },
       }));
+      recordDebugTrace({
+        action: "cloudinary image retry",
+        stage: "failed",
+        endpoint: "/api/upload-image",
+        itemId: String(result.rowIndex),
+        ...debugDetailsFromError(error),
+      });
     }
   }
 
@@ -802,11 +1223,25 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         ),
       );
       setProductImageUploads((current) => ({ ...current, [rowIndex]: "" }));
+      setLastSuccessfulStage("Product image upload");
+      recordDebugTrace({
+        action: "product image upload",
+        stage: "success",
+        endpoint: "/api/upload-image",
+        itemId: String(rowIndex),
+      });
     } catch (error) {
       setProductImageUploads((current) => ({
         ...current,
         [rowIndex]: error instanceof Error ? error.message : "Upload failed.",
       }));
+      recordDebugTrace({
+        action: "product image upload",
+        stage: "failed",
+        endpoint: "/api/upload-image",
+        itemId: String(rowIndex),
+        ...debugDetailsFromError(error),
+      });
     }
   }
 
@@ -817,6 +1252,12 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     setWorkflowStage("parse");
     setParseStatus("Parsing uploaded files and links...");
     setLastEndpoint(`${API_BASE || "not configured"}/intake/generate`);
+    recordDebugTrace({
+      action: "parse files",
+      stage: "started",
+      endpoint: "/intake/generate",
+      message: `${files.length} PDFs, ${bulkImages.length} photos, ${urls.split(/\r?\n/).filter((url) => url.trim()).length} URLs`,
+    });
     try {
       let parsedRows: IntakeRow[] = [];
       let parseErrors: string[] = [];
@@ -827,6 +1268,15 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         parsedRows = response.rows;
         parseErrors = response.errors;
         cost = getEstimatedCost(response);
+        const storageWarnings = response.stage_timings?.storage_warnings;
+        if (Array.isArray(storageWarnings) && storageWarnings.length) {
+          recordDebugTrace({
+            action: "parse files",
+            stage: "warning",
+            endpoint: "/intake/generate",
+            message: JSON.stringify({ storage_warnings: storageWarnings }),
+          });
+        }
       }
 
       let photoMessage = "";
@@ -861,11 +1311,24 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       setEstimatedCost(cost);
       setWorkflowStage("reviewParsed");
       setMessage(`Parsed products are ready for review.${photoMessage}`);
+      setLastSuccessfulStage("Parse complete");
+      recordDebugTrace({
+        action: "parse files",
+        stage: "success",
+        endpoint: "/intake/generate",
+        message: `${finalRows.length} rows parsed; ${finalErrors.length} error(s)`,
+      });
     } catch (error) {
       const formatted = formatApiError(error);
       setParseStatus("Parse failed.");
       setWorkflowStage("upload");
       setMessage(formatted);
+      recordDebugTrace({
+        action: "parse files",
+        stage: "failed",
+        endpoint: "/intake/generate",
+        ...debugDetailsFromError(error),
+      });
     } finally {
       setBusy("");
     }
@@ -879,6 +1342,12 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     const beforeImages = countRows(includedRows, hasImage);
     const beforeDimensions = countRows(includedRows, (row) => hasComplete3dDimensions(row.Dimensions));
     setLastEndpoint(`${API_BASE || "not configured"}/intake/enrich`);
+    recordDebugTrace({
+      action: "enrich missing data",
+      stage: "started",
+      endpoint: "/intake/enrich",
+      message: `mode=${enrichmentMode}; forceRefresh=${forceRefreshEnrichment}`,
+    });
     try {
       const response = await enrichRows({
         rows,
@@ -892,21 +1361,68 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       const afterImages = countRows(enrichedRows, hasImage);
       const afterDimensions = countRows(enrichedRows, (row) => hasComplete3dDimensions(row.Dimensions));
       const unresolved = countRows(enrichedRows, (row) => missingFieldsForRow(row).length > 0);
+      const averageConfidence = stageNumber(response, "average_confidence");
+      const failedBeforeCompletion = response.errors.some((error) =>
+        error.toLowerCase().includes("enrichment failed before completion"),
+      );
       setEnrichmentStats({
         filledImages: Math.max(0, afterImages - beforeImages),
         filledDimensions: Math.max(0, afterDimensions - beforeDimensions),
         unresolved,
+        rowsEnriched: Math.round(stageNumber(response, "rows_enriched") ?? enrichedRows.length - unresolved),
+        missingDimensions: Math.round(stageNumber(response, "rows_missing_dimensions") ?? countRows(enrichedRows, (row) => !rowText(row, "Dimensions").trim())),
+        missingImages: Math.round(stageNumber(response, "rows_missing_images") ?? countRows(enrichedRows, (row) => !hasImage(row))),
+        averageConfidence: averageConfidence === undefined ? "Not reported" : `${Math.round(averageConfidence * 100)}%`,
       });
       setEstimatedCost(getEstimatedCost(response));
-      setEnrichmentStatus(useWebEnrichment ? "Enrichment complete." : "Input updates saved without web enrichment.");
+      setEnrichmentStatus(
+        failedBeforeCompletion
+          ? "Enrichment failed before completion."
+          : useWebEnrichment
+            ? "Enrichment complete."
+            : "Input updates saved without web enrichment.",
+      );
       setEnrichedProductsOpen(false);
       setWorkflowStage("reviewEnriched");
-      setMessage(useWebEnrichment ? "Missing info search complete." : "Input updates saved without web search.");
+      setMessage(
+        failedBeforeCompletion
+          ? "Enrichment failed before completion. Review debug details before exporting."
+          : useWebEnrichment
+            ? "Missing info search complete."
+            : "Input updates saved without web search.",
+      );
+      setLastSuccessfulStage(failedBeforeCompletion ? "Enrichment failed before completion" : "Enrichment complete");
+      recordDebugTrace({
+        action: "enrich missing data",
+        stage: failedBeforeCompletion ? "failed" : "success",
+        endpoint: "/intake/enrich",
+        message: failedBeforeCompletion
+          ? JSON.stringify({
+              errors: response.errors,
+              diagnostics: response.dimension_diagnostics ?? [],
+            })
+          : `${afterImages - beforeImages} image delta; ${afterDimensions - beforeDimensions} dimension delta; ${unresolved} unresolved`,
+      });
+      const storageWarnings = response.stage_timings?.storage_warnings;
+      if (Array.isArray(storageWarnings) && storageWarnings.length) {
+        recordDebugTrace({
+          action: "enrich missing data",
+          stage: "warning",
+          endpoint: "/intake/enrich",
+          message: JSON.stringify({ storage_warnings: storageWarnings }),
+        });
+      }
     } catch (error) {
       const formatted = formatApiError(error);
       setEnrichmentStatus("Enrichment failed.");
       setWorkflowStage("reviewParsed");
       setMessage(formatted);
+      recordDebugTrace({
+        action: "enrich missing data",
+        stage: "failed",
+        endpoint: "/intake/enrich",
+        ...debugDetailsFromError(error),
+      });
     } finally {
       setBusy("");
     }
@@ -918,6 +1434,12 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     setEnrichmentStatus("Recovering missing images from verified product pages...");
     const beforeImages = countRows(includedRows, hasImage);
     setLastEndpoint(`${API_BASE || "not configured"}/intake/recover-images`);
+    recordDebugTrace({
+      action: "recover missing images",
+      stage: "started",
+      endpoint: "/intake/recover-images",
+      message: `mode=${enrichmentMode}; missingImages=${missingImageCount}`,
+    });
     try {
       const response = await recoverMissingImages({
         rows,
@@ -939,9 +1461,22 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       setEnrichmentStatus("Missing image recovery complete.");
       setWorkflowStage("reviewEnriched");
       setMessage(`Image recovery complete: ${imageDelta} image${imageDelta === 1 ? "" : "s"} added.`);
+      setLastSuccessfulStage("Missing image recovery complete");
+      recordDebugTrace({
+        action: "recover missing images",
+        stage: "success",
+        endpoint: "/intake/recover-images",
+        message: `${imageDelta} image(s) added`,
+      });
     } catch (error) {
       setEnrichmentStatus("Image recovery failed.");
       setMessage(formatApiError(error));
+      recordDebugTrace({
+        action: "recover missing images",
+        stage: "failed",
+        endpoint: "/intake/recover-images",
+        ...debugDetailsFromError(error),
+      });
     } finally {
       setBusy("");
     }
@@ -959,6 +1494,21 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   async function handleProgramaExport(format: "csv" | "xlsx" | "zip" | "debug") {
     setBusy("export");
     setMessage("");
+    const endpoint =
+      format === "xlsx"
+        ? "/export/programa/xlsx"
+        : format === "zip"
+          ? "/export/programa/zip"
+          : format === "debug"
+            ? "/export/programa/debug-csv"
+            : "/export/programa/csv";
+    setLastEndpoint(`${API_BASE || "not configured"}${endpoint}`);
+    recordDebugTrace({
+      action: "programa export",
+      stage: "started",
+      endpoint,
+      message: `${format} export; ${includedRows.length} included rows`,
+    });
     try {
       const blob =
         format === "xlsx"
@@ -974,8 +1524,21 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       downloadBlob(blob, filename);
       setWorkflowStage("export");
       setMessage("Use this file for Programa Import Products.");
+      setLastSuccessfulStage(`${format.toUpperCase()} export generated`);
+      recordDebugTrace({
+        action: "programa export",
+        stage: "success",
+        endpoint,
+        message: filename,
+      });
     } catch (error) {
       setMessage(formatApiError(error));
+      recordDebugTrace({
+        action: "programa export",
+        stage: "failed",
+        endpoint,
+        ...debugDetailsFromError(error),
+      });
     } finally {
       setBusy("");
     }
@@ -985,6 +1548,13 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     setBusy("programa");
     setProgramaMessage("");
     setMessage("");
+    setLastEndpoint(`${API_BASE || "not configured"}/programa/send`);
+    recordDebugTrace({
+      action: "send to programa",
+      stage: "started",
+      endpoint: "/programa/send",
+      message: `${includedRows.length} included rows`,
+    });
     try {
       const response = await sendToPrograma({
         projectName: project,
@@ -994,8 +1564,21 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         uploadProductImages: true,
       });
       setProgramaMessage(response.message || `Programa send status: ${response.status}`);
+      setLastSuccessfulStage("Programa send completed");
+      recordDebugTrace({
+        action: "send to programa",
+        stage: "success",
+        endpoint: "/programa/send",
+        message: response.status,
+      });
     } catch (error) {
       setProgramaMessage(formatApiError(error));
+      recordDebugTrace({
+        action: "send to programa",
+        stage: "failed",
+        endpoint: "/programa/send",
+        ...debugDetailsFromError(error),
+      });
     } finally {
       setBusy("");
     }
@@ -1014,6 +1597,13 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   async function handleGenerateCallScript() {
     if (!vendorCall) return;
     setBusy("vendorCall");
+    setLastEndpoint(`${API_BASE || "not configured"}/vendor-call/script`);
+    recordDebugTrace({
+      action: "vendor call script",
+      stage: "started",
+      endpoint: "/vendor-call/script",
+      itemId: rowText(vendorCall.row, "Model/SKU") || rowText(vendorCall.row, "Product Name"),
+    });
     try {
       const response = await generateVendorCallScript({
         row: vendorCall.row,
@@ -1022,8 +1612,22 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         customGoal: vendorCall.customGoal,
       });
       setVendorCall({ ...vendorCall, script: response.script });
+      setLastSuccessfulStage("Vendor call script generated");
+      recordDebugTrace({
+        action: "vendor call script",
+        stage: "success",
+        endpoint: "/vendor-call/script",
+        itemId: rowText(vendorCall.row, "Model/SKU") || rowText(vendorCall.row, "Product Name"),
+      });
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not generate the call script.");
+      recordDebugTrace({
+        action: "vendor call script",
+        stage: "failed",
+        endpoint: "/vendor-call/script",
+        itemId: rowText(vendorCall.row, "Model/SKU") || rowText(vendorCall.row, "Product Name"),
+        ...debugDetailsFromError(error),
+      });
     } finally {
       setBusy("");
     }
@@ -1302,6 +1906,15 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           </div>
         </Panel>
 
+        {debugMode ? (
+          <DebugTracePanel
+            traces={debugTraces}
+            lastSuccessfulStage={lastSuccessfulStage}
+            copyStatus={debugCopyStatus}
+            onCopy={copyDebugReport}
+          />
+        ) : null}
+
         {parsedReviewReady ? (
           <Panel step="3" title="Review Parsed Data" subtitle="Start with the summary, then expand the parsed product table only when needed.">
             <div className="grid gap-4">
@@ -1316,7 +1929,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                 View parsed products
               </DisclosureButton>
               {parsedProductsOpen ? (
-                <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} />
+                <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} debugMode={debugMode} />
               ) : null}
             </div>
           </Panel>
@@ -1378,19 +1991,23 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         {enrichmentHasRun ? (
           <Panel step="5" title="Review Enriched Data" subtitle="Confirm readiness after enrichment before exporting.">
             <div className="grid gap-4">
-              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <SummaryCard label="Rows enriched" value={enrichmentStats.rowsEnriched} />
                 <SummaryCard label="Products ready" value={readyRows} tone={readyRows ? "ok" : "neutral"} />
                 <SummaryCard label="Needs review" value={needsReview} tone={needsReview ? "warning" : "ok"} />
-                <SummaryCard label="Ignored" value={ignored} />
                 <SummaryCard label="Images found" value={imagesFoundCount} />
                 <SummaryCard label="Dimensions found" value={dimensionsFoundCount} />
+                <SummaryCard label="Missing images" value={enrichmentStats.missingImages} tone={enrichmentStats.missingImages ? "warning" : "ok"} />
+                <SummaryCard label="Missing dimensions" value={enrichmentStats.missingDimensions} tone={enrichmentStats.missingDimensions ? "warning" : "ok"} />
+                <SummaryCard label="Avg confidence" value={enrichmentStats.averageConfidence} />
                 <SummaryCard label="Est. cost" value={estimatedCost} />
+                <SummaryCard label="Ignored" value={ignored} />
               </div>
               <DisclosureButton open={enrichedProductsOpen} onClick={() => setEnrichedProductsOpen((open) => !open)}>
                 View enriched products
               </DisclosureButton>
               {enrichedProductsOpen ? (
-                <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} />
+                <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} debugMode={debugMode} />
               ) : null}
             </div>
           </Panel>
@@ -1490,6 +2107,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             useWebEnrichment={useWebEnrichment}
             enrichmentMode={enrichmentMode}
             forceRefreshEnrichment={forceRefreshEnrichment}
+            debugMode={debugMode}
+            accentThemeId={accentThemeId}
             scheduleUrl={scheduleUrl}
             bulkImagesCount={bulkImages.length}
             photoBulkSummary={photoBulkSummary}
@@ -1501,6 +2120,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             onUseWebEnrichmentChange={setUseWebEnrichment}
             onEnrichmentModeChange={setEnrichmentMode}
             onForceRefreshEnrichmentChange={setForceRefreshEnrichment}
+            onDebugModeChange={setDebugMode}
+            onAccentThemeChange={setAccentThemeId}
             onScheduleUrlChange={setScheduleUrl}
             onClose={() => setSettingsOpen(false)}
           />
@@ -1669,12 +2290,14 @@ function ProductTable({
   sections,
   updateRow,
   openVendorCall,
+  debugMode,
 }: {
   rows: IntakeRow[];
   categories: string[];
   sections: string[];
   updateRow: (index: number, key: string, value: unknown) => void;
   openVendorCall: (row: IntakeRow, missingFields: string[]) => void;
+  debugMode: boolean;
 }) {
   if (rows.length === 0) {
     return (
@@ -1714,20 +2337,29 @@ function ProductTable({
         </thead>
         <tbody>
           {rows.map((row, index) => (
-            <tr key={index} className="align-top transition-colors hover:bg-orangeSoft/30">
-              {reviewColumns.map((column) => (
-                <td key={column} className="border-b border-linen/70 px-3 py-3">
-                  <Cell
-                    row={row}
-                    column={column}
-                    categories={categories}
-                    sections={sections}
-                    onChange={(value) => updateRow(index, column, value)}
-                    onVendorCall={(fields) => openVendorCall(row, fields)}
-                  />
-                </td>
-              ))}
-            </tr>
+            <Fragment key={index}>
+              <tr className="align-top transition-colors hover:bg-orangeSoft/30">
+                {reviewColumns.map((column) => (
+                  <td key={column} className="border-b border-linen/70 px-3 py-3">
+                    <Cell
+                      row={row}
+                      column={column}
+                      categories={categories}
+                      sections={sections}
+                      onChange={(value) => updateRow(index, column, value)}
+                      onVendorCall={(fields) => openVendorCall(row, fields)}
+                    />
+                  </td>
+                ))}
+              </tr>
+              {debugMode ? (
+                <tr>
+                  <td colSpan={reviewColumns.length} className="border-b border-linen/70 bg-ivory/60 px-3 py-2">
+                    <RowDebugTrace row={row} />
+                  </td>
+                </tr>
+              ) : null}
+            </Fragment>
           ))}
         </tbody>
       </table>
@@ -1735,8 +2367,103 @@ function ProductTable({
   );
 }
 
+function RowDebugTrace({ row }: { row: IntakeRow }) {
+  const fields = [
+    ["Query", rowText(row, "search_query_used")],
+    ["Provider", rowText(row, "search_provider")],
+    ["Candidates", rowText(row, "product_url_candidates")],
+    ["Chosen URL", rowText(row, "selected_product_url") || rowText(row, "Product URL")],
+    ["URL confidence", rowText(row, "selected_product_url_confidence") || rowText(row, "product_url_confidence")],
+    ["Dimensions", rowText(row, "dimensions_extracted") || rowText(row, "Dimensions")],
+    ["Dimension source", rowText(row, "dimension_source_url") || rowText(row, "Dimension Source URL")],
+    ["Image", rowText(row, "selected_image_url") || rowText(row, "Image URL")],
+    ["Image candidates", rowText(row, "image_candidate_diagnostics")],
+    ["Reason", rowText(row, "skipped_reason") || rowText(row, "Suggested Action")],
+  ].filter(([, value]) => value);
+
+  if (!fields.length) {
+    return <span className="text-xs text-taupe">No enrichment debug trace recorded for this row.</span>;
+  }
+
+  return (
+    <details className="group rounded-xl border border-linen bg-white/80 px-3 py-2 text-xs">
+      <summary className="cursor-pointer list-none font-semibold text-charcoal">
+        Item debug trace
+        <span className="ml-2 text-taupe group-open:hidden">Show details</span>
+        <span className="ml-2 hidden text-taupe group-open:inline">Hide details</span>
+      </summary>
+      <div className="mt-3 grid gap-2 md:grid-cols-2">
+        {fields.map(([label, value]) => (
+          <div key={label} className="rounded-lg border border-linen bg-ivory/70 p-2">
+            <div className="font-semibold text-charcoal">{label}</div>
+            <div className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-taupe">
+              {value}
+            </div>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
 function ReviewValue({ value }: { value: string }) {
   return value ? <span className="text-charcoal">{value}</span> : <span className="font-semibold text-clay">Missing</span>;
+}
+
+function DebugTracePanel({
+  traces,
+  lastSuccessfulStage,
+  copyStatus,
+  onCopy,
+}: {
+  traces: DebugTrace[];
+  lastSuccessfulStage: string;
+  copyStatus: string;
+  onCopy: () => void;
+}) {
+  const latestTraces = traces.slice(-6).reverse();
+  return (
+    <section className="rounded-2xl border border-orangeBorder bg-orangeSoft/45 p-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <h2 className="text-sm font-semibold text-bronze">Debug Mode</h2>
+          <p className="mt-1 text-sm text-charcoal/70">Last successful stage: {lastSuccessfulStage}</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            className="btn-secondary inline-flex h-9 items-center justify-center rounded-xl px-3 text-xs font-semibold hover:bg-white"
+            onClick={onCopy}
+          >
+            Copy debug report
+          </button>
+          {copyStatus ? <span className="text-xs font-semibold text-bronze">{copyStatus}</span> : null}
+        </div>
+      </div>
+      <div className="mt-3 grid gap-2">
+        {latestTraces.length ? (
+          latestTraces.map((trace, index) => (
+            <div key={`${trace.timestamp}-${index}`} className="rounded-xl border border-linen bg-white/82 p-3 text-xs">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-semibold text-charcoal">{trace.action}</span>
+                <span className="font-mono text-taupe">{new Date(trace.timestamp).toLocaleTimeString()}</span>
+              </div>
+              <div className="mt-2 grid gap-1 text-taupe sm:grid-cols-2">
+                <span>Stage: {trace.stage}</span>
+                <span>Endpoint: {trace.endpoint || "none"}</span>
+                {trace.statusCode ? <span>Status: {trace.statusCode}</span> : null}
+                {trace.itemId ? <span>Item: {trace.itemId}</span> : null}
+                {trace.fallback ? <span>Fallback: {trace.fallback}</span> : null}
+              </div>
+              {trace.message ? <p className="mt-2 whitespace-pre-wrap text-charcoal/70">{trace.message}</p> : null}
+            </div>
+          ))
+        ) : (
+          <p className="rounded-xl border border-linen bg-white/82 p-3 text-sm text-taupe">No user action traces yet.</p>
+        )}
+      </div>
+    </section>
+  );
 }
 
 function SettingsDialog({
@@ -1751,6 +2478,8 @@ function SettingsDialog({
   useWebEnrichment,
   enrichmentMode,
   forceRefreshEnrichment,
+  debugMode,
+  accentThemeId,
   scheduleUrl,
   bulkImagesCount,
   photoBulkSummary,
@@ -1762,6 +2491,8 @@ function SettingsDialog({
   onUseWebEnrichmentChange,
   onEnrichmentModeChange,
   onForceRefreshEnrichmentChange,
+  onDebugModeChange,
+  onAccentThemeChange,
   onScheduleUrlChange,
   onClose,
 }: {
@@ -1776,6 +2507,8 @@ function SettingsDialog({
   useWebEnrichment: boolean;
   enrichmentMode: EnrichmentMode;
   forceRefreshEnrichment: boolean;
+  debugMode: boolean;
+  accentThemeId: AccentThemeId;
   scheduleUrl: string;
   bulkImagesCount: number;
   photoBulkSummary: { success: number; failed: number };
@@ -1787,6 +2520,8 @@ function SettingsDialog({
   onUseWebEnrichmentChange: (value: boolean) => void;
   onEnrichmentModeChange: (value: EnrichmentMode) => void;
   onForceRefreshEnrichmentChange: (value: boolean) => void;
+  onDebugModeChange: (value: boolean) => void;
+  onAccentThemeChange: (value: AccentThemeId) => void;
   onScheduleUrlChange: (value: string) => void;
   onClose: () => void;
 }) {
@@ -1830,6 +2565,51 @@ function SettingsDialog({
             <SettingsDetail label="Resolved API base" value={apiBase} />
             <SettingsDetail label="Last endpoint" value={lastEndpoint || "No API request yet"} />
           </dl>
+        </div>
+
+        <div className="mt-4 rounded-xl border border-linen bg-white p-4">
+          <h3 className="text-sm font-semibold text-charcoal">Appearance</h3>
+          <p className="mt-1 text-sm text-taupe">Choose a muted SCH accent for buttons, active stages, cards, and highlights.</p>
+          <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3">
+            {accentThemes.map((theme) => {
+              const selected = theme.id === accentThemeId;
+              return (
+                <button
+                  key={theme.id}
+                  type="button"
+                  className={`flex min-h-11 items-center gap-2 rounded-xl border px-3 text-left text-sm font-semibold transition ${
+                    selected ? "border-orangeBorder bg-orangeSoft text-bronze" : "border-linen bg-white text-charcoal hover:border-orangeBorder"
+                  }`}
+                  onClick={() => onAccentThemeChange(theme.id)}
+                  aria-pressed={selected}
+                >
+                  <span
+                    className="h-4 w-4 rounded-full border border-charcoal/10"
+                    style={{ backgroundColor: theme.accent }}
+                    aria-hidden="true"
+                  />
+                  {theme.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-xl border border-linen bg-ivory/70 p-4">
+          <h3 className="text-sm font-semibold text-charcoal">Debug &amp; Diagnostics</h3>
+          <label className="mt-3 flex items-start gap-3 text-sm text-taupe">
+            <input
+              type="checkbox"
+              checked={debugMode}
+              onChange={(event) => onDebugModeChange(event.target.checked)}
+              className="mt-1 h-4 w-4 accent-bronze"
+            />
+            Enable Debug Mode. Shows sanitized trace details and copyable reports for troubleshooting.
+          </label>
+          <p className="mt-3 text-xs leading-5 text-taupe">
+            Debug reports include action names, endpoint paths, status codes, timestamps, item identifiers, and sanitized errors. API keys,
+            credentials, auth tokens, and full request payloads are not included.
+          </p>
         </div>
 
         <div className="mt-5 rounded-xl border border-linen bg-ivory/70 p-4">

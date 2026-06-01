@@ -7,7 +7,7 @@ debug_enrich_dataframe(df) -> list[dict]
     Runs the full enrichment pipeline for every row (qualifying or not),
     capturing the result at each step. Does NOT write to the DataFrame.
 
-save_debug_report(traces, out_dir="data/enrichment_debug") -> str
+save_debug_report(traces, out_dir="") -> str
     Serialises the trace list to a timestamped JSON file. Returns the path.
 
 Each trace dict contains:
@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import datetime
 import json
-import os
+import logging
 import re
+
+from pathlib import Path
 
 from src.brave_search import BRAVE_API_KEY, search_product_candidates
 from src.dimensions import has_complete_3d_dimensions
@@ -45,6 +47,10 @@ from src.product_enrichment import (
     _qualifies,
     _str_val,
 )
+
+from src.runtime_storage import runtime_data_path, write_json_best_effort
+
+_log = logging.getLogger(__name__)
 
 # Regex that recognises dimension-related terms inside page text.
 _DIM_TERMS_RE = re.compile(
@@ -241,11 +247,12 @@ def debug_enrich_dataframe(df) -> list[dict]:
     return traces
 
 
-def save_debug_report(traces: list[dict], out_dir: str = "data/enrichment_debug") -> str:
+def save_debug_report(traces: list[dict], out_dir: str = "") -> str:
     """Write traces to a timestamped JSON file. Returns the path."""
-    os.makedirs(out_dir, exist_ok=True)
+    target_dir = runtime_data_path("enrichment_debug") if out_dir in {"", "data/enrichment_debug"} else Path(out_dir)
     ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(out_dir, f"debug_{ts}.json")
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(traces, fh, indent=2, ensure_ascii=False)
-    return path
+    path = target_dir / f"debug_{ts}.json"
+    if write_json_best_effort(path, traces, description="enrichment debug report", ensure_ascii=False):
+        return str(path)
+    _log.warning("Enrichment debug report was not persisted: %s", path)
+    return ""

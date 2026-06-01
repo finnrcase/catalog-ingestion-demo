@@ -16,6 +16,7 @@ import time
 
 from src.intake_schema import IMPORTANT_FIELDS, SOURCE_PDF, make_base_row
 from src.dimensions import extract_labeled_dimensions
+from src.location_normalizer import normalize_location
 
 # ── Regex patterns ─────────────────────────────────────────────────────────────
 
@@ -91,6 +92,40 @@ _MATERIAL_RE = re.compile(r"\bmaterial\s*[:\-]\s*([^|;,]+)", re.IGNORECASE)
 _PROJECT_RE = re.compile(r"\bproject\s*[:\-]\s*(.+)", re.IGNORECASE)
 _SUPPLIER_RE = re.compile(r"\b(?:supplier|vendor|sold\s+by|dealer)\s*[:\-]\s*(.+)", re.IGNORECASE)
 
+_ROOM_TERMS: tuple[str, ...] = (
+    "Outdoor Kitchen",
+    "Primary Bathroom",
+    "Primary Bath",
+    "Powder Room",
+    "Laundry Room",
+    "Living Room",
+    "Dining Room",
+    "Family Room",
+    "Great Room",
+    "Media Room",
+    "Mud Room",
+    "Pool House",
+    "Kitchen",
+    "Bar",
+    "Exterior",
+    "Mudroom",
+    "Pantry",
+    "Laundry",
+    "Bathroom",
+    "Bath",
+    "Bedroom",
+    "Office",
+    "Garage",
+    "Basement",
+    "Foyer",
+    "Entry",
+    "Gym",
+)
+_ROOM_RE = re.compile(
+    r"\b(" + "|".join(re.escape(term) for term in _ROOM_TERMS) + r")\b",
+    re.IGNORECASE,
+)
+
 _HEADER_ALIASES: dict[str, tuple[str, ...]] = {
     "Product Name": ("description", "product description", "product", "item description", "item name", "name"),
     "Brand": ("manufacturer", "mfr", "brand", "vendor brand"),
@@ -162,6 +197,96 @@ def _clean_product_name(line: str, model_sku: str = "") -> str:
     text = _MATERIAL_RE.sub("", text)
     text = re.sub(r"\s{2,}", " ", text).strip(" .,;:-")
     return text
+
+
+def _clean_inline_text(text: object) -> str:
+    return re.sub(r"\s{2,}", " ", str(text or "")).strip(" .,;:-")
+
+
+def _is_reddish_color(color: object) -> bool:
+    """True when a PyMuPDF text span color looks like a red room annotation."""
+    try:
+        value = int(color)
+    except Exception:
+        return False
+    r = (value >> 16) & 255
+    g = (value >> 8) & 255
+    b = value & 255
+    return r >= 120 and r > (g * 1.25 + 20) and r > (b * 1.25 + 20)
+
+
+def _extract_room_annotation(text: str, preferred_rooms: list[str] | None = None) -> str:
+    """Return a normalized room/location token found in text, preferring red-span hints."""
+    haystack = f" {text or ''} "
+    for raw_room in preferred_rooms or []:
+        room = _clean_inline_text(raw_room)
+        if room and re.search(rf"\b{re.escape(room)}\b", haystack, re.IGNORECASE):
+            cleaned, _confidence, _reason = normalize_location(room)
+            return cleaned
+    match = _ROOM_RE.search(haystack)
+    if not match:
+        return ""
+    cleaned, _confidence, _reason = normalize_location(match.group(1))
+    return cleaned
+
+
+def _strip_room_annotation(text: object, room: str = "", preferred_rooms: list[str] | None = None) -> str:
+    """Remove room annotations from product/finish text without touching model tokens."""
+    cleaned = str(text or "")
+    candidates = []
+    if room:
+        candidates.append(room)
+    candidates.extend(preferred_rooms or [])
+    if not candidates:
+        candidates.extend(_ROOM_TERMS)
+    for candidate in sorted({c for c in candidates if c}, key=len, reverse=True):
+        cleaned = re.sub(
+            rf"(?i)(?<![A-Za-z0-9]){re.escape(candidate)}(?![A-Za-z0-9])",
+            " ",
+            cleaned,
+        )
+    return _clean_inline_text(cleaned)
+
+
+def _extract_red_room_annotations(page) -> list[str]:
+    """Extract red/colored room labels from a PDF page using PyMuPDF span metadata."""
+    annotations: list[str] = []
+    seen: set[str] = set()
+    try:
+        data = page.get_text("dict")
+    except Exception:
+        return annotations
+    for block in data.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = _clean_inline_text(span.get("text", ""))
+                if not text or not _is_reddish_color(span.get("color")):
+                    continue
+                room = _extract_room_annotation(text)
+                if room and room.lower() not in seen:
+                    seen.add(room.lower())
+                    annotations.append(room)
+    return annotations
+
+
+def _apply_room_annotation(row: dict, preferred_rooms: list[str] | None = None, default_room: str = "") -> dict:
+    """Move visual room annotations out of description/finish fields into Room."""
+    updated = row.copy()
+    existing_room = _clean_inline_text(updated.get("Room"))
+    combined = " ".join(
+        _clean_inline_text(updated.get(field))
+        for field in ("Product Name", "Finish / Color", "Color", "Notes")
+    )
+    detected_room = existing_room or _extract_room_annotation(combined, preferred_rooms)
+    if not detected_room and default_room:
+        detected_room = default_room
+    if detected_room:
+        normalized_room, _confidence, _reason = normalize_location(detected_room, default_room)
+        updated["Room"] = normalized_room
+        for field in ("Product Name", "Finish / Color", "Color"):
+            if updated.get(field):
+                updated[field] = _strip_room_annotation(updated.get(field), normalized_room, preferred_rooms)
+    return updated
 
 
 def _extract_known_brand(text: str) -> str:
@@ -256,7 +381,12 @@ def _compute_status(row: dict) -> str:
 
 
 def _row_from_line(
-    line: str, project: str, room: str, supplier: str, notes: str
+    line: str,
+    project: str,
+    room: str,
+    supplier: str,
+    notes: str,
+    room_annotations: list[str] | None = None,
 ) -> dict | None:
     """Parse a single text line into a row dict, or return None if it should be skipped."""
     if _is_skip_line(line):
@@ -287,12 +417,19 @@ def _row_from_line(
         note_tag = f"[{sku_label}: {model_sku}]"
         row["Notes"] = f"{notes} {note_tag}".strip() if notes else note_tag
 
+    row = _apply_room_annotation(row, room_annotations, room)
     row["Status"] = _compute_status(row)
     return row
 
 
 def _parse_table_rows(
-    page, project: str, room: str, supplier: str, notes: str, category: str = ""
+    page,
+    project: str,
+    room: str,
+    supplier: str,
+    notes: str,
+    category: str = "",
+    room_annotations: list[str] | None = None,
 ) -> list[dict]:
     """Extract product rows from PyMuPDF table structures on a single page."""
     rows = []
@@ -365,7 +502,7 @@ def _parse_table_rows(
                     row["Product Category"] = category
             else:
                 # No header — fall back to line parser on the joined string
-                parsed = _row_from_line(joined, project, room, supplier, notes)
+                parsed = _row_from_line(joined, project, room, supplier, notes, room_annotations)
                 if parsed is None:
                     continue
                 row = parsed
@@ -373,6 +510,7 @@ def _parse_table_rows(
             if not str(row.get("Product Name", "")).strip() and not str(row.get("Model/SKU", "")).strip():
                 continue
 
+            row = _apply_room_annotation(row, room_annotations, room)
             row["Status"] = _compute_status(row)
             rows.append(row)
 
@@ -441,9 +579,11 @@ def parse_pdf_rows(
     seen_keys: set[tuple[str, str]] = set()
 
     for page_index, page in enumerate(doc):
+        room_annotations = _extract_red_room_annotations(page)
+
         # 1. Try table extraction first
         table_start = time.perf_counter()
-        table_rows = _parse_table_rows(page, project, room, supplier, notes, category)
+        table_rows = _parse_table_rows(page, project, room, supplier, notes, category, room_annotations)
         if stage_timings is not None:
             stage_timings["table_row_parsing_ms"] = stage_timings.get("table_row_parsing_ms", 0.0) + (
                 time.perf_counter() - table_start
@@ -477,7 +617,7 @@ def parse_pdf_rows(
             line = line.strip()
             if len(line) < 3:
                 continue
-            row = _row_from_line(line, project, room, supplier, notes)
+            row = _row_from_line(line, project, room, supplier, notes, room_annotations)
             if row is None:
                 continue
             key = (

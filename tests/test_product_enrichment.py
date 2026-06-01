@@ -17,7 +17,7 @@ def _isolate_caches(monkeypatch, tmp_path):
     from src.enrichment_cache import ProductEnrichmentCache, ManufacturerDomainCache
     import src.product_enrichment as pe
     import src.dimension_enrichment as de
-    # Prevent manufacturer_domains.py from writing to real data/manufacturer_domain_cache.json
+    # Prevent manufacturer domain discovery from touching shared runtime cache state.
     monkeypatch.setattr("src.product_enrichment.get_domain_for_brand", lambda brand: None)
     monkeypatch.setattr("src.product_enrichment.record_discovered_domain", lambda brand, domain: None)
     # Isolate ProductEnrichmentCache singleton — redirect _path so _save() never hits real file
@@ -50,9 +50,9 @@ def _base_qualifying_row():
     }
 
 
-def test_qualifies_url_row_skipped():
+def test_qualifies_url_row_with_brand_and_sku():
     row = {**_base_qualifying_row(), "Source Type": "URL"}
-    assert not _qualifies(row)
+    assert _qualifies(row)
 
 
 def test_qualifies_enriched_row_with_missing_dimensions_or_image():
@@ -174,10 +174,13 @@ def test_build_sku_lookup_queries_prioritizes_exact_model_and_domain():
 
     queries = _build_sku_lookup_queries(row, "scotsman-ice.com")
 
-    assert queries[0] == 'site:scotsman-ice.com "SCN60PA1SU"'
+    assert queries[0] == '"Scotsman" "SCN60PA1SU" dimensions image product page'
+    assert 'site:scotsman-ice.com "SCN60PA1SU" dimensions image product page' in queries
+    assert '"Scotsman" "SCN60PA1SU" specifications' in queries
+    assert '"Scotsman" "SCN60PA1SU" spec sheet PDF' in queries
     assert '"Scotsman" "SCN60PA1SU" product' in queries
-    assert '"Scotsman" "SCN60PA1SU" dimensions' in queries
-    assert '"Scotsman" "SCN60PA1SU" spec sheet' in queries
+    assert '"Scotsman" "SCN60PA1SU" "Panel Ready Icemaker"' in queries
+    assert '"Scotsman" "Panel Ready Icemaker"' in queries
 
 
 def test_score_verified_product_page_rejects_sitemap_without_sku():
@@ -789,8 +792,8 @@ def test_recover_images_reports_recovered_count():
 
 def test_enrich_row_extracts_and_fills_image_url():
     """When page HTML contains a valid image, enrich_row fills Image URL on the row."""
-    good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
-    html_with_image = '<meta property="og:image" content="https://wolfappliance.com/img/mdd30ts.jpg">'
+    good_result = SearchResult("Wolf MDD30TS Spec", "https://wolfappliance.com/products/MDD30TS", "desc", 90)
+    html_with_image = '<html><head><title>Wolf MDD30TS Drawer Microwave</title><meta property="og:image" content="https://wolfappliance.com/img/mdd30ts.jpg"></head><body>Wolf MDD30TS</body></html>'
     extracted = {
         "Product Name": "Wolf Drawer Microwave",
         "Dimensions": "", "Finish / Color": "", "Product Category": "Appliance", "materials": "",
@@ -949,7 +952,7 @@ def test_enrich_row_sku_search_selects_official_verified_page(monkeypatch):
 
     assert error is None
     mock_search.assert_called_once()
-    assert mock_search.call_args.args[0] == 'site:scotsman-ice.com "SCN60PA1SU"'
+    assert mock_search.call_args.args[0] == '"Scotsman" "SCN60PA1SU" dimensions image product page'
     assert updated["Product URL"] == official.url
     assert updated["selected_product_url_confidence"] == "high"
     assert updated["manufacturer_domain_used"] == "scotsman-ice.com"
@@ -986,8 +989,8 @@ def test_enrich_row_image_written_to_cache(monkeypatch, tmp_path):
     cache._data = {}
     monkeypatch.setattr(pe, "_product_cache", cache)
 
-    good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
-    html = '<meta property="og:image" content="https://wolfappliance.com/img/spec.jpg">'
+    good_result = SearchResult("Wolf MDD30TS Spec", "https://wolfappliance.com/products/MDD30TS", "desc", 90)
+    html = '<html><head><title>Wolf MDD30TS</title><meta property="og:image" content="https://wolfappliance.com/img/spec.jpg"></head><body>Wolf MDD30TS</body></html>'
     extracted = {"Product Name": "", "Dimensions": "", "Finish / Color": "", "Product Category": "", "materials": ""}
     with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
          patch("src.product_enrichment._fetch_page_html", return_value=html), \
@@ -1012,7 +1015,7 @@ def test_enrich_row_does_not_overwrite_cached_image(monkeypatch, tmp_path):
     cache.update(key, {"image_url": "https://wolfappliance.com/img/original.jpg", "general_confidence": "medium"})
     monkeypatch.setattr(pe, "_product_cache", cache)
 
-    good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
+    good_result = SearchResult("Wolf MDD30TS Spec", "https://wolfappliance.com/products/MDD30TS", "desc", 90)
     html = '<meta property="og:image" content="https://wolfappliance.com/img/new.jpg">'
     extracted = {"Product Name": "", "Dimensions": "", "Finish / Color": "", "Product Category": "", "materials": ""}
     with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
@@ -1096,7 +1099,7 @@ def test_enrich_row_low_score_result_leaves_note():
     low_result = SearchResult("title", "https://amazon.com/dp/B001", "desc", 10)
     with patch("src.product_enrichment.search_product_candidates", return_value=[low_result]):
         updated, error, _ = enrich_row(_qualifying_row())
-    assert "[Enrichment: no confident source found]" in updated["Notes"]
+    assert "ENRICHMENT_FAILED" in updated["Notes"]
 
 
 def test_enrich_row_fetch_failure_leaves_note():
@@ -1108,7 +1111,7 @@ def test_enrich_row_fetch_failure_leaves_note():
 
 
 def test_enrich_row_fills_fields_on_success():
-    good_result = SearchResult("Wolf Spec", "https://wolfappliance.com", "desc", 90)
+    good_result = SearchResult("Wolf MDD30TS Spec", "https://wolfappliance.com/products/MDD30TS", "desc", 90)
     extracted = {
         "Product Name": "Wolf 30\" Drawer Microwave",
         "Dimensions": "29 7/8\" W",
@@ -1117,7 +1120,7 @@ def test_enrich_row_fills_fields_on_success():
         "materials": "",
     }
     with patch("src.product_enrichment.search_product_candidates", return_value=[good_result]), \
-         patch("src.product_enrichment._fetch_page_html", return_value="page content"), \
+         patch("src.product_enrichment._fetch_page_html", return_value="<html><head><title>Wolf 30&quot; Drawer Microwave</title></head><body>Wolf MDD30TS page content</body></html>"), \
          patch("src.product_enrichment._extract_with_claude", return_value=extracted):
         updated, error, _ = enrich_row(_qualifying_row())
 
@@ -1142,7 +1145,7 @@ def test_enrich_row_web_enrichment_disabled_skips_search_domain_and_dimension_lo
 
 # ── enrich_dataframe ───────────────────────────────────────────────────────────
 
-def test_enrich_dataframe_skips_non_qualifying():
+def test_enrich_dataframe_enriches_url_rows_with_brand_and_sku():
     df = pd.DataFrame([{
         "Source Type": "URL",
         "Brand": "Wolf",
@@ -1156,9 +1159,11 @@ def test_enrich_dataframe_skips_non_qualifying():
         "Review Required": False,
         "Suggested Action": "",
     }])
-    with patch("src.product_enrichment.search_product_candidates", return_value=[]) as mock_search:
+    with patch("src.product_enrichment.search_product_candidates", return_value=[]) as mock_search, \
+         patch("src.product_enrichment._fetch_page_html", return_value=""):
         updated_df, errors, diagnostics = enrich_dataframe(df)
-    mock_search.assert_not_called()
+    assert mock_search.called
+    assert "ENRICHMENT_FAILED" in updated_df.iloc[0]["Notes"]
     assert errors == []
 
 

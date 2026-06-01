@@ -28,7 +28,7 @@ run_programa_automation(rows, project_name, auto_done, skip_navigation) -> (list
 Environment
 -----------
 PROGRAMA_URL             Base URL (default: https://app.programa.design/)
-PROGRAMA_BROWSER_PROFILE Profile path (default: data/browser_profiles/programa_assistant)
+PROGRAMA_BROWSER_PROFILE Profile path (default: runtime storage browser profile)
 """
 
 import os
@@ -50,13 +50,14 @@ from src.automation_logs import (
 )
 from src.dimensions import extract_labeled_dimensions
 from src.notes import remove_notes_row_prefix
+from src.runtime_storage import runtime_data_path
 
 load_dotenv()
 
 PROGRAMA_URL = os.environ.get("PROGRAMA_URL", "https://app.programa.design/").rstrip("/") + "/"
 
 PROFILE_DIR = Path(
-    os.getenv("PROGRAMA_BROWSER_PROFILE", "data/browser_profiles/programa_assistant")
+    os.getenv("PROGRAMA_BROWSER_PROFILE", str(runtime_data_path("browser_profiles", "programa_assistant")))
 ).resolve()  # always absolute so Playwright and the OS agree on the path
 
 # ── Automation safety flags ───────────────────────────────────────────────────
@@ -2917,7 +2918,7 @@ def _clean_description_and_notes(row: dict, notes_raw: str) -> tuple[str, str, s
     return clean_description, clean_product_details, "\n\n".join(combined_notes)
 
 
-IMAGE_DOWNLOAD_DIR = Path("temp/product_images")
+IMAGE_DOWNLOAD_DIR = runtime_data_path("product_images")
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
 
 
@@ -4860,7 +4861,7 @@ def fill_field_in_row(
 def run_programa_debug_single_row(
     row: dict,
     project_name: str,
-    screenshots_dir: str = "data/enrichment_debug/programa_steps",
+    screenshots_dir: str | None = None,
 ) -> list[dict]:
     """
     Run the full Schedule → Custom Product → field entry flow for ONE row only.
@@ -4884,6 +4885,7 @@ def run_programa_debug_single_row(
                  "message": "Playwright not installed — run: pip install playwright && playwright install",
                  "screenshot_path": ""}]
 
+    screenshots_dir = screenshots_dir or str(runtime_data_path("enrichment_debug", "programa_steps"))
     os.makedirs(screenshots_dir, exist_ok=True)
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     ensure_dirs()
@@ -7237,7 +7239,7 @@ def run_programa_automation(
 def run_programa_field_diagnostic(
     row: dict,
     project_name: str,
-    out_dir: str = "data/programa_diagnostics",
+    out_dir: str | None = None,
 ) -> list[dict]:
     """
     Step-by-step diagnostic for a single row.
@@ -7279,6 +7281,7 @@ def run_programa_field_diagnostic(
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     ensure_dirs()
 
+    out_dir = out_dir or str(runtime_data_path("programa_diagnostics"))
     steps: list[dict] = []
     product_name = str(row.get("Product Name", "") or "").strip()
     dims = parse_dimensions_for_programa(str(row.get("Dimensions", "") or ""))

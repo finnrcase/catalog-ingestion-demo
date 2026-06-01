@@ -11,17 +11,20 @@ Schema:
     screenshot_path Absolute or relative path to a screenshot, or ""
 """
 
-import json
+import logging
 from datetime import datetime
-from pathlib import Path
 
-LOG_DIR = Path("data/automation_logs")
+from src.runtime_storage import ensure_directory, runtime_data_path, write_json_best_effort
+
+_log = logging.getLogger(__name__)
+
+LOG_DIR = runtime_data_path("automation_logs")
 SCREENSHOT_DIR = LOG_DIR / "screenshots"
 
 
 def ensure_dirs() -> None:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_directory(LOG_DIR, description="automation log directory")
+    ensure_directory(SCREENSHOT_DIR, description="automation screenshot directory")
 
 
 def make_log_entry(
@@ -60,6 +63,7 @@ def save_log(entries: list[dict], project_name: str) -> str:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe = project_name.strip().replace(" ", "_") or "intake"
     path = LOG_DIR / f"{safe}_{ts}.json"
-    with open(path, "w") as f:
-        json.dump(entries, f, indent=2)
-    return str(path)
+    if write_json_best_effort(path, entries, description="Programa automation log"):
+        return str(path)
+    _log.warning("Programa automation log was not persisted: %s", path)
+    return ""

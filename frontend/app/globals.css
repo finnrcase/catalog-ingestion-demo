@@ -4,6 +4,16 @@
 
 :root {
   color-scheme: light;
+  --accent: #f97316;
+  --accent-rgb: 249 115 22;
+  --accent-hover: #ea580c;
+  --accent-hover-rgb: 234 88 12;
+  --accent-soft: #fff3e8;
+  --accent-soft-rgb: 255 243 232;
+  --accent-ring: #fdba74;
+  --accent-ring-rgb: 253 186 116;
+  --accent-foreground: #ffffff;
+  --accent-text: #c2410c;
 }
 
 * {
@@ -43,12 +53,12 @@ button:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
 select:focus-visible {
-  outline: 2px solid rgba(249, 115, 22, 0.28);
+  outline: 2px solid color-mix(in srgb, var(--accent) 32%, transparent);
   outline-offset: 2px;
 }
 
 ::selection {
-  background: rgba(249, 115, 22, 0.14);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
 }
 
 @layer components {
@@ -73,16 +83,16 @@ select:focus-visible {
   }
 
   .btn-primary {
-    border: 1px solid #f97316;
-    background: #f97316;
-    color: white;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--accent-foreground);
     box-shadow: none;
     transition: background 150ms ease, border-color 150ms ease, transform 150ms ease, box-shadow 150ms ease;
   }
 
   .btn-primary:hover:not(:disabled) {
-    border-color: #ea580c;
-    background: #ea580c;
+    border-color: var(--accent-hover);
+    background: var(--accent-hover);
     transform: none;
     box-shadow: none;
   }

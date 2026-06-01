@@ -10,19 +10,24 @@ budget_for_mode(mode) -> SearchBudget
 confidence_ok(entry, field_name) -> bool
 SearchBudget       — per-product Brave call counter
 SessionCache       — in-memory per-run query/URL dedup store
-ManufacturerDomainCache  — persistent data/manufacturer_domain_cache.json
-ProductEnrichmentCache   — persistent data/product_enrichment_cache.json
+ManufacturerDomainCache  — best-effort runtime manufacturer_domain_cache.json
+ProductEnrichmentCache   — best-effort runtime product_enrichment_cache.json
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
-_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
+from src.runtime_storage import record_storage_warning, runtime_data_path
+
+_log = logging.getLogger(__name__)
+
+_DATA_DIR = str(runtime_data_path())
 _MFR_CACHE_PATH = os.path.normpath(os.path.join(_DATA_DIR, "manufacturer_domain_cache.json"))
 _PRODUCT_CACHE_PATH = os.path.normpath(os.path.join(_DATA_DIR, "product_enrichment_cache.json"))
 
@@ -142,10 +147,17 @@ class ManufacturerDomainCache:
             return
         tmp = self._path + ".tmp"
         try:
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2)
             os.replace(tmp, self._path)
-        except Exception:
+        except Exception as exc:
+            record_storage_warning(self._path, exc)
+            _log.warning(
+                "ManufacturerDomainCache: could not save %s",
+                self._path,
+                exc_info=True,
+            )
             try:
                 os.unlink(tmp)
             except OSError:
@@ -199,10 +211,17 @@ class ProductEnrichmentCache:
             return
         tmp = self._path + ".tmp"
         try:
+            os.makedirs(os.path.dirname(self._path), exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, indent=2)
             os.replace(tmp, self._path)
-        except Exception:
+        except Exception as exc:
+            record_storage_warning(self._path, exc)
+            _log.warning(
+                "ProductEnrichmentCache: could not save %s",
+                self._path,
+                exc_info=True,
+            )
             try:
                 os.unlink(tmp)
             except OSError:
