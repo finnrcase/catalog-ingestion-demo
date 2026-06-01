@@ -172,8 +172,9 @@ def test_manufacturer_override_endpoint_saves_mapping(monkeypatch, tmp_path):
 def test_intake_enrich_endpoint_passes_web_enrichment_flag(monkeypatch):
     captured = {}
 
-    def fake_enrich_dataframe(df, enrichment_mode="standard", force_refresh=False, use_web_enrichment=True):
+    def fake_enrich_dataframe(df, enrichment_mode="standard", force_refresh=False, use_web_enrichment=True, enrichment_budget_usd=0.25):
         captured["use_web_enrichment"] = use_web_enrichment
+        captured["enrichment_budget_usd"] = enrichment_budget_usd
         return df, [], []
 
     monkeypatch.setattr("backend.main.enrich_dataframe", fake_enrich_dataframe)
@@ -185,6 +186,7 @@ def test_intake_enrich_endpoint_passes_web_enrichment_flag(monkeypatch):
 
     assert response.status_code == 200
     assert captured["use_web_enrichment"] is False
+    assert captured["enrichment_budget_usd"] == 0.25
 
 
 def test_intake_enrich_endpoint_reports_pre_completion_failure(monkeypatch):

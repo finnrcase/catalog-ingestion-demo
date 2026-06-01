@@ -151,6 +151,10 @@ _ENRICHMENT_DEBUG_FIELDS: list[str] = [
     "selected_image_url",
     "fields_filled",
     "budget_spent",
+    "duplicate_model_skipped",
+    "duplicate_model_source_index",
+    "searches_avoided",
+    "useful_fields_found",
 ]
 
 MIN_USE_SCORE = 40   # below this: skip entirely, note in Notes
@@ -296,22 +300,28 @@ def _build_sku_lookup_queries(row: dict, manufacturer_domain: str = "") -> list[
     model = _str_val(row.get("Model/SKU"))
     product_name = _str_val(row.get("Product Name"))
     queries: list[str] = []
-    if brand and model:
-        queries.extend([
-            f'"{brand}" "{model}" dimensions image product page',
-            f'"{brand}" "{model}" product',
-        ])
     if manufacturer_domain and model:
         queries.extend([
-            f'site:{manufacturer_domain} "{model}" dimensions image product page',
+            f'site:{manufacturer_domain} "{model}" dimensions',
+            f'site:{manufacturer_domain} "{model}" specification',
             f'site:{manufacturer_domain} "{model}" specifications',
             f'site:{manufacturer_domain} "{model}" spec sheet PDF',
+            f'site:{manufacturer_domain} "{model}" installation guide',
             f'site:{manufacturer_domain} "{model}" product',
         ])
     if brand and model:
         queries.extend([
+            f'"{brand}" "{model}" dimensions',
+            f'"{brand}" "{model}" specification',
             f'"{brand}" "{model}" specifications',
             f'"{brand}" "{model}" spec sheet PDF',
+            f'"{brand}" "{model}" installation guide',
+            f'"{brand}" "{model}" product page',
+            f'"{model}" PDF dimensions',
+        ])
+    if brand and model:
+        queries.extend([
+            f'"{brand}" "{model}" dimensions image product page',
         ])
     if brand and model and product_name:
         queries.append(f'"{brand}" "{model}" "{product_name}"')
@@ -1178,6 +1188,10 @@ def _dimension_debug_defaults(row: dict) -> dict:
         "selected_image_url": "",
         "fields_filled": "",
         "budget_spent": "",
+        "duplicate_model_skipped": False,
+        "duplicate_model_source_index": "",
+        "searches_avoided": 0,
+        "useful_fields_found": "",
     }
     debug.update(_image_debug_defaults())
     return debug
@@ -1252,6 +1266,131 @@ def _budget_summary(budget: "_SearchBudget | None") -> str:
     return f"searches={budget.searches_used}/{budget.max_searches}; fetches={budget.urls_used}/{budget.max_urls}"
 
 
+def _budget_searches_used(value: object) -> int:
+    match = re.search(r"searches=(\d+)/\d+", _str_val(value))
+    return int(match.group(1)) if match else 0
+
+
+def _budget_fetches_used(value: object) -> int:
+    match = re.search(r"fetches=(\d+)/\d+", _str_val(value))
+    return int(match.group(1)) if match else 0
+
+
+def _hard_cost_cap_for_mode(mode: str) -> float:
+    if _normalize_mode(mode) == "deep":
+        return float(os.getenv("ENRICHMENT_DEEP_HARD_COST_USD", "1.00") or "1.00")
+    return float(os.getenv("ENRICHMENT_HARD_COST_USD", "0.25") or "0.25")
+
+
+def _brave_cost_per_search() -> float:
+    return float(os.getenv("BRAVE_SEARCH_COST_USD", "0.006") or "0.006")
+
+
+def _row_enrichment_key(row: dict) -> str:
+    brand = _str_val(row.get("Brand"))
+    model = _str_val(row.get("Model/SKU"))
+    if not brand or not model:
+        return ""
+    try:
+        return _normalize_key(brand, model)
+    except ValueError:
+        return ""
+
+
+def _row_richness_score(row: dict) -> int:
+    score = 0
+    for field in ("Product URL", "Image URL", "Dimensions", "Product Name", "Supplier", "Room", "Finish / Color", "Material"):
+        if _str_val(row.get(field)):
+            score += 1
+    if has_complete_3d_dimensions(row.get("Dimensions")):
+        score += 3
+    if _reject_weak_product_url(_str_val(row.get("Product URL"))):
+        score -= 2
+    return score
+
+
+def _merge_duplicate_enrichment(original: dict, source: dict, source_index: int | str) -> dict:
+    """Copy enrichment-only values from source into a duplicate model row."""
+    updated = original.copy()
+    filled: list[str] = []
+
+    def fill_if_blank(column: str) -> None:
+        value = _str_val(source.get(column))
+        if value and not _str_val(updated.get(column)):
+            updated[column] = source.get(column)
+            filled.append(column)
+
+    if _str_val(source.get("Dimensions")) and not has_complete_3d_dimensions(updated.get("Dimensions")):
+        updated["Dimensions"] = source.get("Dimensions")
+        filled.append("Dimensions")
+    for column in ("Width (in)", "Height (in)", "Depth (in)", "Length (in)"):
+        fill_if_blank(column)
+
+    if _str_val(source.get("Image URL")) and _needs_image_recovery(updated):
+        updated["Image URL"] = source.get("Image URL")
+        filled.append("Image URL")
+
+    product_url = _str_val(source.get("Product URL"))
+    if product_url and (not _str_val(updated.get("Product URL")) or _reject_weak_product_url(_str_val(updated.get("Product URL")))):
+        updated["Product URL"] = product_url
+        filled.append("Product URL")
+
+    for column in (
+        "Product Category",
+        "Finish / Color",
+        "Material",
+        "Dimension Source URL",
+        "Dimension Confidence",
+        "Dimension Source Type",
+        "Dimension Lookup Status",
+        "original_image_url",
+        "cloudinary_url",
+        "image_confidence",
+        "image_source_url",
+        "image_candidate_diagnostics",
+        "cloudinary_status",
+        "cloudinary_error",
+        "programa_image_ready",
+        "selected_product_url",
+        "selected_product_url_confidence",
+        "selected_image_url",
+    ):
+        fill_if_blank(column)
+
+    merged_fields = [
+        part.strip()
+        for part in f"{_str_val(source.get('fields_filled'))}, {', '.join(filled)}".split(",")
+        if part.strip()
+    ]
+    updated["fields_filled"] = ", ".join(dict.fromkeys(merged_fields))
+    updated["useful_fields_found"] = updated["fields_filled"]
+    updated["duplicate_model_skipped"] = True
+    updated["duplicate_model_source_index"] = str(source_index)
+    updated["searches_avoided"] = max(1, _budget_searches_used(source.get("budget_spent")))
+    updated["budget_spent"] = "searches=0/0; fetches=0/0"
+    updated["cache_hit"] = _str_val(updated.get("cache_hit")) or "duplicate_model"
+    updated["skipped_reason"] = "duplicate brand/model reused enrichment result"
+    updated["enrichment_error"] = ""
+    updated["enrichment_status"] = _classify_enrichment_status(updated)
+    return updated
+
+
+def _classify_enrichment_status(row: dict, failed: bool = False) -> str:
+    if failed or _str_val(row.get("enrichment_error")):
+        return "failed"
+    brand = _str_val(row.get("Brand"))
+    model = _str_val(row.get("Model/SKU"))
+    if not brand or not model:
+        return "needs_review"
+    missing_dims = _needs_dimension_recovery(row)
+    missing_image = _needs_image_recovery(row)
+    if missing_dims or missing_image:
+        if _str_val(row.get("Product URL")) or _str_val(row.get("Image URL")) or _str_val(row.get("Dimensions")):
+            return "partially_enriched"
+        return "needs_review"
+    return "complete"
+
+
 def _search_sku_product_pages(
     row: dict,
     manufacturer_domain: str,
@@ -1267,7 +1406,7 @@ def _search_sku_product_pages(
     for query in _build_sku_lookup_queries(row, manufacturer_domain):
         if budget is not None and not budget.can_search():
             debug["budget_blocked"] = True
-            debug["skipped_reason"] = "budget blocked SKU product search"
+            debug["budget_stop_reason"] = "SKU product search budget exhausted"
             break
         queries_used.append(query)
         debug["search_provider"] = "brave"
@@ -1291,17 +1430,20 @@ def _search_sku_product_pages(
 
     model_norm = _norm_token(model)
 
-    def _candidate_rank(result) -> tuple[int, int, int, int]:
+    def _candidate_rank(result) -> tuple[int, int, int, int, int]:
         url = _str_val(getattr(result, "url", ""))
         title = _str_val(getattr(result, "title", ""))
         description = _str_val(getattr(result, "description", ""))
+        haystack = " ".join([url, title, description]).lower()
         domain = _domain_of(url)
         sku_hit = 1 if model_norm and model_norm in _norm_token(" ".join([url, title, description])) else 0
         official_hit = 1 if _domain_matches(domain, manufacturer_domain) else 0
+        spec_hit = 1 if any(token in haystack for token in ("dimension", "specification", "spec-sheet", "spec sheet", "installation", ".pdf")) else 0
         weak_penalty = -1 if _reject_weak_product_url(url) else 0
         return (
             sku_hit,
             official_hit,
+            spec_hit,
             int(getattr(result, "domain_score", 0) or 0),
             weak_penalty,
         )
@@ -1412,7 +1554,7 @@ def _try_verified_page_enrichment(
     if product_url:
         candidates_to_check.append((product_url, "", ""))
     if not product_url or _reject_weak_product_url(product_url):
-        candidate_limit = max(5, getattr(budget, "max_urls", 5) if budget is not None else 5)
+        candidate_limit = max(1, min(3, getattr(budget, "max_urls", 3) if budget is not None else 3))
         for result in _search_sku_product_pages(
             row,
             manufacturer_domain,
@@ -1479,20 +1621,6 @@ def _try_verified_page_enrichment(
         debug["selected_product_url_confidence"],
     )
 
-    image_debug: dict = {}
-    if _needs_image_recovery(updated):
-        image_url, image_debug = _extract_image_from_html(selected_html, selected_url, updated, cache_key)
-        debug.update(image_debug)
-        try:
-            debug["image_candidates_count"] = len(extract_product_image_candidates(selected_html, selected_url, updated))
-        except Exception:
-            debug["image_candidates_count"] = ""
-        if image_url:
-            updated["Image URL"] = image_url
-            updated.update(image_debug)
-            debug["selected_image_url"] = image_url
-            fields_filled.append("Image URL")
-
     dim_result: _DimensionResult | None = None
     if _needs_dimension_recovery(updated):
         _append_stage(debug, "SEARCHING_DIMENSIONS")
@@ -1515,6 +1643,20 @@ def _try_verified_page_enrichment(
         debug["Dimension Source URL"] = dim_result.source_url
     else:
         debug["dimensions_found"] = bool(_str_val(updated.get("Dimensions")))
+
+    image_debug: dict = {}
+    if _needs_image_recovery(updated):
+        image_url, image_debug = _extract_image_from_html(selected_html, selected_url, updated, cache_key)
+        debug.update(image_debug)
+        try:
+            debug["image_candidates_count"] = len(extract_product_image_candidates(selected_html, selected_url, updated))
+        except Exception:
+            debug["image_candidates_count"] = ""
+        if image_url:
+            updated["Image URL"] = image_url
+            updated.update(image_debug)
+            debug["selected_image_url"] = image_url
+            fields_filled.append("Image URL")
 
     debug["fields_filled"] = ", ".join(dict.fromkeys(fields_filled))
     debug["budget_spent"] = _budget_summary(budget)
@@ -1554,6 +1696,12 @@ def enrich_row(
 
         mode = _normalize_mode(enrichment_mode)
         budget = _budget_for_mode(mode)
+        remaining_searches = getattr(session_cache, "remaining_searches", None)
+        if remaining_searches is not None:
+            budget.max_searches = min(budget.max_searches, max(0, int(remaining_searches)))
+        remaining_fetches = getattr(session_cache, "remaining_fetches", None)
+        if remaining_fetches is not None:
+            budget.max_urls = min(budget.max_urls, max(0, int(remaining_fetches)))
         brand = _str_val(row.get("Brand"))
         model_sku = _str_val(row.get("Model/SKU"))
         cache_key = _normalize_key(brand, model_sku) if brand and model_sku else ""
@@ -1900,6 +2048,7 @@ def enrich_dataframe(
     enrichment_mode: str = "standard",
     force_refresh: bool = False,
     use_web_enrichment: bool = True,
+    enrichment_budget_usd: float | None = 0.25,
 ) -> tuple[pd.DataFrame, list[str], list[dict]]:
     """
     Enrich all qualifying rows in df. Returns (updated_df, error_list, dimension_diagnostics).
@@ -1921,6 +2070,21 @@ def enrich_dataframe(
     from src.enrichment_cache import SessionCache as _SC
     _session = _SC(force_refresh=force_refresh)
 
+    mode = _normalize_mode(enrichment_mode)
+    search_cost = _brave_cost_per_search()
+    mode_cap_usd = _hard_cost_cap_for_mode(mode)
+    try:
+        requested_cap_usd = float(enrichment_budget_usd) if enrichment_budget_usd is not None else mode_cap_usd
+    except (TypeError, ValueError):
+        requested_cap_usd = mode_cap_usd
+    hard_cap_usd = max(0.0, min(mode_cap_usd, requested_cap_usd))
+    max_run_searches = max(0, int(hard_cap_usd / search_cost)) if search_cost > 0 else 999_999
+    total_searches_used = 0
+    total_fetches_used = 0
+    unique_products_searched = 0
+
+    grouped_indices: dict[str, list] = {}
+    unique_counter = 0
     for idx, row in df.iterrows():
         r = row.to_dict()
         if not _qualifies(r):
@@ -1935,37 +2099,69 @@ def enrich_dataframe(
                 if col in df.columns:
                     df.at[idx, col] = val
             continue
+        key = _row_enrichment_key(r)
+        if not key:
+            unique_counter += 1
+            key = f"__row_{idx}_{unique_counter}"
+        grouped_indices.setdefault(key, []).append(idx)
+
+    for key, indices in grouped_indices.items():
+        rep_idx = max(indices, key=lambda i: _row_richness_score(df.loc[i].to_dict()))
+        remaining_searches = max_run_searches - total_searches_used
+        setattr(_session, "remaining_searches", remaining_searches)
+        # Keep page/spec fetches bounded per run as well. These are usually free,
+        # but they still affect latency and failure noise in serverless.
+        setattr(_session, "remaining_fetches", max(0, (max_run_searches * 3) - total_fetches_used))
+
+        if remaining_searches <= 0:
+            for idx in indices:
+                r = df.loc[idx].to_dict()
+                blocked_debug = _dimension_debug_defaults(r)
+                _append_stage(blocked_debug, "ENRICHMENT_STARTED")
+                _append_stage(blocked_debug, "ENRICHMENT_COMPLETE")
+                blocked_debug.update({
+                    "budget_blocked": True,
+                    "skipped_reason": "Skipped due to enrichment budget cap",
+                    "enrichment_status": "needs_review",
+                    "enrichment_error": "",
+                    "budget_spent": "searches=0/0; fetches=0/0",
+                })
+                for col, val in blocked_debug.items():
+                    if col in df.columns:
+                        df.at[idx, col] = val
+            continue
 
         try:
+            representative = df.loc[rep_idx].to_dict()
             updated, error, dim_result = enrich_row(
-                r,
+                representative,
                 enrichment_mode=enrichment_mode,
                 session_cache=_session,
             )
+            searches_used = _budget_searches_used(updated.get("budget_spent"))
+            fetches_used = _budget_fetches_used(updated.get("budget_spent"))
+            if searches_used > 0:
+                unique_products_searched += 1
+            total_searches_used += searches_used
+            total_fetches_used += fetches_used
             if error:
                 errors.append(error)
                 updated["enrichment_status"] = "failed"
                 updated["enrichment_error"] = error
-            elif not _str_val(updated.get("enrichment_status")):
-                updated["enrichment_status"] = "complete"
+            else:
+                updated["enrichment_status"] = _classify_enrichment_status(updated)
                 updated["enrichment_error"] = ""
+            updated["useful_fields_found"] = _str_val(updated.get("fields_filled"))
 
-            # Only write back columns that already exist in the DataFrame.
-            # The intake schema guarantees all expected columns are present;
-            # this guard prevents accidental column creation mid-iteration.
             for col, val in updated.items():
                 if col in df.columns:
-                    df.at[idx, col] = val
+                    df.at[rep_idx, col] = val
 
             if not error:
                 _log_enrichment_outcome(updated)
-
-                # Collect dimension diagnostics if lookup ran.
-                # Diagnostic is built from DimensionResult directly (not from row dict),
-                # so it is accurate even if dimension columns are absent from the DataFrame.
                 if dim_result is not None:
                     dimension_diagnostics.append({
-                        "row_index": int(idx),
+                        "row_index": int(rep_idx),
                         "product_name": _str_val(updated.get("Product Name")),
                         "model_searched": _str_val(updated.get("Model/SKU")),
                         "domain_used": urllib.parse.urlparse(
@@ -1980,25 +2176,42 @@ def enrich_dataframe(
                         "failure_reason": dim_result.failure_reason,
                         **{field: dim_result.debug.get(field, "") for field in _ENRICHMENT_DEBUG_FIELDS},
                     })
+
+            for idx in indices:
+                if idx == rep_idx:
+                    continue
+                duplicate = _merge_duplicate_enrichment(df.loc[idx].to_dict(), updated, rep_idx)
+                for col, val in duplicate.items():
+                    if col in df.columns:
+                        df.at[idx, col] = val
         except Exception as exc:
             tb = traceback.format_exc()
-            label = _str_val(r.get("Product Name")) or _str_val(r.get("Brand")) or _str_val(r.get("Model/SKU")) or str(idx)
+            label_row = df.loc[rep_idx].to_dict()
+            label = _str_val(label_row.get("Product Name")) or _str_val(label_row.get("Brand")) or _str_val(label_row.get("Model/SKU")) or str(rep_idx)
             errors.append(f"Row '{label}': {exc}")
-            failed_debug = _dimension_debug_defaults(r)
-            _append_stage(failed_debug, "ENRICHMENT_STARTED")
-            _append_stage(failed_debug, "ENRICHMENT_COMPLETE")
-            failed_debug.update({
-                "enrichment_status": "failed",
-                "enrichment_error": str(exc),
-                "debug_traceback": tb,
-                "skipped_reason": str(exc),
-            })
-            for col, val in failed_debug.items():
-                if col in df.columns:
-                    df.at[idx, col] = val
+            for idx in indices:
+                r = df.loc[idx].to_dict()
+                failed_debug = _dimension_debug_defaults(r)
+                _append_stage(failed_debug, "ENRICHMENT_STARTED")
+                _append_stage(failed_debug, "ENRICHMENT_COMPLETE")
+                failed_debug.update({
+                    "enrichment_status": "failed",
+                    "enrichment_error": str(exc),
+                    "debug_traceback": tb,
+                    "skipped_reason": str(exc),
+                })
+                for col, val in failed_debug.items():
+                    if col in df.columns:
+                        df.at[idx, col] = val
 
-        time.sleep(0.5)
+        time.sleep(0.1)
 
+    df.attrs["enrichment_budget_cap_usd"] = hard_cap_usd
+    df.attrs["enrichment_search_cost_usd"] = search_cost
+    df.attrs["unique_products_searched"] = unique_products_searched
+    df.attrs["duplicate_rows_skipped_for_enrichment"] = max(0, sum(len(indices) - 1 for indices in grouped_indices.values()))
+    df.attrs["brave_searches_used"] = total_searches_used
+    df.attrs["page_fetches_used"] = total_fetches_used
     return df, errors, dimension_diagnostics
 
 

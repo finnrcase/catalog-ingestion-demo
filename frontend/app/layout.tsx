@@ -12,9 +12,30 @@ export const metadata: Metadata = {
   },
 };
 
+const themeInitScript = `
+(function () {
+  try {
+    var key = "sch-intake-theme";
+    var stored = window.localStorage.getItem(key);
+    var preference = stored === "system" || stored === "light" || stored === "dark" ? stored : "dark";
+    var resolved = preference === "system"
+      ? (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark")
+      : preference;
+    document.documentElement.dataset.themePreference = preference;
+    document.documentElement.dataset.theme = resolved;
+  } catch (error) {
+    document.documentElement.dataset.themePreference = "dark";
+    document.documentElement.dataset.theme = "dark";
+  }
+})();
+`;
+
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="en" data-theme="dark" data-theme-preference="dark" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
+      </head>
       <body>{children}</body>
     </html>
   );

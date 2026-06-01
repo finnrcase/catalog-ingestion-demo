@@ -174,11 +174,17 @@ def test_build_sku_lookup_queries_prioritizes_exact_model_and_domain():
 
     queries = _build_sku_lookup_queries(row, "scotsman-ice.com")
 
-    assert queries[0] == '"Scotsman" "SCN60PA1SU" dimensions image product page'
-    assert 'site:scotsman-ice.com "SCN60PA1SU" dimensions image product page' in queries
+    assert queries[0] == 'site:scotsman-ice.com "SCN60PA1SU" dimensions'
+    assert queries[1] == 'site:scotsman-ice.com "SCN60PA1SU" specification'
+    assert 'site:scotsman-ice.com "SCN60PA1SU" specifications' in queries
+    assert 'site:scotsman-ice.com "SCN60PA1SU" installation guide' in queries
+    assert 'site:scotsman-ice.com "SCN60PA1SU" spec sheet PDF' in queries
+    assert '"Scotsman" "SCN60PA1SU" dimensions' in queries
     assert '"Scotsman" "SCN60PA1SU" specifications' in queries
     assert '"Scotsman" "SCN60PA1SU" spec sheet PDF' in queries
-    assert '"Scotsman" "SCN60PA1SU" product' in queries
+    assert '"Scotsman" "SCN60PA1SU" installation guide' in queries
+    assert '"SCN60PA1SU" PDF dimensions' in queries
+    assert '"Scotsman" "SCN60PA1SU" product page' in queries
     assert '"Scotsman" "SCN60PA1SU" "Panel Ready Icemaker"' in queries
     assert '"Scotsman" "Panel Ready Icemaker"' in queries
 
@@ -952,7 +958,7 @@ def test_enrich_row_sku_search_selects_official_verified_page(monkeypatch):
 
     assert error is None
     mock_search.assert_called_once()
-    assert mock_search.call_args.args[0] == '"Scotsman" "SCN60PA1SU" dimensions image product page'
+    assert mock_search.call_args.args[0] == 'site:scotsman-ice.com "SCN60PA1SU" dimensions'
     assert updated["Product URL"] == official.url
     assert updated["selected_product_url_confidence"] == "high"
     assert updated["manufacturer_domain_used"] == "scotsman-ice.com"
@@ -1205,6 +1211,109 @@ def test_enrich_dataframe_web_enrichment_disabled_skips_cache_and_search(monkeyp
     mock_search.assert_not_called()
     mock_domain.assert_not_called()
     mock_dimensions.assert_not_called()
+
+
+def test_enrich_dataframe_enriches_duplicate_brand_model_once(monkeypatch):
+    import src.product_enrichment as pe
+
+    calls = []
+
+    def fake_enrich_row(row, enrichment_mode="standard", session_cache=None):
+        calls.append((row["Brand"], row["Model/SKU"], row.get("Room")))
+        updated = dict(row)
+        updated.update(
+            {
+                "Dimensions": '30"W x 12"H x 24"D',
+                "Image URL": "https://res.cloudinary.com/demo/image/upload/wolf.jpg",
+                "Product URL": "https://wolf.example/products/mdd30ts",
+                "fields_filled": "Dimensions, Image URL, Product URL",
+                "budget_spent": "searches=1/4; fetches=1/5",
+            }
+        )
+        return updated, None, None
+
+    rows = [
+        {**_qualifying_row(), "Room": "Kitchen"},
+        {**_qualifying_row(), "Room": "Bar", "Dimensions": "", "Image URL": "", "Product URL": ""},
+    ]
+    monkeypatch.setattr(pe, "enrich_row", fake_enrich_row)
+    monkeypatch.setattr(pe.time, "sleep", lambda *_args, **_kwargs: None)
+
+    updated_df, errors, diagnostics = enrich_dataframe(pd.DataFrame(rows), enrichment_mode="standard")
+
+    assert errors == []
+    assert diagnostics == []
+    assert calls == [("Wolf", "MDD30TS", "Kitchen")]
+    assert updated_df.iloc[0]["Dimensions"] == '30"W x 12"H x 24"D'
+    assert updated_df.iloc[1]["Dimensions"] == '30"W x 12"H x 24"D'
+    assert updated_df.iloc[1]["Image URL"] == "https://res.cloudinary.com/demo/image/upload/wolf.jpg"
+    assert updated_df.iloc[1]["duplicate_model_skipped"] is True
+    assert int(updated_df.iloc[1]["searches_avoided"]) >= 1
+
+
+def test_enrich_dataframe_run_budget_blocks_extra_unique_models(monkeypatch):
+    import src.product_enrichment as pe
+
+    calls = []
+
+    def fake_enrich_row(row, enrichment_mode="standard", session_cache=None):
+        calls.append(row["Model/SKU"])
+        updated = dict(row)
+        updated["budget_spent"] = "searches=1/4; fetches=1/5"
+        updated["fields_filled"] = "Product URL"
+        updated["Product URL"] = f"https://example.com/{row['Model/SKU'].lower()}"
+        return updated, None, None
+
+    rows = [
+        {**_qualifying_row(), "Model/SKU": "MDD30TS"},
+        {**_qualifying_row(), "Model/SKU": "WWD30"},
+    ]
+    monkeypatch.setenv("ENRICHMENT_HARD_COST_USD", "0.006")
+    monkeypatch.setenv("BRAVE_SEARCH_COST_USD", "0.006")
+    monkeypatch.setattr(pe, "enrich_row", fake_enrich_row)
+    monkeypatch.setattr(pe.time, "sleep", lambda *_args, **_kwargs: None)
+
+    updated_df, errors, diagnostics = enrich_dataframe(pd.DataFrame(rows), enrichment_mode="fast")
+
+    assert errors == []
+    assert diagnostics == []
+    assert calls == ["MDD30TS"]
+    assert updated_df.iloc[1]["budget_blocked"] is True
+    assert "budget cap" in updated_df.iloc[1]["skipped_reason"].lower()
+
+
+def test_enrich_dataframe_uses_explicit_document_budget_cap(monkeypatch):
+    import src.product_enrichment as pe
+
+    calls = []
+
+    def fake_enrich_row(row, enrichment_mode="standard", session_cache=None):
+        calls.append(row["Model/SKU"])
+        updated = dict(row)
+        updated["budget_spent"] = "searches=1/4; fetches=1/5"
+        updated["Product URL"] = f"https://example.com/{row['Model/SKU'].lower()}"
+        updated["fields_filled"] = "Product URL"
+        return updated, None, None
+
+    rows = [
+        {**_qualifying_row(), "Model/SKU": "MDD30TS"},
+        {**_qualifying_row(), "Model/SKU": "WWD30"},
+    ]
+    monkeypatch.setenv("BRAVE_SEARCH_COST_USD", "0.006")
+    monkeypatch.setattr(pe, "enrich_row", fake_enrich_row)
+    monkeypatch.setattr(pe.time, "sleep", lambda *_args, **_kwargs: None)
+
+    updated_df, errors, _ = enrich_dataframe(
+        pd.DataFrame(rows),
+        enrichment_mode="standard",
+        enrichment_budget_usd=0.006,
+    )
+
+    assert errors == []
+    assert calls == ["MDD30TS"]
+    assert updated_df.attrs["enrichment_budget_cap_usd"] == 0.006
+    assert updated_df.attrs["unique_products_searched"] == 1
+    assert updated_df.iloc[1]["budget_blocked"] is True
 
 
 # ── has_complete_3d_dimensions ─────────────────────────────────────────────────

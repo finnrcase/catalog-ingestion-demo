@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 
 const DEBUG_MODE_STORAGE_KEY = "sch-intake-debug-mode";
+const THEME_STORAGE_KEY = "sch-intake-theme";
 const ACCENT_THEME_STORAGE_KEY = "sch-intake-accent-theme";
 const UI_MODE_STORAGE_KEY = "sch-intake-ui-mode";
 
@@ -23,7 +24,14 @@ const accentThemes = [
 ] as const;
 
 type AccentThemeId = (typeof accentThemes)[number]["id"];
+type ThemePreference = "system" | "dark" | "light";
 type UiMode = "explanation" | "simple";
+
+const themeOptions: { id: ThemePreference; label: string; description: string }[] = [
+  { id: "system", label: "System", description: "Follow browser or OS preference." },
+  { id: "dark", label: "Dark", description: "Current SCH dark workspace." },
+  { id: "light", label: "Light", description: "Warm premium light workspace." },
+];
 
 const fallbackBuildInfo = {
   commit:
@@ -53,8 +61,19 @@ function applyAccent(themeId: AccentThemeId) {
   root.style.setProperty("--accent-text", theme.text);
 }
 
+function resolveThemePreference(preference: ThemePreference) {
+  if (preference !== "system") return preference;
+  return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+
+function applyThemePreference(preference: ThemePreference) {
+  document.documentElement.dataset.themePreference = preference;
+  document.documentElement.dataset.theme = resolveThemePreference(preference);
+}
+
 export default function SettingsPage() {
   const [debugMode, setDebugMode] = useState(false);
+  const [themePreference, setThemePreference] = useState<ThemePreference>("dark");
   const [accentThemeId, setAccentThemeId] = useState<AccentThemeId>("orange");
   const [uiMode, setUiMode] = useState<UiMode>("explanation");
   const [apiStatus, setApiStatus] = useState("checking");
@@ -62,9 +81,13 @@ export default function SettingsPage() {
 
   useEffect(() => {
     const storedDebug = window.localStorage.getItem(DEBUG_MODE_STORAGE_KEY) === "true";
+    const storedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
     const storedAccent = window.localStorage.getItem(ACCENT_THEME_STORAGE_KEY) as AccentThemeId | null;
     const storedUiMode = window.localStorage.getItem(UI_MODE_STORAGE_KEY);
     setDebugMode(storedDebug);
+    const nextTheme = storedTheme === "system" || storedTheme === "light" || storedTheme === "dark" ? storedTheme : "dark";
+    setThemePreference(nextTheme);
+    applyThemePreference(nextTheme);
     setUiMode(storedUiMode === "simple" ? "simple" : "explanation");
     if (storedAccent && accentThemes.some((theme) => theme.id === storedAccent)) {
       setAccentThemeId(storedAccent);
@@ -77,6 +100,17 @@ export default function SettingsPage() {
   useEffect(() => {
     window.localStorage.setItem(DEBUG_MODE_STORAGE_KEY, String(debugMode));
   }, [debugMode]);
+
+  useEffect(() => {
+    window.localStorage.setItem(THEME_STORAGE_KEY, themePreference);
+    applyThemePreference(themePreference);
+    if (themePreference !== "system") return;
+    const media = window.matchMedia?.("(prefers-color-scheme: light)");
+    if (!media) return;
+    const handleChange = () => applyThemePreference("system");
+    media.addEventListener?.("change", handleChange);
+    return () => media.removeEventListener?.("change", handleChange);
+  }, [themePreference]);
 
   useEffect(() => {
     window.localStorage.setItem(ACCENT_THEME_STORAGE_KEY, accentThemeId);
@@ -103,11 +137,13 @@ export default function SettingsPage() {
       <div className="mx-auto max-w-4xl rounded-[28px] border border-linen bg-white/70 p-6 shadow-panel">
         <div className="flex flex-col gap-4 border-b border-linen pb-5 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-bronze">SCH FRONTEND v2 ACTIVE</p>
+            {debugMode ? (
+              <p className="text-xs font-semibold uppercase tracking-[0.22em] text-bronze">SCH FRONTEND v2 ACTIVE</p>
+            ) : null}
             <h1 className="mt-2 text-3xl font-semibold text-charcoal">Production frontend settings</h1>
             {!isSimpleMode ? (
               <p className="mt-2 text-sm leading-6 text-taupe">
-                Color themes, debug mode, backend status, and export preferences for the live Next frontend.
+                Theme, interface mode, debug mode, and export preferences for the SCH workspace.
               </p>
             ) : null}
             <p className="mt-2 text-xs font-semibold uppercase tracking-[0.12em] text-taupe">
@@ -122,10 +158,60 @@ export default function SettingsPage() {
         <section className="mt-5 rounded-2xl border border-linen bg-ivory/70 p-4">
           <h2 className="text-sm font-semibold text-charcoal">Appearance</h2>
           {!isSimpleMode ? (
-            <p className="mt-1 text-sm text-taupe">Choose the accent used for buttons, workflow stages, highlights, and selected controls.</p>
+            <p className="mt-1 text-sm text-taupe">Choose the workspace theme and SCH accent styling.</p>
+          ) : null}
+          <div className="mt-4">
+            <div className="text-xs font-semibold uppercase tracking-[0.12em] text-charcoal/55">Theme</div>
+            <div className="mt-2 grid gap-2 sm:grid-cols-3">
+              {themeOptions.map((theme) => {
+                const selected = themePreference === theme.id;
+                return (
+                  <button
+                    key={theme.id}
+                    type="button"
+                    className={`rounded-xl border px-3 py-2 text-left text-sm font-semibold transition ${
+                      selected ? "border-orangeBorder bg-orangeSoft text-bronze" : "border-linen bg-white/60 text-charcoal hover:border-orangeBorder"
+                    }`}
+                    onClick={() => setThemePreference(theme.id)}
+                    aria-pressed={selected}
+                  >
+                    {theme.label}
+                    {!isSimpleMode ? <span className="mt-1 block text-xs font-medium text-taupe">{theme.description}</span> : null}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          <div className="mt-4">
+            <div className="text-xs font-semibold uppercase tracking-[0.12em] text-charcoal/55">Accent</div>
+            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4">
+              {accentThemes.map((theme) => {
+                const selected = accentThemeId === theme.id;
+                return (
+                  <button
+                    key={theme.id}
+                    type="button"
+                    className={`flex items-center gap-2 rounded-xl border px-3 py-2 text-left text-sm font-semibold transition ${
+                      selected ? "border-orangeBorder bg-orangeSoft text-bronze" : "border-linen bg-white/60 text-charcoal hover:border-orangeBorder"
+                    }`}
+                    onClick={() => setAccentThemeId(theme.id)}
+                  >
+                    <span className="h-4 w-4 rounded-full border border-white/30" style={{ backgroundColor: theme.accent }} />
+                    {theme.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+
+        <section className="mt-4 rounded-2xl border border-linen bg-white/58 p-4">
+          <h2 className="text-sm font-semibold text-charcoal">Interface</h2>
+          {!isSimpleMode ? (
+            <p className="mt-1 text-sm text-taupe">Switch between a cleaner workflow and the fuller guided experience.</p>
           ) : null}
           <div className="mt-4 grid gap-2 sm:grid-cols-2">
-            {(["explanation", "simple"] as UiMode[]).map((mode) => {
+            {(["simple", "explanation"] as UiMode[]).map((mode) => {
               const selected = uiMode === mode;
               return (
                 <button
@@ -140,27 +226,9 @@ export default function SettingsPage() {
                   {mode === "simple" ? "Simple Mode" : "Explanation Mode"}
                   {!isSimpleMode ? (
                     <span className="mt-1 block text-xs font-medium text-taupe">
-                      {mode === "simple" ? "Hide helper descriptions and keep actions compact." : "Show helper text and explanatory copy."}
+                      {mode === "simple" ? "Minimal descriptions and cleaner cards." : "Helper text, onboarding descriptions, and extra context."}
                     </span>
                   ) : null}
-                </button>
-              );
-            })}
-          </div>
-          <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4">
-            {accentThemes.map((theme) => {
-              const selected = accentThemeId === theme.id;
-              return (
-                <button
-                  key={theme.id}
-                  type="button"
-                  className={`flex items-center gap-2 rounded-xl border px-3 py-2 text-left text-sm font-semibold transition ${
-                    selected ? "border-orangeBorder bg-orangeSoft text-bronze" : "border-linen bg-white/60 text-charcoal hover:border-orangeBorder"
-                  }`}
-                  onClick={() => setAccentThemeId(theme.id)}
-                >
-                  <span className="h-4 w-4 rounded-full border border-white/30" style={{ backgroundColor: theme.accent }} />
-                  {theme.label}
                 </button>
               );
             })}
@@ -168,7 +236,7 @@ export default function SettingsPage() {
         </section>
 
         <section className="mt-4 rounded-2xl border border-linen bg-white/58 p-4">
-          <h2 className="text-sm font-semibold text-charcoal">Debug & Diagnostics</h2>
+          <h2 className="text-sm font-semibold text-charcoal">Developer</h2>
           <label className="mt-3 flex items-start gap-3 text-sm text-taupe">
             <input
               type="checkbox"
@@ -186,24 +254,41 @@ export default function SettingsPage() {
         </section>
 
         <section className="mt-4 rounded-2xl border border-linen bg-ivory/70 p-4">
-          <h2 className="text-sm font-semibold text-charcoal">Backend / API Status</h2>
+          <h2 className="text-sm font-semibold text-charcoal">About</h2>
           <dl className="mt-3 grid gap-2 text-xs text-taupe sm:grid-cols-2">
             <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Status</dt>
-              <dd className="mt-1 font-mono text-charcoal">{apiStatus}</dd>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Theme</dt>
+              <dd className="mt-1 font-mono text-charcoal">{themeOptions.find((theme) => theme.id === themePreference)?.label || themePreference}</dd>
             </div>
             <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">NEXT_PUBLIC_API_BASE_URL</dt>
-              <dd className="mt-1 break-all font-mono text-charcoal">{fallbackBuildInfo.apiBase}</dd>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">UI mode</dt>
+              <dd className="mt-1 font-mono text-charcoal">{isSimpleMode ? "Simple" : "Explanation"}</dd>
             </div>
-            <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Homepage route</dt>
-              <dd className="mt-1 font-mono text-charcoal">frontend/app/page.tsx</dd>
-            </div>
-            <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Commit</dt>
-              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.commit}</dd>
-            </div>
+            {debugMode ? (
+              <>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Backend status</dt>
+                  <dd className="mt-1 font-mono text-charcoal">{apiStatus}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">NEXT_PUBLIC_API_BASE_URL</dt>
+                  <dd className="mt-1 break-all font-mono text-charcoal">{fallbackBuildInfo.apiBase}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Homepage route</dt>
+                  <dd className="mt-1 font-mono text-charcoal">frontend/app/page.tsx</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Build</dt>
+                  <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.commit}</dd>
+                </div>
+              </>
+            ) : (
+              <div className="sm:col-span-2">
+                <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Build & environment</dt>
+                <dd className="mt-1 text-charcoal">Enable Debug Mode to view build, route, API, and backend diagnostics.</dd>
+              </div>
+            )}
           </dl>
         </section>
 

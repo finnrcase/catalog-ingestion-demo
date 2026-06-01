@@ -184,6 +184,7 @@ export async function enrichRows(input: {
   useWebEnrichment: boolean;
   enrichmentMode?: string;
   forceRefresh?: boolean;
+  enrichmentBudgetUsd?: number;
 }): Promise<IntakeResponse> {
   return parseJson<IntakeResponse>(
     await apiFetch(apiUrl("/intake/enrich"), {
@@ -194,6 +195,7 @@ export async function enrichRows(input: {
         use_web_enrichment: input.useWebEnrichment,
         enrichment_mode: input.enrichmentMode,
         force_refresh: input.forceRefresh ?? false,
+        enrichment_budget_usd: input.enrichmentBudgetUsd ?? 0.25,
       }),
     }),
   );

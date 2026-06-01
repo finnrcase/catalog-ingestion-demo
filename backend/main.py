@@ -29,6 +29,7 @@ from src.ai_extraction import (
 )
 from src.confidence import apply_confidence_checks
 from src.document_parser import parse_pdf_rows
+from src.dimensions import has_complete_3d_dimensions
 from src.eligibility import split_eligible_rows
 from src.export import get_csv_bytes
 from src.intake import build_intake_dataframe, create_pdf_rows, create_url_rows
@@ -84,6 +85,7 @@ class RowsPayload(BaseModel):
     enrichment_mode: str = "standard"
     force_refresh: bool = False
     use_web_enrichment: bool = True
+    enrichment_budget_usd: float = 0.25
 
 
 class ProgramaPayload(RowsPayload):
@@ -232,7 +234,12 @@ def _text_value(value: Any) -> str:
 
 def _enrichment_summary(df: pd.DataFrame, elapsed_ms: float) -> dict:
     rows = df.fillna("").to_dict("records")
-    included = [row for row in rows if str(row.get("Include", True)).lower() not in {"false", "0", "no"}]
+    included = [
+        row
+        for row in rows
+        if str(row.get("Include", True)).lower() not in {"false", "0", "no"}
+        and _text_value(row.get("Import Type")).lower() not in {"unresolved_charge", "manual_review_charge"}
+    ]
 
     def _confidence_value(row: dict) -> float | None:
         for key in ("selected_product_url_confidence", "Dimension Confidence", "dimension_confidence", "image_confidence"):
@@ -254,12 +261,26 @@ def _enrichment_summary(df: pd.DataFrame, elapsed_ms: float) -> dict:
 
     searches_used = 0
     fetches_used = 0
+    duplicate_models_skipped = 0
+    searches_avoided = 0
+    cache_hits = 0
+    useful_fields_found = 0
     for row in included:
         budget_text = _text_value(row.get("budget_spent"))
         match = re.search(r"searches=(\d+)/\d+;\s*fetches=(\d+)/\d+", budget_text)
         if match:
             searches_used += int(match.group(1))
             fetches_used += int(match.group(2))
+        if str(row.get("duplicate_model_skipped", "")).lower() in {"true", "1", "yes"}:
+            duplicate_models_skipped += 1
+        try:
+            searches_avoided += int(float(_text_value(row.get("searches_avoided")) or "0"))
+        except ValueError:
+            pass
+        if _text_value(row.get("cache_hit")).lower() in {"full", "partial", "duplicate_model"}:
+            cache_hits += 1
+        fields_text = _text_value(row.get("useful_fields_found")) or _text_value(row.get("fields_filled"))
+        useful_fields_found += len([field for field in re.split(r"\s*,\s*", fields_text) if field])
 
     brave_cost = float(os.getenv("BRAVE_SEARCH_COST_USD", "0.006") or "0.006")
     confidences = [value for row in included if (value := _confidence_value(row)) is not None]
@@ -272,10 +293,16 @@ def _enrichment_summary(df: pd.DataFrame, elapsed_ms: float) -> dict:
         or _text_value(row.get("Dimensions"))
         or _text_value(row.get("Image URL"))
     )
-    missing_dimensions = sum(1 for row in included if not _text_value(row.get("Dimensions")))
+    missing_dimensions = sum(1 for row in included if not has_complete_3d_dimensions(row.get("Dimensions")))
     missing_images = sum(1 for row in included if not _text_value(row.get("Image URL")))
 
     estimated_cost = searches_used * brave_cost
+    cost_per_useful_field = estimated_cost / useful_fields_found if useful_fields_found else 0
+    images_present = sum(1 for row in included if _text_value(row.get("Image URL")))
+    dimensions_present = sum(1 for row in included if has_complete_3d_dimensions(row.get("Dimensions")))
+    budget_cap = df.attrs.get("enrichment_budget_cap_usd", 0.25)
+    unique_products_searched = int(df.attrs.get("unique_products_searched", 0) or 0)
+    duplicate_rows_skipped = int(df.attrs.get("duplicate_rows_skipped_for_enrichment", duplicate_models_skipped) or 0)
     return {
         "enrichment_ms": elapsed_ms,
         "rows_considered": len(included),
@@ -285,6 +312,17 @@ def _enrichment_summary(df: pd.DataFrame, elapsed_ms: float) -> dict:
         "average_confidence": round(sum(confidences) / len(confidences), 3) if confidences else 0,
         "brave_searches_used": searches_used,
         "page_fetches_used": fetches_used,
+        "budget_cap_usd": round(float(budget_cap), 4),
+        "unique_products_searched": unique_products_searched,
+        "duplicate_rows_skipped_for_enrichment": duplicate_rows_skipped,
+        "cache_hits": cache_hits,
+        "duplicate_models_skipped": duplicate_models_skipped,
+        "searches_avoided": searches_avoided,
+        "useful_fields_found": useful_fields_found,
+        "cost_per_useful_field": round(cost_per_useful_field, 4),
+        "cost_per_dimension_found": round(estimated_cost / dimensions_present, 4) if dimensions_present else 0,
+        "dimensions_found_per_dollar": round(dimensions_present / estimated_cost, 2) if estimated_cost else 0,
+        "images_found_per_dollar": round(images_present / estimated_cost, 2) if estimated_cost else 0,
         "estimated_bravi_api_cost": round(estimated_cost, 4),
         "estimated_cost_usd": round(estimated_cost, 4),
     }
@@ -485,6 +523,7 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
             enrichment_mode=payload.enrichment_mode,
             force_refresh=payload.force_refresh,
             use_web_enrichment=payload.use_web_enrichment,
+            enrichment_budget_usd=payload.enrichment_budget_usd,
         )
         df = apply_confidence_checks(df)
         elapsed_ms = _elapsed_ms(start)
