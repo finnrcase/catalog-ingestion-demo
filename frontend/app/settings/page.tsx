@@ -24,7 +24,9 @@ const accentThemes = [
 type AccentThemeId = (typeof accentThemes)[number]["id"];
 
 const fallbackBuildInfo = {
-  commit: process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA?.slice(0, 12) || "local",
+  commit:
+    (process.env.NEXT_PUBLIC_APP_COMMIT_SHA || process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA)
+      ?.slice(0, 12) || "local",
   apiBase: process.env.NEXT_PUBLIC_API_BASE_URL || "not configured",
 };
 

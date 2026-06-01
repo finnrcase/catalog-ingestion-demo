@@ -2,6 +2,7 @@ import { IntakeWorkspace } from "@/components/intake-workspace";
 
 export default function Page() {
   const commit = (
+    process.env.NEXT_PUBLIC_APP_COMMIT_SHA ||
     process.env.VERCEL_GIT_COMMIT_SHA ||
     process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA ||
     "local"
