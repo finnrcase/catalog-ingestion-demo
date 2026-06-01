@@ -80,6 +80,8 @@ def _is_public_https_url(value) -> bool:
 
 def _is_ignored_row(row: dict) -> bool:
     """True if the row looks like a non-product line or is completely blank."""
+    if _str(row.get("Import Type")).lower() in {"unresolved_charge", "manual_review_charge"}:
+        return True
     source = _str(row.get("Source Type"))
     # These source types are never auto-ignored:
     # - URL: missing product name is expected
@@ -88,7 +90,7 @@ def _is_ignored_row(row: dict) -> bool:
     if source in (SOURCE_URL, SOURCE_PDF_AI, SOURCE_MANUAL, SOURCE_PHOTO):
         return False
 
-    useful_fields = ("Product Name", "Brand", "Model/SKU", "Product URL", "Supplier")
+    useful_fields = ("Product Name", "Brand", "Model/SKU", "Product URL")
     if not any(_str(row.get(f)) for f in useful_fields):
         return True  # completely blank row
 

@@ -427,7 +427,9 @@ def test_validate_result_keys():
         "section_too_long", "too_many_unique_sections", "canonical_sections",
         "duplicates_removed", "duplicate_rows_removed",
         "suspicious_dimensions_rejected", "rejected_product_urls",
-        "pdf_product_urls",
+        "pdf_product_urls", "blank_price_only_rows",
+        "missing_model_manufacturer", "phone_email_header_contamination",
+        "parsed_rows_count", "export_rows_count",
     }
 
 
@@ -628,6 +630,37 @@ def test_validate_warns_when_product_url_is_pdf():
     summary = validate_for_export(rows)
 
     assert summary["pdf_product_urls"][0]["sku"] == "WWD30"
+
+
+def test_validate_reports_parse_qa_issues():
+    rows = _make_rows([
+        {
+            "Include": False,
+            "Import Type": "unresolved_charge",
+            "Product Name": "",
+            "Brand": "",
+            "Model/SKU": "",
+            "Price": "$285.97",
+        },
+        {
+            "Product Name": "Potential Product",
+            "Brand": "",
+            "Model/SKU": "",
+        },
+        {
+            "Product Name": "Sub-Zero Refrigerator",
+            "Brand": "Sub-Zero",
+            "Model/SKU": "631-287-2405",
+        },
+    ])
+
+    summary = validate_for_export(rows)
+
+    assert summary["blank_price_only_rows"][0]["price"] == "$285.97"
+    assert summary["missing_model_manufacturer"][0]["reason"] == "missing manufacturer and model"
+    assert summary["phone_email_header_contamination"][0]["reason"] == "phone/email captured as model"
+    assert summary["parsed_rows_count"] == 3
+    assert summary["export_rows_count"] == 2
 
 
 # ── build_programa_debug_dataframe ────────────────────────────────────────────

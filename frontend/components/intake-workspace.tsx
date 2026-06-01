@@ -617,15 +617,6 @@ function formatBuildTime(value: string) {
   });
 }
 
-function workflowStepIndex(stage: WorkflowStage) {
-  if (stage === "parse") return 1;
-  if (stage === "reviewParsed") return 2;
-  if (stage === "enrich") return 3;
-  if (stage === "reviewEnriched") return 4;
-  if (stage === "export") return 5;
-  return 0;
-}
-
 function mainWorkflowStepIndex(stage: WorkflowStage) {
   if (stage === "parse" || stage === "reviewParsed") return 1;
   if (stage === "enrich" || stage === "reviewEnriched") return 2;
@@ -670,6 +661,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const [lastSuccessfulStage, setLastSuccessfulStage] = useState("App loaded");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [workflowStage, setWorkflowStage] = useState<WorkflowStage>("upload");
+  const [parseReviewed, setParseReviewed] = useState(false);
+  const [enrichmentReviewed, setEnrichmentReviewed] = useState(false);
+  const [exportGenerated, setExportGenerated] = useState(false);
   const [parsedProductsOpen, setParsedProductsOpen] = useState(false);
   const [enrichedProductsOpen, setEnrichedProductsOpen] = useState(false);
   const [parseStatus, setParseStatus] = useState("Ready for upload.");
@@ -711,6 +705,11 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     suspicious_dimensions_rejected: [] as { index: number; product_name: string; brand?: string; sku?: string; dimensions?: string; reason?: string }[],
     rejected_product_urls: [] as { index: number; product_name: string; brand?: string; sku?: string; url?: string; reason?: string }[],
     pdf_product_urls: [] as { index: number; product_name: string; brand?: string; sku?: string; url?: string; reason?: string }[],
+    blank_price_only_rows: [] as { index: number; price?: string; reason?: string }[],
+    missing_model_manufacturer: [] as { index: number; product_name: string; brand?: string; sku?: string; reason?: string }[],
+    phone_email_header_contamination: [] as { index: number; product_name: string; brand?: string; sku?: string; reason?: string }[],
+    parsed_rows_count: 0,
+    export_rows_count: 0,
   });
   const [errors, setErrors] = useState<string[]>([]);
   const [vendorCall, setVendorCall] = useState<{
@@ -858,14 +857,70 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     () => countRows(includedRows, (row) => hasComplete3dDimensions(row.Dimensions)),
     [includedRows],
   );
+  const rowsWithRoomCount = useMemo(() => countRows(includedRows, (row) => Boolean(rowText(row, "Room").trim())), [includedRows]);
+  const rowsWithSourceUrlCount = useMemo(() => countRows(includedRows, (row) => Boolean(rowText(row, "Product URL").trim())), [includedRows]);
+  const rowsWithBrandCount = useMemo(() => countRows(includedRows, (row) => Boolean(rowText(row, "Brand").trim())), [includedRows]);
   const unresolvedCount = missingInputRows.length;
-  const parseInputCount = files.length + bulkImages.length + urls.split(/\r?\n/).filter((url) => url.trim()).length;
+  const linkInputCount = urls.split(/\r?\n/).filter((url) => url.trim()).length;
+  const parseInputCount = files.length + bulkImages.length + linkInputCount;
   const programaSendEnabled = process.env.NEXT_PUBLIC_PROGRAMA_SEND_ENABLED === "true";
-  const activeWorkflowIndex = workflowStepIndex(workflowStage);
   const activeMainWorkflowIndex = mainWorkflowStepIndex(workflowStage);
   const hasParsedRows = rows.length > 0;
-  const parsedReviewReady = hasParsedRows && activeWorkflowIndex >= 2;
-  const enrichmentHasRun = workflowStage === "reviewEnriched" || workflowStage === "export";
+  const uploadComplete = parseInputCount > 0 && !uploadError && !bulkImageError;
+  const parsedReviewReady = hasParsedRows;
+  const enrichmentHasRun = workflowStage === "reviewEnriched" || workflowStage === "export" || enrichmentReviewed || exportGenerated;
+  const stageCompletion = {
+    upload: uploadComplete,
+    parse: parseReviewed,
+    enrich: enrichmentReviewed,
+    export: exportGenerated,
+  };
+  const completedStageCount = Object.values(stageCompletion).filter(Boolean).length;
+  const workflowProgress = completedStageCount * 25;
+  const stageSummaries = [
+    {
+      label: "Upload",
+      title: uploadComplete ? "Upload Complete" : "Upload Needed",
+      detail: uploadComplete
+        ? [
+            files.length ? `${files.length} PDF${files.length === 1 ? "" : "s"} uploaded` : "",
+            bulkImages.length ? `${bulkImages.length} photo${bulkImages.length === 1 ? "" : "s"} selected` : "",
+            linkInputCount ? `${linkInputCount} link${linkInputCount === 1 ? "" : "s"} pasted` : "",
+          ].filter(Boolean).join(" · ")
+        : "Add at least one PDF, photo, or product link.",
+      complete: stageCompletion.upload,
+      unlocked: true,
+    },
+    {
+      label: "Parse",
+      title: parseReviewed ? "Parse Complete" : hasParsedRows ? "Review Parse Results" : "Parse Locked",
+      detail: hasParsedRows ? `${includedRows.length} product${includedRows.length === 1 ? "" : "s"} detected` : "Parse files after upload.",
+      complete: stageCompletion.parse,
+      unlocked: uploadComplete || hasParsedRows,
+    },
+    {
+      label: "Enrich",
+      title: enrichmentReviewed ? "Enrichment Complete" : enrichmentHasRun ? "Review Enrichment" : "Enrich Locked",
+      detail: enrichmentHasRun
+        ? `${Math.max(0, includedRows.length - unresolvedCount)}/${includedRows.length} product${includedRows.length === 1 ? "" : "s"} enriched`
+        : "Enrich after parse review.",
+      complete: stageCompletion.enrich,
+      unlocked: parseReviewed || enrichmentHasRun,
+    },
+    {
+      label: "Export",
+      title: exportGenerated ? "Export Complete" : enrichmentReviewed ? "Export Ready" : "Export Locked",
+      detail: exportGenerated
+        ? "Programa import generated"
+        : enrichmentReviewed
+          ? "Programa import validated"
+          : "Export after enrichment review.",
+      complete: stageCompletion.export,
+      unlocked: enrichmentReviewed || exportGenerated,
+    },
+  ];
+  const currentStageSummary = stageSummaries[activeMainWorkflowIndex];
+  const readinessScore = includedRows.length ? Math.round((exportSummary.export_count / includedRows.length) * 100) : 0;
   const apiConnectionStatus = API_BASE ? apiStatus : "misconfigured";
   const apiConnectionText = API_BASE ? apiStatusText : "NEXT_PUBLIC_API_BASE_URL is missing or invalid.";
   const displayApiBase = API_BASE || "not configured";
@@ -893,6 +948,11 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         suspicious_dimensions_rejected: [],
         rejected_product_urls: [],
         pdf_product_urls: [],
+        blank_price_only_rows: [],
+        missing_model_manufacturer: [],
+        phone_email_header_contamination: [],
+        parsed_rows_count: 0,
+        export_rows_count: 0,
       });
       return;
     }
@@ -917,6 +977,37 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       cancelled = true;
     };
   }, [includedRows, sections]);
+
+  function goToMainStage(index: number) {
+    const target = stageSummaries[index];
+    if (!target?.unlocked) return;
+    if (index === 0) {
+      setWorkflowStage("upload");
+    } else if (index === 1) {
+      setWorkflowStage(hasParsedRows ? "reviewParsed" : "parse");
+    } else if (index === 2) {
+      setWorkflowStage(enrichmentHasRun ? "reviewEnriched" : "enrich");
+    } else if (index === 3) {
+      setWorkflowStage("export");
+    }
+  }
+
+  function continueToParse() {
+    if (!uploadComplete) return;
+    setWorkflowStage("parse");
+  }
+
+  function continueToEnrich() {
+    if (!hasParsedRows || errors.some((error) => error.toLowerCase().includes("parse failed"))) return;
+    setParseReviewed(true);
+    setWorkflowStage("enrich");
+  }
+
+  function continueToExport() {
+    if (!enrichmentHasRun) return;
+    setEnrichmentReviewed(true);
+    setWorkflowStage("export");
+  }
 
   function updateRow(index: number, key: string, value: unknown) {
     setRows((current) => current.map((row, i) => (i === index ? { ...row, [key]: value } : row)));
@@ -998,6 +1089,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       }
       setFiles(nextFiles);
       setWorkflowStage("upload");
+      setParseReviewed(false);
+      setEnrichmentReviewed(false);
+      setExportGenerated(false);
       recordDebugTrace({
         action: "pdf upload",
         stage: "selected",
@@ -1045,6 +1139,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     setPhotoBulkResults({});
     setPhotoBulkSummary({ success: 0, failed: 0 });
     setWorkflowStage("upload");
+    setParseReviewed(false);
+    setEnrichmentReviewed(false);
+    setExportGenerated(false);
     recordDebugTrace({
       action: "bulk photo upload",
       stage: "selected",
@@ -1058,6 +1155,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     setPhotoBulkResults({});
     setPhotoBulkSummary({ success: 0, failed: 0 });
     setWorkflowStage("upload");
+    setParseReviewed(false);
+    setEnrichmentReviewed(false);
+    setExportGenerated(false);
     if (bulkImageInputRef.current) bulkImageInputRef.current.value = "";
   }
 
@@ -1275,6 +1375,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     setMessage("");
     setErrors([]);
     setWorkflowStage("parse");
+    setParseReviewed(false);
+    setEnrichmentReviewed(false);
+    setExportGenerated(false);
     setParseStatus("Parsing uploaded files and links...");
     setLastEndpoint(`${API_BASE || "not configured"}/intake/generate`);
     recordDebugTrace({
@@ -1363,6 +1466,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     setBusy("validate");
     setMessage("");
     setWorkflowStage("enrich");
+    setEnrichmentReviewed(false);
+    setExportGenerated(false);
     setEnrichmentStatus("Enriching missing product data...");
     const beforeImages = countRows(includedRows, hasImage);
     const beforeDimensions = countRows(includedRows, (row) => hasComplete3dDimensions(row.Dimensions));
@@ -1516,6 +1621,31 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     URL.revokeObjectURL(url);
   }
 
+  function handleJsonExport() {
+    const today = new Date().toISOString().slice(0, 10);
+    const payload = {
+      generatedAt: new Date().toISOString(),
+      project,
+      defaultRoom: room,
+      rows: includedRows,
+      exportSummary,
+      estimatedCost,
+    };
+    downloadBlob(
+      new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }),
+      `programa_import_${today}.json`,
+    );
+    setWorkflowStage("export");
+    setExportGenerated(true);
+    setMessage("JSON export generated.");
+    setLastSuccessfulStage("JSON export generated");
+    recordDebugTrace({
+      action: "json export",
+      stage: "success",
+      message: `${includedRows.length} included rows`,
+    });
+  }
+
   async function handleProgramaExport(format: "csv" | "xlsx" | "zip" | "debug") {
     setBusy("export");
     setMessage("");
@@ -1548,6 +1678,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       const filename = format === "debug" ? `programa_debug_${today}.${suffix}` : `programa_import_${today}.${suffix}`;
       downloadBlob(blob, filename);
       setWorkflowStage("export");
+      setExportGenerated(true);
       setMessage("Use this file for Programa Import Products.");
       setLastSuccessfulStage(`${format.toUpperCase()} export generated`);
       recordDebugTrace({
@@ -1700,62 +1831,28 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         </header>
 
         <section className="glass-panel rounded-[28px] p-5 sm:p-7">
-          <div className="grid gap-5 lg:grid-cols-[1fr_0.8fr] lg:items-end">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.22em] text-bronze">SCH Production Frontend</p>
-              <h1 className="mt-3 max-w-3xl text-3xl font-semibold tracking-normal text-charcoal sm:text-5xl">
-                Upload, parse, enrich, and export Programa-ready product schedules.
-              </h1>
-              {!isSimpleMode ? (
-                <p className="mt-4 max-w-2xl text-sm leading-6 text-taupe">
-                  A staged intake workspace for SCH quotes, spec sheets, product links, and image-ready exports.
-                </p>
-              ) : null}
-            </div>
-            <div className="grid gap-2 rounded-2xl border border-linen bg-white/44 p-4">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-xs font-semibold uppercase tracking-[0.14em] text-taupe">Build</span>
-                <span className="font-mono text-xs text-charcoal">{buildInfo.commit}</span>
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-xs font-semibold uppercase tracking-[0.14em] text-taupe">API</span>
-                <span className="max-w-[220px] truncate font-mono text-xs text-charcoal">{displayApiBase}</span>
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-xs font-semibold uppercase tracking-[0.14em] text-taupe">Primary export</span>
-                <span className="text-xs font-semibold text-bronze">Excel for Programa</span>
-              </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-xs font-semibold uppercase tracking-[0.14em] text-taupe">UI mode</span>
-                <span className="text-xs font-semibold text-bronze">{isSimpleMode ? "Simple" : "Explanation"}</span>
-              </div>
-            </div>
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-bronze">SCH Catalog Engine</p>
+            <h1 className="mt-3 max-w-3xl text-3xl font-semibold tracking-normal text-charcoal sm:text-5xl">
+              Programa Schedule Builder
+            </h1>
+            {!isSimpleMode ? (
+              <p className="mt-4 max-w-2xl text-sm leading-6 text-taupe">
+                Convert vendor quotes, spec sheets, product links, and photos into Programa-ready schedules.
+              </p>
+            ) : null}
           </div>
         </section>
 
-        <div className="grid gap-2 rounded-2xl border border-linen bg-white/60 p-3 sm:grid-cols-2 lg:grid-cols-4">
-          {["Upload", "Parse", "Enrich", "Export"].map((label, index) => (
-            <div
-              key={label}
-              className={`flex items-center gap-2 rounded-xl px-3 py-2 transition ${
-                index === activeMainWorkflowIndex
-                  ? "border border-orangeBorder bg-orangeSoft text-bronze shadow-sm"
-                  : index < activeMainWorkflowIndex
-                    ? "border border-sage/15 bg-sage/10 text-sage"
-                    : "border border-transparent bg-ivory/70 text-charcoal/60"
-              }`}
-            >
-              <span className={`grid h-6 w-6 place-items-center rounded-full text-xs font-semibold ${
-                index <= activeMainWorkflowIndex ? "bg-white text-bronze" : "bg-orangeSoft text-bronze"
-              }`}>
-                {index + 1}
-              </span>
-              <span className="text-xs font-semibold uppercase tracking-[0.08em]">{label}</span>
-            </div>
-          ))}
-        </div>
+        <StageProgressTracker
+          stages={stageSummaries}
+          activeIndex={activeMainWorkflowIndex}
+          progress={workflowProgress}
+          onStageClick={goToMainStage}
+        />
 
-        <Panel step="1" title="Upload / Input" subtitle="Add vendor PDFs, quote sheets, tear sheets, receipts, product links, and mass photo uploads." simple={isSimpleMode}>
+        {activeMainWorkflowIndex === 0 ? (
+        <Panel step="1" title="Upload" subtitle="Add vendor PDFs, product photos, product links, project context, and default room before moving to parsing." simple={isSimpleMode}>
           <div className="grid gap-5">
             <div className="grid gap-3 sm:grid-cols-2">
               <Field label="Existing Programa Project / Property">
@@ -1848,7 +1945,13 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                 <textarea
                   className="input-surface min-h-28 w-full resize-none rounded-xl p-3 text-sm leading-6 text-charcoal"
                   value={urls}
-                  onChange={(event) => setUrls(event.target.value)}
+                  onChange={(event) => {
+                    setUrls(event.target.value);
+                    setWorkflowStage("upload");
+                    setParseReviewed(false);
+                    setEnrichmentReviewed(false);
+                    setExportGenerated(false);
+                  }}
                   placeholder={"https://www.vendor.com/product\nhttps://www.vendor.com/quote"}
                 />
               </InputCard>
@@ -1955,10 +2058,35 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                 </div>
               </div>
             ) : null}
+            <div className="rounded-2xl border border-linen bg-ivory/70 p-4">
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <div>
+                  <div className="text-sm font-semibold text-charcoal">Input Summary</div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <StatusBadge value={`${files.length} PDFs`} />
+                    <StatusBadge value={`${bulkImages.length} photos`} />
+                    <StatusBadge value={`${linkInputCount} product links`} />
+                    <StatusBadge value={project.trim() ? `Project: ${project.trim()}` : "No project name"} />
+                    <StatusBadge value={room.trim() ? `Default room: ${room.trim()}` : "No default room"} />
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="btn-primary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-6 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
+                  disabled={!uploadComplete}
+                  onClick={continueToParse}
+                >
+                  {uploadComplete ? <CheckCircle2 className="h-4 w-4" /> : <Upload className="h-4 w-4" />}
+                  Continue to Parse
+                </button>
+              </div>
+            </div>
           </div>
         </Panel>
+        ) : null}
 
-        <Panel step="2" title="Parse" subtitle="Create initial product rows from PDFs, product links, and Cloudinary-hosted photo uploads. Enrichment stays off until Step 4." simple={isSimpleMode}>
+        {activeMainWorkflowIndex === 1 ? (
+        <Panel step="2" title="Parse" subtitle="Create initial product rows from PDFs, product links, and Cloudinary-hosted photo uploads. Enrichment stays off until parse review is complete." simple={isSimpleMode}>
           <div className="grid gap-4">
             <div className="rounded-xl border border-linen bg-ivory/70 p-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -1980,7 +2108,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
               <div className="mt-3 flex flex-wrap gap-2">
                 <StatusBadge value={`${files.length} PDFs`} />
                 <StatusBadge value={`${bulkImages.length} photos`} />
-                <StatusBadge value={`${urls.split(/\r?\n/).filter((url) => url.trim()).length} URLs`} />
+                <StatusBadge value={`${linkInputCount} URLs`} />
                 <StatusBadge value={useAiPdf ? "AI PDF parsing on" : "AI PDF parsing off"} />
                 <StatusBadge value={`${rows.length} products found`} />
               </div>
@@ -1989,6 +2117,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             {errors.length ? <ErrorList errors={errors} /> : null}
           </div>
         </Panel>
+        ) : null}
 
         {debugMode ? (
           <DebugTracePanel
@@ -1999,7 +2128,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           />
         ) : null}
 
-        {parsedReviewReady ? (
+        {activeMainWorkflowIndex === 1 && parsedReviewReady ? (
           <Panel step="3" title="Review Parsed Data" subtitle="Start with the summary, then expand the parsed product table only when needed." simple={isSimpleMode}>
             <div className="grid gap-4">
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
@@ -2008,18 +2137,52 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                 <SummaryCard label="Missing dimensions" value={missingDimensionsCount} tone={missingDimensionsCount ? "warning" : "ok"} />
                 <SummaryCard label="Missing image" value={missingImageCount} tone={missingImageCount ? "warning" : "ok"} />
                 <SummaryCard label="Missing supplier" value={missingSupplierCount} tone={missingSupplierCount ? "warning" : "ok"} />
+                <SummaryCard label="Room assignments" value={rowsWithRoomCount} />
+                <SummaryCard label="Manual review" value={needsReview + ignored} tone={needsReview + ignored ? "warning" : "ok"} />
+                <SummaryCard label="Duplicates removed" value={exportSummary.duplicate_rows_removed} tone={exportSummary.duplicate_rows_removed ? "warning" : "ok"} />
               </div>
+              {exportSummary.blank_price_only_rows.length ||
+              exportSummary.missing_model_manufacturer.length ||
+              exportSummary.phone_email_header_contamination.length ||
+              exportSummary.duplicate_rows_removed ? (
+                <div className="rounded-xl border border-orangeBorder bg-orangeSoft/40 px-4 py-3 text-sm text-bronze">
+                  <div className="font-semibold text-charcoal">Parse QA warnings</div>
+                  {exportSummary.duplicate_rows_removed ? <div>{exportSummary.duplicate_rows_removed} duplicate candidate row(s) detected.</div> : null}
+                  {exportSummary.blank_price_only_rows.length ? <div>{exportSummary.blank_price_only_rows.length} price-only/manual review row(s) detected.</div> : null}
+                  {exportSummary.missing_model_manufacturer.length ? <div>{exportSummary.missing_model_manufacturer.length} row(s) missing manufacturer/model.</div> : null}
+                  {exportSummary.phone_email_header_contamination.length ? <div>{exportSummary.phone_email_header_contamination.length} row(s) flagged for header/contact contamination.</div> : null}
+                </div>
+              ) : (
+                <div className="rounded-xl border border-sage/20 bg-sage/10 px-4 py-3 text-sm font-semibold text-sage">
+                  Parse QA clear: no blocking duplicate, identity, or contamination warnings.
+                </div>
+              )}
               <DisclosureButton open={parsedProductsOpen} onClick={() => setParsedProductsOpen((open) => !open)}>
                 View parsed products
               </DisclosureButton>
               {parsedProductsOpen ? (
                 <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} debugMode={debugMode} />
               ) : null}
+              <div className="flex flex-col gap-3 rounded-2xl border border-linen bg-ivory/70 p-4 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <div className="text-sm font-semibold text-charcoal">Parse Complete</div>
+                  <p className="mt-1 text-sm text-taupe">{includedRows.length} product{includedRows.length === 1 ? "" : "s"} detected. Review or edit rows, then continue.</p>
+                </div>
+                <button
+                  type="button"
+                  className="btn-primary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
+                  disabled={!hasParsedRows || errors.some((error) => error.toLowerCase().includes("parse failed"))}
+                  onClick={continueToEnrich}
+                >
+                  <CheckCircle2 className="h-4 w-4" />
+                  Continue to Enrich
+                </button>
+              </div>
             </div>
           </Panel>
         ) : null}
 
-        {parsedReviewReady ? (
+        {activeMainWorkflowIndex === 2 && (parseReviewed || enrichmentHasRun) ? (
           <Panel step="4" title="Enrich" subtitle="Run missing-field enrichment only after parsed data has been reviewed. This does not reparse the PDFs." simple={isSimpleMode}>
             <div className="grid gap-4">
               <div className="rounded-xl border border-linen bg-ivory/70 p-4">
@@ -2063,6 +2226,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                 <SummaryCard label="Need enrichment" value={unresolvedCount} tone={unresolvedCount ? "warning" : "ok"} />
                 <SummaryCard label="Images present" value={imagesFoundCount} />
                 <SummaryCard label="Dimensions present" value={dimensionsFoundCount} />
+                <SummaryCard label="Manufacturer set" value={rowsWithBrandCount} />
+                <SummaryCard label="Source URLs" value={rowsWithSourceUrlCount} />
               </div>
               {!isSimpleMode ? (
                 <p className="rounded-xl border border-linen bg-white px-4 py-3 text-sm text-charcoal/70">
@@ -2074,7 +2239,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           </Panel>
         ) : null}
 
-        {enrichmentHasRun ? (
+        {activeMainWorkflowIndex === 2 && enrichmentHasRun ? (
           <Panel step="5" title="Review Enriched Data" subtitle="Confirm readiness after enrichment before exporting." simple={isSimpleMode}>
             <div className="grid gap-4">
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
@@ -2095,13 +2260,33 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
               {enrichedProductsOpen ? (
                 <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} debugMode={debugMode} />
               ) : null}
+              <div className="flex flex-col gap-3 rounded-2xl border border-linen bg-ivory/70 p-4 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <div className="text-sm font-semibold text-charcoal">Enrichment Complete</div>
+                  <p className="mt-1 text-sm text-taupe">{Math.max(0, includedRows.length - unresolvedCount)}/{includedRows.length} product{includedRows.length === 1 ? "" : "s"} enriched or intentionally left for review.</p>
+                </div>
+                <button
+                  type="button"
+                  className="btn-primary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold"
+                  onClick={continueToExport}
+                >
+                  <CheckCircle2 className="h-4 w-4" />
+                  Continue to Export
+                </button>
+              </div>
             </div>
           </Panel>
         ) : null}
 
-        {enrichmentHasRun ? (
+        {activeMainWorkflowIndex === 3 && (enrichmentReviewed || exportGenerated) ? (
           <Panel step="6" title="Export" subtitle="Download the Programa-ready workbook first. CSV, ZIP, debug, and direct send are secondary." simple={isSimpleMode}>
             <div className="grid gap-4">
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <SummaryCard label="Programa readiness" value={`${readinessScore}%`} tone={readinessScore >= 90 ? "ok" : readinessScore ? "warning" : "neutral"} />
+                <SummaryCard label="Export-ready rows" value={exportSummary.export_count} tone={exportSummary.export_count ? "ok" : "warning"} />
+                <SummaryCard label="Missing fields" value={missingInputRows.length} tone={missingInputRows.length ? "warning" : "ok"} />
+                <SummaryCard label="Images ready" value={`${exportSummary.image_url_present}/${exportSummary.image_url_total}`} />
+              </div>
               <div className="grid gap-3 lg:grid-cols-[1.2fr_1fr]">
                 <button
                   className="btn-primary inline-flex h-14 items-center justify-center gap-2 rounded-xl px-6 text-base font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
@@ -2131,6 +2316,14 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                   <button
                     className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
                     disabled={busy === "export" || rows.length === 0}
+                    onClick={handleJsonExport}
+                  >
+                    <FileText className="h-4 w-4" />
+                    Download JSON
+                  </button>
+                  <button
+                    className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                    disabled={busy === "export" || rows.length === 0}
                     onClick={() => handleProgramaExport("debug")}
                   >
                     <FileText className="h-4 w-4" />
@@ -2153,6 +2346,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                 <StatusBadge value={`${exportSummary.export_count} export-ready`} />
                 <StatusBadge value={`Images ${exportSummary.image_url_present}/${exportSummary.image_url_total}`} />
                 <StatusBadge value={`${exportSummary.missing_section.length} missing section`} />
+                {exportSummary.parsed_rows_count ? (
+                  <StatusBadge value={`${exportSummary.parsed_rows_count} parsed · ${exportSummary.export_rows_count || exportSummary.export_count} export rows`} />
+                ) : null}
                 {programaSendEnabled ? <StatusBadge value="Programa send configured" /> : <StatusBadge value="Programa send not configured" />}
               </div>
               {programaMessage ? (
@@ -2162,10 +2358,26 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
               exportSummary.missing_dimensions ||
               exportSummary.rejected_product_urls.length ||
               exportSummary.pdf_product_urls.length ||
-              exportSummary.suspicious_dimensions_rejected.length ? (
+              exportSummary.suspicious_dimensions_rejected.length ||
+              exportSummary.duplicate_rows_removed ||
+              exportSummary.blank_price_only_rows?.length ||
+              exportSummary.missing_model_manufacturer?.length ||
+              exportSummary.phone_email_header_contamination?.length ? (
                 <div className="rounded-xl border border-orangeBorder bg-orangeSoft/40 px-4 py-3 text-sm text-bronze">
+                  {exportSummary.duplicate_rows_removed ? (
+                    <div>{exportSummary.duplicate_rows_removed} duplicate raw/fallback row(s) removed before export.</div>
+                  ) : null}
                   {exportSummary.missing_image_url ? <div>{exportSummary.missing_image_url} row(s) missing image URLs.</div> : null}
                   {exportSummary.missing_dimensions ? <div>{exportSummary.missing_dimensions} row(s) missing dimensions.</div> : null}
+                  {exportSummary.blank_price_only_rows?.length ? (
+                    <div>{exportSummary.blank_price_only_rows.length} blank/price-only quote row(s) held for manual review.</div>
+                  ) : null}
+                  {exportSummary.missing_model_manufacturer?.length ? (
+                    <div>{exportSummary.missing_model_manufacturer.length} row(s) missing manufacturer/model identity.</div>
+                  ) : null}
+                  {exportSummary.phone_email_header_contamination?.length ? (
+                    <div>{exportSummary.phone_email_header_contamination.length} row(s) flagged for phone/email/header contamination.</div>
+                  ) : null}
                   {exportSummary.suspicious_dimensions_rejected.length ? (
                     <div>{exportSummary.suspicious_dimensions_rejected.length} suspicious dimension value(s) rejected before export.</div>
                   ) : null}
@@ -3166,6 +3378,75 @@ function Detail({ label, value }: { label: string; value: string }) {
       <div className="text-xs font-semibold uppercase text-charcoal/50">{label}</div>
       <div className="text-sm text-charcoal">{value}</div>
     </div>
+  );
+}
+
+function StageProgressTracker({
+  stages,
+  activeIndex,
+  progress,
+  onStageClick,
+}: {
+  stages: {
+    label: string;
+    title: string;
+    detail: string;
+    complete: boolean;
+    unlocked: boolean;
+  }[];
+  activeIndex: number;
+  progress: number;
+  onStageClick: (index: number) => void;
+}) {
+  return (
+    <section className="rounded-[28px] border border-linen bg-white/72 p-4 shadow-panel">
+      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <div className="text-xs font-semibold uppercase tracking-[0.18em] text-taupe">Workflow progress</div>
+          <div className="mt-1 text-2xl font-semibold text-charcoal">{progress}%</div>
+        </div>
+        <div className="h-2 overflow-hidden rounded-full bg-ivory sm:w-56">
+          <div className="h-full rounded-full bg-[var(--accent)] transition-all duration-500" style={{ width: `${progress}%` }} />
+        </div>
+      </div>
+      <div className="grid gap-2 lg:grid-cols-4">
+        {stages.map((stage, index) => {
+          const isActive = index === activeIndex;
+          const stateClass = stage.complete
+            ? "border-sage/30 bg-sage/10 text-sage"
+            : isActive
+              ? "border-orangeBorder bg-orangeSoft text-bronze shadow-sm"
+              : stage.unlocked
+                ? "border-linen bg-ivory/70 text-charcoal"
+                : "border-transparent bg-ivory/50 text-charcoal/45";
+          const dotClass = stage.complete
+            ? "bg-sage text-white"
+            : isActive
+              ? "bg-white text-bronze"
+              : "bg-white/70 text-charcoal/50";
+          return (
+            <button
+              key={stage.label}
+              type="button"
+              disabled={!stage.unlocked}
+              onClick={() => onStageClick(index)}
+              className={`min-h-[104px] rounded-2xl border p-3 text-left transition ${stateClass} disabled:cursor-not-allowed`}
+            >
+              <div className="flex items-start gap-3">
+                <span className={`grid h-8 w-8 shrink-0 place-items-center rounded-full text-xs font-bold ${dotClass}`}>
+                  {stage.complete ? <CheckCircle2 className="h-4 w-4" /> : index + 1}
+                </span>
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold uppercase tracking-[0.1em]">{stage.label}</div>
+                  <div className="mt-1 text-sm font-semibold text-charcoal">{stage.title}</div>
+                  <div className="mt-1 text-xs leading-5 text-current/75">{stage.detail}</div>
+                </div>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 

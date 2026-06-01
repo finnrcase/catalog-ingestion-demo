@@ -39,7 +39,7 @@ _SKU_LABEL_RE = re.compile(
 _SKIP_RE = re.compile(
     r"\b(subtotal|sub[- ]?total|tax|gst|hst|vat|pst|delivery|shipping|freight|"
     r"total|balance(\s+due)?|discount|credit|surcharge|handling|deposit|"
-    r"freight\s*&\s*handling|f&h|service\s+plan)\b",
+    r"freight\s*&\s*handling|f&h|service\s+plan|protection\s+plan|warrant(?:y|ies))\b",
     re.IGNORECASE,
 )
 
@@ -51,6 +51,18 @@ _QTY_RE = re.compile(
 )
 
 _PRICE_RE = re.compile(r"\$[\d,]+(?:\.\d{2})?|\b\d{1,6}\.\d{2}\b")
+_PHONE_RE = re.compile(r"(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}\b")
+_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
+_ROW_NUMBER_PREFIX_RE = re.compile(r"^\s*(?:row\s*)?#?\d{1,3}\s*(?:[|.)\-:]\s*)?", re.IGNORECASE)
+_ONLY_PUNCT_OR_NUMBER_RE = re.compile(r"^[\d\s|.,;:()#-]+$")
+_HEADER_CONTEXT_RE = re.compile(
+    r"\b("
+    r"pc\s+richard|quotation|quote|selection|salesperson|sales\s*person|"
+    r"phone|tel(?:ephone)?|fax|email|e-mail|address|date|page\s+\d+|"
+    r"manufacturer|model|description|color|colour|price|amount|extension"
+    r")\b",
+    re.IGNORECASE,
+)
 
 # Labels that are mundane enough not to need recording in Notes
 _COMMON_SKU_LABELS = frozenset({"model #", "model number", "model no", "sku", "serial number", "serial #"})
@@ -152,19 +164,82 @@ def _is_skip_line(line: str) -> bool:
     return bool(_SKIP_RE.search(stripped))
 
 
+def _is_contact_or_header_line(line: str) -> bool:
+    """True for quote headers/contact rows that should never become products."""
+    stripped = str(line or "").strip()
+    if not stripped:
+        return False
+    if _EMAIL_RE.search(stripped):
+        return True
+    if _PHONE_RE.search(stripped) and _HEADER_CONTEXT_RE.search(stripped):
+        return True
+    if _HEADER_CONTEXT_RE.search(stripped) and not _extract_known_brand(stripped):
+        # Column headers and quote metadata often contain model/price words but
+        # no actual product identity.
+        model_like = bool(_MODEL_TOKEN_RE.search(stripped))
+        return not model_like or bool(_PHONE_RE.search(stripped))
+    return False
+
+
+def _is_bad_model_token(token: str, context: str = "") -> bool:
+    clean = str(token or "").strip().strip(".,;:()[]")
+    upper = clean.upper()
+    if not clean:
+        return True
+    if clean.startswith("$"):
+        return True
+    if _PHONE_RE.fullmatch(clean) or _PHONE_RE.search(clean):
+        return True
+    if _EMAIL_RE.search(clean):
+        return True
+    if upper in {"PHONE", "EMAIL", "TOTAL", "QUOTE", "MODEL", "COLOR", "PRICE", "FAX", "DATE"}:
+        return True
+    if _HEADER_CONTEXT_RE.search(context or "") and not _extract_known_brand(context or ""):
+        return True
+    return False
+
+
+def _is_price_only_line(line: str) -> bool:
+    """True when a line/table row is only an item marker plus a price."""
+    text = str(line or "").strip()
+    if not text or not _PRICE_RE.search(text):
+        return False
+    without_price = _PRICE_RE.sub(" ", text)
+    without_price = _ROW_NUMBER_PREFIX_RE.sub(" ", without_price)
+    without_price = re.sub(r"\s+", " ", without_price).strip()
+    return not without_price or bool(_ONLY_PUNCT_OR_NUMBER_RE.fullmatch(without_price))
+
+
+def _make_unresolved_charge_row(
+    line: str,
+    project: str,
+    room: str,
+    supplier: str,
+    notes: str,
+) -> dict:
+    row = make_base_row(project=project, room=room, supplier=supplier, notes=notes)
+    row["Include"] = False
+    row["Price"] = _extract_price(line)
+    row["Source Type"] = SOURCE_PDF
+    row["Import Type"] = "unresolved_charge"
+    row["Status"] = "Manual Review"
+    row["Notes"] = f"{notes} [Unresolved charge: {str(line).strip()}]".strip() if notes else f"[Unresolved charge: {str(line).strip()}]"
+    return row
+
+
 def _extract_model_sku(line: str) -> tuple[str, str]:
     """Return (value, original_label) or ('', '') if none found."""
     m = _SKU_LABEL_RE.search(line)
     if m:
         label = m.group("label").strip().rstrip(":")
         value = m.group("value").strip().rstrip(".,;")
+        if _is_bad_model_token(value, line):
+            return "", ""
         return value, label
 
     for token in _MODEL_TOKEN_RE.findall(line or ""):
         clean = token.strip().rstrip(".,;")
-        if clean.startswith("$"):
-            continue
-        if clean.upper() in {"PHONE", "EMAIL", "TOTAL", "QUOTE", "MODEL", "COLOR"}:
+        if _is_bad_model_token(clean, line):
             continue
         return clean, "model token"
     return "", ""
@@ -195,7 +270,10 @@ def _clean_product_name(line: str, model_sku: str = "") -> str:
     text = _QTY_RE.sub("", text)
     text = _FINISH_RE.sub("", text)
     text = _MATERIAL_RE.sub("", text)
+    text = _ROW_NUMBER_PREFIX_RE.sub("", text)
     text = re.sub(r"\s{2,}", " ", text).strip(" .,;:-")
+    if _ONLY_PUNCT_OR_NUMBER_RE.fullmatch(text):
+        return ""
     return text
 
 
@@ -389,6 +467,10 @@ def _row_from_line(
     room_annotations: list[str] | None = None,
 ) -> dict | None:
     """Parse a single text line into a row dict, or return None if it should be skipped."""
+    if _is_contact_or_header_line(line):
+        return None
+    if _is_price_only_line(line):
+        return _make_unresolved_charge_row(line, project, room, supplier, notes)
     if _is_skip_line(line):
         return None
 
@@ -452,7 +534,12 @@ def _parse_table_rows(
                 header = [_canonical_header(c) for c in cells]
                 continue
 
+            if _is_contact_or_header_line(joined):
+                continue
             if _is_skip_line(joined):
+                continue
+            if _is_price_only_line(joined):
+                rows.append(_make_unresolved_charge_row(joined, project, room, supplier, notes))
                 continue
 
             row = make_base_row(project=project, room=room, supplier=supplier, notes=notes)
@@ -507,6 +594,8 @@ def _parse_table_rows(
                     continue
                 row = parsed
 
+            if _is_contact_or_header_line(joined):
+                continue
             if not str(row.get("Product Name", "")).strip() and not str(row.get("Model/SKU", "")).strip():
                 continue
 

@@ -99,6 +99,8 @@ _DEBUG_EXTRA_COLUMNS: list[str] = [
 _MATERIAL_TAG_RE = re.compile(r"\[Materials:\s*([^\]]+)\]", re.IGNORECASE)
 _SYSTEM_TAG_RE = re.compile(r"\[[^\]]*\]")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_PHONE_RE = re.compile(r"(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}\b")
+_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
 _URL_WEAK_PAGE_RE = re.compile(
     r"(^|/)(?:sitemap|product-sitemap|search|category|categories|collections?|browse|tag|blog|support)(?:/|$)",
     re.IGNORECASE,
@@ -306,6 +308,36 @@ def _product_identity_key(row: dict) -> tuple[str, str] | None:
     if brand and sku:
         return brand, sku
     return None
+
+
+def _is_unresolved_charge(row: dict) -> bool:
+    return _str_val(row.get("Import Type")).lower() in {"unresolved_charge", "manual_review_charge"}
+
+
+def _missing_identity_reason(row: dict) -> str:
+    if _is_unresolved_charge(row):
+        return ""
+    missing = []
+    if not _str_val(row.get("Brand")):
+        missing.append("manufacturer")
+    if not _str_val(row.get("Model/SKU")):
+        missing.append("model")
+    return "missing " + " and ".join(missing) if missing else ""
+
+
+def _contamination_reason(row: dict) -> str:
+    model = _str_val(row.get("Model/SKU"))
+    text = " ".join(
+        _str_val(row.get(field))
+        for field in ("Product Name", "Model/SKU", "Brand", "Notes")
+    )
+    if model and (_PHONE_RE.search(model) or _EMAIL_RE.search(model)):
+        return "phone/email captured as model"
+    if _EMAIL_RE.search(text):
+        return "email/header text detected"
+    if _PHONE_RE.search(text) and not _product_identity_key(row):
+        return "phone/header text detected"
+    return ""
 
 
 def _room_key(row: dict) -> str:
@@ -563,10 +595,14 @@ def validate_for_export(rows) -> dict:
     Photo-only rows require Product Name, Product Category/Section, and Image URL.
     Standard rows require Product Name to appear in the export.
     """
+    source_rows = _to_row_list(rows)
     row_list, export_diagnostics = _prepare_rows_for_programa_export(rows)
     included = [r for r in row_list if _is_included(r)]
 
     skipped: list[dict] = []
+    blank_price_only_rows: list[dict] = []
+    missing_model_manufacturer: list[dict] = []
+    phone_email_header_contamination: list[dict] = []
     missing_section: list[dict] = []
     missing_dimensions = 0
     missing_product_url = 0
@@ -577,6 +613,32 @@ def validate_for_export(rows) -> dict:
     section_counts: dict[str, int] = {}
     section_equals_product_name: list[dict] = []
     section_too_long: list[dict] = []
+
+    for original_index, source_row in enumerate(source_rows):
+        if _is_unresolved_charge(source_row):
+            blank_price_only_rows.append({
+                "index": original_index,
+                "price": _str_val(source_row.get("Price")),
+                "reason": "blank/price-only quote row",
+            })
+        identity_reason = _missing_identity_reason(source_row)
+        if identity_reason and _is_included(source_row):
+            missing_model_manufacturer.append({
+                "index": original_index,
+                "product_name": _str_val(source_row.get("Product Name")) or "(unnamed)",
+                "brand": _str_val(source_row.get("Brand")),
+                "sku": _str_val(source_row.get("Model/SKU")),
+                "reason": identity_reason,
+            })
+        contamination_reason = _contamination_reason(source_row)
+        if contamination_reason:
+            phone_email_header_contamination.append({
+                "index": original_index,
+                "product_name": _str_val(source_row.get("Product Name")) or "(unnamed)",
+                "brand": _str_val(source_row.get("Brand")),
+                "sku": _str_val(source_row.get("Model/SKU")),
+                "reason": contamination_reason,
+            })
 
     for i, row in enumerate(included):
         name = _str_val(row.get("Product Name"))
@@ -630,6 +692,11 @@ def validate_for_export(rows) -> dict:
         "suspicious_dimensions_rejected": export_diagnostics["suspicious_dimensions_rejected"],
         "rejected_product_urls": export_diagnostics["rejected_product_urls"],
         "pdf_product_urls": export_diagnostics["pdf_product_urls"],
+        "blank_price_only_rows": blank_price_only_rows,
+        "missing_model_manufacturer": missing_model_manufacturer,
+        "phone_email_header_contamination": phone_email_header_contamination,
+        "parsed_rows_count": len(source_rows),
+        "export_rows_count": export_count,
     }
 
 

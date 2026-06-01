@@ -68,6 +68,18 @@ def test_extract_model_sku_none():
     assert label == ""
 
 
+def test_extract_model_sku_ignores_phone_number_token():
+    val, label = _extract_model_sku("Salesperson phone 631-287-2405")
+    assert val == ""
+    assert label == ""
+
+
+def test_extract_model_sku_prefers_real_model_over_phone_number():
+    val, label = _extract_model_sku("Sub-Zero DEC3650RID/R refrigerator 631-287-2405")
+    assert val == "DEC3650RID/R"
+    assert label == "model token"
+
+
 # ── Quantity extraction ────────────────────────────────────────────────────────
 
 def test_extract_quantity_qty():
@@ -111,6 +123,51 @@ def test_row_from_line_extracts_brand_model_dimensions_and_finish():
     assert row["Finish / Color"] == "Stainless Steel"
     assert row["Supplier"] == "PC Richard"
     assert row["Product Category"] == "Appliances"
+
+
+def test_row_from_line_price_only_becomes_unresolved_charge():
+    row = _row_from_line(
+        "5 | $285.97",
+        "1 Lily Pond",
+        "",
+        "PC Richard",
+        "",
+    )
+
+    assert row is not None
+    assert row["Include"] is False
+    assert row["Import Type"] == "unresolved_charge"
+    assert row["Price"] == "$285.97"
+    assert row["Product Name"] == ""
+    assert row["Brand"] == ""
+    assert row["Model/SKU"] == ""
+
+
+def test_row_from_line_service_plan_is_not_product():
+    row = _row_from_line(
+        "5 Years Protection Plan $285.97",
+        "1 Lily Pond",
+        "",
+        "PC Richard",
+        "",
+    )
+
+    assert row is None
+
+
+def test_row_from_line_keeps_qty_two_as_single_product():
+    row = _row_from_line(
+        "Wolf PL522212 Liner Exterior qty 2 $1,200.00",
+        "1 Lily Pond",
+        "Exterior",
+        "PC Richard",
+        "",
+    )
+
+    assert row is not None
+    assert row["Brand"] == "Wolf"
+    assert row["Model/SKU"] == "PL522212"
+    assert row["Quantity"] == 2
 
 
 def test_red_room_annotation_moves_to_room_not_description():
@@ -191,3 +248,35 @@ def test_pc_richard_room_annotations_preserve_late_quote_models():
     assert by_model["829155"]["Room"] == "Bar"
     for row in rows:
         assert row["Room"] not in row["Product Name"]
+
+
+def test_pc_richard_table_price_only_row_is_manual_review_not_product():
+    class FakeTable:
+        def extract(self):
+            return [
+                ["Item", "Manufacturer", "Model", "Description", "Color", "Qty", "Price"],
+                ["5", "", "", "", "", "", "$285.97"],
+                ["6", "Scotsman", "SCN60PA1SU", "Icemaker built in pump", "PNL", "1", "$4,299.00"],
+            ]
+
+    class FakePage:
+        def find_tables(self):
+            return [FakeTable()]
+
+    rows = _parse_table_rows(
+        FakePage(),
+        project="1 Lily Pond",
+        room="",
+        supplier="PC Richard",
+        notes="",
+        category="Appliances",
+    )
+
+    charges = [row for row in rows if row.get("Import Type") == "unresolved_charge"]
+    products = [row for row in rows if row.get("Include") is not False]
+
+    assert len(charges) == 1
+    assert charges[0]["Price"] == "$285.97"
+    assert len(products) == 1
+    assert products[0]["Brand"] == "Scotsman"
+    assert products[0]["Model/SKU"] == "SCN60PA1SU"

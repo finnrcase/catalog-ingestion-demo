@@ -58,6 +58,11 @@ export type ProgramaExportValidation = {
   suspicious_dimensions_rejected: { index: number; product_name: string; brand?: string; sku?: string; dimensions?: string; reason?: string }[];
   rejected_product_urls: { index: number; product_name: string; brand?: string; sku?: string; url?: string; reason?: string }[];
   pdf_product_urls: { index: number; product_name: string; brand?: string; sku?: string; url?: string; reason?: string }[];
+  blank_price_only_rows: { index: number; price?: string; reason?: string }[];
+  missing_model_manufacturer: { index: number; product_name: string; brand?: string; sku?: string; reason?: string }[];
+  phone_email_header_contamination: { index: number; product_name: string; brand?: string; sku?: string; reason?: string }[];
+  parsed_rows_count: number;
+  export_rows_count: number;
 };
 
 export type VendorCallResponse = {
