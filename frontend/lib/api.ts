@@ -182,6 +182,8 @@ export async function validateRows(rows: IntakeRow[]): Promise<IntakeResponse> {
 export async function enrichRows(input: {
   rows: IntakeRow[];
   useWebEnrichment: boolean;
+  enrichmentMode?: string;
+  forceRefresh?: boolean;
 }): Promise<IntakeResponse> {
   return parseJson<IntakeResponse>(
     await apiFetch(apiUrl("/intake/enrich"), {
@@ -190,6 +192,26 @@ export async function enrichRows(input: {
       body: JSON.stringify({
         rows: input.rows,
         use_web_enrichment: input.useWebEnrichment,
+        enrichment_mode: input.enrichmentMode,
+        force_refresh: input.forceRefresh ?? false,
+      }),
+    }),
+  );
+}
+
+export async function recoverMissingImages(input: {
+  rows: IntakeRow[];
+  enrichmentMode?: string;
+  forceRefresh?: boolean;
+}): Promise<IntakeResponse> {
+  return parseJson<IntakeResponse>(
+    await apiFetch(apiUrl("/intake/recover-images"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        rows: input.rows,
+        enrichment_mode: input.enrichmentMode,
+        force_refresh: input.forceRefresh ?? false,
       }),
     }),
   );

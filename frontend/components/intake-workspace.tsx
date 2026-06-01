@@ -23,6 +23,7 @@ import {
   exportProgramaZip,
   formatApiError,
   API_BASE,
+  RAW_API_BASE,
   fetchHealth,
   fetchSchema,
   fetchVendorCallStatus,
@@ -30,6 +31,7 @@ import {
   generateIntakeTable,
   generateVendorCallScript,
   refreshVendorCall,
+  recoverMissingImages,
   sendToPrograma,
   startVendorCall,
   uploadImage,
@@ -109,6 +111,96 @@ type BuildInfo = {
   version: string;
   deploymentUrl?: string;
 };
+
+type WorkflowStage = "upload" | "parse" | "reviewParsed" | "enrich" | "reviewEnriched" | "export";
+type EnrichmentMode = "fast" | "standard" | "deep";
+
+const frontendRouteWiring = [
+  {
+    action: "Backend health",
+    endpoint: "GET /health",
+    body: "none",
+    response: "{ status }",
+  },
+  {
+    action: "Schema/categories",
+    endpoint: "GET /schema",
+    body: "none",
+    response: "{ categories, sections, statuses, reviewFields }",
+  },
+  {
+    action: "PDF parse / product links",
+    endpoint: "POST /intake/generate",
+    body: "multipart FormData: project, room, urls, use_ai_pdf, files[]",
+    response: "IntakeResponse: rows, errors, eligible_count, blocked_count, stage_timings",
+  },
+  {
+    action: "Bulk/product image upload",
+    endpoint: "POST /api/upload-image",
+    body: "multipart FormData: file",
+    response: "{ secure_url, stage_timings }",
+  },
+  {
+    action: "Row validation",
+    endpoint: "POST /intake/validate",
+    body: "{ rows }",
+    response: "IntakeResponse",
+  },
+  {
+    action: "Enrich missing data",
+    endpoint: "POST /intake/enrich",
+    body: "{ rows, use_web_enrichment, enrichment_mode, force_refresh }",
+    response: "IntakeResponse + dimension_diagnostics/stage_timings",
+  },
+  {
+    action: "Targeted missing image recovery",
+    endpoint: "POST /intake/recover-images",
+    body: "{ rows, enrichment_mode, force_refresh }",
+    response: "IntakeResponse + image diagnostics in dimension_diagnostics",
+  },
+  {
+    action: "Export validation",
+    endpoint: "POST /export/programa/validate",
+    body: "{ rows }",
+    response: "ProgramaExportValidation",
+  },
+  {
+    action: "Excel export",
+    endpoint: "POST /export/programa/xlsx",
+    body: "{ rows }",
+    response: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  },
+  {
+    action: "CSV export",
+    endpoint: "POST /export/programa/csv",
+    body: "{ rows }",
+    response: "text/csv",
+  },
+  {
+    action: "ZIP with images",
+    endpoint: "POST /export/programa/zip",
+    body: "{ rows }",
+    response: "application/zip",
+  },
+  {
+    action: "Debug export",
+    endpoint: "POST /export/programa/debug-csv",
+    body: "{ rows }",
+    response: "text/csv",
+  },
+  {
+    action: "Send to Programa",
+    endpoint: "POST /programa/send",
+    body: "{ project_name, schedule_url, rows, allow_blank_fields, upload_product_images }",
+    response: "{ status, message, entries, blocked }",
+  },
+  {
+    action: "Vendor phone workflow",
+    endpoint: "POST /vendor-call/script, POST /vendor-call/start, POST /vendor-call/refresh",
+    body: "{ row, missing_fields, phone_number, custom_goal/call_id }",
+    response: "script/status/transcript payloads",
+  },
+] as const;
 
 function rowText(row: IntakeRow, key: string) {
   return String(row[key] ?? "");
@@ -282,6 +374,15 @@ function formatBuildTime(value: string) {
   });
 }
 
+function workflowStepIndex(stage: WorkflowStage) {
+  if (stage === "parse") return 1;
+  if (stage === "reviewParsed") return 2;
+  if (stage === "enrich") return 3;
+  if (stage === "reviewEnriched") return 4;
+  if (stage === "export") return 5;
+  return 0;
+}
+
 export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?: BuildInfo }) {
   const [project, setProject] = useState("");
   const [room, setRoom] = useState("");
@@ -308,7 +409,10 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const [sections, setSections] = useState<string[]>(fallbackSections);
   const [message, setMessage] = useState("");
   const [useWebEnrichment, setUseWebEnrichment] = useState(true);
+  const [enrichmentMode, setEnrichmentMode] = useState<EnrichmentMode>("standard");
+  const [forceRefreshEnrichment, setForceRefreshEnrichment] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [workflowStage, setWorkflowStage] = useState<WorkflowStage>("upload");
   const [parsedProductsOpen, setParsedProductsOpen] = useState(false);
   const [enrichedProductsOpen, setEnrichedProductsOpen] = useState(false);
   const [parseStatus, setParseStatus] = useState("Ready for upload.");
@@ -325,7 +429,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const [scheduleUrl, setScheduleUrl] = useState("");
   const [programaMessage, setProgramaMessage] = useState("");
   const [productImageUploads, setProductImageUploads] = useState<Record<number, string>>({});
-  const [busy, setBusy] = useState<"generate" | "validate" | "vendorCall" | "export" | "photoBulk" | "programa" | "">("");
+  const [busy, setBusy] = useState<"generate" | "validate" | "imageRecovery" | "vendorCall" | "export" | "photoBulk" | "programa" | "">("");
   const [exportSummary, setExportSummary] = useState({
     skipped: [] as { index: number; product_name: string }[],
     missing_section: [] as { index: number; product_name: string }[],
@@ -424,6 +528,13 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const unresolvedCount = missingInputRows.length;
   const parseInputCount = files.length + bulkImages.length + urls.split(/\r?\n/).filter((url) => url.trim()).length;
   const programaSendEnabled = process.env.NEXT_PUBLIC_PROGRAMA_SEND_ENABLED === "true";
+  const activeWorkflowIndex = workflowStepIndex(workflowStage);
+  const hasParsedRows = rows.length > 0;
+  const parsedReviewReady = hasParsedRows && activeWorkflowIndex >= 2;
+  const enrichmentHasRun = workflowStage === "reviewEnriched" || workflowStage === "export";
+  const apiConnectionStatus = API_BASE ? apiStatus : "misconfigured";
+  const apiConnectionText = API_BASE ? apiStatusText : "NEXT_PUBLIC_API_BASE_URL is missing or invalid.";
+  const displayApiBase = API_BASE || "not configured";
 
   useEffect(() => {
     if (includedRows.length === 0) {
@@ -490,6 +601,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         return;
       }
       setFiles(nextFiles);
+      setWorkflowStage("upload");
     } catch {
       setFiles([]);
       setUploadError("Upload failed. Please choose the PDF again.");
@@ -521,6 +633,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     setBulkImages(nextFiles);
     setPhotoBulkResults({});
     setPhotoBulkSummary({ success: 0, failed: 0 });
+    setWorkflowStage("upload");
   }
 
   function clearBulkImages() {
@@ -528,6 +641,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     setBulkImageError("");
     setPhotoBulkResults({});
     setPhotoBulkSummary({ success: 0, failed: 0 });
+    setWorkflowStage("upload");
     if (bulkImageInputRef.current) bulkImageInputRef.current.value = "";
   }
 
@@ -557,24 +671,12 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     } satisfies IntakeRow;
   }
 
-  async function handlePhotoBulkCreate() {
-    if (!bulkImages.length) {
-      setBulkImageError("Choose at least one image first.");
-      return;
-    }
-    const selectedSection = photoBulkSection === "__custom__" ? photoBulkCustomSection.trim() : photoBulkSection;
-    if (!selectedSection.trim()) {
-      setBulkImageError("Choose a section before creating rows.");
-      return;
-    }
-    setBusy("photoBulk");
-    setBulkImageError("");
-    setMessage("");
+  async function createBulkPhotoRows(startIndex: number) {
     const nextResults: typeof photoBulkResults = {};
     let success = 0;
     let failed = 0;
     const createdRows: IntakeRow[] = [];
-    const startIndex = rows.length;
+    setLastEndpoint(`${API_BASE || "not configured"}/api/upload-image`);
 
     for (const [index, file] of bulkImages.entries()) {
       const key = bulkImageKey(file, index);
@@ -602,14 +704,36 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       setPhotoBulkSummary({ success, failed });
     }
 
+    return { createdRows, success, failed };
+  }
+
+  async function handlePhotoBulkCreate() {
+    if (!bulkImages.length) {
+      setBulkImageError("Choose at least one image first.");
+      return;
+    }
+    const selectedSection = photoBulkSection === "__custom__" ? photoBulkCustomSection.trim() : photoBulkSection;
+    if (!selectedSection.trim()) {
+      setBulkImageError("Choose a section before creating rows.");
+      return;
+    }
+    setBusy("photoBulk");
+    setBulkImageError("");
+    setMessage("");
+    let createdRows: IntakeRow[] = [];
+    let success = 0;
+    let failed = 0;
     try {
+      ({ createdRows, success, failed } = await createBulkPhotoRows(rows.length));
       const response = await validateRows([...rows, ...createdRows]);
       setRows(response.rows);
       setErrors(response.errors);
       setMessage(`Photo-only bulk import created ${success} row${success === 1 ? "" : "s"} with images; ${failed} failed.`);
+      setWorkflowStage("reviewParsed");
     } catch {
       setRows((current) => [...current, ...createdRows]);
       setMessage(`Photo-only bulk import created ${success} row${success === 1 ? "" : "s"} with images; ${failed} failed.`);
+      setWorkflowStage("reviewParsed");
     } finally {
       setBusy("");
     }
@@ -619,6 +743,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     const key = bulkImageKey(file, index);
     const result = photoBulkResults[key];
     if (!result || result.rowIndex === undefined) return;
+    setLastEndpoint(`${API_BASE || "not configured"}/api/upload-image`);
     setPhotoBulkResults((current) => ({ ...current, [key]: { ...result, status: "queued", error: "" } }));
     try {
       const response = await uploadImage(file);
@@ -659,6 +784,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
 
   async function handleProductImageUpload(rowIndex: number, file: File | undefined) {
     if (!file) return;
+    setLastEndpoint(`${API_BASE || "not configured"}/api/upload-image`);
     setProductImageUploads((current) => ({ ...current, [rowIndex]: "Uploading..." }));
     try {
       const response = await uploadImage(file);
@@ -688,20 +814,57 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     setBusy("generate");
     setMessage("");
     setErrors([]);
+    setWorkflowStage("parse");
     setParseStatus("Parsing uploaded files and links...");
     setLastEndpoint(`${API_BASE || "not configured"}/intake/generate`);
     try {
-      const response = await generateIntakeTable({ project, room, urls, useAiPdf, files });
-      setRows(response.rows);
-      setErrors(response.errors);
-      setParseStatus(`Parse complete: ${response.rows.length} product${response.rows.length === 1 ? "" : "s"} found.`);
+      let parsedRows: IntakeRow[] = [];
+      let parseErrors: string[] = [];
+      let cost = "Not reported";
+
+      if (files.length || urls.trim()) {
+        const response = await generateIntakeTable({ project, room, urls, useAiPdf, files });
+        parsedRows = response.rows;
+        parseErrors = response.errors;
+        cost = getEstimatedCost(response);
+      }
+
+      let photoMessage = "";
+      if (bulkImages.length) {
+        const selectedSection = photoBulkSection === "__custom__" ? photoBulkCustomSection.trim() : photoBulkSection;
+        if (!selectedSection.trim()) {
+          throw new Error("Choose a section before parsing product photos.");
+        }
+        setParseStatus("Uploading photos to Cloudinary...");
+        const { createdRows, success, failed } = await createBulkPhotoRows(parsedRows.length);
+        parsedRows = [...parsedRows, ...createdRows];
+        photoMessage = ` Photo rows: ${success} uploaded, ${failed} failed.`;
+      }
+
+      let finalRows = parsedRows;
+      let finalErrors = parseErrors;
+      if (parsedRows.length) {
+        try {
+          const validated = await validateRows(parsedRows);
+          finalRows = validated.rows;
+          finalErrors = [...parseErrors, ...validated.errors];
+        } catch {
+          finalRows = parsedRows;
+        }
+      }
+
+      setRows(finalRows);
+      setErrors(finalErrors);
+      setParseStatus(`Parse complete: ${finalRows.length} product${finalRows.length === 1 ? "" : "s"} found.`);
       setParsedProductsOpen(false);
       setEnrichedProductsOpen(false);
-      setEstimatedCost(getEstimatedCost(response));
-      setMessage("Parsed products are ready for review.");
+      setEstimatedCost(cost);
+      setWorkflowStage("reviewParsed");
+      setMessage(`Parsed products are ready for review.${photoMessage}`);
     } catch (error) {
       const formatted = formatApiError(error);
       setParseStatus("Parse failed.");
+      setWorkflowStage("upload");
       setMessage(formatted);
     } finally {
       setBusy("");
@@ -711,12 +874,18 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   async function handleValidate() {
     setBusy("validate");
     setMessage("");
+    setWorkflowStage("enrich");
     setEnrichmentStatus("Enriching missing product data...");
     const beforeImages = countRows(includedRows, hasImage);
     const beforeDimensions = countRows(includedRows, (row) => hasComplete3dDimensions(row.Dimensions));
     setLastEndpoint(`${API_BASE || "not configured"}/intake/enrich`);
     try {
-      const response = await enrichRows({ rows, useWebEnrichment });
+      const response = await enrichRows({
+        rows,
+        useWebEnrichment,
+        enrichmentMode,
+        forceRefresh: forceRefreshEnrichment,
+      });
       setRows(response.rows);
       setErrors(response.errors);
       const enrichedRows = response.rows.filter((row) => row.Include !== false);
@@ -731,11 +900,48 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       setEstimatedCost(getEstimatedCost(response));
       setEnrichmentStatus(useWebEnrichment ? "Enrichment complete." : "Input updates saved without web enrichment.");
       setEnrichedProductsOpen(false);
+      setWorkflowStage("reviewEnriched");
       setMessage(useWebEnrichment ? "Missing info search complete." : "Input updates saved without web search.");
     } catch (error) {
       const formatted = formatApiError(error);
       setEnrichmentStatus("Enrichment failed.");
+      setWorkflowStage("reviewParsed");
       setMessage(formatted);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function handleRecoverMissingImages() {
+    setBusy("imageRecovery");
+    setMessage("");
+    setEnrichmentStatus("Recovering missing images from verified product pages...");
+    const beforeImages = countRows(includedRows, hasImage);
+    setLastEndpoint(`${API_BASE || "not configured"}/intake/recover-images`);
+    try {
+      const response = await recoverMissingImages({
+        rows,
+        enrichmentMode,
+        forceRefresh: forceRefreshEnrichment,
+      });
+      setRows(response.rows);
+      setErrors(response.errors);
+      const enrichedRows = response.rows.filter((row) => row.Include !== false);
+      const afterImages = countRows(enrichedRows, hasImage);
+      const imageDelta = Math.max(0, afterImages - beforeImages);
+      const unresolved = countRows(enrichedRows, (row) => missingFieldsForRow(row).length > 0);
+      setEnrichmentStats((current) => ({
+        ...current,
+        filledImages: current.filledImages + imageDelta,
+        unresolved,
+      }));
+      setEstimatedCost(getEstimatedCost(response));
+      setEnrichmentStatus("Missing image recovery complete.");
+      setWorkflowStage("reviewEnriched");
+      setMessage(`Image recovery complete: ${imageDelta} image${imageDelta === 1 ? "" : "s"} added.`);
+    } catch (error) {
+      setEnrichmentStatus("Image recovery failed.");
+      setMessage(formatApiError(error));
     } finally {
       setBusy("");
     }
@@ -766,6 +972,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       const today = new Date().toISOString().slice(0, 10);
       const filename = format === "debug" ? `programa_debug_${today}.${suffix}` : `programa_import_${today}.${suffix}`;
       downloadBlob(blob, filename);
+      setWorkflowStage("export");
       setMessage("Use this file for Programa Import Products.");
     } catch (error) {
       setMessage(formatApiError(error));
@@ -825,7 +1032,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   return (
     <main className="min-h-screen px-4 py-6 sm:px-7 lg:px-10">
       <div className="mx-auto flex max-w-[1180px] flex-col gap-7">
-        <header className="flex flex-col gap-4 border-b border-linen pb-5 md:flex-row md:items-center md:justify-between">
+        <header className="sticky top-0 z-40 flex flex-col gap-4 border-b border-linen bg-ivory/95 pb-5 pt-1 backdrop-blur md:flex-row md:items-center md:justify-between">
           <div className="flex flex-wrap items-center gap-3">
             <LogoMark />
             <span className="rounded-full border border-orangeBorder bg-orangeSoft px-3 py-1 text-xs font-medium text-bronze">
@@ -833,10 +1040,10 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             </span>
           </div>
           <div className="flex flex-wrap items-center gap-3">
-            <ApiConnectionBadge status={apiStatus} label={apiStatusText} apiBase={API_BASE} />
+            <ApiConnectionBadge status={apiConnectionStatus} label={apiConnectionText} apiBase={displayApiBase} />
             <button
               type="button"
-              className="btn-secondary inline-flex h-10 items-center justify-center gap-2 rounded-xl px-3 text-sm font-semibold text-charcoal hover:border-orangeBorder hover:bg-orangeSoft/40"
+              className="inline-flex h-12 items-center justify-center gap-2 rounded-xl border border-orangeBorder bg-orangeSoft px-5 text-sm font-bold text-bronze shadow-sm transition hover:border-bronze hover:bg-white"
               onClick={() => setSettingsOpen(true)}
             >
               <Settings className="h-4 w-4" />
@@ -845,13 +1052,24 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           </div>
         </header>
 
-        <div className="grid gap-2 rounded-2xl border border-linen bg-white/72 p-3 sm:grid-cols-5">
-          {["Upload", "Parse", "Review", "Enrich", "Export"].map((label, index) => (
-            <div key={label} className="flex items-center gap-2 rounded-xl bg-ivory/70 px-3 py-2">
-              <span className="grid h-6 w-6 place-items-center rounded-full bg-orangeSoft text-xs font-semibold text-bronze">
+        <div className="grid gap-2 rounded-2xl border border-linen bg-white/72 p-3 sm:grid-cols-2 lg:grid-cols-6">
+          {["Upload", "Parse", "Review Parsed", "Enrich", "Review Enriched", "Export"].map((label, index) => (
+            <div
+              key={label}
+              className={`flex items-center gap-2 rounded-xl px-3 py-2 transition ${
+                index === activeWorkflowIndex
+                  ? "border border-orangeBorder bg-orangeSoft text-bronze shadow-sm"
+                  : index < activeWorkflowIndex
+                    ? "border border-sage/15 bg-sage/10 text-sage"
+                    : "border border-transparent bg-ivory/70 text-charcoal/60"
+              }`}
+            >
+              <span className={`grid h-6 w-6 place-items-center rounded-full text-xs font-semibold ${
+                index <= activeWorkflowIndex ? "bg-white text-bronze" : "bg-orangeSoft text-bronze"
+              }`}>
                 {index + 1}
               </span>
-              <span className="text-xs font-semibold uppercase tracking-[0.08em] text-charcoal/60">{label}</span>
+              <span className="text-xs font-semibold uppercase tracking-[0.08em]">{label}</span>
             </div>
           ))}
         </div>
@@ -880,8 +1098,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             <div className="grid gap-4 lg:grid-cols-3">
               <InputCard
                 icon={<Upload className="h-5 w-5 text-bronze" />}
-                title="PDFs, quote sheets, tear sheets, receipts"
-                description="Upload vendor PDFs or document captures for parser extraction."
+                title="Upload PDFs"
+                description="Vendor quotes, spec sheets, tear sheets, receipts, or schedules for Step 2 parsing."
                 meta={files.length ? `${files.length} PDF${files.length === 1 ? "" : "s"} selected` : "No PDFs selected"}
               >
                 <label className="btn-secondary inline-flex h-10 cursor-pointer items-center justify-center rounded-xl px-4 text-sm font-semibold">
@@ -899,8 +1117,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
 
               <InputCard
                 icon={<ImageIcon className="h-5 w-5 text-bronze" />}
-                title="Mass photo upload"
-                description="Create photo-only inventory rows with uploaded product images."
+                title="Upload Product Photos"
+                description="Photos are uploaded to Cloudinary during Parse and become image-ready rows."
                 meta={bulkImages.length ? `${bulkImages.length} image${bulkImages.length === 1 ? "" : "s"} selected` : "No photos selected"}
               >
                 <label
@@ -939,8 +1157,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
 
               <InputCard
                 icon={<FileText className="h-5 w-5 text-bronze" />}
-                title="Product URLs / links"
-                description="Paste product pages, vendor links, or source URLs one per line."
+                title="Paste Product Links"
+                description="Product pages, vendor links, or source URLs. One link per line."
                 meta={`${urls.split(/\r?\n/).filter((url) => url.trim()).length} link${urls.split(/\r?\n/).filter((url) => url.trim()).length === 1 ? "" : "s"} entered`}
               >
                 <textarea
@@ -1041,26 +1259,20 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                     </button>
                   ) : null}
                 </div>
+                <p className="text-sm text-taupe">
+                  Photo rows are created in Step 2 when you click Parse Files. PDF parsing and web enrichment will not run for photo-only rows.
+                </p>
                 <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
                   {bulkImagePreviews.slice(0, 6).map(({ file, url }, index) => (
                     <img key={`${file.name}-${file.size}-${file.lastModified}`} src={url} alt={file.name} className="h-20 w-full rounded-xl object-cover" />
                   ))}
                 </div>
-                <button
-                  type="button"
-                  className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold disabled:cursor-not-allowed disabled:text-taupe/60"
-                  disabled={busy === "photoBulk" || !bulkImages.length}
-                  onClick={handlePhotoBulkCreate}
-                >
-                  {busy === "photoBulk" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageIcon className="h-4 w-4" />}
-                  Add Photo Rows
-                </button>
               </div>
             ) : null}
           </div>
         </Panel>
 
-        <Panel step="2" title="Parse" subtitle="Run the parsing system on uploaded PDFs and product links. Enrichment stays off until Step 4.">
+        <Panel step="2" title="Parse" subtitle="Create initial product rows from PDFs, product links, and Cloudinary-hosted photo uploads. Enrichment stays off until Step 4.">
           <div className="grid gap-4">
             <div className="rounded-xl border border-linen bg-ivory/70 p-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -1070,15 +1282,16 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                 </div>
                 <button
                   className="btn-primary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-6 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze disabled:shadow-none"
-                  disabled={busy === "generate" || (!files.length && !urls.trim())}
+                  disabled={busy === "generate" || parseInputCount === 0}
                   onClick={handleGenerate}
                 >
                   {busy === "generate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileText className="h-4 w-4" />}
-                  Parse Uploaded Files
+                  Parse Files
                 </button>
               </div>
               <div className="mt-3 flex flex-wrap gap-2">
                 <StatusBadge value={`${files.length} PDFs`} />
+                <StatusBadge value={`${bulkImages.length} photos`} />
                 <StatusBadge value={`${urls.split(/\r?\n/).filter((url) => url.trim()).length} URLs`} />
                 <StatusBadge value={useAiPdf ? "AI PDF parsing on" : "AI PDF parsing off"} />
                 <StatusBadge value={`${rows.length} products found`} />
@@ -1089,198 +1302,205 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           </div>
         </Panel>
 
-        <Panel step="3" title="Review Parsed Products" subtitle="Start with the summary, then expand the parsed product table only when needed.">
-          <div className="grid gap-4">
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-              <SummaryCard label="Products found" value={rows.length} />
-              <SummaryCard label="Missing SKU" value={missingSkuCount} tone={missingSkuCount ? "warning" : "ok"} />
-              <SummaryCard label="Missing dimensions" value={missingDimensionsCount} tone={missingDimensionsCount ? "warning" : "ok"} />
-              <SummaryCard label="Missing image" value={missingImageCount} tone={missingImageCount ? "warning" : "ok"} />
-              <SummaryCard label="Missing supplier" value={missingSupplierCount} tone={missingSupplierCount ? "warning" : "ok"} />
+        {parsedReviewReady ? (
+          <Panel step="3" title="Review Parsed Data" subtitle="Start with the summary, then expand the parsed product table only when needed.">
+            <div className="grid gap-4">
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+                <SummaryCard label="Products found" value={rows.length} />
+                <SummaryCard label="Missing SKU" value={missingSkuCount} tone={missingSkuCount ? "warning" : "ok"} />
+                <SummaryCard label="Missing dimensions" value={missingDimensionsCount} tone={missingDimensionsCount ? "warning" : "ok"} />
+                <SummaryCard label="Missing image" value={missingImageCount} tone={missingImageCount ? "warning" : "ok"} />
+                <SummaryCard label="Missing supplier" value={missingSupplierCount} tone={missingSupplierCount ? "warning" : "ok"} />
+              </div>
+              <DisclosureButton open={parsedProductsOpen} onClick={() => setParsedProductsOpen((open) => !open)}>
+                View parsed products
+              </DisclosureButton>
+              {parsedProductsOpen ? (
+                <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} />
+              ) : null}
             </div>
-            <DisclosureButton open={parsedProductsOpen} onClick={() => setParsedProductsOpen((open) => !open)}>
-              View parsed products
-            </DisclosureButton>
-            {parsedProductsOpen ? (
-              <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} />
-            ) : null}
-          </div>
-        </Panel>
+          </Panel>
+        ) : null}
 
-        <Panel step="4" title="Enrich Missing Data" subtitle="Use the backend enrichment route only when you choose to search for missing fields.">
-          <div className="grid gap-4">
-            <div className="rounded-xl border border-linen bg-ivory/70 p-4">
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <div className="text-sm font-semibold text-charcoal">{enrichmentStatus}</div>
-                  <div className="mt-1 text-xs text-taupe">Estimated cost: {estimatedCost}</div>
+        {parsedReviewReady ? (
+          <Panel step="4" title="Enrich" subtitle="Run missing-field enrichment only after parsed data has been reviewed. This does not reparse the PDFs.">
+            <div className="grid gap-4">
+              <div className="rounded-xl border border-linen bg-ivory/70 p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <div className="text-sm font-semibold text-charcoal">{enrichmentStatus}</div>
+                    <div className="mt-1 text-xs text-taupe">Estimated cost: {estimatedCost}</div>
+                  </div>
+                  <button
+                    className="btn-primary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
+                    disabled={(busy !== "" && busy !== "validate") || busy === "validate" || rows.length === 0}
+                    onClick={handleValidate}
+                  >
+                    {busy === "validate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                    Enrich Missing Data
+                  </button>
                 </div>
-                <button
-                  className="btn-primary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
-                  disabled={busy === "validate" || rows.length === 0}
-                  onClick={handleValidate}
-                >
-                  {busy === "validate" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-                  Enrich Products
-                </button>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <StatusBadge value={`${includedRows.length} products queued`} />
+                  <StatusBadge value={`Mode: ${enrichmentMode}`} />
+                  <StatusBadge value={`${missingSkuCount} missing SKU/model`} />
+                  <StatusBadge value={`${missingDimensionsCount} missing dimensions`} />
+                  <StatusBadge value={`${missingImageCount} missing image`} />
+                  <StatusBadge value={useWebEnrichment ? "Web enrichment on" : "Web enrichment off"} />
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    className="btn-secondary inline-flex h-10 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-white disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                    disabled={(busy !== "" && busy !== "imageRecovery") || busy === "imageRecovery" || rows.length === 0 || missingImageCount === 0}
+                    onClick={handleRecoverMissingImages}
+                  >
+                    {busy === "imageRecovery" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageIcon className="h-4 w-4" />}
+                    Recover Missing Images
+                  </button>
+                </div>
               </div>
-              <div className="mt-3 flex flex-wrap gap-2">
-                <StatusBadge value={`${enrichmentStats.filledImages} images filled`} />
-                <StatusBadge value={`${enrichmentStats.filledDimensions} dimensions filled`} />
-                <StatusBadge value={`${enrichmentStats.unresolved || unresolvedCount} unresolved`} />
-                <StatusBadge value={useWebEnrichment ? "Web enrichment on" : "Web enrichment off"} />
+
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <SummaryCard label="Rows to inspect" value={includedRows.length} />
+                <SummaryCard label="Need enrichment" value={unresolvedCount} tone={unresolvedCount ? "warning" : "ok"} />
+                <SummaryCard label="Images present" value={imagesFoundCount} />
+                <SummaryCard label="Dimensions present" value={dimensionsFoundCount} />
               </div>
+              <p className="rounded-xl border border-linen bg-white px-4 py-3 text-sm text-charcoal/70">
+                Enrichment uses existing SKU/model, product URLs, preferred sources, and cache first. It fills missing data without rerunning PDF parsing.
+              </p>
+              {errors.length ? <ErrorList errors={errors} /> : null}
             </div>
+          </Panel>
+        ) : null}
 
-            {rows.length > 0 && missingInputRows.length ? (
-              <div className="divide-y divide-linen rounded-xl border border-linen bg-white">
-                {rows.map((row, index) => {
-                  const missingFields = row.Include !== false ? missingFieldsForRow(row) : [];
-                  return missingFields.length > 0 ? (
-                    <div key={index} className="grid gap-3 p-4 lg:grid-cols-[0.8fr_1.2fr] lg:items-start">
-                      <div>
-                        <div className="text-sm font-semibold text-charcoal">{rowText(row, "Product Name") || "Unnamed Item"}</div>
-                        <div className="mt-2 flex flex-wrap gap-2">
-                          {missingFields.map((field) => (
-                            <StatusBadge
-                              key={field}
-                              value={field === "Dimensions" ? "Missing Dimensions" : field === "Image URL" ? "Missing Image" : `Missing ${field}`}
-                            />
-                          ))}
-                        </div>
-                      </div>
-                      <div className="grid gap-2">
-                        {missingFields.map((field) => {
-                          const key = missingFieldKeys[field];
-                          return (
-                            <MissingInputField
-                              key={field}
-                              field={field}
-                              value={rowText(row, key)}
-                              onChange={(value) => updateRow(index, key, key === "Quantity" && value ? Number(value) : value)}
-                              onVendorCall={() => openVendorCall(row, [field])}
-                            />
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ) : null;
-                })}
+        {enrichmentHasRun ? (
+          <Panel step="5" title="Review Enriched Data" subtitle="Confirm readiness after enrichment before exporting.">
+            <div className="grid gap-4">
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
+                <SummaryCard label="Products ready" value={readyRows} tone={readyRows ? "ok" : "neutral"} />
+                <SummaryCard label="Needs review" value={needsReview} tone={needsReview ? "warning" : "ok"} />
+                <SummaryCard label="Ignored" value={ignored} />
+                <SummaryCard label="Images found" value={imagesFoundCount} />
+                <SummaryCard label="Dimensions found" value={dimensionsFoundCount} />
+                <SummaryCard label="Est. cost" value={estimatedCost} />
               </div>
-            ) : rows.length > 0 ? (
-              <div className="flex items-center gap-2 rounded-xl border border-sage/20 bg-sage/10 p-4 text-sm text-sage">
-                <CheckCircle2 className="h-4 w-4" />
-                No missing details.
-              </div>
-            ) : (
-              <p className="text-sm text-taupe">Create product entries first.</p>
-            )}
-            {errors.length ? <ErrorList errors={errors} /> : null}
-          </div>
-        </Panel>
-
-        <Panel step="5" title="Review Enriched Products" subtitle="Confirm readiness after enrichment before exporting.">
-          <div className="grid gap-4">
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
-              <SummaryCard label="Products ready" value={readyRows} tone={readyRows ? "ok" : "neutral"} />
-              <SummaryCard label="Needs review" value={needsReview} tone={needsReview ? "warning" : "ok"} />
-              <SummaryCard label="Ignored" value={ignored} />
-              <SummaryCard label="Images found" value={imagesFoundCount} />
-              <SummaryCard label="Dimensions found" value={dimensionsFoundCount} />
-              <SummaryCard label="Est. cost" value={estimatedCost} />
+              <DisclosureButton open={enrichedProductsOpen} onClick={() => setEnrichedProductsOpen((open) => !open)}>
+                View enriched products
+              </DisclosureButton>
+              {enrichedProductsOpen ? (
+                <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} />
+              ) : null}
             </div>
-            <DisclosureButton open={enrichedProductsOpen} onClick={() => setEnrichedProductsOpen((open) => !open)}>
-              View enriched products
-            </DisclosureButton>
-            {enrichedProductsOpen ? (
-              <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} />
-            ) : null}
-          </div>
-        </Panel>
+          </Panel>
+        ) : null}
 
-        <Panel step="6" title="Export" subtitle="Download the Programa-ready workbook first. CSV, ZIP, debug, and direct send are secondary.">
-          <div className="grid gap-4">
-            <div className="grid gap-3 lg:grid-cols-[1.2fr_1fr]">
-              <button
-                className="btn-primary inline-flex h-14 items-center justify-center gap-2 rounded-xl px-6 text-base font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
-                disabled={busy === "export" || exportSummary.export_count === 0}
-                onClick={() => handleProgramaExport("xlsx")}
-              >
-                {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
-                Download Excel for Programa
-              </button>
-              <div className="grid gap-2 sm:grid-cols-2">
+        {enrichmentHasRun ? (
+          <Panel step="6" title="Export" subtitle="Download the Programa-ready workbook first. CSV, ZIP, debug, and direct send are secondary.">
+            <div className="grid gap-4">
+              <div className="grid gap-3 lg:grid-cols-[1.2fr_1fr]">
                 <button
-                  className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                  className="btn-primary inline-flex h-14 items-center justify-center gap-2 rounded-xl px-6 text-base font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
                   disabled={busy === "export" || exportSummary.export_count === 0}
-                  onClick={() => handleProgramaExport("csv")}
+                  onClick={() => handleProgramaExport("xlsx")}
                 >
-                  <Download className="h-4 w-4" />
-                  Download CSV
+                  {busy === "export" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                  Download Excel for Programa
                 </button>
-                <button
-                  className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
-                  disabled={busy === "export" || exportSummary.export_count === 0}
-                  onClick={() => handleProgramaExport("zip")}
-                >
-                  <Archive className="h-4 w-4" />
-                  Download ZIP with Images
-                </button>
-                <button
-                  className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
-                  disabled={busy === "export" || rows.length === 0}
-                  onClick={() => handleProgramaExport("debug")}
-                >
-                  <FileText className="h-4 w-4" />
-                  Export Debug Report
-                </button>
-                <button
-                  className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold text-taupe hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
-                  disabled={!programaSendEnabled || busy === "programa" || exportSummary.export_count === 0 || !scheduleUrl.trim()}
-                  onClick={handleSendToPrograma}
-                  title={programaSendEnabled ? "Send approved rows to Programa" : "Direct Programa send is disabled unless the integration is configured."}
-                >
-                  {busy === "programa" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-                  Send to Programa
-                </button>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <button
+                    className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                    disabled={busy === "export" || exportSummary.export_count === 0}
+                    onClick={() => handleProgramaExport("csv")}
+                  >
+                    <Download className="h-4 w-4" />
+                    Download CSV
+                  </button>
+                  <button
+                    className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                    disabled={busy === "export" || exportSummary.export_count === 0}
+                    onClick={() => handleProgramaExport("zip")}
+                  >
+                    <Archive className="h-4 w-4" />
+                    Download ZIP with Images
+                  </button>
+                  <button
+                    className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                    disabled={busy === "export" || rows.length === 0}
+                    onClick={() => handleProgramaExport("debug")}
+                  >
+                    <FileText className="h-4 w-4" />
+                    Export Debug Report
+                  </button>
+                  {programaSendEnabled ? (
+                    <button
+                      className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold text-taupe hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                      disabled={busy === "programa" || exportSummary.export_count === 0 || !scheduleUrl.trim()}
+                      onClick={handleSendToPrograma}
+                      title="Send approved rows to Programa"
+                    >
+                      {busy === "programa" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                      Send to Programa
+                    </button>
+                  ) : null}
+                </div>
               </div>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <StatusBadge value={`${exportSummary.export_count} export-ready`} />
-              <StatusBadge value={`Images ${exportSummary.image_url_present}/${exportSummary.image_url_total}`} />
-              <StatusBadge value={`${exportSummary.missing_section.length} missing section`} />
-              {programaSendEnabled ? <StatusBadge value="Programa send configured" /> : <StatusBadge value="Programa send not configured" />}
-            </div>
-            {programaMessage ? <p className="whitespace-pre-wrap rounded-xl border border-linen bg-white px-4 py-3 text-sm text-charcoal/70">{programaMessage}</p> : null}
-            {exportSummary.missing_image_url ||
-            exportSummary.missing_dimensions ||
-            exportSummary.rejected_product_urls.length ||
-            exportSummary.pdf_product_urls.length ||
-            exportSummary.suspicious_dimensions_rejected.length ? (
-              <div className="rounded-xl border border-orangeBorder bg-orangeSoft/40 px-4 py-3 text-sm text-bronze">
-                {exportSummary.missing_image_url ? <div>{exportSummary.missing_image_url} row(s) missing image URLs.</div> : null}
-                {exportSummary.missing_dimensions ? <div>{exportSummary.missing_dimensions} row(s) missing dimensions.</div> : null}
-                {exportSummary.suspicious_dimensions_rejected.length ? (
-                  <div>{exportSummary.suspicious_dimensions_rejected.length} suspicious dimension value(s) rejected before export.</div>
-                ) : null}
-                {exportSummary.rejected_product_urls.length ? (
-                  <div>{exportSummary.rejected_product_urls.length} sitemap/category/search Product URL(s) rejected.</div>
-                ) : null}
-                {exportSummary.pdf_product_urls.length ? (
-                  <div>{exportSummary.pdf_product_urls.length} row(s) still use a PDF/spec sheet as Product URL.</div>
-                ) : null}
+              <div className="flex flex-wrap gap-2">
+                <StatusBadge value={`${exportSummary.export_count} export-ready`} />
+                <StatusBadge value={`Images ${exportSummary.image_url_present}/${exportSummary.image_url_total}`} />
+                <StatusBadge value={`${exportSummary.missing_section.length} missing section`} />
+                {programaSendEnabled ? <StatusBadge value="Programa send configured" /> : <StatusBadge value="Programa send not configured" />}
               </div>
-            ) : null}
-          </div>
-        </Panel>
+              {programaMessage ? (
+                <p className="whitespace-pre-wrap rounded-xl border border-linen bg-white px-4 py-3 text-sm text-charcoal/70">{programaMessage}</p>
+              ) : null}
+              {exportSummary.missing_image_url ||
+              exportSummary.missing_dimensions ||
+              exportSummary.rejected_product_urls.length ||
+              exportSummary.pdf_product_urls.length ||
+              exportSummary.suspicious_dimensions_rejected.length ? (
+                <div className="rounded-xl border border-orangeBorder bg-orangeSoft/40 px-4 py-3 text-sm text-bronze">
+                  {exportSummary.missing_image_url ? <div>{exportSummary.missing_image_url} row(s) missing image URLs.</div> : null}
+                  {exportSummary.missing_dimensions ? <div>{exportSummary.missing_dimensions} row(s) missing dimensions.</div> : null}
+                  {exportSummary.suspicious_dimensions_rejected.length ? (
+                    <div>{exportSummary.suspicious_dimensions_rejected.length} suspicious dimension value(s) rejected before export.</div>
+                  ) : null}
+                  {exportSummary.rejected_product_urls.length ? (
+                    <div>{exportSummary.rejected_product_urls.length} sitemap/category/search Product URL(s) rejected.</div>
+                  ) : null}
+                  {exportSummary.pdf_product_urls.length ? (
+                    <div>{exportSummary.pdf_product_urls.length} row(s) still use a PDF/spec sheet as Product URL.</div>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          </Panel>
+        ) : null}
         {settingsOpen ? (
           <SettingsDialog
             buildInfo={buildInfo}
+            apiStatus={apiConnectionStatus}
+            apiStatusText={apiConnectionText}
+            apiBase={displayApiBase}
+            rawApiBase={RAW_API_BASE || "not configured"}
+            lastEndpoint={lastEndpoint}
+            estimatedCost={estimatedCost}
             useAiPdf={useAiPdf}
             useWebEnrichment={useWebEnrichment}
+            enrichmentMode={enrichmentMode}
+            forceRefreshEnrichment={forceRefreshEnrichment}
             scheduleUrl={scheduleUrl}
+            bulkImagesCount={bulkImages.length}
+            photoBulkSummary={photoBulkSummary}
+            programaSendEnabled={programaSendEnabled}
+            exportReadyCount={exportSummary.export_count}
+            imageReadyCount={exportSummary.image_url_present}
+            imageTotalCount={exportSummary.image_url_total}
             onUseAiPdfChange={setUseAiPdf}
             onUseWebEnrichmentChange={setUseWebEnrichment}
+            onEnrichmentModeChange={setEnrichmentMode}
+            onForceRefreshEnrichmentChange={setForceRefreshEnrichment}
             onScheduleUrlChange={setScheduleUrl}
             onClose={() => setSettingsOpen(false)}
           />
@@ -1298,6 +1518,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           <span>Frontend v{buildInfo.version}</span>
           <span>Commit {buildInfo.commit}</span>
           <span>Built {formatBuildTime(buildInfo.builtAt)}</span>
+          <span className="break-all">API {displayApiBase}</span>
         </footer>
       </div>
     </main>
@@ -1328,20 +1549,30 @@ function ApiConnectionBadge({
   label,
   apiBase,
 }: {
-  status: "checking" | "online" | "offline";
+  status: "checking" | "online" | "offline" | "misconfigured";
   label: string;
   apiBase: string;
 }) {
   const tone =
     status === "online"
       ? "border-sage/20 bg-sage/10 text-sage"
+      : status === "misconfigured"
+        ? "border-clay/20 bg-clay/10 text-clay"
       : status === "offline"
         ? "border-clay/20 bg-clay/10 text-clay"
         : "border-orangeBorder bg-orangeSoft text-bronze";
 
   return (
     <div className={`max-w-full rounded-xl border px-3 py-2 text-xs ${tone}`} title={apiBase || "API base URL not configured"}>
-      <div className="font-semibold">{status === "online" ? "Backend connected" : status === "offline" ? "Backend offline" : "Checking backend"}</div>
+      <div className="font-semibold">
+        {status === "online"
+          ? "Backend connected"
+          : status === "misconfigured"
+            ? "Backend misconfigured"
+            : status === "offline"
+              ? "Backend offline"
+              : "Checking backend"}
+      </div>
       <div className="max-w-[280px] truncate opacity-80">{label}</div>
     </div>
   );
@@ -1510,30 +1741,71 @@ function ReviewValue({ value }: { value: string }) {
 
 function SettingsDialog({
   buildInfo,
+  apiStatus,
+  apiStatusText,
+  apiBase,
+  rawApiBase,
+  lastEndpoint,
+  estimatedCost,
   useAiPdf,
   useWebEnrichment,
+  enrichmentMode,
+  forceRefreshEnrichment,
   scheduleUrl,
+  bulkImagesCount,
+  photoBulkSummary,
+  programaSendEnabled,
+  exportReadyCount,
+  imageReadyCount,
+  imageTotalCount,
   onUseAiPdfChange,
   onUseWebEnrichmentChange,
+  onEnrichmentModeChange,
+  onForceRefreshEnrichmentChange,
   onScheduleUrlChange,
   onClose,
 }: {
   buildInfo: BuildInfo;
+  apiStatus: "checking" | "online" | "offline" | "misconfigured";
+  apiStatusText: string;
+  apiBase: string;
+  rawApiBase: string;
+  lastEndpoint: string;
+  estimatedCost: string;
   useAiPdf: boolean;
   useWebEnrichment: boolean;
+  enrichmentMode: EnrichmentMode;
+  forceRefreshEnrichment: boolean;
   scheduleUrl: string;
+  bulkImagesCount: number;
+  photoBulkSummary: { success: number; failed: number };
+  programaSendEnabled: boolean;
+  exportReadyCount: number;
+  imageReadyCount: number;
+  imageTotalCount: number;
   onUseAiPdfChange: (value: boolean) => void;
   onUseWebEnrichmentChange: (value: boolean) => void;
+  onEnrichmentModeChange: (value: EnrichmentMode) => void;
+  onForceRefreshEnrichmentChange: (value: boolean) => void;
   onScheduleUrlChange: (value: string) => void;
   onClose: () => void;
 }) {
+  const statusLabel =
+    apiStatus === "online"
+      ? "Connected"
+      : apiStatus === "misconfigured"
+        ? "Misconfigured"
+        : apiStatus === "offline"
+          ? "Offline"
+          : "Checking";
+
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-end bg-charcoal/28 px-4 py-5 backdrop-blur-sm sm:px-7">
-      <div className="w-full max-w-md origin-top-right rounded-2xl border border-linen bg-white p-5 shadow-xl">
+      <div className="max-h-[calc(100vh-2.5rem)] w-full max-w-2xl origin-top-right overflow-y-auto rounded-2xl border border-linen bg-white p-5 shadow-xl">
         <div className="flex items-center justify-between gap-4">
           <div>
-            <h2 className="text-base font-semibold text-charcoal">Settings</h2>
-            <p className="mt-1 text-sm text-taupe">Internal intake preferences.</p>
+            <h2 className="text-lg font-semibold text-charcoal">Settings</h2>
+            <p className="mt-1 text-sm text-taupe">Internal intake preferences, connection status, and build details.</p>
           </div>
           <button
             type="button"
@@ -1543,6 +1815,21 @@ function SettingsDialog({
           >
             <X className="h-4 w-4" />
           </button>
+        </div>
+
+        <div className="mt-5 rounded-xl border border-linen bg-ivory/70 p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-charcoal">Backend / API Status</h3>
+              <p className="mt-1 text-sm text-taupe">{apiStatusText}</p>
+            </div>
+            <SettingsStatusPill status={apiStatus} label={statusLabel} />
+          </div>
+          <dl className="mt-4 grid gap-2 text-xs text-taupe">
+            <SettingsDetail label="NEXT_PUBLIC_API_BASE_URL" value={rawApiBase} />
+            <SettingsDetail label="Resolved API base" value={apiBase} />
+            <SettingsDetail label="Last endpoint" value={lastEndpoint || "No API request yet"} />
+          </dl>
         </div>
 
         <div className="mt-5 rounded-xl border border-linen bg-ivory/70 p-4">
@@ -1565,6 +1852,52 @@ function SettingsDialog({
             />
             Use web enrichment for missing product data.
           </label>
+          <Field label="Enrichment Mode">
+            <select
+              className="input-surface mt-3 h-10 w-full rounded-xl px-3 text-sm text-charcoal"
+              value={enrichmentMode}
+              onChange={(event) => onEnrichmentModeChange(event.target.value as EnrichmentMode)}
+            >
+              <option value="fast">Fast: lowest external lookup budget</option>
+              <option value="standard">Standard: default backend balance</option>
+              <option value="deep">Deep: broader lookup, use intentionally</option>
+            </select>
+          </Field>
+          <label className="mt-3 flex items-start gap-3 text-sm text-taupe">
+            <input
+              type="checkbox"
+              checked={forceRefreshEnrichment}
+              onChange={(event) => onForceRefreshEnrichmentChange(event.target.checked)}
+              className="mt-1 h-4 w-4 accent-bronze"
+            />
+            Force refresh enrichment cache on the next enrichment/image recovery run.
+          </label>
+          <dl className="mt-4 grid gap-2 text-xs text-taupe">
+            <SettingsDetail label="Current mode" value={useWebEnrichment ? enrichmentMode : "Local validation only"} />
+            <SettingsDetail label="Last reported cost" value={estimatedCost} />
+            <SettingsDetail label="Budget display" value="Reported by backend when enrichment returns cost telemetry" />
+          </dl>
+        </div>
+
+        <div className="mt-4 rounded-xl border border-linen bg-white p-4">
+          <h3 className="text-sm font-semibold text-charcoal">Cloudinary / Image Upload</h3>
+          <dl className="mt-3 grid gap-2 text-xs text-taupe">
+            <SettingsDetail label="Image upload route" value={apiBase !== "not configured" ? `${apiBase}/api/upload-image` : "Backend not configured"} />
+            <SettingsDetail label="Selected photo uploads" value={`${bulkImagesCount} queued in current upload step`} />
+            <SettingsDetail label="Uploaded / failed" value={`${photoBulkSummary.success} uploaded / ${photoBulkSummary.failed} failed`} />
+            <SettingsDetail label="Programa image URLs" value={`${imageReadyCount}/${imageTotalCount || 0} rows have image URLs`} />
+            <SettingsDetail label="Product link metadata" value="No dedicated metadata route; links become rows in /intake/generate and are filled during enrichment." />
+          </dl>
+        </div>
+
+        <div className="mt-4 rounded-xl border border-linen bg-ivory/70 p-4">
+          <h3 className="text-sm font-semibold text-charcoal">Export Preferences</h3>
+          <p className="mt-1 text-sm text-taupe">Excel is the primary Programa handoff. CSV, ZIP, and debug exports stay available after enrichment.</p>
+          <dl className="mt-4 grid gap-2 text-xs text-taupe">
+            <SettingsDetail label="Primary export" value="Download Excel for Programa (.xlsx)" />
+            <SettingsDetail label="Export-ready rows" value={String(exportReadyCount)} />
+            <SettingsDetail label="Direct Programa send" value={programaSendEnabled ? "Configured" : "Disabled until integration is configured"} />
+          </dl>
           <Field label="Programa Schedule URL">
             <input
               className="input-surface mt-3 h-10 w-full rounded-xl px-3 text-sm text-charcoal"
@@ -1576,29 +1909,62 @@ function SettingsDialog({
         </div>
 
         <div className="mt-4 rounded-xl border border-linen bg-white p-4">
+          <h3 className="text-sm font-semibold text-charcoal">Frontend Action Wiring</h3>
+          <div className="mt-3 grid gap-3">
+            {frontendRouteWiring.map((route) => (
+              <div key={`${route.action}-${route.endpoint}`} className="rounded-xl border border-linen bg-ivory/60 p-3">
+                <div className="flex flex-wrap items-baseline justify-between gap-2">
+                  <div className="text-sm font-semibold text-charcoal">{route.action}</div>
+                  <code className="rounded-lg bg-white px-2 py-1 text-xs text-bronze">{route.endpoint}</code>
+                </div>
+                <dl className="mt-2 grid gap-1 text-xs text-taupe">
+                  <SettingsDetail label="Request body" value={route.body} />
+                  <SettingsDetail label="Response" value={route.response} />
+                </dl>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-xl border border-linen bg-white p-4">
           <h3 className="text-sm font-semibold text-charcoal">Build Version</h3>
           <dl className="mt-3 grid gap-2 text-xs text-taupe">
-            <div className="flex items-center justify-between gap-3">
-              <dt>Frontend</dt>
-              <dd className="font-mono text-charcoal">v{buildInfo.version}</dd>
-            </div>
-            <div className="flex items-center justify-between gap-3">
-              <dt>Commit</dt>
-              <dd className="font-mono text-charcoal">{buildInfo.commit}</dd>
-            </div>
-            <div className="flex items-center justify-between gap-3">
-              <dt>Built</dt>
-              <dd className="text-right font-mono text-charcoal">{formatBuildTime(buildInfo.builtAt)}</dd>
-            </div>
+            <SettingsDetail label="Frontend" value={`v${buildInfo.version}`} />
+            <SettingsDetail label="Commit" value={buildInfo.commit} />
+            <SettingsDetail label="Build timestamp" value={buildInfo.builtAt} />
+            <SettingsDetail label="API base" value={apiBase} />
             {buildInfo.deploymentUrl ? (
-              <div className="grid gap-1">
-                <dt>Deployment</dt>
-                <dd className="break-all font-mono text-charcoal">{buildInfo.deploymentUrl}</dd>
-              </div>
+              <SettingsDetail label="Deployment" value={buildInfo.deploymentUrl} />
             ) : null}
           </dl>
         </div>
       </div>
+    </div>
+  );
+}
+
+function SettingsStatusPill({
+  status,
+  label,
+}: {
+  status: "checking" | "online" | "offline" | "misconfigured";
+  label: string;
+}) {
+  const tone =
+    status === "online"
+      ? "border-sage/20 bg-sage/10 text-sage"
+      : status === "checking"
+        ? "border-orangeBorder bg-orangeSoft text-bronze"
+        : "border-clay/20 bg-clay/10 text-clay";
+
+  return <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${tone}`}>{label}</span>;
+}
+
+function SettingsDetail({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="grid gap-1 sm:grid-cols-[170px_1fr]">
+      <dt className="font-semibold uppercase tracking-[0.08em] text-charcoal/50">{label}</dt>
+      <dd className="break-all font-mono text-charcoal">{value}</dd>
     </div>
   );
 }
