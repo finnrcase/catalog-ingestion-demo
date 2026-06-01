@@ -1653,6 +1653,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             <span className="rounded-full border border-linen bg-white/42 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-taupe">
               Live route: frontend/app/page.tsx
             </span>
+            <span className="rounded-full border border-orangeBorder bg-orangeSoft px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-bronze">
+              SCH UI v2 - settings enabled
+            </span>
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <ApiConnectionBadge status={apiConnectionStatus} label={apiConnectionText} apiBase={displayApiBase} />
@@ -1664,6 +1667,12 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
               <Settings className="h-4 w-4" />
               <span>Settings</span>
             </button>
+            <a
+              href="/settings"
+              className="inline-flex h-12 items-center justify-center rounded-xl border border-linen bg-white/45 px-4 text-sm font-semibold text-charcoal transition hover:border-orangeBorder hover:text-bronze"
+            >
+              Settings Page
+            </a>
           </div>
         </header>
 
@@ -2176,6 +2185,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         ) : null}
         <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-linen pt-4 text-[11px] font-medium uppercase tracking-[0.12em] text-taupe">
           <span>Frontend v{buildInfo.version}</span>
+          <span>SCH UI v2 - settings enabled</span>
           <span>Commit {buildInfo.commit}</span>
           <span>Built {formatBuildTime(buildInfo.builtAt)}</span>
           <span className="break-all">API {displayApiBase}</span>
