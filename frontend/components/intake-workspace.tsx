@@ -172,9 +172,9 @@ const ENRICHMENT_BUDGET_STORAGE_KEY = "sch-intake-enrichment-budget-usd";
 const DEFAULT_ENRICHMENT_BUDGET_USD = 0.25;
 
 const themeOptions: { id: ThemePreference; label: string; description: string }[] = [
-  { id: "system", label: "System", description: "Follow your browser or OS preference." },
-  { id: "dark", label: "Dark", description: "The current SCH dark workspace." },
   { id: "light", label: "Light", description: "A warm, clean light workspace." },
+  { id: "dark", label: "Dark", description: "The current SCH dark workspace." },
+  { id: "system", label: "System", description: "Follow your browser or OS preference." },
 ];
 
 const accentThemes: AccentTheme[] = [
@@ -1123,7 +1123,6 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const apiConnectionStatus = API_BASE ? apiStatus : "misconfigured";
   const apiConnectionText = API_BASE ? apiStatusText : "NEXT_PUBLIC_API_BASE_URL is missing or invalid.";
   const displayApiBase = API_BASE || "not configured";
-  const showHeaderBackendStatus = apiConnectionStatus === "offline" || apiConnectionStatus === "misconfigured";
   const isSimpleMode = uiMode === "simple";
 
   useEffect(() => {
@@ -2369,9 +2368,6 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             <LogoMark />
           </div>
           <div className="flex flex-wrap items-center gap-3">
-            {showHeaderBackendStatus ? (
-              <ApiConnectionBadge status={apiConnectionStatus} label={apiConnectionText} apiBase={displayApiBase} />
-            ) : null}
             <button
               type="button"
               className="inline-flex h-12 items-center justify-center gap-2 rounded-xl border border-orangeBorder bg-orangeSoft px-5 text-sm font-bold text-bronze shadow-sm transition hover:border-bronze hover:bg-white"
@@ -3063,40 +3059,6 @@ function StatusBadge({ value }: { value: string }) {
   );
 }
 
-function ApiConnectionBadge({
-  status,
-  label,
-  apiBase,
-}: {
-  status: "checking" | "online" | "offline" | "misconfigured";
-  label: string;
-  apiBase: string;
-}) {
-  const tone =
-    status === "online"
-      ? "border-sage/20 bg-sage/10 text-sage"
-      : status === "misconfigured"
-        ? "border-clay/20 bg-clay/10 text-clay"
-      : status === "offline"
-        ? "border-clay/20 bg-clay/10 text-clay"
-        : "border-orangeBorder bg-orangeSoft text-bronze";
-
-  return (
-    <div className={`max-w-full rounded-xl border px-3 py-2 text-xs ${tone}`} title={apiBase || "API base URL not configured"}>
-      <div className="font-semibold">
-        {status === "online"
-          ? "Backend connected"
-          : status === "misconfigured"
-            ? "Backend misconfigured"
-            : status === "offline"
-              ? "Backend offline"
-              : "Checking backend"}
-      </div>
-      <div className="max-w-[280px] truncate opacity-80">{label}</div>
-    </div>
-  );
-}
-
 function InputCard({
   icon,
   title,
@@ -3643,9 +3605,32 @@ function SettingsDialog({
                   credentials, auth tokens, and full request payloads are not included.
                 </p>
               ) : null}
-              <div className="rounded-xl border border-linen bg-white p-3">
-                <h4 className="text-xs font-semibold uppercase tracking-[0.12em] text-charcoal/60">Frontend Action Wiring</h4>
-                <div className="mt-3 grid gap-3">
+              <details className="rounded-xl border border-linen bg-white p-3">
+                <summary className="cursor-pointer text-xs font-semibold uppercase tracking-[0.12em] text-charcoal/60">
+                  Debug details
+                </summary>
+                <dl className="mt-3 grid gap-2 text-xs text-taupe">
+                  <SettingsDetail label="Internal" value="Enabled" />
+                  <SettingsDetail label="Repo" value={buildInfo.repo} />
+                  <SettingsDetail label="Branch" value={buildInfo.branch} />
+                  <SettingsDetail label="Live route" value={buildInfo.homepageRoute} />
+                  <SettingsDetail label="Build hash" value={buildInfo.commit} />
+                  <SettingsDetail label="Build timestamp" value={buildInfo.builtAt} />
+                  <SettingsDetail label="Backend status" value={`${statusLabel}: ${apiStatusText}`} />
+                  <SettingsDetail label="Environment" value={buildInfo.environment} />
+                  <SettingsDetail label="Version" value={`v${buildInfo.version}`} />
+                  <SettingsDetail label="Vercel project" value={buildInfo.project} />
+                  <SettingsDetail label="Root directory" value={buildInfo.rootDirectory} />
+                  <SettingsDetail label="Settings renderer" value={buildInfo.settingsRoute} />
+                  <SettingsDetail label="Workflow renderer" value={buildInfo.workflowComponent} />
+                  <SettingsDetail label="NEXT_PUBLIC_API_BASE_URL" value={rawApiBase} />
+                  <SettingsDetail label="Resolved API base" value={apiBase} />
+                  <SettingsDetail label="Last endpoint" value={lastEndpoint || "No API request yet"} />
+                  {buildInfo.deploymentUrl ? (
+                    <SettingsDetail label="Deployment URL" value={buildInfo.deploymentUrl} />
+                  ) : null}
+                </dl>
+                <div className="mt-4 grid gap-3">
                   {frontendRouteWiring.map((route) => (
                     <div key={`${route.action}-${route.endpoint}`} className="rounded-xl border border-linen bg-ivory/60 p-3">
                       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -3659,7 +3644,7 @@ function SettingsDialog({
                     </div>
                   ))}
                 </div>
-              </div>
+              </details>
             </div>
           ) : null}
         </div>
@@ -3668,27 +3653,8 @@ function SettingsDialog({
           <h3 className="text-sm font-semibold text-charcoal">About</h3>
           <dl className="mt-3 grid gap-2 text-xs text-taupe">
             <SettingsDetail label="Version" value={`v${buildInfo.version}`} />
-            <SettingsDetail label="Repo" value={buildInfo.repo} />
-            <SettingsDetail label="Branch" value={buildInfo.branch} />
-            <SettingsDetail label="Commit hash" value={buildInfo.commit} />
-            <SettingsDetail label="Build timestamp" value={buildInfo.builtAt} />
-            <SettingsDetail label="Frontend route" value={buildInfo.homepageRoute} />
+            <SettingsDetail label="Build" value={`${buildInfo.commit} · ${buildInfo.builtAt}`} />
             <SettingsDetail label="Environment" value={buildInfo.environment} />
-            <SettingsDetail label="Vercel project" value={buildInfo.project} />
-            <SettingsDetail label="Root directory" value={buildInfo.rootDirectory} />
-            <SettingsDetail label="Settings renderer" value={buildInfo.settingsRoute} />
-            <SettingsDetail label="Workflow renderer" value={buildInfo.workflowComponent} />
-            {buildInfo.deploymentUrl ? (
-              <SettingsDetail label="Deployment URL" value={buildInfo.deploymentUrl} />
-            ) : null}
-            {debugMode ? (
-              <>
-                <SettingsDetail label="Backend status" value={`${statusLabel}: ${apiStatusText}`} />
-                <SettingsDetail label="NEXT_PUBLIC_API_BASE_URL" value={rawApiBase} />
-                <SettingsDetail label="Resolved API base" value={apiBase} />
-                <SettingsDetail label="Last endpoint" value={lastEndpoint || "No API request yet"} />
-              </>
-            ) : null}
           </dl>
         </div>
 

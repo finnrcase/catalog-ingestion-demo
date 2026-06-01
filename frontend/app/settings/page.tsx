@@ -28,9 +28,9 @@ type ThemePreference = "system" | "dark" | "light";
 type UiMode = "explanation" | "simple";
 
 const themeOptions: { id: ThemePreference; label: string; description: string }[] = [
-  { id: "system", label: "System", description: "Follow browser or OS preference." },
-  { id: "dark", label: "Dark", description: "Current SCH dark workspace." },
   { id: "light", label: "Light", description: "Warm premium light workspace." },
+  { id: "dark", label: "Dark", description: "Current SCH dark workspace." },
+  { id: "system", label: "System", description: "Follow browser or OS preference." },
 ];
 
 const fallbackBuildInfo = {
@@ -256,8 +256,57 @@ export default function SettingsPage() {
               {!isSimpleMode
                 ? "Default OFF. When enabled, the intake workspace shows safe route, endpoint, status, and sanitized error traces."
                 : null}
-            </span>
+              </span>
           </label>
+          {debugMode ? (
+            <details className="mt-4 rounded-xl border border-linen bg-white/70 p-3">
+              <summary className="cursor-pointer text-xs font-semibold uppercase tracking-[0.12em] text-charcoal/60">
+                Debug details
+              </summary>
+              <dl className="mt-3 grid gap-2 text-xs text-taupe sm:grid-cols-2">
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Internal</dt>
+                  <dd className="mt-1 font-mono text-charcoal">Enabled</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Repo</dt>
+                  <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.repo}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Branch</dt>
+                  <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.branch}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Live route</dt>
+                  <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.homepageRoute}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Build hash</dt>
+                  <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.commit}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Build timestamp</dt>
+                  <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.builtAt}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Backend status</dt>
+                  <dd className="mt-1 font-mono text-charcoal">{apiStatus}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Environment</dt>
+                  <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.environment}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Version</dt>
+                  <dd className="mt-1 font-mono text-charcoal">v{fallbackBuildInfo.version}</dd>
+                </div>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">NEXT_PUBLIC_API_BASE_URL</dt>
+                  <dd className="mt-1 break-all font-mono text-charcoal">{fallbackBuildInfo.apiBase}</dd>
+                </div>
+              </dl>
+            </details>
+          ) : null}
         </section>
 
         <section className="mt-4 rounded-2xl border border-linen bg-ivory/70 p-4">
@@ -268,57 +317,13 @@ export default function SettingsPage() {
               <dd className="mt-1 font-mono text-charcoal">v{fallbackBuildInfo.version}</dd>
             </div>
             <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Repo</dt>
-              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.repo}</dd>
-            </div>
-            <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Branch</dt>
-              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.branch}</dd>
-            </div>
-            <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Commit hash</dt>
-              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.commit}</dd>
-            </div>
-            <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Build timestamp</dt>
-              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.builtAt}</dd>
-            </div>
-            <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Frontend route</dt>
-              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.homepageRoute}</dd>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Build</dt>
+              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.commit} · {fallbackBuildInfo.builtAt}</dd>
             </div>
             <div>
               <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Environment</dt>
               <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.environment}</dd>
             </div>
-            <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Vercel project</dt>
-              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.project}</dd>
-            </div>
-            <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Root directory</dt>
-              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.rootDirectory}</dd>
-            </div>
-            <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Settings route</dt>
-              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.settingsRoute}</dd>
-            </div>
-            <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Workflow renderer</dt>
-              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.workflowComponent}</dd>
-            </div>
-            {debugMode ? (
-              <>
-                <div>
-                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Backend status</dt>
-                  <dd className="mt-1 font-mono text-charcoal">{apiStatus}</dd>
-                </div>
-                <div>
-                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">NEXT_PUBLIC_API_BASE_URL</dt>
-                  <dd className="mt-1 break-all font-mono text-charcoal">{fallbackBuildInfo.apiBase}</dd>
-                </div>
-              </>
-            ) : null}
           </dl>
         </section>
 
