@@ -1644,6 +1644,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   return (
     <main className="min-h-screen px-4 py-6 sm:px-7 lg:px-10">
       <div className="mx-auto flex max-w-[1220px] flex-col gap-7">
+        <div className="rounded-2xl border border-orangeBorder bg-orangeSoft px-4 py-3 text-center text-xs font-bold uppercase tracking-[0.18em] text-bronze">
+          SCH FRONTEND v2 ACTIVE
+        </div>
         <header className="sticky top-0 z-40 flex flex-col gap-4 rounded-2xl border border-linen bg-paper/88 px-4 py-4 shadow-panel backdrop-blur md:flex-row md:items-center md:justify-between">
           <div className="flex flex-wrap items-center gap-3">
             <LogoMark />
@@ -1654,7 +1657,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
               Live route: frontend/app/page.tsx
             </span>
             <span className="rounded-full border border-orangeBorder bg-orangeSoft px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-bronze">
-              SCH UI v2 - settings enabled
+              SCH FRONTEND v2 ACTIVE
             </span>
           </div>
           <div className="flex flex-wrap items-center gap-3">
@@ -2185,7 +2188,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         ) : null}
         <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-linen pt-4 text-[11px] font-medium uppercase tracking-[0.12em] text-taupe">
           <span>Frontend v{buildInfo.version}</span>
-          <span>SCH UI v2 - settings enabled</span>
+          <span>SCH FRONTEND v2 ACTIVE</span>
           <span>Commit {buildInfo.commit}</span>
           <span>Built {formatBuildTime(buildInfo.builtAt)}</span>
           <span className="break-all">API {displayApiBase}</span>

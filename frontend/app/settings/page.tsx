@@ -91,7 +91,7 @@ export default function SettingsPage() {
       <div className="mx-auto max-w-4xl rounded-[28px] border border-linen bg-white/70 p-6 shadow-panel">
         <div className="flex flex-col gap-4 border-b border-linen pb-5 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-bronze">SCH UI v2 - settings enabled</p>
+            <p className="text-xs font-semibold uppercase tracking-[0.22em] text-bronze">SCH FRONTEND v2 ACTIVE</p>
             <h1 className="mt-2 text-3xl font-semibold text-charcoal">Production frontend settings</h1>
             <p className="mt-2 text-sm leading-6 text-taupe">
               Color themes, debug mode, backend status, and export preferences for the live Next frontend.
