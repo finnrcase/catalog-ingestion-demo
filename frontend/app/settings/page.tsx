@@ -38,6 +38,16 @@ const fallbackBuildInfo = {
     (process.env.NEXT_PUBLIC_APP_COMMIT_SHA || process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA)
       ?.slice(0, 12) || "local",
   apiBase: process.env.NEXT_PUBLIC_API_BASE_URL || "not configured",
+  repo: process.env.NEXT_PUBLIC_APP_REPO || "catalog-ingestion-demo",
+  branch: process.env.NEXT_PUBLIC_APP_BRANCH || "not exposed",
+  builtAt: process.env.NEXT_PUBLIC_APP_BUILD_TIMESTAMP || "not exposed",
+  environment: process.env.NEXT_PUBLIC_VERCEL_ENV || process.env.NEXT_PUBLIC_APP_ENV || "not exposed",
+  version: process.env.NEXT_PUBLIC_APP_VERSION || "0.1.0",
+  project: "frontend",
+  rootDirectory: "frontend",
+  homepageRoute: "frontend/app/page.tsx",
+  settingsRoute: "frontend/app/settings/page.tsx",
+  workflowComponent: "frontend/components/intake-workspace.tsx",
 };
 
 function hexToRgbTriplet(hex: string) {
@@ -137,9 +147,6 @@ export default function SettingsPage() {
       <div className="mx-auto max-w-4xl rounded-[28px] border border-linen bg-white/70 p-6 shadow-panel">
         <div className="flex flex-col gap-4 border-b border-linen pb-5 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            {debugMode ? (
-              <p className="text-xs font-semibold uppercase tracking-[0.22em] text-bronze">SCH FRONTEND v2 ACTIVE</p>
-            ) : null}
             <h1 className="mt-2 text-3xl font-semibold text-charcoal">Production frontend settings</h1>
             {!isSimpleMode ? (
               <p className="mt-2 text-sm leading-6 text-taupe">
@@ -257,12 +264,48 @@ export default function SettingsPage() {
           <h2 className="text-sm font-semibold text-charcoal">About</h2>
           <dl className="mt-3 grid gap-2 text-xs text-taupe sm:grid-cols-2">
             <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Theme</dt>
-              <dd className="mt-1 font-mono text-charcoal">{themeOptions.find((theme) => theme.id === themePreference)?.label || themePreference}</dd>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Version</dt>
+              <dd className="mt-1 font-mono text-charcoal">v{fallbackBuildInfo.version}</dd>
             </div>
             <div>
-              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">UI mode</dt>
-              <dd className="mt-1 font-mono text-charcoal">{isSimpleMode ? "Simple" : "Explanation"}</dd>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Repo</dt>
+              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.repo}</dd>
+            </div>
+            <div>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Branch</dt>
+              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.branch}</dd>
+            </div>
+            <div>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Commit hash</dt>
+              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.commit}</dd>
+            </div>
+            <div>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Build timestamp</dt>
+              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.builtAt}</dd>
+            </div>
+            <div>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Frontend route</dt>
+              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.homepageRoute}</dd>
+            </div>
+            <div>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Environment</dt>
+              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.environment}</dd>
+            </div>
+            <div>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Vercel project</dt>
+              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.project}</dd>
+            </div>
+            <div>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Root directory</dt>
+              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.rootDirectory}</dd>
+            </div>
+            <div>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Settings route</dt>
+              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.settingsRoute}</dd>
+            </div>
+            <div>
+              <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Workflow renderer</dt>
+              <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.workflowComponent}</dd>
             </div>
             {debugMode ? (
               <>
@@ -274,21 +317,8 @@ export default function SettingsPage() {
                   <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">NEXT_PUBLIC_API_BASE_URL</dt>
                   <dd className="mt-1 break-all font-mono text-charcoal">{fallbackBuildInfo.apiBase}</dd>
                 </div>
-                <div>
-                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Homepage route</dt>
-                  <dd className="mt-1 font-mono text-charcoal">frontend/app/page.tsx</dd>
-                </div>
-                <div>
-                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Build</dt>
-                  <dd className="mt-1 font-mono text-charcoal">{fallbackBuildInfo.commit}</dd>
-                </div>
               </>
-            ) : (
-              <div className="sm:col-span-2">
-                <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Build & environment</dt>
-                <dd className="mt-1 text-charcoal">Enable Debug Mode to view build, route, API, and backend diagnostics.</dd>
-              </div>
-            )}
+            ) : null}
           </dl>
         </section>
 

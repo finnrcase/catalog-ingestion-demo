@@ -110,6 +110,14 @@ type BuildInfo = {
   commit: string;
   builtAt: string;
   version: string;
+  repo: string;
+  branch: string;
+  environment: string;
+  project: string;
+  rootDirectory: string;
+  homepageRoute: string;
+  settingsRoute: string;
+  workflowComponent: string;
   deploymentUrl?: string;
 };
 
@@ -752,20 +760,16 @@ const fallbackBuildInfo: BuildInfo = {
   commit: "local",
   builtAt: "local",
   version: "0.1.0",
+  repo: "catalog-ingestion-demo",
+  branch: "local",
+  environment: "local",
+  project: "frontend",
+  rootDirectory: "frontend",
+  homepageRoute: "frontend/app/page.tsx",
+  settingsRoute: "frontend/components/intake-workspace.tsx",
+  workflowComponent: "frontend/components/intake-workspace.tsx",
   deploymentUrl: "",
 };
-
-function formatBuildTime(value: string) {
-  if (!value || value === "local") return "local";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
-}
 
 function mainWorkflowStepIndex(stage: WorkflowStage) {
   if (stage === "parse" || stage === "reviewParsed") return 1;
@@ -1119,7 +1123,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const apiConnectionStatus = API_BASE ? apiStatus : "misconfigured";
   const apiConnectionText = API_BASE ? apiStatusText : "NEXT_PUBLIC_API_BASE_URL is missing or invalid.";
   const displayApiBase = API_BASE || "not configured";
-  const showHeaderBackendStatus = debugMode || apiConnectionStatus === "offline" || apiConnectionStatus === "misconfigured";
+  const showHeaderBackendStatus = apiConnectionStatus === "offline" || apiConnectionStatus === "misconfigured";
   const isSimpleMode = uiMode === "simple";
 
   useEffect(() => {
@@ -2360,30 +2364,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   return (
     <main className="min-h-screen px-4 py-6 sm:px-7 lg:px-10">
       <div className="mx-auto flex max-w-[1220px] flex-col gap-7">
-        {debugMode ? (
-        <div className="rounded-2xl border border-orangeBorder bg-orangeSoft px-4 py-3 text-center text-xs font-bold uppercase tracking-[0.18em] text-bronze">
-          SCH FRONTEND v2 ACTIVE
-        </div>
-        ) : null}
         <header className="sticky top-0 z-40 flex flex-col gap-4 rounded-2xl border border-linen bg-paper/88 px-4 py-4 shadow-panel backdrop-blur md:flex-row md:items-center md:justify-between">
           <div className="flex flex-wrap items-center gap-3">
             <LogoMark />
-            {debugMode ? (
-            <>
-            <span className="rounded-full border border-orangeBorder bg-orangeSoft px-3 py-1 text-xs font-semibold text-bronze">
-              Internal
-            </span>
-            <span className="rounded-full border border-linen bg-white/42 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-taupe">
-              Live route: frontend/app/page.tsx
-            </span>
-            <span className="rounded-full border border-orangeBorder bg-orangeSoft px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-bronze">
-              SCH FRONTEND v2 ACTIVE
-            </span>
-            <span className="rounded-full border border-linen bg-white/42 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-taupe">
-              {isSimpleMode ? "Simple Mode" : "Explanation Mode"}
-            </span>
-            </>
-            ) : null}
           </div>
           <div className="flex flex-wrap items-center gap-3">
             {showHeaderBackendStatus ? (
@@ -3056,15 +3039,6 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             onGenerateScript={handleGenerateCallScript}
           />
         ) : null}
-        {debugMode ? (
-        <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-linen pt-4 text-[11px] font-medium uppercase tracking-[0.12em] text-taupe">
-          <span>Frontend v{buildInfo.version}</span>
-          <span>SCH FRONTEND v2 ACTIVE</span>
-          <span>Commit {buildInfo.commit}</span>
-          <span>Built {formatBuildTime(buildInfo.builtAt)}</span>
-          <span className="break-all">API {displayApiBase}</span>
-        </footer>
-        ) : null}
       </div>
     </main>
   );
@@ -3694,25 +3668,27 @@ function SettingsDialog({
           <h3 className="text-sm font-semibold text-charcoal">About</h3>
           <dl className="mt-3 grid gap-2 text-xs text-taupe">
             <SettingsDetail label="Version" value={`v${buildInfo.version}`} />
-            <SettingsDetail label="Theme" value={themeOptions.find((theme) => theme.id === themePreference)?.label || themePreference} />
-            <SettingsDetail label="UI mode" value={isSimpleMode ? "Simple" : "Explanation"} />
+            <SettingsDetail label="Repo" value={buildInfo.repo} />
+            <SettingsDetail label="Branch" value={buildInfo.branch} />
+            <SettingsDetail label="Commit hash" value={buildInfo.commit} />
+            <SettingsDetail label="Build timestamp" value={buildInfo.builtAt} />
+            <SettingsDetail label="Frontend route" value={buildInfo.homepageRoute} />
+            <SettingsDetail label="Environment" value={buildInfo.environment} />
+            <SettingsDetail label="Vercel project" value={buildInfo.project} />
+            <SettingsDetail label="Root directory" value={buildInfo.rootDirectory} />
+            <SettingsDetail label="Settings renderer" value={buildInfo.settingsRoute} />
+            <SettingsDetail label="Workflow renderer" value={buildInfo.workflowComponent} />
+            {buildInfo.deploymentUrl ? (
+              <SettingsDetail label="Deployment URL" value={buildInfo.deploymentUrl} />
+            ) : null}
             {debugMode ? (
               <>
-                <SettingsDetail label="UI version marker" value="SCH FRONTEND v2 ACTIVE" />
-                <SettingsDetail label="Build hash" value={buildInfo.commit} />
-                <SettingsDetail label="Build timestamp" value={buildInfo.builtAt} />
-                <SettingsDetail label="Live route" value="frontend/app/page.tsx" />
                 <SettingsDetail label="Backend status" value={`${statusLabel}: ${apiStatusText}`} />
                 <SettingsDetail label="NEXT_PUBLIC_API_BASE_URL" value={rawApiBase} />
                 <SettingsDetail label="Resolved API base" value={apiBase} />
                 <SettingsDetail label="Last endpoint" value={lastEndpoint || "No API request yet"} />
-                {buildInfo.deploymentUrl ? (
-                  <SettingsDetail label="Last deployment" value={buildInfo.deploymentUrl} />
-                ) : null}
               </>
-            ) : (
-              <SettingsDetail label="Build & environment" value="Enable Debug Mode to view build, route, API, and backend diagnostics." />
-            )}
+            ) : null}
           </dl>
         </div>
 
