@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 
 const DEBUG_MODE_STORAGE_KEY = "sch-intake-debug-mode";
 const ACCENT_THEME_STORAGE_KEY = "sch-intake-accent-theme";
+const UI_MODE_STORAGE_KEY = "sch-intake-ui-mode";
 
 const accentThemes = [
   { id: "orange", label: "Orange", accent: "#f97316", soft: "#2c2118", ring: "#fdba74", foreground: "#ffffff", text: "#fb923c" },
@@ -22,6 +23,7 @@ const accentThemes = [
 ] as const;
 
 type AccentThemeId = (typeof accentThemes)[number]["id"];
+type UiMode = "explanation" | "simple";
 
 const fallbackBuildInfo = {
   commit:
@@ -54,12 +56,16 @@ function applyAccent(themeId: AccentThemeId) {
 export default function SettingsPage() {
   const [debugMode, setDebugMode] = useState(false);
   const [accentThemeId, setAccentThemeId] = useState<AccentThemeId>("orange");
+  const [uiMode, setUiMode] = useState<UiMode>("explanation");
   const [apiStatus, setApiStatus] = useState("checking");
+  const isSimpleMode = uiMode === "simple";
 
   useEffect(() => {
     const storedDebug = window.localStorage.getItem(DEBUG_MODE_STORAGE_KEY) === "true";
     const storedAccent = window.localStorage.getItem(ACCENT_THEME_STORAGE_KEY) as AccentThemeId | null;
+    const storedUiMode = window.localStorage.getItem(UI_MODE_STORAGE_KEY);
     setDebugMode(storedDebug);
+    setUiMode(storedUiMode === "simple" ? "simple" : "explanation");
     if (storedAccent && accentThemes.some((theme) => theme.id === storedAccent)) {
       setAccentThemeId(storedAccent);
       applyAccent(storedAccent);
@@ -76,6 +82,10 @@ export default function SettingsPage() {
     window.localStorage.setItem(ACCENT_THEME_STORAGE_KEY, accentThemeId);
     applyAccent(accentThemeId);
   }, [accentThemeId]);
+
+  useEffect(() => {
+    window.localStorage.setItem(UI_MODE_STORAGE_KEY, uiMode);
+  }, [uiMode]);
 
   useEffect(() => {
     const apiBase = fallbackBuildInfo.apiBase;
@@ -95,8 +105,13 @@ export default function SettingsPage() {
           <div>
             <p className="text-xs font-semibold uppercase tracking-[0.22em] text-bronze">SCH FRONTEND v2 ACTIVE</p>
             <h1 className="mt-2 text-3xl font-semibold text-charcoal">Production frontend settings</h1>
-            <p className="mt-2 text-sm leading-6 text-taupe">
-              Color themes, debug mode, backend status, and export preferences for the live Next frontend.
+            {!isSimpleMode ? (
+              <p className="mt-2 text-sm leading-6 text-taupe">
+                Color themes, debug mode, backend status, and export preferences for the live Next frontend.
+              </p>
+            ) : null}
+            <p className="mt-2 text-xs font-semibold uppercase tracking-[0.12em] text-taupe">
+              UI mode: <span className="text-bronze">{isSimpleMode ? "Simple" : "Explanation"}</span>
             </p>
           </div>
           <Link href="/" className="btn-primary inline-flex h-11 items-center justify-center rounded-xl px-5 text-sm font-semibold">
@@ -106,7 +121,32 @@ export default function SettingsPage() {
 
         <section className="mt-5 rounded-2xl border border-linen bg-ivory/70 p-4">
           <h2 className="text-sm font-semibold text-charcoal">Appearance</h2>
-          <p className="mt-1 text-sm text-taupe">Choose the accent used for buttons, workflow stages, highlights, and selected controls.</p>
+          {!isSimpleMode ? (
+            <p className="mt-1 text-sm text-taupe">Choose the accent used for buttons, workflow stages, highlights, and selected controls.</p>
+          ) : null}
+          <div className="mt-4 grid gap-2 sm:grid-cols-2">
+            {(["explanation", "simple"] as UiMode[]).map((mode) => {
+              const selected = uiMode === mode;
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  className={`rounded-xl border px-3 py-2 text-left text-sm font-semibold transition ${
+                    selected ? "border-orangeBorder bg-orangeSoft text-bronze" : "border-linen bg-white/60 text-charcoal hover:border-orangeBorder"
+                  }`}
+                  onClick={() => setUiMode(mode)}
+                  aria-pressed={selected}
+                >
+                  {mode === "simple" ? "Simple Mode" : "Explanation Mode"}
+                  {!isSimpleMode ? (
+                    <span className="mt-1 block text-xs font-medium text-taupe">
+                      {mode === "simple" ? "Hide helper descriptions and keep actions compact." : "Show helper text and explanatory copy."}
+                    </span>
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
           <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4">
             {accentThemes.map((theme) => {
               const selected = accentThemeId === theme.id;
@@ -138,7 +178,9 @@ export default function SettingsPage() {
             />
             <span>
               <span className="block font-semibold text-charcoal">Debug Mode</span>
-              Default OFF. When enabled, the intake workspace shows safe route, endpoint, status, and sanitized error traces.
+              {!isSimpleMode
+                ? "Default OFF. When enabled, the intake workspace shows safe route, endpoint, status, and sanitized error traces."
+                : null}
             </span>
           </label>
         </section>

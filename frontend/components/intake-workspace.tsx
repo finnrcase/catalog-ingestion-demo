@@ -153,8 +153,11 @@ type AccentTheme = {
   text: string;
 };
 
+type UiMode = "explanation" | "simple";
+
 const DEBUG_MODE_STORAGE_KEY = "sch-intake-debug-mode";
 const ACCENT_THEME_STORAGE_KEY = "sch-intake-accent-theme";
+const UI_MODE_STORAGE_KEY = "sch-intake-ui-mode";
 
 const accentThemes: AccentTheme[] = [
   {
@@ -660,6 +663,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const [forceRefreshEnrichment, setForceRefreshEnrichment] = useState(false);
   const [debugMode, setDebugMode] = useState(false);
   const [accentThemeId, setAccentThemeId] = useState<AccentThemeId>("orange");
+  const [uiMode, setUiMode] = useState<UiMode>("explanation");
   const [settingsHydrated, setSettingsHydrated] = useState(false);
   const [debugTraces, setDebugTraces] = useState<DebugTrace[]>([]);
   const [debugCopyStatus, setDebugCopyStatus] = useState("");
@@ -775,11 +779,14 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     try {
       const storedDebugMode = window.localStorage.getItem(DEBUG_MODE_STORAGE_KEY);
       const storedAccentTheme = window.localStorage.getItem(ACCENT_THEME_STORAGE_KEY);
+      const storedUiMode = window.localStorage.getItem(UI_MODE_STORAGE_KEY);
       setDebugMode(storedDebugMode === "true");
       setAccentThemeId(getAccentTheme(storedAccentTheme).id);
+      setUiMode(storedUiMode === "simple" ? "simple" : "explanation");
     } catch {
       setDebugMode(false);
       setAccentThemeId("orange");
+      setUiMode("explanation");
     }
     setSettingsHydrated(true);
   }, []);
@@ -803,6 +810,15 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       // Local persistence is best-effort only.
     }
   }, [debugMode, settingsHydrated]);
+
+  useEffect(() => {
+    if (!settingsHydrated) return;
+    try {
+      window.localStorage.setItem(UI_MODE_STORAGE_KEY, uiMode);
+    } catch {
+      // Local persistence is best-effort only.
+    }
+  }, [uiMode, settingsHydrated]);
 
   const bulkImagePreviews = useMemo(
     () =>
@@ -853,6 +869,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const apiConnectionStatus = API_BASE ? apiStatus : "misconfigured";
   const apiConnectionText = API_BASE ? apiStatusText : "NEXT_PUBLIC_API_BASE_URL is missing or invalid.";
   const displayApiBase = API_BASE || "not configured";
+  const isSimpleMode = uiMode === "simple";
 
   useEffect(() => {
     if (includedRows.length === 0) {
@@ -1659,6 +1676,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             <span className="rounded-full border border-orangeBorder bg-orangeSoft px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-bronze">
               SCH FRONTEND v2 ACTIVE
             </span>
+            <span className="rounded-full border border-linen bg-white/42 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-taupe">
+              {isSimpleMode ? "Simple Mode" : "Explanation Mode"}
+            </span>
           </div>
           <div className="flex flex-wrap items-center gap-3">
             <ApiConnectionBadge status={apiConnectionStatus} label={apiConnectionText} apiBase={displayApiBase} />
@@ -1686,9 +1706,11 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
               <h1 className="mt-3 max-w-3xl text-3xl font-semibold tracking-normal text-charcoal sm:text-5xl">
                 Upload, parse, enrich, and export Programa-ready product schedules.
               </h1>
-              <p className="mt-4 max-w-2xl text-sm leading-6 text-taupe">
-                A staged intake workspace for SCH quotes, spec sheets, product links, and image-ready exports.
-              </p>
+              {!isSimpleMode ? (
+                <p className="mt-4 max-w-2xl text-sm leading-6 text-taupe">
+                  A staged intake workspace for SCH quotes, spec sheets, product links, and image-ready exports.
+                </p>
+              ) : null}
             </div>
             <div className="grid gap-2 rounded-2xl border border-linen bg-white/44 p-4">
               <div className="flex items-center justify-between gap-3">
@@ -1702,6 +1724,10 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
               <div className="flex items-center justify-between gap-3">
                 <span className="text-xs font-semibold uppercase tracking-[0.14em] text-taupe">Primary export</span>
                 <span className="text-xs font-semibold text-bronze">Excel for Programa</span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-xs font-semibold uppercase tracking-[0.14em] text-taupe">UI mode</span>
+                <span className="text-xs font-semibold text-bronze">{isSimpleMode ? "Simple" : "Explanation"}</span>
               </div>
             </div>
           </div>
@@ -1729,7 +1755,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           ))}
         </div>
 
-        <Panel step="1" title="Upload / Input" subtitle="Add vendor PDFs, quote sheets, tear sheets, receipts, product links, and mass photo uploads.">
+        <Panel step="1" title="Upload / Input" subtitle="Add vendor PDFs, quote sheets, tear sheets, receipts, product links, and mass photo uploads." simple={isSimpleMode}>
           <div className="grid gap-5">
             <div className="grid gap-3 sm:grid-cols-2">
               <Field label="Existing Programa Project / Property">
@@ -1756,6 +1782,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                 title="Upload PDFs"
                 description="Vendor quotes, spec sheets, tear sheets, receipts, or schedules for Step 2 parsing."
                 meta={files.length ? `${files.length} PDF${files.length === 1 ? "" : "s"} selected` : "No PDFs selected"}
+                simple={isSimpleMode}
               >
                 <label className="btn-secondary inline-flex h-10 cursor-pointer items-center justify-center rounded-xl px-4 text-sm font-semibold">
                   Choose PDFs
@@ -1775,6 +1802,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                 title="Upload Product Photos"
                 description="Photos are uploaded to Cloudinary during Parse and become image-ready rows."
                 meta={bulkImages.length ? `${bulkImages.length} image${bulkImages.length === 1 ? "" : "s"} selected` : "No photos selected"}
+                simple={isSimpleMode}
               >
                 <label
                   className={`btn-secondary inline-flex h-10 cursor-pointer items-center justify-center rounded-xl px-4 text-sm font-semibold ${
@@ -1815,6 +1843,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                 title="Paste Product Links"
                 description="Product pages, vendor links, or source URLs. One link per line."
                 meta={`${urls.split(/\r?\n/).filter((url) => url.trim()).length} link${urls.split(/\r?\n/).filter((url) => url.trim()).length === 1 ? "" : "s"} entered`}
+                simple={isSimpleMode}
               >
                 <textarea
                   className="input-surface min-h-28 w-full resize-none rounded-xl p-3 text-sm leading-6 text-charcoal"
@@ -1914,9 +1943,11 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                     </button>
                   ) : null}
                 </div>
-                <p className="text-sm text-taupe">
-                  Photo rows are created in Step 2 when you click Parse Files. PDF parsing and web enrichment will not run for photo-only rows.
-                </p>
+                {!isSimpleMode ? (
+                  <p className="text-sm text-taupe">
+                    Photo rows are created in Step 2 when you click Parse Files. PDF parsing and web enrichment will not run for photo-only rows.
+                  </p>
+                ) : null}
                 <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
                   {bulkImagePreviews.slice(0, 6).map(({ file, url }, index) => (
                     <img key={`${file.name}-${file.size}-${file.lastModified}`} src={url} alt={file.name} className="h-20 w-full rounded-xl object-cover" />
@@ -1927,13 +1958,15 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           </div>
         </Panel>
 
-        <Panel step="2" title="Parse" subtitle="Create initial product rows from PDFs, product links, and Cloudinary-hosted photo uploads. Enrichment stays off until Step 4.">
+        <Panel step="2" title="Parse" subtitle="Create initial product rows from PDFs, product links, and Cloudinary-hosted photo uploads. Enrichment stays off until Step 4." simple={isSimpleMode}>
           <div className="grid gap-4">
             <div className="rounded-xl border border-linen bg-ivory/70 p-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <div className="text-sm font-semibold text-charcoal">{parseStatus}</div>
-                  <div className="mt-1 text-xs text-taupe">Endpoint: {lastEndpoint || `${API_BASE || "not configured"}/intake/generate`}</div>
+                  {!isSimpleMode ? (
+                    <div className="mt-1 text-xs text-taupe">Endpoint: {lastEndpoint || `${API_BASE || "not configured"}/intake/generate`}</div>
+                  ) : null}
                 </div>
                 <button
                   className="btn-primary inline-flex h-12 items-center justify-center gap-2 rounded-xl px-6 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze disabled:shadow-none"
@@ -1967,7 +2000,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         ) : null}
 
         {parsedReviewReady ? (
-          <Panel step="3" title="Review Parsed Data" subtitle="Start with the summary, then expand the parsed product table only when needed.">
+          <Panel step="3" title="Review Parsed Data" subtitle="Start with the summary, then expand the parsed product table only when needed." simple={isSimpleMode}>
             <div className="grid gap-4">
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
                 <SummaryCard label="Products found" value={rows.length} />
@@ -1987,7 +2020,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         ) : null}
 
         {parsedReviewReady ? (
-          <Panel step="4" title="Enrich" subtitle="Run missing-field enrichment only after parsed data has been reviewed. This does not reparse the PDFs.">
+          <Panel step="4" title="Enrich" subtitle="Run missing-field enrichment only after parsed data has been reviewed. This does not reparse the PDFs." simple={isSimpleMode}>
             <div className="grid gap-4">
               <div className="rounded-xl border border-linen bg-ivory/70 p-4">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -2031,16 +2064,18 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                 <SummaryCard label="Images present" value={imagesFoundCount} />
                 <SummaryCard label="Dimensions present" value={dimensionsFoundCount} />
               </div>
-              <p className="rounded-xl border border-linen bg-white px-4 py-3 text-sm text-charcoal/70">
-                Enrichment uses existing SKU/model, product URLs, preferred sources, and cache first. It fills missing data without rerunning PDF parsing.
-              </p>
+              {!isSimpleMode ? (
+                <p className="rounded-xl border border-linen bg-white px-4 py-3 text-sm text-charcoal/70">
+                  Enrichment uses existing SKU/model, product URLs, preferred sources, and cache first. It fills missing data without rerunning PDF parsing.
+                </p>
+              ) : null}
               {errors.length ? <ErrorList errors={errors} /> : null}
             </div>
           </Panel>
         ) : null}
 
         {enrichmentHasRun ? (
-          <Panel step="5" title="Review Enriched Data" subtitle="Confirm readiness after enrichment before exporting.">
+          <Panel step="5" title="Review Enriched Data" subtitle="Confirm readiness after enrichment before exporting." simple={isSimpleMode}>
             <div className="grid gap-4">
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <SummaryCard label="Rows enriched" value={enrichmentStats.rowsEnriched} />
@@ -2065,7 +2100,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         ) : null}
 
         {enrichmentHasRun ? (
-          <Panel step="6" title="Export" subtitle="Download the Programa-ready workbook first. CSV, ZIP, debug, and direct send are secondary.">
+          <Panel step="6" title="Export" subtitle="Download the Programa-ready workbook first. CSV, ZIP, debug, and direct send are secondary." simple={isSimpleMode}>
             <div className="grid gap-4">
               <div className="grid gap-3 lg:grid-cols-[1.2fr_1fr]">
                 <button
@@ -2160,6 +2195,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             forceRefreshEnrichment={forceRefreshEnrichment}
             debugMode={debugMode}
             accentThemeId={accentThemeId}
+            uiMode={uiMode}
             scheduleUrl={scheduleUrl}
             bulkImagesCount={bulkImages.length}
             photoBulkSummary={photoBulkSummary}
@@ -2173,6 +2209,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             onForceRefreshEnrichmentChange={setForceRefreshEnrichment}
             onDebugModeChange={setDebugMode}
             onAccentThemeChange={setAccentThemeId}
+            onUiModeChange={setUiMode}
             onScheduleUrlChange={setScheduleUrl}
             onClose={() => setSettingsOpen(false)}
           />
@@ -2256,12 +2293,14 @@ function InputCard({
   title,
   description,
   meta,
+  simple = false,
   children,
 }: {
   icon: ReactNode;
   title: string;
   description: string;
   meta: string;
+  simple?: boolean;
   children: ReactNode;
 }) {
   return (
@@ -2272,7 +2311,7 @@ function InputCard({
         </div>
         <div>
           <h3 className="text-sm font-semibold text-charcoal">{title}</h3>
-          <p className="mt-1 text-sm leading-5 text-taupe">{description}</p>
+          {!simple ? <p className="mt-1 text-sm leading-5 text-taupe">{description}</p> : null}
           <p className="mt-2 text-xs font-semibold uppercase tracking-[0.08em] text-bronze">{meta}</p>
         </div>
       </div>
@@ -2532,6 +2571,7 @@ function SettingsDialog({
   forceRefreshEnrichment,
   debugMode,
   accentThemeId,
+  uiMode,
   scheduleUrl,
   bulkImagesCount,
   photoBulkSummary,
@@ -2545,6 +2585,7 @@ function SettingsDialog({
   onForceRefreshEnrichmentChange,
   onDebugModeChange,
   onAccentThemeChange,
+  onUiModeChange,
   onScheduleUrlChange,
   onClose,
 }: {
@@ -2561,6 +2602,7 @@ function SettingsDialog({
   forceRefreshEnrichment: boolean;
   debugMode: boolean;
   accentThemeId: AccentThemeId;
+  uiMode: UiMode;
   scheduleUrl: string;
   bulkImagesCount: number;
   photoBulkSummary: { success: number; failed: number };
@@ -2574,6 +2616,7 @@ function SettingsDialog({
   onForceRefreshEnrichmentChange: (value: boolean) => void;
   onDebugModeChange: (value: boolean) => void;
   onAccentThemeChange: (value: AccentThemeId) => void;
+  onUiModeChange: (value: UiMode) => void;
   onScheduleUrlChange: (value: string) => void;
   onClose: () => void;
 }) {
@@ -2585,6 +2628,7 @@ function SettingsDialog({
         : apiStatus === "offline"
           ? "Offline"
           : "Checking";
+  const isSimpleMode = uiMode === "simple";
 
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-end bg-charcoal/28 px-4 py-5 backdrop-blur-sm sm:px-7">
@@ -2592,7 +2636,9 @@ function SettingsDialog({
         <div className="flex items-center justify-between gap-4">
           <div>
             <h2 className="text-lg font-semibold text-charcoal">Settings</h2>
-            <p className="mt-1 text-sm text-taupe">Internal intake preferences, connection status, and build details.</p>
+            {!isSimpleMode ? (
+              <p className="mt-1 text-sm text-taupe">Internal intake preferences, connection status, and build details.</p>
+            ) : null}
           </div>
           <button
             type="button"
@@ -2608,7 +2654,7 @@ function SettingsDialog({
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <h3 className="text-sm font-semibold text-charcoal">Backend / API Status</h3>
-              <p className="mt-1 text-sm text-taupe">{apiStatusText}</p>
+              {!isSimpleMode ? <p className="mt-1 text-sm text-taupe">{apiStatusText}</p> : null}
             </div>
             <SettingsStatusPill status={apiStatus} label={statusLabel} />
           </div>
@@ -2621,7 +2667,35 @@ function SettingsDialog({
 
         <div className="mt-4 rounded-xl border border-linen bg-white p-4">
           <h3 className="text-sm font-semibold text-charcoal">Appearance</h3>
-          <p className="mt-1 text-sm text-taupe">Choose a muted SCH accent for buttons, active stages, cards, and highlights.</p>
+          {!isSimpleMode ? (
+            <p className="mt-1 text-sm text-taupe">Choose a muted SCH accent for buttons, active stages, cards, and highlights.</p>
+          ) : null}
+          <div className="mt-4 grid gap-2 sm:grid-cols-2">
+            {(["explanation", "simple"] as UiMode[]).map((mode) => {
+              const selected = uiMode === mode;
+              return (
+                <button
+                  key={mode}
+                  type="button"
+                  className={`min-h-11 rounded-xl border px-3 text-left text-sm font-semibold transition ${
+                    selected ? "border-orangeBorder bg-orangeSoft text-bronze" : "border-linen bg-white text-charcoal hover:border-orangeBorder"
+                  }`}
+                  onClick={() => onUiModeChange(mode)}
+                  aria-pressed={selected}
+                >
+                  {mode === "simple" ? "Simple Mode" : "Explanation Mode"}
+                  {!isSimpleMode ? (
+                    <span className="mt-1 block text-xs font-medium text-taupe">
+                      {mode === "simple" ? "Cleaner workflow with less helper copy." : "Full helper text and explanations."}
+                    </span>
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
+          <div className="mt-3 text-xs font-semibold uppercase tracking-[0.12em] text-taupe">
+            Current UI mode: <span className="text-bronze">{isSimpleMode ? "Simple" : "Explanation"}</span>
+          </div>
           <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3">
             {accentThemes.map((theme) => {
               const selected = theme.id === accentThemeId;
@@ -2658,10 +2732,12 @@ function SettingsDialog({
             />
             Enable Debug Mode. Shows sanitized trace details and copyable reports for troubleshooting.
           </label>
-          <p className="mt-3 text-xs leading-5 text-taupe">
-            Debug reports include action names, endpoint paths, status codes, timestamps, item identifiers, and sanitized errors. API keys,
-            credentials, auth tokens, and full request payloads are not included.
-          </p>
+          {!isSimpleMode ? (
+            <p className="mt-3 text-xs leading-5 text-taupe">
+              Debug reports include action names, endpoint paths, status codes, timestamps, item identifiers, and sanitized errors. API keys,
+              credentials, auth tokens, and full request payloads are not included.
+            </p>
+          ) : null}
         </div>
 
         <div className="mt-5 rounded-xl border border-linen bg-ivory/70 p-4">
@@ -2724,7 +2800,9 @@ function SettingsDialog({
 
         <div className="mt-4 rounded-xl border border-linen bg-ivory/70 p-4">
           <h3 className="text-sm font-semibold text-charcoal">Export Preferences</h3>
-          <p className="mt-1 text-sm text-taupe">Excel is the primary Programa handoff. CSV, ZIP, and debug exports stay available after enrichment.</p>
+          {!isSimpleMode ? (
+            <p className="mt-1 text-sm text-taupe">Excel is the primary Programa handoff. CSV, ZIP, and debug exports stay available after enrichment.</p>
+          ) : null}
           <dl className="mt-4 grid gap-2 text-xs text-taupe">
             <SettingsDetail label="Primary export" value="Download Excel for Programa (.xlsx)" />
             <SettingsDetail label="Export-ready rows" value={String(exportReadyCount)} />
@@ -2805,11 +2883,13 @@ function Panel({
   step,
   title,
   subtitle,
+  simple = false,
   children,
 }: {
   step?: string;
   title: string;
   subtitle: string;
+  simple?: boolean;
   children: ReactNode;
 }) {
   return (
@@ -2824,7 +2904,7 @@ function Panel({
             ) : null}
             <h2 className="text-xl font-semibold tracking-normal text-charcoal">{title}</h2>
           </div>
-          <p className="mt-2 text-sm leading-6 text-charcoal/60">{subtitle}</p>
+          {!simple ? <p className="mt-2 text-sm leading-6 text-charcoal/60">{subtitle}</p> : null}
         </div>
       </div>
       {children}
