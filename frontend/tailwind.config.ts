@@ -5,12 +5,13 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        ivory: "#FAFAF8",
-        paper: "#FFFFFF",
-        charcoal: "#1F2933",
+        ivory: "rgb(var(--app-bg-rgb) / <alpha-value>)",
+        paper: "rgb(var(--panel-rgb) / <alpha-value>)",
+        white: "rgb(var(--panel-rgb) / <alpha-value>)",
+        charcoal: "rgb(var(--text-rgb) / <alpha-value>)",
         bronze: "rgb(var(--accent-rgb) / <alpha-value>)",
-        taupe: "#6B7280",
-        linen: "#E5E7EB",
+        taupe: "rgb(var(--muted-rgb) / <alpha-value>)",
+        linen: "rgb(var(--border-rgb) / <alpha-value>)",
         sage: "#5F7A65",
         clay: "#A6533A",
         orangeSoft: "rgb(var(--accent-soft-rgb) / <alpha-value>)",

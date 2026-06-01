@@ -162,120 +162,120 @@ const accentThemes: AccentTheme[] = [
     label: "Orange",
     accent: "#f97316",
     hover: "#ea580c",
-    soft: "#fff3e8",
+    soft: "#2c2118",
     ring: "#fdba74",
     foreground: "#ffffff",
-    text: "#c2410c",
+    text: "#fb923c",
   },
   {
     id: "sage",
     label: "Sage",
     accent: "#5f7a65",
     hover: "#4d6653",
-    soft: "#edf3ee",
+    soft: "#1f2a22",
     ring: "#a8b9ad",
     foreground: "#ffffff",
-    text: "#405846",
+    text: "#a8b9ad",
   },
   {
     id: "blue",
     label: "Blue",
     accent: "#3f6f8f",
     hover: "#315b75",
-    soft: "#edf5f9",
+    soft: "#1b2730",
     ring: "#9ebbd0",
     foreground: "#ffffff",
-    text: "#294e67",
+    text: "#9ebbd0",
   },
   {
     id: "plum",
     label: "Plum",
     accent: "#7d5266",
     hover: "#684354",
-    soft: "#f6eef2",
+    soft: "#2a2026",
     ring: "#c9aabb",
     foreground: "#ffffff",
-    text: "#5a3948",
+    text: "#c9aabb",
   },
   {
     id: "mustard",
     label: "Mustard",
     accent: "#a87a22",
     hover: "#8c651b",
-    soft: "#fbf4e3",
+    soft: "#2b2517",
     ring: "#d9bd72",
     foreground: "#ffffff",
-    text: "#795817",
+    text: "#d9bd72",
   },
   {
     id: "terracotta",
     label: "Terracotta",
     accent: "#a65f43",
     hover: "#8c4f38",
-    soft: "#f8eee9",
+    soft: "#2d211c",
     ring: "#d2a08c",
     foreground: "#ffffff",
-    text: "#794532",
+    text: "#d2a08c",
   },
   {
     id: "slateBlue",
     label: "Slate Blue",
     accent: "#56657f",
     hover: "#46536a",
-    soft: "#eef1f5",
+    soft: "#202632",
     ring: "#a8b1c0",
     foreground: "#ffffff",
-    text: "#3c485c",
+    text: "#a8b1c0",
   },
   {
     id: "sand",
     label: "Sand",
     accent: "#967f5c",
     hover: "#7d6a4c",
-    soft: "#f6f1e9",
+    soft: "#29251d",
     ring: "#cab892",
     foreground: "#ffffff",
-    text: "#6d5b41",
+    text: "#cab892",
   },
   {
     id: "forest",
     label: "Forest",
     accent: "#3f604b",
     hover: "#344f3e",
-    soft: "#edf3ef",
+    soft: "#1c2920",
     ring: "#94ad9d",
     foreground: "#ffffff",
-    text: "#304838",
+    text: "#94ad9d",
   },
   {
     id: "ocean",
     label: "Ocean",
     accent: "#2f7780",
     hover: "#28636a",
-    soft: "#eaf5f6",
+    soft: "#192b2e",
     ring: "#91c0c5",
     foreground: "#ffffff",
-    text: "#235960",
+    text: "#91c0c5",
   },
   {
     id: "clay",
     label: "Clay",
     accent: "#9a5a48",
     hover: "#824c3d",
-    soft: "#f7eeeb",
+    soft: "#2c211e",
     ring: "#c89b8e",
     foreground: "#ffffff",
-    text: "#704235",
+    text: "#c89b8e",
   },
   {
     id: "rosewood",
     label: "Rosewood",
     accent: "#854f55",
     hover: "#704248",
-    soft: "#f7eef0",
+    soft: "#2a2022",
     ring: "#c79da3",
     foreground: "#ffffff",
-    text: "#623a40",
+    text: "#c79da3",
   },
 ];
 
@@ -579,11 +579,11 @@ function isColumnMissing(row: IntakeRow, column: string) {
 function LogoMark() {
   return (
     <div className="flex items-center gap-4">
-      <div className="min-w-[132px] border-r border-linen pr-4 text-center">
+      <div className="min-w-[132px] rounded-2xl border border-orangeBorder bg-orangeSoft/80 px-4 py-3 text-center shadow-sm">
         <div className="font-serif text-[28px] font-light leading-none tracking-[0.24em] text-charcoal">
           SCH
         </div>
-        <div className="mt-1 text-[9px] font-medium uppercase leading-tight tracking-[0.22em] text-taupe">
+        <div className="mt-1 text-[9px] font-semibold uppercase leading-tight tracking-[0.22em] text-bronze">
           Saffron Case Homes
         </div>
       </div>
@@ -620,6 +620,13 @@ function workflowStepIndex(stage: WorkflowStage) {
   if (stage === "enrich") return 3;
   if (stage === "reviewEnriched") return 4;
   if (stage === "export") return 5;
+  return 0;
+}
+
+function mainWorkflowStepIndex(stage: WorkflowStage) {
+  if (stage === "parse" || stage === "reviewParsed") return 1;
+  if (stage === "enrich" || stage === "reviewEnriched") return 2;
+  if (stage === "export") return 3;
   return 0;
 }
 
@@ -839,6 +846,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const parseInputCount = files.length + bulkImages.length + urls.split(/\r?\n/).filter((url) => url.trim()).length;
   const programaSendEnabled = process.env.NEXT_PUBLIC_PROGRAMA_SEND_ENABLED === "true";
   const activeWorkflowIndex = workflowStepIndex(workflowStage);
+  const activeMainWorkflowIndex = mainWorkflowStepIndex(workflowStage);
   const hasParsedRows = rows.length > 0;
   const parsedReviewReady = hasParsedRows && activeWorkflowIndex >= 2;
   const enrichmentHasRun = workflowStage === "reviewEnriched" || workflowStage === "export";
@@ -1635,12 +1643,15 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
 
   return (
     <main className="min-h-screen px-4 py-6 sm:px-7 lg:px-10">
-      <div className="mx-auto flex max-w-[1180px] flex-col gap-7">
-        <header className="sticky top-0 z-40 flex flex-col gap-4 border-b border-linen bg-ivory/95 pb-5 pt-1 backdrop-blur md:flex-row md:items-center md:justify-between">
+      <div className="mx-auto flex max-w-[1220px] flex-col gap-7">
+        <header className="sticky top-0 z-40 flex flex-col gap-4 rounded-2xl border border-linen bg-paper/88 px-4 py-4 shadow-panel backdrop-blur md:flex-row md:items-center md:justify-between">
           <div className="flex flex-wrap items-center gap-3">
             <LogoMark />
-            <span className="rounded-full border border-orangeBorder bg-orangeSoft px-3 py-1 text-xs font-medium text-bronze">
+            <span className="rounded-full border border-orangeBorder bg-orangeSoft px-3 py-1 text-xs font-semibold text-bronze">
               Internal
+            </span>
+            <span className="rounded-full border border-linen bg-white/42 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-taupe">
+              Live route: frontend/app/page.tsx
             </span>
           </div>
           <div className="flex flex-wrap items-center gap-3">
@@ -1656,20 +1667,48 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           </div>
         </header>
 
-        <div className="grid gap-2 rounded-2xl border border-linen bg-white/72 p-3 sm:grid-cols-2 lg:grid-cols-6">
-          {["Upload", "Parse", "Review Parsed", "Enrich", "Review Enriched", "Export"].map((label, index) => (
+        <section className="glass-panel rounded-[28px] p-5 sm:p-7">
+          <div className="grid gap-5 lg:grid-cols-[1fr_0.8fr] lg:items-end">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.22em] text-bronze">SCH Production Frontend</p>
+              <h1 className="mt-3 max-w-3xl text-3xl font-semibold tracking-normal text-charcoal sm:text-5xl">
+                Upload, parse, enrich, and export Programa-ready product schedules.
+              </h1>
+              <p className="mt-4 max-w-2xl text-sm leading-6 text-taupe">
+                A staged intake workspace for SCH quotes, spec sheets, product links, and image-ready exports.
+              </p>
+            </div>
+            <div className="grid gap-2 rounded-2xl border border-linen bg-white/44 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-xs font-semibold uppercase tracking-[0.14em] text-taupe">Build</span>
+                <span className="font-mono text-xs text-charcoal">{buildInfo.commit}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-xs font-semibold uppercase tracking-[0.14em] text-taupe">API</span>
+                <span className="max-w-[220px] truncate font-mono text-xs text-charcoal">{displayApiBase}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-xs font-semibold uppercase tracking-[0.14em] text-taupe">Primary export</span>
+                <span className="text-xs font-semibold text-bronze">Excel for Programa</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <div className="grid gap-2 rounded-2xl border border-linen bg-white/60 p-3 sm:grid-cols-2 lg:grid-cols-4">
+          {["Upload", "Parse", "Enrich", "Export"].map((label, index) => (
             <div
               key={label}
               className={`flex items-center gap-2 rounded-xl px-3 py-2 transition ${
-                index === activeWorkflowIndex
+                index === activeMainWorkflowIndex
                   ? "border border-orangeBorder bg-orangeSoft text-bronze shadow-sm"
-                  : index < activeWorkflowIndex
+                  : index < activeMainWorkflowIndex
                     ? "border border-sage/15 bg-sage/10 text-sage"
                     : "border border-transparent bg-ivory/70 text-charcoal/60"
               }`}
             >
               <span className={`grid h-6 w-6 place-items-center rounded-full text-xs font-semibold ${
-                index <= activeWorkflowIndex ? "bg-white text-bronze" : "bg-orangeSoft text-bronze"
+                index <= activeMainWorkflowIndex ? "bg-white text-bronze" : "bg-orangeSoft text-bronze"
               }`}>
                 {index + 1}
               </span>
@@ -2761,7 +2800,7 @@ function Panel({
   children: ReactNode;
 }) {
   return (
-    <section className="rounded-2xl border border-linen bg-white/72 p-5 sm:p-6">
+    <section className="rounded-2xl border border-linen bg-white/70 p-5 shadow-panel sm:p-6">
       <div className="mb-5">
         <div>
           <div className="flex items-center gap-3">
