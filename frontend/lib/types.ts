@@ -38,6 +38,79 @@ export type SchemaResponse = {
   reviewFields: string[];
 };
 
+export type IntegrationsStatus = {
+  openai?: {
+    provider?: string;
+    status?: "Connected" | "Not Configured" | string;
+    configured?: boolean;
+    model?: string;
+    further_enrichment_supported?: boolean;
+  };
+  further_enrichment?: {
+    available?: boolean;
+    default_enabled?: boolean;
+    requires?: string[];
+  };
+  [key: string]: unknown;
+};
+
+export type StoredProductSource = {
+  id?: string;
+  normalized_brand?: string;
+  normalized_model_sku?: string;
+  display_brand?: string;
+  display_model_sku?: string;
+  brand?: string;
+  model_sku?: string;
+  product_name?: string;
+  product_page_url?: string;
+  manufacturer_url?: string;
+  spec_sheet_url?: string;
+  image_url?: string;
+  dimension_source_url?: string;
+  image_source_url?: string;
+  dimensions_text?: string;
+  dimensions?: string;
+  width_in?: string | number;
+  height_in?: string | number;
+  depth_in?: string | number;
+  source_domain?: string;
+  source_type?: string;
+  confidence_score?: number;
+  confidence?: string;
+  dimension_confidence?: string;
+  image_confidence?: string;
+  success_count?: number;
+  failure_count?: number;
+  last_verified_at?: string;
+  first_seen_at?: string;
+  notes?: string;
+  [key: string]: unknown;
+};
+
+export type PreferredSourceDomain = {
+  id?: string;
+  domain?: string;
+  source_type?: string;
+  success_count?: number;
+  failure_count?: number;
+  downranked?: boolean;
+  last_success_at?: string;
+  last_failure_at?: string;
+  notes?: string;
+  [key: string]: unknown;
+};
+
+export type StoredSourcesResponse = {
+  storage_backend: string;
+  sources: StoredProductSource[];
+};
+
+export type PreferredDomainsResponse = {
+  storage_backend: string;
+  domains: PreferredSourceDomain[];
+};
+
 export type ProgramaExportValidation = {
   skipped: { index: number; product_name: string }[];
   missing_section: { index: number; product_name: string }[];

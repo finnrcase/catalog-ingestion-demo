@@ -615,10 +615,14 @@ def _parse_html_for_dimensions(
     """
     Extract (product_dimensions, cutout_dimensions) from an HTML page.
     Three passes: JSON-LD → spec tables/dl → visible text.
-    Returns (None, None) if no complete 3D dimensions found.
+    Returns the best product dimensions found. Complete W/H/D wins; a useful
+    partial is returned only after all deterministic sources are checked.
     """
     product_dims: str | None = None
     cutout_dims: str | None = None
+    best_partial_dims: str | None = None
+    best_partial_count = 0
+    best_partial_method = ""
 
     soup = _BeautifulSoup(html, "html.parser") if _BeautifulSoup else None
     page_text: str | None = None  # lazily computed once
@@ -641,14 +645,23 @@ def _parse_html_for_dimensions(
         return page_text
 
     def _remember(candidates: list[str], method: str) -> str | None:
+        nonlocal best_partial_dims, best_partial_count, best_partial_method
         candidates_seen.extend(candidates)
         best = _best_dimension_candidate(candidates)
-        if best and debug is not None:
-            if not debug.get("dimension_parse_method"):
+        if not best:
+            return None
+        part_count = _dimension_part_count(best)
+        if part_count >= 3:
+            if debug is not None and not debug.get("dimension_parse_method"):
                 debug["dimension_parse_method"] = method
-            if 0 < _dimension_part_count(best) < 3 and not debug.get("partial_dimensions_found"):
+            return best
+        if part_count > best_partial_count:
+            best_partial_dims = best
+            best_partial_count = part_count
+            best_partial_method = method
+            if debug is not None and not debug.get("partial_dimensions_found"):
                 debug["partial_dimensions_found"] = best
-        return best
+        return None
 
     # ── Pass 1: JSON-LD ────────────────────────────────────────────────────────
     if soup:
@@ -776,6 +789,12 @@ def _parse_html_for_dimensions(
             elif _find_dimension_candidates(text, include_cutout=True):
                 debug["rejected_dimensions_reason"] = debug.get("rejected_dimensions_reason") or "cutout/opening dimensions only"
 
+    if not product_dims and best_partial_dims:
+        product_dims = best_partial_dims
+        if debug is not None:
+            debug["dimension_parse_method"] = debug.get("dimension_parse_method") or best_partial_method
+            debug["partial_dimensions_found"] = debug.get("partial_dimensions_found") or best_partial_dims
+
     # ── Cutout pass (appliances only) ──────────────────────────────────────────
     if is_appliance and product_dims:
         text = _get_page_text()
@@ -812,17 +831,29 @@ def _parse_text_pages_for_dimensions(
     """
     product_dims: str | None = None
     cutout_dims: str | None = None
+    best_partial_dims: str | None = None
+    best_partial_count = 0
     shipping_fallback: str | None = None
 
     for page_text in pages:
         candidates = _candidate_strings_from_text(page_text, include_cutout=is_appliance)
-        product_dims = _best_dimension_candidate(candidates)
+        candidate = _best_dimension_candidate(candidates)
 
-        if product_dims:
+        if candidate:
+            part_count = _dimension_part_count(candidate)
+            if debug is not None:
+                if 0 < part_count < 3 and not debug.get("partial_dimensions_found"):
+                    debug["partial_dimensions_found"] = candidate
+            if part_count < 3:
+                if part_count > best_partial_count:
+                    best_partial_dims = candidate
+                    best_partial_count = part_count
+                # Keep scanning pages. A one/two-axis partial is useful, but it
+                # is not a Programa-ready dimension result.
+                continue
+            product_dims = candidate
             if debug is not None:
                 debug["dimension_parse_method"] = debug.get("dimension_parse_method") or "pdf_text"
-                if 0 < _dimension_part_count(product_dims) < 3:
-                    debug["partial_dimensions_found"] = product_dims
             # Look for cutout on same page if appliance
             if is_appliance:
                 cutout_candidates = _find_dimension_candidates(
@@ -835,7 +866,7 @@ def _parse_text_pages_for_dimensions(
                     if pos >= 0 and "cutout" in page_text[max(0, pos - 30): pos].lower():
                         cutout_dims = c
                         break
-            break  # stop searching pages once product dims found
+            break  # stop searching pages once complete product dims found
 
         # Collect shipping fallback while scanning (only when no product dims yet)
         if include_shipping_fallback and not shipping_fallback:
@@ -848,6 +879,12 @@ def _parse_text_pages_for_dimensions(
                 debug["rejected_dimensions_reason"] = "shipping/package dimensions only"
             elif _find_dimension_candidates(page_text, include_cutout=True):
                 debug["rejected_dimensions_reason"] = "cutout/opening dimensions only"
+
+    if not product_dims and best_partial_dims:
+        product_dims = best_partial_dims
+        if debug is not None:
+            debug["dimension_parse_method"] = debug.get("dimension_parse_method") or "pdf_text_partial"
+            debug["partial_dimensions_found"] = debug.get("partial_dimensions_found") or best_partial_dims
 
     # Use shipping fallback only when nothing better found
     if not product_dims and include_shipping_fallback and shipping_fallback:
@@ -1145,6 +1182,14 @@ def find_dimensions(
         "final_dimension_writeback_success": False,
         "skipped_reason": "",
         "budget_blocked": False,
+        "pages_found": 0,
+        "pages_fully_parsed": 0,
+        "dimensions_successfully_extracted": False,
+        "dimensions_blocked_by_budget": False,
+        "dimensions_blocked_by_parser": False,
+        "spec_sheets_found": 0,
+        "spec_sheets_parsed": 0,
+        "image_only_success": False,
     }
 
     if has_complete_3d_dimensions(current_dims):
@@ -1177,6 +1222,7 @@ def find_dimensions(
         result.debug["dimension_confidence"] = result.confidence
         result.debug["dimension_source"] = result.source_url
         result.debug["dimension_source_url"] = result.source_url
+        result.debug["dimensions_successfully_extracted"] = result.status == "found"
         if 0 < _dimension_part_count(result.dimensions) < 3:
             result.debug["partial_dimensions_found"] = result.dimensions
         result.debug["final_dimensions"] = result.dimensions if result.status == "found" else current_dims
@@ -1203,12 +1249,14 @@ def find_dimensions(
         if cached_content:
             page_html = str(cached_content)
             local_debug["page_fetch_success"] = True
+            local_debug["pages_fully_parsed"] = int(local_debug.get("pages_fully_parsed") or 0) + 1
             product_dims, cutout_dims = _parse_html_for_dimensions(
                 page_html, is_appliance=is_appliance, debug=local_debug
             )
         else:
             if budget is not None and not budget.can_fetch():
                 local_debug["budget_blocked"] = True
+                local_debug["dimensions_blocked_by_budget"] = True
                 local_debug["skipped_reason"] = "budget blocked product URL fetch"
                 return None
             product_dims = None
@@ -1226,6 +1274,7 @@ def find_dimensions(
                     if "pdf" in content_type or _urlparse.urlparse(product_url).path.lower().endswith(tuple(_PDF_EXTENSIONS)):
                         source_suffix = "pdf"
                         local_debug["spec_pdf_fetched"] = True
+                        local_debug["spec_sheets_parsed"] = int(local_debug.get("spec_sheets_parsed") or 0) + 1
                         product_dims, cutout_dims = _parse_pdf_for_dimensions(
                             resp.content,
                             is_appliance=is_appliance,
@@ -1241,6 +1290,7 @@ def find_dimensions(
                             debug=local_debug,
                         )
                     local_debug["page_fetch_success"] = True
+                    local_debug["pages_fully_parsed"] = int(local_debug.get("pages_fully_parsed") or 0) + 1
                 except Exception:
                     local_debug["page_fetch_success"] = False
             if budget is not None:
@@ -1277,20 +1327,24 @@ def find_dimensions(
         if page_html:
             pdf_links = _extract_spec_pdf_links(page_html, product_url, model)
             local_debug["spec_pdf_links_found"] = len(pdf_links)
+            local_debug["spec_sheets_found"] = len(pdf_links)
             for pdf_url in pdf_links[:3]:
                 if budget is not None and not budget.can_fetch():
                     local_debug["budget_blocked"] = True
+                    local_debug["dimensions_blocked_by_budget"] = True
                     local_debug["skipped_reason"] = "budget blocked spec PDF fetch"
                     break
                 urls_checked.append(pdf_url)
                 pdf_debug = dict(local_debug)
                 pdf_debug["spec_pdf_fetched"] = True
+                pdf_debug["spec_sheets_parsed"] = int(pdf_debug.get("spec_sheets_parsed") or 0) + 1
                 pdf_dims, pdf_cutout, pdf_suffix = _fetch_and_parse_url_with_debug(
                     pdf_url, is_appliance=is_appliance, debug=pdf_debug
                 )
                 if budget is not None:
                     budget.consume_fetch()
                 if not pdf_dims:
+                    pdf_debug["dimensions_blocked_by_parser"] = True
                     continue
                 confidence = _confidence_for_dimension(
                     pdf_dims,
@@ -1321,21 +1375,29 @@ def find_dimensions(
         for query in query_list:
             queries_tried.append(query)
             search_urls = _brave_search_urls(query, limit=5, brand=brand, session_cache=session_cache, budget=budget)
+            debug["pages_found"] = int(debug.get("pages_found") or 0) + len(search_urls)
             for url in search_urls:
                 urls_checked.append(url)
                 if budget is not None and not budget.can_fetch():
                     debug["budget_blocked"] = True
+                    debug["dimensions_blocked_by_budget"] = True
                     debug["skipped_reason"] = "budget blocked page/spec fetch"
                     break
                 url_debug = dict(debug)
                 url_debug["page_fetch_attempted"] = True
+                if _urlparse.urlparse(url).path.lower().endswith(tuple(_PDF_EXTENSIONS)):
+                    url_debug["spec_sheets_found"] = int(url_debug.get("spec_sheets_found") or 0) + 1
                 product_dims, cutout_dims, src_suffix = _fetch_and_parse_url_with_debug(
                     url, is_appliance=is_appliance, debug=url_debug
                 )
                 if budget is not None:
                     budget.consume_fetch()
+                url_debug["pages_fully_parsed"] = int(url_debug.get("pages_fully_parsed") or 0) + 1
+                if src_suffix == "pdf":
+                    url_debug["spec_sheets_parsed"] = int(url_debug.get("spec_sheets_parsed") or 0) + 1
                 url_debug["page_fetch_success"] = bool(product_dims or cutout_dims)
                 if not product_dims or _dimension_part_count(product_dims) == 0:
+                    url_debug["dimensions_blocked_by_parser"] = True
                     continue
                 matched_variant = None
                 for v in model_variants:

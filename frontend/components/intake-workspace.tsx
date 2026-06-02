@@ -25,22 +25,34 @@ import {
   formatApiError,
   API_BASE,
   RAW_API_BASE,
+  deletePreferredDomain,
+  deleteStoredSource,
+  fetchProductKnowledgeBaseAudit,
   fetchHealth,
+  fetchIntegrationsStatus,
+  fetchPreferredDomains,
   fetchSchema,
+  fetchStoredSources,
   fetchVendorCallStatus,
   enrichRows,
+  furtherEnrichRows,
   generateIntakeTable,
   generateVendorCallScript,
   refreshVendorCall,
   recoverMissingImages,
+  reverifyStoredSource,
   sendToPrograma,
+  savePreferredDomain,
+  saveStoredSource,
   startVendorCall,
+  updatePreferredDomain,
+  updateStoredSource,
   uploadImage,
   validateProgramaExport,
   validateRows,
 } from "@/lib/api";
 import { hasComplete3dDimensions } from "@/lib/dimensions";
-import type { IntakeResponse, IntakeRow } from "@/lib/types";
+import type { IntakeResponse, IntakeRow, IntegrationsStatus, PreferredSourceDomain, StoredProductSource } from "@/lib/types";
 
 const reviewColumns = [
   "Include",
@@ -164,12 +176,69 @@ type AccentTheme = {
 
 type UiMode = "explanation" | "simple";
 
+type SourceTypeFilter = "" | "manufacturer" | "retailer" | "spec_sheet" | "manual" | "other";
+
+type SourceForm = {
+  brand: string;
+  model_sku: string;
+  product_name: string;
+  product_page_url: string;
+  manufacturer_url: string;
+  spec_sheet_url: string;
+  image_url: string;
+  dimension_source_url: string;
+  dimensions: string;
+  width_in: string;
+  height_in: string;
+  depth_in: string;
+  source_type: SourceTypeFilter;
+  notes: string;
+};
+
+type DomainForm = {
+  domain: string;
+  source_type: SourceTypeFilter;
+  notes: string;
+};
+
 const DEBUG_MODE_STORAGE_KEY = "sch-intake-debug-mode";
 const THEME_STORAGE_KEY = "sch-intake-theme";
 const ACCENT_THEME_STORAGE_KEY = "sch-intake-accent-theme";
 const UI_MODE_STORAGE_KEY = "sch-intake-ui-mode";
+const sourceTypeOptions: { value: SourceTypeFilter; label: string }[] = [
+  { value: "", label: "All source types" },
+  { value: "manufacturer", label: "Manufacturer" },
+  { value: "retailer", label: "Trusted retailer" },
+  { value: "spec_sheet", label: "Manual / spec archive" },
+  { value: "manual", label: "Manual / guide" },
+  { value: "other", label: "Other" },
+];
+const emptySourceForm: SourceForm = {
+  brand: "",
+  model_sku: "",
+  product_name: "",
+  product_page_url: "",
+  manufacturer_url: "",
+  spec_sheet_url: "",
+  image_url: "",
+  dimension_source_url: "",
+  dimensions: "",
+  width_in: "",
+  height_in: "",
+  depth_in: "",
+  source_type: "manufacturer",
+  notes: "",
+};
+const emptyDomainForm: DomainForm = {
+  domain: "",
+  source_type: "manufacturer",
+  notes: "",
+};
 const ENRICHMENT_BUDGET_STORAGE_KEY = "sch-intake-enrichment-budget-usd";
 const DEFAULT_ENRICHMENT_BUDGET_USD = 0.25;
+const FURTHER_ENRICHMENT_ENABLED_STORAGE_KEY = "sch-intake-further-enrichment-enabled";
+const FURTHER_ENRICHMENT_BUDGET_STORAGE_KEY = "sch-intake-further-enrichment-budget-usd";
+const DEFAULT_FURTHER_ENRICHMENT_BUDGET_USD = 0.25;
 
 const themeOptions: { id: ThemePreference; label: string; description: string }[] = [
   { id: "light", label: "Light", description: "A warm, clean light workspace." },
@@ -314,6 +383,12 @@ const frontendRouteWiring = [
     response: "{ categories, sections, statuses, reviewFields }",
   },
   {
+    action: "Integrations status",
+    endpoint: "GET /integrations/status",
+    body: "none",
+    response: "{ openai: { status, configured, model }, further_enrichment }",
+  },
+  {
     action: "PDF parse / product links",
     endpoint: "POST /intake/generate",
     body: "multipart FormData: project, room, urls, use_ai_pdf, files[]",
@@ -342,6 +417,12 @@ const frontendRouteWiring = [
     endpoint: "POST /intake/recover-images",
     body: "{ rows, enrichment_mode, force_refresh }",
     response: "IntakeResponse + image diagnostics in dimension_diagnostics",
+  },
+  {
+    action: "Further enrichment",
+    endpoint: "POST /intake/further-enrich",
+    body: "{ rows, further_enrichment_enabled, further_enrichment_budget_usd }",
+    response: "IntakeResponse + further_enrichment stage_timings",
   },
   {
     action: "Export validation",
@@ -389,6 +470,11 @@ const frontendRouteWiring = [
 
 function rowText(row: IntakeRow, key: string) {
   return String(row[key] ?? "");
+}
+
+function boolish(value: unknown) {
+  if (typeof value === "boolean") return value;
+  return ["true", "1", "yes", "on"].includes(String(value ?? "").trim().toLowerCase());
 }
 
 function hasValue(row: IntakeRow, key: string) {
@@ -731,6 +817,30 @@ function missingFieldsForRow(row: IntakeRow) {
   return missing;
 }
 
+function confidenceIsLow(row: IntakeRow) {
+  const rawValues = [
+    rowText(row, "Dimension Confidence"),
+    rowText(row, "dimension_confidence"),
+    rowText(row, "image_confidence"),
+    rowText(row, "selected_product_url_confidence"),
+    rowText(row, "product_url_confidence"),
+  ].map((value) => value.trim().toLowerCase());
+  if (rawValues.some((value) => value === "low" || value === "none")) return true;
+  const score = Number(row["Confidence Score"] ?? 0);
+  return Number.isFinite(score) && score > 0 && score < 0.75;
+}
+
+function needsFurtherEnrichment(row: IntakeRow) {
+  if (!isProductRow(row)) return false;
+  return !hasComplete3dDimensions(row.Dimensions) || !isPublicHttpsImageUrl(rowText(row, "Image URL")) || confidenceIsLow(row);
+}
+
+function estimateFurtherCost(rows: IntakeRow[], cap: number) {
+  const candidates = rows.filter(needsFurtherEnrichment).length;
+  if (!candidates) return 0;
+  return Math.min(cap, Math.max(0.0025, 0.006 * candidates + 0.004));
+}
+
 function isColumnMissing(row: IntakeRow, column: string) {
   if (!callFieldColumns.includes(column)) return false;
   const label = callFieldLabels[column] || column;
@@ -807,6 +917,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const [enrichmentMode, setEnrichmentMode] = useState<EnrichmentMode>("fast");
   const [forceRefreshEnrichment, setForceRefreshEnrichment] = useState(false);
   const [enrichmentBudgetUsd, setEnrichmentBudgetUsd] = useState(DEFAULT_ENRICHMENT_BUDGET_USD);
+  const [furtherEnrichmentEnabled, setFurtherEnrichmentEnabled] = useState(false);
+  const [furtherEnrichmentBudgetUsd, setFurtherEnrichmentBudgetUsd] = useState(DEFAULT_FURTHER_ENRICHMENT_BUDGET_USD);
   const [debugMode, setDebugMode] = useState(false);
   const [themePreference, setThemePreference] = useState<ThemePreference>("dark");
   const [accentThemeId, setAccentThemeId] = useState<AccentThemeId>("orange");
@@ -818,6 +930,25 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const [enrichmentDebugReportStatus, setEnrichmentDebugReportStatus] = useState("");
   const [lastSuccessfulStage, setLastSuccessfulStage] = useState("App loaded");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [sourceMemoryStatus, setSourceMemoryStatus] = useState("Not loaded");
+  const [sourceMemoryBackend, setSourceMemoryBackend] = useState("unknown");
+  const [sourceMemoryAudit, setSourceMemoryAudit] = useState<{
+    runtime_cache_persistent?: boolean;
+    runtime_cache_persistence_note?: string;
+    product_enrichment_cache_path?: string;
+    product_knowledge_base_backend?: string;
+    tables?: string[];
+  }>({});
+  const [storedSources, setStoredSources] = useState<StoredProductSource[]>([]);
+  const [preferredDomains, setPreferredDomains] = useState<PreferredSourceDomain[]>([]);
+  const [sourceSearch, setSourceSearch] = useState("");
+  const [domainSearch, setDomainSearch] = useState("");
+  const [sourceTypeFilter, setSourceTypeFilter] = useState<SourceTypeFilter>("");
+  const [domainTypeFilter, setDomainTypeFilter] = useState<SourceTypeFilter>("");
+  const [sourceForm, setSourceForm] = useState<SourceForm>(emptySourceForm);
+  const [domainForm, setDomainForm] = useState<DomainForm>(emptyDomainForm);
+  const [editingSourceId, setEditingSourceId] = useState("");
+  const [editingDomainId, setEditingDomainId] = useState("");
   const [workflowStage, setWorkflowStage] = useState<WorkflowStage>("upload");
   const [parseReviewed, setParseReviewed] = useState(false);
   const [enrichmentReviewed, setEnrichmentReviewed] = useState(false);
@@ -828,6 +959,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const [enrichmentStatus, setEnrichmentStatus] = useState("Not started.");
   const [apiStatus, setApiStatus] = useState<"checking" | "online" | "offline">("checking");
   const [apiStatusText, setApiStatusText] = useState("Checking backend...");
+  const [integrationsStatus, setIntegrationsStatus] = useState<IntegrationsStatus>({
+    openai: { status: "Not Configured", configured: false, model: "Not reported" },
+  });
   const [lastEndpoint, setLastEndpoint] = useState("");
   const [estimatedCost, setEstimatedCost] = useState("Not reported");
   const [enrichmentStats, setEnrichmentStats] = useState({
@@ -852,7 +986,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const [scheduleUrl, setScheduleUrl] = useState("");
   const [programaMessage, setProgramaMessage] = useState("");
   const [productImageUploads, setProductImageUploads] = useState<Record<number, string>>({});
-  const [busy, setBusy] = useState<"generate" | "validate" | "imageRecovery" | "vendorCall" | "export" | "photoBulk" | "programa" | "">("");
+  const [busy, setBusy] = useState<"generate" | "validate" | "furtherEnrichment" | "imageRecovery" | "vendorCall" | "export" | "photoBulk" | "programa" | "">("");
   const [exportSummary, setExportSummary] = useState({
     skipped: [] as { index: number; product_name: string }[],
     missing_section: [] as { index: number; product_name: string }[],
@@ -941,6 +1075,27 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           fallback: "local fallback sections",
         });
       });
+    fetchIntegrationsStatus()
+      .then((status) => {
+        setIntegrationsStatus(status);
+        recordDebugTrace({
+          action: "load integrations status",
+          stage: "success",
+          endpoint: "/integrations/status",
+          message: `OpenAI ${status.openai?.status || "Not Configured"} · model ${status.openai?.model || "not reported"}`,
+        });
+      })
+      .catch((error) => {
+        setIntegrationsStatus({
+          openai: { status: "Not Configured", configured: false, model: "Not reported" },
+        });
+        recordDebugTrace({
+          action: "load integrations status",
+          stage: "failed",
+          endpoint: "/integrations/status",
+          ...debugDetailsFromError(error),
+        });
+      });
   }, []);
 
   useEffect(() => {
@@ -950,17 +1105,23 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       const storedAccentTheme = window.localStorage.getItem(ACCENT_THEME_STORAGE_KEY);
       const storedUiMode = window.localStorage.getItem(UI_MODE_STORAGE_KEY);
       const storedBudget = Number.parseFloat(window.localStorage.getItem(ENRICHMENT_BUDGET_STORAGE_KEY) || "");
+      const storedFurtherEnabled = window.localStorage.getItem(FURTHER_ENRICHMENT_ENABLED_STORAGE_KEY);
+      const storedFurtherBudget = Number.parseFloat(window.localStorage.getItem(FURTHER_ENRICHMENT_BUDGET_STORAGE_KEY) || "");
       setDebugMode(storedDebugMode === "true");
       setThemePreference(isThemePreference(storedThemePreference) ? storedThemePreference : "dark");
       setAccentThemeId(getAccentTheme(storedAccentTheme).id);
       setUiMode(storedUiMode === "simple" ? "simple" : "explanation");
       setEnrichmentBudgetUsd(Number.isFinite(storedBudget) ? clampBudgetUsd(storedBudget) : DEFAULT_ENRICHMENT_BUDGET_USD);
+      setFurtherEnrichmentEnabled(storedFurtherEnabled === "true");
+      setFurtherEnrichmentBudgetUsd(Number.isFinite(storedFurtherBudget) ? clampBudgetUsd(storedFurtherBudget) : DEFAULT_FURTHER_ENRICHMENT_BUDGET_USD);
     } catch {
       setDebugMode(false);
       setThemePreference("dark");
       setAccentThemeId("orange");
       setUiMode("explanation");
       setEnrichmentBudgetUsd(DEFAULT_ENRICHMENT_BUDGET_USD);
+      setFurtherEnrichmentEnabled(false);
+      setFurtherEnrichmentBudgetUsd(DEFAULT_FURTHER_ENRICHMENT_BUDGET_USD);
     }
     setSettingsHydrated(true);
   }, []);
@@ -973,6 +1134,16 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       // Local persistence is best-effort only.
     }
   }, [enrichmentBudgetUsd, settingsHydrated]);
+
+  useEffect(() => {
+    if (!settingsHydrated) return;
+    try {
+      window.localStorage.setItem(FURTHER_ENRICHMENT_ENABLED_STORAGE_KEY, String(furtherEnrichmentEnabled));
+      window.localStorage.setItem(FURTHER_ENRICHMENT_BUDGET_STORAGE_KEY, String(furtherEnrichmentBudgetUsd));
+    } catch {
+      // Local persistence is best-effort only.
+    }
+  }, [furtherEnrichmentBudgetUsd, furtherEnrichmentEnabled, settingsHydrated]);
 
   useEffect(() => {
     if (!settingsHydrated) return;
@@ -1018,6 +1189,11 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     }
   }, [uiMode, settingsHydrated]);
 
+  useEffect(() => {
+    if (!settingsOpen) return;
+    void loadSourceMemory();
+  }, [settingsOpen, sourceSearch, sourceTypeFilter, domainSearch, domainTypeFilter]);
+
   const bulkImagePreviews = useMemo(
     () =>
       bulkImages.map((file) => ({
@@ -1055,6 +1231,14 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const dimensionsFoundCount = useMemo(
     () => countRows(includedRows, (row) => hasComplete3dDimensions(row.Dimensions)),
     [includedRows],
+  );
+  const furtherEnrichmentCandidateCount = useMemo(
+    () => countRows(includedRows, needsFurtherEnrichment),
+    [includedRows],
+  );
+  const furtherEnrichmentEstimatedCost = useMemo(
+    () => estimateFurtherCost(includedRows, furtherEnrichmentBudgetUsd),
+    [includedRows, furtherEnrichmentBudgetUsd],
   );
   const rowsWithRoomCount = useMemo(() => countRows(includedRows, (row) => Boolean(rowText(row, "Room").trim())), [includedRows]);
   const rowsWithSourceUrlCount = useMemo(() => countRows(includedRows, (row) => Boolean(rowText(row, "Product URL").trim())), [includedRows]);
@@ -1244,6 +1428,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         enrichmentMode,
         enrichmentBudgetUsd,
         forceRefreshEnrichment,
+        furtherEnrichmentEnabled,
+        furtherEnrichmentBudgetUsd,
       },
       counts: {
         rows: rows.length,
@@ -1253,10 +1439,173 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         missingImages: missingImageCount,
         exportReady: exportSummary.export_count,
       },
+      sourceMemory: {
+        backend: sourceMemoryBackend,
+        status: sourceMemoryStatus,
+        audit: sourceMemoryAudit,
+        storedSources: storedSources.length,
+        preferredDomains: preferredDomains.length,
+      },
+      integrations: {
+        openaiStatus: integrationsStatus.openai?.status || "Not Configured",
+        openaiModel: integrationsStatus.openai?.model || "Not reported",
+        furtherEnrichmentEnabled,
+      },
       lastMessage: message ? sanitizedErrorMessage(message) : "",
       errors: errors.slice(0, 8).map(sanitizedErrorMessage),
       traces: debugTraces,
     };
+  }
+
+  async function loadSourceMemory() {
+    if (!API_BASE) {
+      setSourceMemoryStatus("Backend not configured.");
+      return;
+    }
+    setSourceMemoryStatus("Loading stored sources...");
+    try {
+      const [sourceResponse, domainResponse, auditResponse] = await Promise.all([
+        fetchStoredSources({ query: sourceSearch, sourceType: sourceTypeFilter, limit: 100 }),
+        fetchPreferredDomains({ query: domainSearch, sourceType: domainTypeFilter, limit: 100 }),
+        fetchProductKnowledgeBaseAudit(),
+      ]);
+      setStoredSources(sourceResponse.sources || []);
+      setPreferredDomains(domainResponse.domains || []);
+      setSourceMemoryAudit(auditResponse || {});
+      setSourceMemoryBackend(auditResponse.product_knowledge_base_backend || sourceResponse.storage_backend || domainResponse.storage_backend || "unknown");
+      setSourceMemoryStatus(`Loaded ${sourceResponse.sources?.length || 0} sources and ${domainResponse.domains?.length || 0} domains.`);
+      recordDebugTrace({
+        action: "load source memory",
+        stage: "success",
+        endpoint: "/settings/product-knowledge-base",
+        message: `${sourceResponse.storage_backend || "unknown"} backend`,
+      });
+    } catch (error) {
+      setSourceMemoryStatus(sanitizedErrorMessage(formatApiError(error)));
+      recordDebugTrace({
+        action: "load source memory",
+        stage: "failed",
+        endpoint: "/settings/product-knowledge-base",
+        ...debugDetailsFromError(error),
+      });
+    }
+  }
+
+  async function handleSaveSource() {
+    if (!sourceForm.brand.trim() || !sourceForm.model_sku.trim()) {
+      setSourceMemoryStatus("Brand and model/SKU are required for an exact product source.");
+      return;
+    }
+    try {
+      const payload = { ...sourceForm, source_type: sourceForm.source_type || "manufacturer" };
+      const response = editingSourceId
+        ? await updateStoredSource(editingSourceId, payload)
+        : await saveStoredSource(payload);
+      setSourceMemoryBackend(response.storage_backend || sourceMemoryBackend);
+      setSourceForm(emptySourceForm);
+      setEditingSourceId("");
+      setSourceMemoryStatus(editingSourceId ? "Stored source updated." : "Stored source saved.");
+      await loadSourceMemory();
+    } catch (error) {
+      setSourceMemoryStatus(sanitizedErrorMessage(formatApiError(error)));
+      recordDebugTrace({
+        action: editingSourceId ? "update stored source" : "save stored source",
+        stage: "failed",
+        endpoint: "/settings/product-knowledge-base",
+        ...debugDetailsFromError(error),
+      });
+    }
+  }
+
+  function handleEditSource(source: StoredProductSource) {
+    setEditingSourceId(String(source.id || ""));
+    setSourceForm({
+      brand: String(source.brand || ""),
+      model_sku: String(source.model_sku || ""),
+      product_name: String(source.product_name || ""),
+      product_page_url: String(source.product_page_url || ""),
+      manufacturer_url: String(source.manufacturer_url || ""),
+      spec_sheet_url: String(source.spec_sheet_url || ""),
+      image_url: String(source.image_url || ""),
+      dimension_source_url: String(source.dimension_source_url || ""),
+      dimensions: String(source.dimensions || ""),
+      width_in: String(source.width_in || ""),
+      height_in: String(source.height_in || ""),
+      depth_in: String(source.depth_in || ""),
+      source_type: (String(source.source_type || "manufacturer") as SourceTypeFilter) || "manufacturer",
+      notes: String(source.notes || ""),
+    });
+  }
+
+  async function handleDeleteSource(source: StoredProductSource) {
+    const sourceId = String(source.id || "");
+    if (!sourceId) return;
+    try {
+      await deleteStoredSource(sourceId);
+      setSourceMemoryStatus("Stored source deleted.");
+      await loadSourceMemory();
+    } catch (error) {
+      setSourceMemoryStatus(sanitizedErrorMessage(formatApiError(error)));
+    }
+  }
+
+  async function handleReverifySource(source: StoredProductSource) {
+    const sourceId = String(source.id || "");
+    if (!sourceId) return;
+    try {
+      await reverifyStoredSource(sourceId);
+      setSourceMemoryStatus("Stored source marked for re-verification.");
+      await loadSourceMemory();
+    } catch (error) {
+      setSourceMemoryStatus(sanitizedErrorMessage(formatApiError(error)));
+    }
+  }
+
+  async function handleSaveDomain() {
+    if (!domainForm.domain.trim()) {
+      setSourceMemoryStatus("Domain is required.");
+      return;
+    }
+    try {
+      const payload = { ...domainForm, source_type: domainForm.source_type || "manufacturer" };
+      const response = editingDomainId
+        ? await updatePreferredDomain(editingDomainId, payload)
+        : await savePreferredDomain(payload);
+      setSourceMemoryBackend(response.storage_backend || sourceMemoryBackend);
+      setDomainForm(emptyDomainForm);
+      setEditingDomainId("");
+      setSourceMemoryStatus(editingDomainId ? "Preferred domain updated." : "Preferred domain saved.");
+      await loadSourceMemory();
+    } catch (error) {
+      setSourceMemoryStatus(sanitizedErrorMessage(formatApiError(error)));
+      recordDebugTrace({
+        action: editingDomainId ? "update preferred domain" : "save preferred domain",
+        stage: "failed",
+        endpoint: "/settings/preferred-domains",
+        ...debugDetailsFromError(error),
+      });
+    }
+  }
+
+  function handleEditDomain(domain: PreferredSourceDomain) {
+    setEditingDomainId(String(domain.id || ""));
+    setDomainForm({
+      domain: String(domain.domain || ""),
+      source_type: (String(domain.source_type || "manufacturer") as SourceTypeFilter) || "manufacturer",
+      notes: String(domain.notes || ""),
+    });
+  }
+
+  async function handleDeleteDomain(domain: PreferredSourceDomain) {
+    const domainId = String(domain.id || "");
+    if (!domainId) return;
+    try {
+      await deletePreferredDomain(domainId);
+      setSourceMemoryStatus("Preferred domain deleted.");
+      await loadSourceMemory();
+    } catch (error) {
+      setSourceMemoryStatus(sanitizedErrorMessage(formatApiError(error)));
+    }
   }
 
   async function copyDebugReport() {
@@ -1295,6 +1644,14 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     const rowsMissingImages = stageNumber(response, "rows_missing_images") ?? countRows(productRows, (row) => !hasImage(row));
     const dimensionsFound = countRows(productRows, (row) => hasComplete3dDimensions(row.Dimensions));
     const imagesFound = countRows(productRows, hasImage);
+    const knowledgeBaseHits = countRows(productRows, (row) => boolish(rowText(row, "knowledge_base_hit")) || boolish(rowText(row, "stored_source_hit")));
+    const knowledgeBaseMisses = countRows(productRows, (row) => boolish(rowText(row, "knowledge_base_miss")));
+    const knowledgeBaseUpdates = countRows(productRows, (row) => boolish(rowText(row, "knowledge_base_updated")) || boolish(rowText(row, "stored_source_updated")));
+    const duplicateSearchesAvoidedFromKb = productRows.reduce((total, row) => total + (Number.parseInt(rowText(row, "duplicate_searches_avoided_from_cache") || "0", 10) || 0), 0);
+    const furtherRowsSent = stageNumber(response, "further_enrichment_rows_sent") ?? 0;
+    const furtherFieldsFilled = stageNumber(response, "further_enrichment_fields_filled") ?? 0;
+    const furtherCost = stageNumber(response, "further_enrichment_cost_usd");
+    const furtherSourceRows = productRows.filter((row) => rowText(row, "further_enrichment_sources").trim());
     const allErrors = [
       ...(response?.errors || []),
       ...extraErrors,
@@ -1332,14 +1689,24 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         reportLine("search queries used", queryText),
         reportLine("sources checked", candidates.length ? candidates.join("\n  - ") : ""),
         reportLine("source selected", selectedUrl),
+        reportLine("knowledge base hit", boolish(rowText(row, "knowledge_base_hit")) || boolish(rowText(row, "stored_source_hit")) ? "yes" : "no"),
+        reportLine("stored source used", rowText(row, "knowledge_base_source_used") || rowText(row, "stored_source_used")),
+        reportLine("stored source updated", boolish(rowText(row, "knowledge_base_updated")) || boolish(rowText(row, "stored_source_updated")) ? "yes" : "no"),
+        reportLine("source rejected reason", rowText(row, "knowledge_base_rejected_reason") || rowText(row, "stored_source_rejected_reason")),
+        reportLine("preferred domain used", rowText(row, "preferred_domain_used")),
         reportLine("selected source domain", reportDomain(selectedUrl)),
         reportLine("image found", imageFound ? "yes" : "no"),
         reportLine("dimensions found", dimensionsFound ? "yes" : dimensionsText ? "partial/low confidence" : "no"),
         reportLine("extracted dimensions", dimensionsText),
         reportLine("dimension source", rowText(row, "dimension_source_url") || rowText(row, "Dimension Source URL")),
         reportLine("confidence score", rowText(row, "selected_product_url_confidence") || rowText(row, "Dimension Confidence") || rowText(row, "image_confidence") || rowText(row, "Confidence Score")),
+        reportLine("further enrichment status", rowText(row, "further_enrichment_status")),
+        reportLine("further enrichment model", rowText(row, "further_enrichment_model")),
+        reportLine("further enrichment fields filled", rowText(row, "further_enrichment_fields_filled")),
+        reportLine("further enrichment sources", rowText(row, "further_enrichment_sources")),
+        reportLine("further enrichment row cost", rowText(row, "further_enrichment_cost_estimate")),
         reportLine("cost estimate", formatUsd(rowCost, 4)),
-        reportLine("reason if failed", rowText(row, "skipped_reason") || rowText(row, "enrichment_error") || rowText(row, "Suggested Action")),
+        reportLine("reason if failed", rowText(row, "further_enrichment_error") || rowText(row, "skipped_reason") || rowText(row, "enrichment_error") || rowText(row, "Suggested Action")),
       ].join("\n");
     });
 
@@ -1408,11 +1775,27 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       reportLine("cost per product", groups.length && stageNumber(response, "estimated_cost_usd") !== undefined ? formatUsd((stageNumber(response, "estimated_cost_usd") || 0) / groups.length, 4) : "not reported"),
       reportLine("duplicate searches avoided", stageNumber(response, "searches_avoided") ?? 0),
       reportLine("cache hits", stageNumber(response, "cache_hits") ?? 0),
+      reportLine("knowledge base hits", knowledgeBaseHits),
+      reportLine("knowledge base misses", knowledgeBaseMisses),
+      reportLine("knowledge base updates", knowledgeBaseUpdates),
+      reportLine("duplicate paid searches avoided from knowledge base", duplicateSearchesAvoidedFromKb),
       reportLine("failed searches/errors", allErrors.length),
       reportLine("cost per image found", imagesFound && stageNumber(response, "estimated_cost_usd") !== undefined ? formatUsd((stageNumber(response, "estimated_cost_usd") || 0) / imagesFound, 4) : "not reported"),
       reportLine("cost per dimension found", stageNumber(response, "cost_per_dimension_found") !== undefined ? formatUsd(stageNumber(response, "cost_per_dimension_found"), 4) : "not reported"),
       reportLine("dimensions found", dimensionsFound),
       reportLine("images found", imagesFound),
+      reportLine("further enrichment enabled", furtherEnrichmentEnabled ? "yes" : "no"),
+      reportLine("OpenAI used", furtherRowsSent > 0 ? "yes" : "no"),
+      reportLine("OpenAI status", integrationsStatus.openai?.status || "Not Configured"),
+      reportLine("OpenAI model", integrationsStatus.openai?.model || "Not reported"),
+      reportLine("further enrichment cap", formatUsd(furtherEnrichmentBudgetUsd)),
+      reportLine("further enrichment rows considered", stageNumber(response, "further_enrichment_rows_considered") ?? 0),
+      reportLine("Rows sent to OpenAI", furtherRowsSent),
+      reportLine("further enrichment rows updated", stageNumber(response, "further_enrichment_rows_updated") ?? 0),
+      reportLine("Fields recovered by OpenAI", furtherFieldsFilled),
+      reportLine("OpenAI cost estimate", furtherCost !== undefined ? formatUsd(furtherCost, 4) : "not reported"),
+      reportLine("OpenAI cost per row", stageNumber(response, "further_enrichment_cost_per_row_usd") !== undefined ? formatUsd(stageNumber(response, "further_enrichment_cost_per_row_usd"), 4) : "not reported"),
+      reportLine("OpenAI source links returned", furtherSourceRows.length ? furtherSourceRows.map((row) => rowText(row, "further_enrichment_sources")).join("\n") : "none"),
       reportLine("backend timing keys", Object.keys(timings).join(", ")),
       "",
       "5. Errors",
@@ -2111,6 +2494,109 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     }
   }
 
+  async function handleFurtherEnrichment() {
+    if (!furtherEnrichmentEnabled) {
+      setMessage("Further Enrichment is off. Enable it in Settings before running AI fallback research.");
+      setSettingsOpen(true);
+      return;
+    }
+    setBusy("furtherEnrichment");
+    setMessage("");
+    setWorkflowStage("enrich");
+    setEnrichmentStatus("Further enrichment running on incomplete rows...");
+    setEstimatedCost(`${formatUsd(furtherEnrichmentEstimatedCost, 4)} estimated · capped at ${formatUsd(furtherEnrichmentBudgetUsd)}`);
+    const beforeImages = countRows(includedRows, hasImage);
+    const beforeDimensions = countRows(includedRows, (row) => hasComplete3dDimensions(row.Dimensions));
+    setLastEndpoint(`${API_BASE || "not configured"}/intake/further-enrich`);
+    recordDebugTrace({
+      action: "further enrich missing fields",
+      stage: "started",
+      endpoint: "/intake/further-enrich",
+      message: `candidates=${furtherEnrichmentCandidateCount}; estimated=${formatUsd(furtherEnrichmentEstimatedCost, 4)}; cap=${formatUsd(furtherEnrichmentBudgetUsd)}`,
+    });
+    try {
+      const response = await furtherEnrichRows({
+        rows,
+        enabled: furtherEnrichmentEnabled,
+        maxCostUsd: furtherEnrichmentBudgetUsd,
+      });
+      setRows(response.rows);
+      setErrors(response.errors);
+      const enrichedRows = response.rows.filter(isProductRow);
+      const afterImages = countRows(enrichedRows, hasImage);
+      const afterDimensions = countRows(enrichedRows, (row) => hasComplete3dDimensions(row.Dimensions));
+      const missingDimensionsAfter = countRows(enrichedRows, (row) => !hasComplete3dDimensions(row.Dimensions));
+      const missingImagesAfter = countRows(enrichedRows, (row) => !hasImage(row));
+      const rowsUpdated = Math.round(stageNumber(response, "further_enrichment_rows_updated") ?? 0);
+      const fieldsFilled = Math.round(stageNumber(response, "further_enrichment_fields_filled") ?? 0);
+      const cap = stageNumber(response, "further_enrichment_estimated_cost_usd") ?? furtherEnrichmentEstimatedCost;
+      const actualCost = stageNumber(response, "further_enrichment_cost_usd") ?? 0;
+      const finalStatus =
+        rowsUpdated > 0
+          ? `Further enrichment updated ${rowsUpdated} row${rowsUpdated === 1 ? "" : "s"}.`
+          : response.errors.length
+            ? "Further enrichment did not update rows."
+            : "Further enrichment found no safe high-confidence updates.";
+      setEnrichmentStats((current) => ({
+        ...current,
+        filledImages: Math.max(0, afterImages - beforeImages),
+        filledDimensions: Math.max(0, afterDimensions - beforeDimensions),
+        unresolved: countRows(enrichedRows, (row) => missingFieldsForRow(row).length > 0),
+        missingDimensions: missingDimensionsAfter,
+        missingImages: missingImagesAfter,
+        usefulFieldsFound: fieldsFilled || current.usefulFieldsFound,
+        budgetCap: formatUsd(furtherEnrichmentBudgetUsd),
+      }));
+      setEstimatedCost(`${formatUsd(actualCost, 4)} spent · ${formatUsd(furtherEnrichmentBudgetUsd)} cap`);
+      setEnrichmentStatus(finalStatus);
+      setEnrichmentDebugReport(
+        buildEnrichmentDebugReportText({
+          reportRows: response.rows,
+          response,
+          action: "Further Enrich Missing Fields",
+          finalStatus,
+        }),
+      );
+      setEnrichmentDebugReportStatus("");
+      setWorkflowStage("reviewEnriched");
+      setMessage(
+        rowsUpdated > 0
+          ? `Further enrichment filled ${fieldsFilled} field${fieldsFilled === 1 ? "" : "s"} across ${rowsUpdated} row${rowsUpdated === 1 ? "" : "s"}.`
+          : response.errors.length
+            ? userFacingApiMessage(new Error(response.errors[0]), debugMode)
+            : "Further enrichment finished without safe writebacks. Existing high-confidence data was preserved.",
+      );
+      setLastSuccessfulStage(rowsUpdated > 0 ? "Further enrichment complete" : "Further enrichment reviewed");
+      recordDebugTrace({
+        action: "further enrich missing fields",
+        stage: response.errors.length && rowsUpdated === 0 ? "failed" : "success",
+        endpoint: "/intake/further-enrich",
+        message: `rowsUpdated=${rowsUpdated}; fieldsFilled=${fieldsFilled}; cost=${formatUsd(actualCost, 4)}; estimated=${formatUsd(cap, 4)}; missingDimensions=${missingDimensionsAfter}; missingImages=${missingImagesAfter}`,
+      });
+    } catch (error) {
+      setEnrichmentStatus("Further enrichment failed.");
+      setWorkflowStage("reviewEnriched");
+      setMessage(userFacingApiMessage(error, debugMode));
+      setEnrichmentDebugReport(
+        buildEnrichmentDebugReportText({
+          reportRows: rows,
+          action: "Further Enrich Missing Fields",
+          finalStatus: "Further enrichment failed.",
+          extraErrors: [sanitizedDebugText(formatApiError(error), 2000)],
+        }),
+      );
+      setEnrichmentDebugReportStatus("");
+      recordDebugTrace({
+        action: "further enrich missing fields",
+        stage: "failed",
+        endpoint: "/intake/further-enrich",
+        ...debugDetailsFromError(error),
+      });
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function handleRecoverMissingImages() {
     setBusy("imageRecovery");
     setMessage("");
@@ -2795,6 +3281,30 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                     {busy === "imageRecovery" ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageIcon className="h-4 w-4" />}
                     Recover Missing Images
                   </button>
+                  <button
+                    type="button"
+                    className="btn-secondary inline-flex h-10 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-white disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
+                    disabled={
+                      (busy !== "" && busy !== "furtherEnrichment") ||
+                      busy === "furtherEnrichment" ||
+                      rows.length === 0 ||
+                      !enrichmentHasRun ||
+                      !furtherEnrichmentEnabled ||
+                      furtherEnrichmentCandidateCount === 0
+                    }
+                    onClick={handleFurtherEnrichment}
+                    title={
+                      furtherEnrichmentEnabled
+                        ? `Estimated ${formatUsd(furtherEnrichmentEstimatedCost, 4)} for ${furtherEnrichmentCandidateCount} incomplete row${furtherEnrichmentCandidateCount === 1 ? "" : "s"}`
+                        : "Enable Further Enrichment in Settings."
+                    }
+                  >
+                    {busy === "furtherEnrichment" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                    Further Enrich Missing Fields
+                  </button>
+                </div>
+                <div className="mt-3 rounded-xl border border-linen bg-white/75 px-3 py-2 text-xs text-taupe">
+                  Further Enrichment: {furtherEnrichmentEnabled ? "enabled" : "off"} · {furtherEnrichmentCandidateCount} incomplete row{furtherEnrichmentCandidateCount === 1 ? "" : "s"} · estimated {formatUsd(furtherEnrichmentEstimatedCost, 4)} · cap {formatUsd(furtherEnrichmentBudgetUsd)}
                 </div>
               </div>
 
@@ -2997,11 +3507,16 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             rawApiBase={RAW_API_BASE || "not configured"}
             lastEndpoint={lastEndpoint}
             estimatedCost={estimatedCost}
+            integrationsStatus={integrationsStatus}
             useAiPdf={useAiPdf}
             useWebEnrichment={useWebEnrichment}
             enrichmentMode={enrichmentMode}
             forceRefreshEnrichment={forceRefreshEnrichment}
             enrichmentBudgetUsd={enrichmentBudgetUsd}
+            furtherEnrichmentEnabled={furtherEnrichmentEnabled}
+            furtherEnrichmentBudgetUsd={furtherEnrichmentBudgetUsd}
+            furtherEnrichmentCandidateCount={furtherEnrichmentCandidateCount}
+            furtherEnrichmentEstimatedCost={furtherEnrichmentEstimatedCost}
             debugMode={debugMode}
             accentThemeId={accentThemeId}
             uiMode={uiMode}
@@ -3012,17 +3527,53 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             exportReadyCount={exportSummary.export_count}
             imageReadyCount={exportSummary.image_url_present}
             imageTotalCount={exportSummary.image_url_total}
+            sourceMemoryStatus={sourceMemoryStatus}
+            sourceMemoryBackend={sourceMemoryBackend}
+            sourceMemoryAudit={sourceMemoryAudit}
+            storedSources={storedSources}
+            preferredDomains={preferredDomains}
+            sourceSearch={sourceSearch}
+            domainSearch={domainSearch}
+            sourceTypeFilter={sourceTypeFilter}
+            domainTypeFilter={domainTypeFilter}
+            sourceForm={sourceForm}
+            domainForm={domainForm}
+            editingSourceId={editingSourceId}
+            editingDomainId={editingDomainId}
             onUseAiPdfChange={setUseAiPdf}
             onUseWebEnrichmentChange={setUseWebEnrichment}
             onEnrichmentModeChange={setEnrichmentMode}
             onForceRefreshEnrichmentChange={setForceRefreshEnrichment}
             onEnrichmentBudgetUsdChange={setEnrichmentBudgetUsd}
+            onFurtherEnrichmentEnabledChange={setFurtherEnrichmentEnabled}
+            onFurtherEnrichmentBudgetUsdChange={setFurtherEnrichmentBudgetUsd}
             onDebugModeChange={setDebugMode}
             themePreference={themePreference}
             onThemePreferenceChange={setThemePreference}
             onAccentThemeChange={setAccentThemeId}
             onUiModeChange={setUiMode}
             onScheduleUrlChange={setScheduleUrl}
+            onSourceSearchChange={setSourceSearch}
+            onDomainSearchChange={setDomainSearch}
+            onSourceTypeFilterChange={setSourceTypeFilter}
+            onDomainTypeFilterChange={setDomainTypeFilter}
+            onSourceFormChange={setSourceForm}
+            onDomainFormChange={setDomainForm}
+            onSaveSource={handleSaveSource}
+            onEditSource={handleEditSource}
+            onDeleteSource={handleDeleteSource}
+            onReverifySource={handleReverifySource}
+            onCancelSourceEdit={() => {
+              setEditingSourceId("");
+              setSourceForm(emptySourceForm);
+            }}
+            onSaveDomain={handleSaveDomain}
+            onEditDomain={handleEditDomain}
+            onDeleteDomain={handleDeleteDomain}
+            onCancelDomainEdit={() => {
+              setEditingDomainId("");
+              setDomainForm(emptyDomainForm);
+            }}
             onClose={() => setSettingsOpen(false)}
           />
         ) : null}
@@ -3386,11 +3937,16 @@ function SettingsDialog({
   rawApiBase,
   lastEndpoint,
   estimatedCost,
+  integrationsStatus,
   useAiPdf,
   useWebEnrichment,
   enrichmentMode,
   forceRefreshEnrichment,
   enrichmentBudgetUsd,
+  furtherEnrichmentEnabled,
+  furtherEnrichmentBudgetUsd,
+  furtherEnrichmentCandidateCount,
+  furtherEnrichmentEstimatedCost,
   debugMode,
   accentThemeId,
   uiMode,
@@ -3401,17 +3957,47 @@ function SettingsDialog({
   exportReadyCount,
   imageReadyCount,
   imageTotalCount,
+  sourceMemoryStatus,
+  sourceMemoryBackend,
+  sourceMemoryAudit,
+  storedSources,
+  preferredDomains,
+  sourceSearch,
+  domainSearch,
+  sourceTypeFilter,
+  domainTypeFilter,
+  sourceForm,
+  domainForm,
+  editingSourceId,
+  editingDomainId,
   onUseAiPdfChange,
   onUseWebEnrichmentChange,
   onEnrichmentModeChange,
   onForceRefreshEnrichmentChange,
   onEnrichmentBudgetUsdChange,
+  onFurtherEnrichmentEnabledChange,
+  onFurtherEnrichmentBudgetUsdChange,
   onDebugModeChange,
   themePreference,
   onThemePreferenceChange,
   onAccentThemeChange,
   onUiModeChange,
   onScheduleUrlChange,
+  onSourceSearchChange,
+  onDomainSearchChange,
+  onSourceTypeFilterChange,
+  onDomainTypeFilterChange,
+  onSourceFormChange,
+  onDomainFormChange,
+  onSaveSource,
+  onEditSource,
+  onDeleteSource,
+  onReverifySource,
+  onCancelSourceEdit,
+  onSaveDomain,
+  onEditDomain,
+  onDeleteDomain,
+  onCancelDomainEdit,
   onClose,
 }: {
   buildInfo: BuildInfo;
@@ -3421,11 +4007,16 @@ function SettingsDialog({
   rawApiBase: string;
   lastEndpoint: string;
   estimatedCost: string;
+  integrationsStatus: IntegrationsStatus;
   useAiPdf: boolean;
   useWebEnrichment: boolean;
   enrichmentMode: EnrichmentMode;
   forceRefreshEnrichment: boolean;
   enrichmentBudgetUsd: number;
+  furtherEnrichmentEnabled: boolean;
+  furtherEnrichmentBudgetUsd: number;
+  furtherEnrichmentCandidateCount: number;
+  furtherEnrichmentEstimatedCost: number;
   debugMode: boolean;
   accentThemeId: AccentThemeId;
   uiMode: UiMode;
@@ -3436,17 +4027,53 @@ function SettingsDialog({
   exportReadyCount: number;
   imageReadyCount: number;
   imageTotalCount: number;
+  sourceMemoryStatus: string;
+  sourceMemoryBackend: string;
+  sourceMemoryAudit: {
+    runtime_cache_persistent?: boolean;
+    runtime_cache_persistence_note?: string;
+    product_enrichment_cache_path?: string;
+    product_knowledge_base_backend?: string;
+    tables?: string[];
+  };
+  storedSources: StoredProductSource[];
+  preferredDomains: PreferredSourceDomain[];
+  sourceSearch: string;
+  domainSearch: string;
+  sourceTypeFilter: SourceTypeFilter;
+  domainTypeFilter: SourceTypeFilter;
+  sourceForm: SourceForm;
+  domainForm: DomainForm;
+  editingSourceId: string;
+  editingDomainId: string;
   onUseAiPdfChange: (value: boolean) => void;
   onUseWebEnrichmentChange: (value: boolean) => void;
   onEnrichmentModeChange: (value: EnrichmentMode) => void;
   onForceRefreshEnrichmentChange: (value: boolean) => void;
   onEnrichmentBudgetUsdChange: (value: number) => void;
+  onFurtherEnrichmentEnabledChange: (value: boolean) => void;
+  onFurtherEnrichmentBudgetUsdChange: (value: number) => void;
   onDebugModeChange: (value: boolean) => void;
   themePreference: ThemePreference;
   onThemePreferenceChange: (value: ThemePreference) => void;
   onAccentThemeChange: (value: AccentThemeId) => void;
   onUiModeChange: (value: UiMode) => void;
   onScheduleUrlChange: (value: string) => void;
+  onSourceSearchChange: (value: string) => void;
+  onDomainSearchChange: (value: string) => void;
+  onSourceTypeFilterChange: (value: SourceTypeFilter) => void;
+  onDomainTypeFilterChange: (value: SourceTypeFilter) => void;
+  onSourceFormChange: (value: SourceForm | ((current: SourceForm) => SourceForm)) => void;
+  onDomainFormChange: (value: DomainForm | ((current: DomainForm) => DomainForm)) => void;
+  onSaveSource: () => void;
+  onEditSource: (source: StoredProductSource) => void;
+  onDeleteSource: (source: StoredProductSource) => void;
+  onReverifySource: (source: StoredProductSource) => void;
+  onCancelSourceEdit: () => void;
+  onSaveDomain: () => void;
+  onEditDomain: (domain: PreferredSourceDomain) => void;
+  onDeleteDomain: (domain: PreferredSourceDomain) => void;
+  onCancelDomainEdit: () => void;
   onClose: () => void;
 }) {
   const statusLabel =
@@ -3458,6 +4085,9 @@ function SettingsDialog({
           ? "Offline"
           : "Checking";
   const isSimpleMode = uiMode === "simple";
+  const openAiConfigured = integrationsStatus.openai?.configured === true;
+  const openAiStatusLabel = integrationsStatus.openai?.status || (openAiConfigured ? "Connected" : "Not Configured");
+  const openAiModel = integrationsStatus.openai?.model || "Not reported";
 
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-end bg-charcoal/28 px-4 py-5 backdrop-blur-sm sm:px-7">
@@ -3658,6 +4288,40 @@ function SettingsDialog({
           </dl>
         </div>
 
+        <div className="mt-4 rounded-xl border border-linen bg-white p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-charcoal">Integrations</h3>
+              {!isSimpleMode ? (
+                <p className="mt-1 text-sm text-taupe">Backend-only provider status for optional enrichment and image workflows.</p>
+              ) : null}
+            </div>
+            <StatusBadge value={`OpenAI: ${openAiStatusLabel}`} />
+          </div>
+          <div className="mt-4 rounded-xl border border-linen bg-ivory/60 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h4 className="text-sm font-semibold text-charcoal">OpenAI</h4>
+                <p className="mt-1 text-xs text-taupe">
+                  Used only by optional Further Enrichment after standard enrichment leaves missing fields.
+                </p>
+              </div>
+              <span
+                className={`rounded-full border px-3 py-1 text-xs font-semibold ${
+                  openAiConfigured ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-linen bg-white text-taupe"
+                }`}
+              >
+                {openAiStatusLabel}
+              </span>
+            </div>
+            <dl className="mt-3 grid gap-2 text-xs text-taupe">
+              <SettingsDetail label="Model used" value={openAiModel} />
+              <SettingsDetail label="Further Enrichment" value={furtherEnrichmentEnabled ? "Enabled" : "Disabled"} />
+              <SettingsDetail label="Cost cap" value={formatUsd(furtherEnrichmentBudgetUsd)} />
+            </dl>
+          </div>
+        </div>
+
         <div className="mt-5 rounded-xl border border-linen bg-ivory/70 p-4">
           <h3 className="text-sm font-semibold text-charcoal">Parsing &amp; Enrichment</h3>
           <label className="mt-3 flex items-start gap-3 text-sm text-taupe">
@@ -3700,6 +4364,42 @@ function SettingsDialog({
               onChange={(event) => onEnrichmentBudgetUsdChange(clampBudgetUsd(Number.parseFloat(event.target.value)))}
             />
           </Field>
+          <div className="mt-4 rounded-xl border border-linen bg-white/75 p-3">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h4 className="text-sm font-semibold text-charcoal">Further Enrichment</h4>
+                <p className="mt-1 text-sm leading-5 text-taupe">
+                  Use AI reasoning to research missing product details after standard enrichment fails. Higher accuracy, slower, and may cost more.
+                </p>
+              </div>
+              <StatusBadge value={furtherEnrichmentEnabled ? "Enabled" : "Off"} />
+            </div>
+            <label className="mt-3 flex items-start gap-3 text-sm text-taupe">
+              <input
+                type="checkbox"
+                checked={furtherEnrichmentEnabled}
+                onChange={(event) => onFurtherEnrichmentEnabledChange(event.target.checked)}
+                className="mt-1 h-4 w-4 accent-bronze"
+              />
+              Enable Further Enrichment for rows with missing dimensions, missing images, or low confidence.
+            </label>
+            <Field label="Max cost cap for further enrichment">
+              <input
+                type="number"
+                min="0"
+                max="5"
+                step="0.01"
+                className="input-surface mt-3 h-10 w-full rounded-xl px-3 text-sm text-charcoal"
+                value={furtherEnrichmentBudgetUsd}
+                onChange={(event) => onFurtherEnrichmentBudgetUsdChange(clampBudgetUsd(Number.parseFloat(event.target.value)))}
+              />
+            </Field>
+            <dl className="mt-3 grid gap-2 text-xs text-taupe">
+              <SettingsDetail label="Rows currently eligible" value={String(furtherEnrichmentCandidateCount)} />
+              <SettingsDetail label="Estimated next run" value={formatUsd(furtherEnrichmentEstimatedCost, 4)} />
+              <SettingsDetail label="Writeback rule" value="Only blank/low-confidence fields; high-confidence values are preserved." />
+            </dl>
+          </div>
           <label className="mt-3 flex items-start gap-3 text-sm text-taupe">
             <input
               type="checkbox"
@@ -3715,6 +4415,257 @@ function SettingsDialog({
             <SettingsDetail label="Last reported cost" value={estimatedCost} />
             <SettingsDetail label="Budget display" value="Backend stops paid searches before this cap." />
           </dl>
+        </div>
+
+        <div className="mt-4 rounded-xl border border-linen bg-white p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-charcoal">Product Knowledge Base</h3>
+              {!isSimpleMode ? (
+                <p className="mt-1 text-sm text-taupe">
+                  Exact brand + model links are checked before Brave/API search, so repeated products can reuse dimensions, images, and source URLs.
+                </p>
+              ) : null}
+            </div>
+            <StatusBadge value={sourceMemoryBackend === "supabase" ? "Persistent DB" : "Runtime fallback"} />
+          </div>
+          <p className="mt-3 text-xs font-semibold text-bronze">{sourceMemoryStatus}</p>
+          <p className="mt-1 text-xs text-taupe">
+            {sourceMemoryBackend === "supabase"
+              ? `Persistent tables: ${(sourceMemoryAudit.tables || ["stored_product_sources", "preferred_source_domains"]).join(", ")}`
+              : sourceMemoryAudit.runtime_cache_persistence_note || "Runtime fallback is temporary unless Supabase is configured."}
+          </p>
+          <div className="mt-4 grid gap-2 sm:grid-cols-[1fr_180px]">
+            <input
+              className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+              value={sourceSearch}
+              onChange={(event) => onSourceSearchChange(event.target.value)}
+              placeholder="Search brand, model, domain, notes"
+            />
+            <select
+              className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+              value={sourceTypeFilter}
+              onChange={(event) => onSourceTypeFilterChange(event.target.value as SourceTypeFilter)}
+            >
+              {sourceTypeOptions.map((option) => (
+                <option key={option.value || "all-sources"} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </div>
+          <div className="mt-4 rounded-xl border border-linen bg-ivory/60 p-3">
+            <div className="grid gap-2 sm:grid-cols-2">
+              <input
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+                value={sourceForm.brand}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, brand: event.target.value }))}
+                placeholder="Brand"
+              />
+              <input
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+                value={sourceForm.model_sku}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, model_sku: event.target.value }))}
+                placeholder="Model / SKU"
+              />
+              <input
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal sm:col-span-2"
+                value={sourceForm.product_name}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, product_name: event.target.value }))}
+                placeholder="Product name / keyword"
+              />
+              <input
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal sm:col-span-2"
+                value={sourceForm.product_page_url}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, product_page_url: event.target.value }))}
+                placeholder="Product page URL"
+              />
+              <input
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal sm:col-span-2"
+                value={sourceForm.manufacturer_url}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, manufacturer_url: event.target.value }))}
+                placeholder="Manufacturer URL"
+              />
+              <input
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+                value={sourceForm.spec_sheet_url}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, spec_sheet_url: event.target.value }))}
+                placeholder="Spec sheet URL"
+              />
+              <input
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+                value={sourceForm.image_url}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, image_url: event.target.value }))}
+                placeholder="Image URL"
+              />
+              <input
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal sm:col-span-2"
+                value={sourceForm.dimension_source_url}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, dimension_source_url: event.target.value }))}
+                placeholder="Dimension source URL"
+              />
+              <input
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal sm:col-span-2"
+                value={sourceForm.dimensions}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, dimensions: event.target.value }))}
+                placeholder="Dimensions"
+              />
+              <input
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+                value={sourceForm.width_in}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, width_in: event.target.value }))}
+                placeholder="Width in"
+              />
+              <input
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+                value={sourceForm.height_in}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, height_in: event.target.value }))}
+                placeholder="Height in"
+              />
+              <input
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+                value={sourceForm.depth_in}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, depth_in: event.target.value }))}
+                placeholder="Depth in"
+              />
+              <select
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+                value={sourceForm.source_type}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, source_type: event.target.value as SourceTypeFilter }))}
+              >
+                {sourceTypeOptions.filter((option) => option.value).map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+              <input
+                className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal sm:col-span-2"
+                value={sourceForm.notes}
+                onChange={(event) => onSourceFormChange((current) => ({ ...current, notes: event.target.value }))}
+                placeholder="Notes"
+              />
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button type="button" className="btn-primary inline-flex h-9 items-center rounded-xl px-4 text-xs font-semibold" onClick={onSaveSource}>
+                {editingSourceId ? "Update source" : "Add source"}
+              </button>
+              {editingSourceId ? (
+                <button type="button" className="btn-secondary inline-flex h-9 items-center rounded-xl px-4 text-xs font-semibold" onClick={onCancelSourceEdit}>
+                  Cancel edit
+                </button>
+              ) : null}
+            </div>
+          </div>
+          <div className="mt-4 grid gap-2">
+            {storedSources.length ? storedSources.slice(0, 12).map((source) => (
+              <div key={String(source.id || `${source.brand}-${source.model_sku}-${source.product_page_url}`)} className="rounded-xl border border-linen bg-ivory/50 p-3">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="font-semibold text-charcoal">{source.display_brand || source.brand || "Unknown brand"} {source.display_model_sku || source.model_sku || ""}</div>
+                    <div className="mt-1 truncate text-xs text-taupe">{source.product_page_url || source.manufacturer_url || source.dimension_source_url || source.spec_sheet_url || "No URL saved"}</div>
+                    <div className="mt-2 flex flex-wrap gap-2 text-[11px] font-semibold uppercase tracking-[0.1em] text-taupe">
+                      <span>{source.source_type || "other"}</span>
+                      <span>{source.source_domain || "domain pending"}</span>
+                      <span>confidence {Number(source.confidence_score || 0)}</span>
+                      <span>success {Number(source.success_count || 0)}</span>
+                      <span>fail {Number(source.failure_count || 0)}</span>
+                      <span>verified {source.last_verified_at ? new Date(String(source.last_verified_at)).toLocaleDateString() : "never"}</span>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button type="button" className="btn-secondary rounded-xl px-3 py-2 text-xs font-semibold" onClick={() => onEditSource(source)}>Edit</button>
+                    <button type="button" className="btn-secondary rounded-xl px-3 py-2 text-xs font-semibold" onClick={() => onReverifySource(source)}>Re-verify</button>
+                    <button type="button" className="btn-secondary rounded-xl px-3 py-2 text-xs font-semibold" onClick={() => onDeleteSource(source)}>Delete</button>
+                  </div>
+                </div>
+                {source.dimensions_text || source.dimensions || source.image_url ? (
+                  <div className="mt-2 text-xs text-taupe">
+                    {source.dimensions_text || source.dimensions ? <span>Dimensions: {String(source.dimensions_text || source.dimensions)} </span> : null}
+                    {source.image_url ? <span>Image saved </span> : null}
+                    {source.dimension_confidence ? <span>Dimension confidence: {String(source.dimension_confidence)} </span> : null}
+                    {source.image_confidence ? <span>Image confidence: {String(source.image_confidence)}</span> : null}
+                  </div>
+                ) : null}
+              </div>
+            )) : (
+              <p className="rounded-xl border border-linen bg-ivory/50 p-3 text-sm text-taupe">No stored product sources yet.</p>
+            )}
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-xl border border-linen bg-ivory/70 p-4">
+          <h3 className="text-sm font-semibold text-charcoal">Preferred Source Domains</h3>
+          {!isSimpleMode ? (
+            <p className="mt-1 text-sm text-taupe">These domains are prioritized before broad search and down-ranked as failures accumulate.</p>
+          ) : null}
+          <div className="mt-4 grid gap-2 sm:grid-cols-[1fr_180px]">
+            <input
+              className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+              value={domainSearch}
+              onChange={(event) => onDomainSearchChange(event.target.value)}
+              placeholder="Search domain"
+            />
+            <select
+              className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+              value={domainTypeFilter}
+              onChange={(event) => onDomainTypeFilterChange(event.target.value as SourceTypeFilter)}
+            >
+              {sourceTypeOptions.map((option) => (
+                <option key={option.value || "all-domains"} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </div>
+          <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_170px]">
+            <input
+              className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+              value={domainForm.domain}
+              onChange={(event) => onDomainFormChange((current) => ({ ...current, domain: event.target.value }))}
+              placeholder="subzero-wolf.com"
+            />
+            <select
+              className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal"
+              value={domainForm.source_type}
+              onChange={(event) => onDomainFormChange((current) => ({ ...current, source_type: event.target.value as SourceTypeFilter }))}
+            >
+              {sourceTypeOptions.filter((option) => option.value).map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+            <input
+              className="input-surface h-10 rounded-xl px-3 text-sm text-charcoal sm:col-span-2"
+              value={domainForm.notes}
+              onChange={(event) => onDomainFormChange((current) => ({ ...current, notes: event.target.value }))}
+              placeholder="Notes"
+            />
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button type="button" className="btn-primary inline-flex h-9 items-center rounded-xl px-4 text-xs font-semibold" onClick={onSaveDomain}>
+              {editingDomainId ? "Update domain" : "Add domain"}
+            </button>
+            {editingDomainId ? (
+              <button type="button" className="btn-secondary inline-flex h-9 items-center rounded-xl px-4 text-xs font-semibold" onClick={onCancelDomainEdit}>
+                Cancel edit
+              </button>
+            ) : null}
+          </div>
+          <div className="mt-4 grid gap-2">
+            {preferredDomains.length ? preferredDomains.slice(0, 16).map((domain) => (
+              <div key={String(domain.id || domain.domain)} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-linen bg-white p-3">
+                <div>
+                  <div className="font-semibold text-charcoal">{domain.domain || "Unknown domain"}</div>
+                  <div className="mt-1 flex flex-wrap gap-2 text-[11px] font-semibold uppercase tracking-[0.1em] text-taupe">
+                    <span>{domain.source_type || "other"}</span>
+                    <span>success {Number(domain.success_count || 0)}</span>
+                    <span>fail {Number(domain.failure_count || 0)}</span>
+                    {domain.downranked ? <span>downranked</span> : null}
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button type="button" className="btn-secondary rounded-xl px-3 py-2 text-xs font-semibold" onClick={() => onEditDomain(domain)}>Edit</button>
+                  <button type="button" className="btn-secondary rounded-xl px-3 py-2 text-xs font-semibold" onClick={() => onDeleteDomain(domain)}>Delete</button>
+                </div>
+              </div>
+            )) : (
+              <p className="rounded-xl border border-linen bg-white p-3 text-sm text-taupe">No preferred domains saved yet.</p>
+            )}
+          </div>
         </div>
 
         <div className="mt-4 rounded-xl border border-linen bg-white p-4">

@@ -453,6 +453,25 @@ def test_parse_html_definition_list_two_axis_partial_kept():
     assert debug["dimension_parse_method"] == "definition_list_parts"
 
 
+def test_parse_html_keeps_scanning_after_partial_for_complete_dimensions():
+    html = """
+    <html><body>
+    <script type="application/ld+json">
+    {"@type":"Product","width":"30 in"}
+    </script>
+    <section>
+      <h2>Specifications</h2>
+      <p>Overall Dimensions: 30"W x 12"H x 24"D</p>
+    </section>
+    </body></html>
+    """
+    debug = {}
+    product_dims, _ = _parse_html_for_dimensions(html, debug=debug)
+    assert product_dims == '30"W x 12"H x 24"D'
+    assert debug["partial_dimensions_found"] == '30"W'
+    assert debug["dimension_parse_method"] == "visible_text"
+
+
 def test_parse_html_rejects_shipping_only_dimensions():
     html = """
     <html><body>
@@ -554,6 +573,18 @@ def test_parse_text_pages_stops_at_first_match_across_pages():
     product_dims, _ = _parse_text_pages_for_dimensions(pages)
     assert "36" in product_dims
     assert "50" not in product_dims
+
+
+def test_parse_text_pages_keeps_scanning_after_partial_for_complete_dimensions():
+    pages = [
+        "Specifications\nWidth: 30 in",
+        'Overall Dimensions: 30"W x 12"H x 24"D',
+    ]
+    debug = {}
+    product_dims, _ = _parse_text_pages_for_dimensions(pages, debug=debug)
+    assert product_dims == '30"W x 12"H x 24"D'
+    assert debug["partial_dimensions_found"] == '30"W'
+    assert debug["dimension_parse_method"] == "pdf_text"
 
 
 def test_parse_text_pages_shipping_not_used_when_product_found():

@@ -9,6 +9,7 @@ import re
 import sys
 import time
 import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,7 @@ from src.document_parser import parse_pdf_rows
 from src.dimensions import has_complete_3d_dimensions
 from src.eligibility import split_eligible_rows
 from src.export import get_csv_bytes
+from src.further_enrichment import further_enrich_dataframe, openai_integration_status
 from src.intake import build_intake_dataframe, create_pdf_rows, create_url_rows
 from src.intake_schema import CATEGORIES, STATUSES
 from src.image_uploader import is_public_https_image_url, upload_image
@@ -40,6 +42,7 @@ from src.notes import remove_notes_row_prefix
 from src.product_enrichment import enrich_dataframe, recover_images_for_dataframe
 from src.programa_export import (
     CANONICAL_SECTIONS,
+    append_source_links_to_notes_dataframe,
     build_programa_debug_dataframe,
     build_programa_import_dataframe,
     export_programa_csv,
@@ -48,6 +51,19 @@ from src.programa_export import (
     validate_for_export,
 )
 from src.runtime_storage import consume_storage_warnings
+from src.runtime_storage import runtime_data_path
+from src.source_memory import (
+    delete_preferred_domain,
+    delete_product_source,
+    list_preferred_domains,
+    list_product_sources,
+    reverify_product_source,
+    storage_backend_name,
+    update_preferred_domain,
+    update_product_source,
+    upsert_preferred_domain,
+    upsert_product_source,
+)
 from src.programa_automation import open_programa_login_window, run_programa_automation
 from src.vendor_call_agent import (
     build_call_script,
@@ -86,6 +102,11 @@ class RowsPayload(BaseModel):
     force_refresh: bool = False
     use_web_enrichment: bool = True
     enrichment_budget_usd: float = 0.25
+
+
+class FurtherEnrichmentPayload(RowsPayload):
+    further_enrichment_enabled: bool = False
+    further_enrichment_budget_usd: float = 0.25
 
 
 class ProgramaPayload(RowsPayload):
@@ -139,10 +160,56 @@ class ManufacturerOverridePayload(BaseModel):
     website: str = ""
 
 
+class StoredSourcePayload(BaseModel):
+    normalized_brand: str = ""
+    normalized_model_sku: str = ""
+    display_brand: str = ""
+    display_model_sku: str = ""
+    brand: str = ""
+    model_sku: str = ""
+    product_name: str = ""
+    product_page_url: str = ""
+    manufacturer_url: str = ""
+    spec_sheet_url: str = ""
+    image_url: str = ""
+    dimension_source_url: str = ""
+    image_source_url: str = ""
+    dimensions_text: str = ""
+    dimensions: str = ""
+    width_in: str | float | None = ""
+    height_in: str | float | None = ""
+    depth_in: str | float | None = ""
+    source_domain: str = ""
+    source_type: str = "manufacturer"
+    confidence_score: int = 80
+    dimension_confidence: str = ""
+    image_confidence: str = ""
+    notes: str = ""
+
+
+class PreferredDomainPayload(BaseModel):
+    domain: str = ""
+    source_type: str = "manufacturer"
+    notes: str = ""
+    downranked: bool = False
+
+
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    openai_status = openai_integration_status()
+    _log.info(
+        "[INTEGRATION_STATUS] OpenAI=%s model=%s",
+        openai_status["status"],
+        openai_status["model"],
+    )
+    yield
+
+
 app = FastAPI(
     title="SCH DesignOps Intake API",
     version="0.1.0",
     description="Extraction, enrichment, validation, export, and Programa automation API.",
+    lifespan=lifespan,
 )
 
 _origins = [
@@ -230,6 +297,12 @@ def _text_value(value: Any) -> str:
         return ""
     text = str(value).strip()
     return "" if text.lower() in {"nan", "none", "null"} else text
+
+
+def _payload_dict(payload: BaseModel) -> dict:
+    if hasattr(payload, "model_dump"):
+        return payload.model_dump(exclude_unset=True)
+    return payload.dict(exclude_unset=True)
 
 
 def _enrichment_summary(df: pd.DataFrame, elapsed_ms: float) -> dict:
@@ -333,6 +406,18 @@ def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/integrations/status")
+def integrations_status() -> dict:
+    return {
+        "openai": openai_integration_status(),
+        "further_enrichment": {
+            "available": True,
+            "default_enabled": False,
+            "requires": ["OPENAI_API_KEY"],
+        },
+    }
+
+
 @app.get("/schema")
 def schema() -> dict:
     return {
@@ -357,6 +442,127 @@ def schema() -> dict:
             "Notes",
         ],
     }
+
+
+@app.get("/settings/stored-sources")
+def get_stored_sources(query: str = "", source_type: str = "", limit: int = 100) -> dict:
+    return {
+        "storage_backend": storage_backend_name(),
+        "sources": list_product_sources(query=query, source_type=source_type, limit=limit),
+    }
+
+
+@app.get("/settings/product-knowledge-base")
+def get_product_knowledge_base(query: str = "", source_type: str = "", limit: int = 100) -> dict:
+    return get_stored_sources(query=query, source_type=source_type, limit=limit)
+
+
+@app.get("/settings/product-knowledge-base/audit")
+def product_knowledge_base_audit() -> dict:
+    configured_data_dir = os.getenv("SCH_DATA_DIR") or os.getenv("DATA_DIR") or ""
+    return {
+        "runtime_data_dir": str(runtime_data_path()),
+        "product_enrichment_cache_path": str(runtime_data_path("product_enrichment_cache.json")),
+        "manufacturer_domain_cache_path": str(runtime_data_path("manufacturer_domain_cache.json")),
+        "runtime_cache_persistent": bool(configured_data_dir),
+        "runtime_cache_persistence_note": (
+            "SCH_DATA_DIR/DATA_DIR is configured; persistence depends on that mounted storage."
+            if configured_data_dir
+            else "Runtime cache defaults to /tmp/sch-data and may disappear across deploys, restarts, or serverless instance changes."
+        ),
+        "product_knowledge_base_backend": storage_backend_name(),
+        "supabase_configured": storage_backend_name() == "supabase",
+        "required_env": ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "SOURCE_MEMORY_ENABLED"],
+        "tables": ["stored_product_sources", "preferred_source_domains"],
+    }
+
+
+@app.post("/settings/stored-sources")
+def save_stored_source(payload: StoredSourcePayload) -> dict:
+    try:
+        source = upsert_product_source(_payload_dict(payload))
+    except Exception as exc:
+        _log.exception("Could not save stored source")
+        raise HTTPException(status_code=500, detail=f"Could not save stored source: {exc}") from exc
+    return {"status": "saved", "storage_backend": storage_backend_name(), "source": source}
+
+
+@app.post("/settings/product-knowledge-base")
+def save_product_knowledge_source(payload: StoredSourcePayload) -> dict:
+    return save_stored_source(payload)
+
+
+@app.put("/settings/stored-sources/{source_id}")
+def edit_stored_source(source_id: str, payload: StoredSourcePayload) -> dict:
+    source = update_product_source(source_id, _payload_dict(payload))
+    if source is None:
+        raise HTTPException(status_code=404, detail="Stored source not found")
+    return {"status": "updated", "storage_backend": storage_backend_name(), "source": source}
+
+
+@app.put("/settings/product-knowledge-base/{source_id}")
+def edit_product_knowledge_source(source_id: str, payload: StoredSourcePayload) -> dict:
+    return edit_stored_source(source_id, payload)
+
+
+@app.delete("/settings/stored-sources/{source_id}")
+def remove_stored_source(source_id: str) -> dict:
+    deleted = delete_product_source(source_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Stored source not found")
+    return {"status": "deleted", "storage_backend": storage_backend_name()}
+
+
+@app.delete("/settings/product-knowledge-base/{source_id}")
+def remove_product_knowledge_source(source_id: str) -> dict:
+    return remove_stored_source(source_id)
+
+
+@app.post("/settings/stored-sources/{source_id}/reverify")
+def reverify_stored_source(source_id: str) -> dict:
+    source = reverify_product_source(source_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Stored source not found")
+    return {"status": "marked_for_reverify", "storage_backend": storage_backend_name(), "source": source}
+
+
+@app.post("/settings/product-knowledge-base/{source_id}/reverify")
+def reverify_product_knowledge_source(source_id: str) -> dict:
+    return reverify_stored_source(source_id)
+
+
+@app.get("/settings/preferred-domains")
+def get_preferred_domains(query: str = "", source_type: str = "", limit: int = 100) -> dict:
+    return {
+        "storage_backend": storage_backend_name(),
+        "domains": list_preferred_domains(query=query, source_type=source_type, limit=limit),
+    }
+
+
+@app.post("/settings/preferred-domains")
+def save_preferred_domain(payload: PreferredDomainPayload) -> dict:
+    try:
+        domain = upsert_preferred_domain(_payload_dict(payload))
+    except Exception as exc:
+        _log.exception("Could not save preferred domain")
+        raise HTTPException(status_code=500, detail=f"Could not save preferred domain: {exc}") from exc
+    return {"status": "saved", "storage_backend": storage_backend_name(), "domain": domain}
+
+
+@app.put("/settings/preferred-domains/{domain_id}")
+def edit_preferred_domain(domain_id: str, payload: PreferredDomainPayload) -> dict:
+    domain = update_preferred_domain(domain_id, _payload_dict(payload))
+    if domain is None:
+        raise HTTPException(status_code=404, detail="Preferred domain not found")
+    return {"status": "updated", "storage_backend": storage_backend_name(), "domain": domain}
+
+
+@app.delete("/settings/preferred-domains/{domain_id}")
+def remove_preferred_domain(domain_id: str) -> dict:
+    deleted = delete_preferred_domain(domain_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Preferred domain not found")
+    return {"status": "deleted", "storage_backend": storage_backend_name()}
 
 
 @app.post("/intake/generate", response_model=IntakeResponse)
@@ -526,6 +732,7 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
             enrichment_budget_usd=payload.enrichment_budget_usd,
         )
         df = apply_confidence_checks(df)
+        df = append_source_links_to_notes_dataframe(df)
         elapsed_ms = _elapsed_ms(start)
         summary = _enrichment_summary(df, elapsed_ms)
         storage_warnings = consume_storage_warnings()
@@ -591,6 +798,83 @@ def enrich_intake(payload: RowsPayload) -> IntakeResponse:
         )
 
 
+@app.post("/intake/further-enrich", response_model=IntakeResponse)
+def further_enrich_intake(payload: FurtherEnrichmentPayload) -> IntakeResponse:
+    start = time.perf_counter()
+    _log_stage(
+        "FURTHER_ENRICHMENT_STARTED",
+        rows=len(payload.rows),
+        enabled=payload.further_enrichment_enabled,
+        cap=payload.further_enrichment_budget_usd,
+    )
+    try:
+        result = further_enrich_dataframe(
+            pd.DataFrame(payload.rows),
+            enabled=payload.further_enrichment_enabled,
+            max_cost_usd=payload.further_enrichment_budget_usd,
+        )
+        df = apply_confidence_checks(result.dataframe)
+        df = append_source_links_to_notes_dataframe(df)
+        elapsed_ms = _elapsed_ms(start)
+        summary = _enrichment_summary(df, elapsed_ms)
+        storage_warnings = consume_storage_warnings()
+        if storage_warnings:
+            summary["storage_warnings"] = storage_warnings
+        _log_stage(
+            "FURTHER_ENRICHMENT_COMPLETE",
+            rows=len(df),
+            errors=len(result.errors),
+            elapsed_ms=elapsed_ms,
+        )
+        return _df_response(
+            df,
+            result.errors,
+            result.diagnostics,
+            stage_timings={
+                **summary,
+                **result.stage_timings,
+                "further_enrichment_ms": elapsed_ms,
+                "stage_log": "FURTHER_ENRICHMENT_STARTED; FURTHER_ENRICHMENT_COMPLETE",
+            },
+        )
+    except Exception as exc:
+        tb = traceback.format_exc()
+        message = f"Further enrichment failed before completion: {exc}"
+        _log.exception("FURTHER_ENRICHMENT_FAILED_BEFORE_COMPLETION")
+        df = pd.DataFrame(payload.rows).copy()
+        for col in ("further_enrichment_status", "further_enrichment_error", "debug_traceback", "stage_log"):
+            if col not in df.columns:
+                df[col] = ""
+        if len(df) == 0:
+            df = pd.DataFrame(
+                [
+                    {
+                        "Product Name": "",
+                        "further_enrichment_status": "failed",
+                        "further_enrichment_error": message,
+                        "debug_traceback": tb,
+                        "stage_log": "FURTHER_ENRICHMENT_STARTED; FURTHER_ENRICHMENT_COMPLETE",
+                    }
+                ]
+            )
+        else:
+            df["further_enrichment_status"] = "failed"
+            df["further_enrichment_error"] = message
+            df["debug_traceback"] = tb
+            df["stage_log"] = "FURTHER_ENRICHMENT_STARTED; FURTHER_ENRICHMENT_COMPLETE"
+        elapsed_ms = _elapsed_ms(start)
+        return _df_response(
+            df,
+            [message],
+            [{"stage": "FURTHER_ENRICHMENT_FAILED", "failure_reason": message, "traceback": tb}],
+            stage_timings={
+                "further_enrichment_ms": elapsed_ms,
+                "total_request_ms": elapsed_ms,
+                "stage_log": "FURTHER_ENRICHMENT_STARTED; FURTHER_ENRICHMENT_COMPLETE",
+            },
+        )
+
+
 @app.post("/intake/recover-images", response_model=IntakeResponse)
 def recover_images(payload: RowsPayload) -> IntakeResponse:
     """Run a targeted image recovery pass on rows that are missing Image URL.
@@ -603,6 +887,7 @@ def recover_images(payload: RowsPayload) -> IntakeResponse:
     _log_stage("SEARCHING_IMAGES", rows=len(payload.rows))
     df, diagnostics = recover_images_for_dataframe(pd.DataFrame(payload.rows))
     df = apply_confidence_checks(df)
+    df = append_source_links_to_notes_dataframe(df)
     _log_stage("ENRICHMENT_COMPLETE", rows=len(df), image_recovery_ms=_elapsed_ms(start))
     return _df_response(
         df,

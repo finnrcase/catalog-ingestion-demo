@@ -39,6 +39,14 @@ from src.product_image_extraction import (
     select_best_product_image,
     top_candidate_diagnostics,
 )
+from src.source_memory import (
+    apply_product_source_to_row,
+    increment_source_failure,
+    lookup_product_source,
+    preferred_domain_hint,
+    save_successful_source_from_row,
+    storage_backend_name,
+)
 
 try:
     import html2text as _html2text
@@ -151,10 +159,30 @@ _ENRICHMENT_DEBUG_FIELDS: list[str] = [
     "selected_image_url",
     "fields_filled",
     "budget_spent",
+    "pages_found",
+    "pages_fully_parsed",
+    "dimensions_successfully_extracted",
+    "dimensions_blocked_by_budget",
+    "dimensions_blocked_by_parser",
+    "spec_sheets_found",
+    "spec_sheets_parsed",
+    "image_only_success",
     "duplicate_model_skipped",
     "duplicate_model_source_index",
     "searches_avoided",
     "useful_fields_found",
+    "stored_source_hit",
+    "stored_source_used",
+    "stored_source_updated",
+    "stored_source_rejected_reason",
+    "source_memory_backend",
+    "duplicate_searches_avoided_from_cache",
+    "knowledge_base_hit",
+    "knowledge_base_miss",
+    "knowledge_base_source_used",
+    "knowledge_base_updated",
+    "knowledge_base_rejected_reason",
+    "preferred_domain_used",
 ]
 
 MIN_USE_SCORE = 40   # below this: skip entirely, note in Notes
@@ -1188,10 +1216,30 @@ def _dimension_debug_defaults(row: dict) -> dict:
         "selected_image_url": "",
         "fields_filled": "",
         "budget_spent": "",
+        "pages_found": 0,
+        "pages_fully_parsed": 0,
+        "dimensions_successfully_extracted": False,
+        "dimensions_blocked_by_budget": False,
+        "dimensions_blocked_by_parser": False,
+        "spec_sheets_found": 0,
+        "spec_sheets_parsed": 0,
+        "image_only_success": False,
         "duplicate_model_skipped": False,
         "duplicate_model_source_index": "",
         "searches_avoided": 0,
         "useful_fields_found": "",
+        "stored_source_hit": False,
+        "stored_source_used": "",
+        "stored_source_updated": False,
+        "stored_source_rejected_reason": "",
+        "source_memory_backend": storage_backend_name(),
+        "duplicate_searches_avoided_from_cache": 0,
+        "knowledge_base_hit": False,
+        "knowledge_base_miss": False,
+        "knowledge_base_source_used": "",
+        "knowledge_base_updated": False,
+        "knowledge_base_rejected_reason": "",
+        "preferred_domain_used": "",
     }
     debug.update(_image_debug_defaults())
     return debug
@@ -1657,6 +1705,8 @@ def _try_verified_page_enrichment(
             updated.update(image_debug)
             debug["selected_image_url"] = image_url
             fields_filled.append("Image URL")
+            if _needs_dimension_recovery(updated):
+                debug["image_only_success"] = True
 
     debug["fields_filled"] = ", ".join(dict.fromkeys(fields_filled))
     debug["budget_spent"] = _budget_summary(budget)
@@ -1670,6 +1720,24 @@ def _try_verified_page_enrichment(
         image_debug=image_debug,
         dim_result=dim_result,
     )
+    try:
+        saved_source = save_successful_source_from_row(updated, notes="Verified product page enrichment.")
+        if saved_source:
+            debug["stored_source_updated"] = True
+            debug["knowledge_base_updated"] = True
+            debug["stored_source_used"] = (
+                debug.get("stored_source_used")
+                or saved_source.get("product_page_url")
+                or saved_source.get("manufacturer_url")
+                or saved_source.get("dimension_source_url")
+                or saved_source.get("spec_sheet_url")
+                or saved_source.get("image_source_url")
+                or ""
+            )
+            debug["knowledge_base_source_used"] = debug["stored_source_used"]
+    except Exception as exc:
+        debug["stored_source_rejected_reason"] = f"source memory save failed: {exc}"
+        debug["knowledge_base_rejected_reason"] = debug["stored_source_rejected_reason"]
     return updated, dim_result, debug
 
 
@@ -1731,33 +1799,13 @@ def enrich_row(
                     original = _str_val(updated.get("Source Type", ""))
                     if not original.endswith("_Enriched"):
                         updated["Source Type"] = f"{original}_Enriched" if original else "Enriched"
-                    # Image is not an essential cache field. If it is missing,
-                    # exploit the known product URL deterministically instead of
-                    # letting a full cache hit block fresh image recovery.
-                    if _needs_image_recovery(updated):
-                        product_url = _str_val(updated.get("Product URL"))
-                        if product_url:
-                            enrichment_debug["fresh_extraction_forced"] = True
-                            img, image_debug = _unpack_image_result(
-                                _try_image_from_url(
-                                    product_url,
-                                    cache_key,
-                                    session_cache=session_cache,
-                                    budget=budget,
-                                    row=updated,
-                                    return_debug=True,
-                                )
-                            )
-                            enrichment_debug.update(image_debug)
-                            if img:
-                                updated["Image URL"] = img
-                                updated.update(image_debug)
                     product_url = _str_val(updated.get("Product URL"))
                     needs_cached_page_exploit = bool(product_url) and (
                         _needs_dimension_recovery(updated)
                         or _needs_image_recovery(updated)
                     )
                     if needs_cached_page_exploit:
+                        enrichment_debug["fresh_extraction_forced"] = True
                         domain_match_for_cache = get_domain_for_brand(brand)
                         verified_updated, verified_dim_result, verified_debug = _try_verified_page_enrichment(
                             updated,
@@ -1810,8 +1858,65 @@ def enrich_row(
         else:
             enrichment_debug["cache_hit"] = "unavailable"
 
+        stored_source = None
+        if cache_key and not force_refresh:
+            try:
+                stored_source = lookup_product_source(brand, model_sku)
+            except Exception as exc:
+                enrichment_debug["stored_source_rejected_reason"] = f"source memory lookup failed: {exc}"
+                enrichment_debug["knowledge_base_rejected_reason"] = enrichment_debug["stored_source_rejected_reason"]
+                stored_source = None
+            if stored_source:
+                before_missing = set(_missing_enrichment_fields(row))
+                row, source_fields_filled = apply_product_source_to_row(row, stored_source)
+                after_missing = set(_missing_enrichment_fields(row))
+                enrichment_debug["stored_source_hit"] = True
+                enrichment_debug["stored_source_used"] = _str_val(row.get("stored_source_used"))
+                enrichment_debug["knowledge_base_hit"] = True
+                enrichment_debug["knowledge_base_source_used"] = enrichment_debug["stored_source_used"]
+                enrichment_debug["cache_hit"] = "stored_source"
+                enrichment_debug["fields_filled"] = ", ".join(dict.fromkeys(cache_fields_filled + source_fields_filled))
+                enrichment_debug["searches_avoided"] = max(1, int(enrichment_debug.get("searches_avoided") or 0))
+                enrichment_debug["duplicate_searches_avoided_from_cache"] = 1
+                if after_missing and before_missing != after_missing and (
+                    _needs_dimension_recovery(row) or _needs_image_recovery(row)
+                ):
+                    enrichment_debug["fresh_extraction_forced"] = True
+                try:
+                    save_successful_source_from_row(row, notes="Stored source reused before paid search.")
+                except Exception as exc:
+                    enrichment_debug["stored_source_rejected_reason"] = f"source memory reuse update failed: {exc}"
+                    enrichment_debug["knowledge_base_rejected_reason"] = enrichment_debug["stored_source_rejected_reason"]
+                if not _needs_dimension_recovery(row) and not _needs_image_recovery(row):
+                    updated = row.copy()
+                    original = _str_val(updated.get("Source Type", ""))
+                    if not original.endswith("_Enriched"):
+                        updated["Source Type"] = f"{original}_Enriched" if original else "Enriched"
+                    _append_stage(enrichment_debug, "ENRICHMENT_COMPLETE")
+                    return _stamp_dimension_debug(
+                        updated,
+                        {
+                            **enrichment_debug,
+                            "skipped_reason": "stored source cache hit",
+                            "enrichment_status": _classify_enrichment_status(updated),
+                            "enrichment_error": "",
+                        },
+                    ), None, None
+            else:
+                enrichment_debug["knowledge_base_miss"] = True
+
         domain_match = get_domain_for_brand(brand)
         manufacturer_domain = domain_match[0] if domain_match else ""
+        if not manufacturer_domain:
+            try:
+                manufacturer_domain = preferred_domain_hint(brand, _str_val(row.get("Product Category")))
+                if manufacturer_domain:
+                    enrichment_debug["manufacturer_domain_used"] = manufacturer_domain
+                    enrichment_debug["stored_source_used"] = enrichment_debug.get("stored_source_used") or f"preferred-domain:{manufacturer_domain}"
+                    enrichment_debug["preferred_domain_used"] = manufacturer_domain
+            except Exception as exc:
+                enrichment_debug["stored_source_rejected_reason"] = f"preferred domain hint failed: {exc}"
+                enrichment_debug["knowledge_base_rejected_reason"] = enrichment_debug["stored_source_rejected_reason"]
         cached_or_existing_product_url = _str_val(row.get("Product URL"))
         if cached_or_existing_product_url and (
             _needs_dimension_recovery(row) or _needs_image_recovery(row)
@@ -1852,10 +1957,22 @@ def enrich_row(
                 verified_updated,
                 {**enrichment_debug, "enrichment_status": "complete", "enrichment_error": ""},
             ), None, verified_dim_result
+        if stored_source and _str_val(row.get("Product URL")) and not _str_val(enrichment_debug.get("selected_product_url")):
+            try:
+                increment_source_failure(
+                    brand,
+                    model_sku,
+                    _str_val(row.get("Product URL")),
+                    _str_val(enrichment_debug.get("skipped_reason")) or "stored source did not verify during extraction",
+                )
+            except Exception as exc:
+                enrichment_debug["stored_source_rejected_reason"] = f"source memory failure update failed: {exc}"
+                enrichment_debug["knowledge_base_rejected_reason"] = enrichment_debug["stored_source_rejected_reason"]
 
         # Legacy fallback: If cache (or the row itself) gives us a Product URL but
-        # the verified-page pass could not accept it, still try the older
-        # deterministic image-only path before generic search.
+        # the verified-page pass could not accept it, still exploit that URL in
+        # Programa priority order: dimensions first, image second.
+        legacy_dim_result: _DimensionResult | None = None
         if cached_or_existing_product_url and (
             _needs_dimension_recovery(row) or _needs_image_recovery(row)
         ):
@@ -1866,6 +1983,25 @@ def enrich_row(
                 )
             ):
                 enrichment_debug["fresh_extraction_forced"] = True
+            if _needs_dimension_recovery(row):
+                _append_stage(enrichment_debug, "SEARCHING_DIMENSIONS")
+                legacy_dim_result = _find_dimensions(row, session_cache=session_cache, budget=budget)
+                enrichment_debug.update(legacy_dim_result.debug or {})
+                if legacy_dim_result.status == "found" and legacy_dim_result.confidence in ("high", "medium"):
+                    row = row.copy()
+                    row["Dimensions"] = legacy_dim_result.dimensions
+                    if legacy_dim_result.width:
+                        row["Width (in)"] = legacy_dim_result.width
+                    if legacy_dim_result.height:
+                        row["Height (in)"] = legacy_dim_result.height
+                    if legacy_dim_result.depth:
+                        row["Depth (in)"] = legacy_dim_result.depth
+                    if legacy_dim_result.length:
+                        row["Length (in)"] = legacy_dim_result.length
+                    row["Dimension Source URL"] = legacy_dim_result.source_url
+                    row["Dimension Confidence"] = legacy_dim_result.confidence
+                    row["Dimension Source Type"] = legacy_dim_result.source_type
+                    row["Dimension Lookup Status"] = legacy_dim_result.status
             if _needs_image_recovery(row):
                 img, image_debug = _unpack_image_result(
                     _try_image_from_url(
@@ -1880,6 +2016,8 @@ def enrich_row(
                 enrichment_debug.update(image_debug)
                 if img:
                     row = {**row, **image_debug, "Image URL": img}
+                    if _needs_dimension_recovery(row):
+                        enrichment_debug["image_only_success"] = True
 
         # Fast mode: if manufacturer domain is known, skip general Brave search
         # (dimension lookup will handle targeted search via the known domain)
@@ -1968,7 +2106,7 @@ def enrich_row(
         brand_val = _str_val(updated.get("Brand"))
         model_val = _str_val(updated.get("Model/SKU"))
         dims_val = _str_val(updated.get("Dimensions"))
-        dim_result: _DimensionResult | None = None
+        dim_result: _DimensionResult | None = legacy_dim_result
         if brand_val and model_val and not has_complete_3d_dimensions(dims_val):
             _append_stage(enrichment_debug, "SEARCHING_DIMENSIONS")
             dim_result = _find_dimensions(updated, session_cache=session_cache, budget=budget)
@@ -2021,6 +2159,24 @@ def enrich_row(
             )
 
         _append_stage(enrichment_debug, "ENRICHMENT_COMPLETE")
+        try:
+            saved_source = save_successful_source_from_row(updated, notes="Enrichment result saved after fallback extraction.")
+            if saved_source:
+                enrichment_debug["stored_source_updated"] = True
+                enrichment_debug["knowledge_base_updated"] = True
+                enrichment_debug["stored_source_used"] = (
+                    enrichment_debug.get("stored_source_used")
+                    or saved_source.get("product_page_url")
+                    or saved_source.get("manufacturer_url")
+                    or saved_source.get("dimension_source_url")
+                    or saved_source.get("spec_sheet_url")
+                    or saved_source.get("image_source_url")
+                    or ""
+                )
+                enrichment_debug["knowledge_base_source_used"] = enrichment_debug["stored_source_used"]
+        except Exception as exc:
+            enrichment_debug["stored_source_rejected_reason"] = f"source memory save failed: {exc}"
+            enrichment_debug["knowledge_base_rejected_reason"] = enrichment_debug["stored_source_rejected_reason"]
         return _stamp_dimension_debug(
             updated,
             _merge_preserved_debug(

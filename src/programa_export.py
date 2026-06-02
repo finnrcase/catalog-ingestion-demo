@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import io
 import re
+import urllib.parse
 import zipfile
 
 import pandas as pd
@@ -99,6 +100,15 @@ _DEBUG_EXTRA_COLUMNS: list[str] = [
 _MATERIAL_TAG_RE = re.compile(r"\[Materials:\s*([^\]]+)\]", re.IGNORECASE)
 _SYSTEM_TAG_RE = re.compile(r"\[[^\]]*\]")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_HTTP_URL_RE = re.compile(r"https?://[^\s,)\]\"']+", re.IGNORECASE)
+_SOURCE_LINKS_BLOCK_RE = re.compile(
+    r"(?:\n{2,})?(?:Source links:\n.*|No verified source found during enrichment\.)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_TECHNICAL_NOISE_RE = re.compile(
+    r"\b(?:invalid ipv6|traceback|stack trace|api key|secret|token|httpx|exception)\b",
+    re.IGNORECASE,
+)
 _PHONE_RE = re.compile(r"(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}\b")
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
 _URL_WEAK_PAGE_RE = re.compile(
@@ -239,8 +249,180 @@ def _extract_material_from_notes(notes: str) -> str:
 def _clean_notes(notes: str) -> str:
     """Strip all [...] system tags and leading row-number prefixes from notes."""
     text = _SYSTEM_TAG_RE.sub("", notes)
+    text = _SOURCE_LINKS_BLOCK_RE.sub("", text)
+    text = " ".join(
+        part.strip()
+        for part in re.split(r"[\r\n]+", text)
+        if part.strip() and not _TECHNICAL_NOISE_RE.search(part)
+    )
     text = re.sub(r"\s{2,}", " ", text).strip()
     return remove_notes_row_prefix(text)
+
+
+def _first_url(value: object) -> str:
+    """Return the first clean http(s) URL from a cell/debug value."""
+    text = _str_val(value)
+    if not text:
+        return ""
+    match = _HTTP_URL_RE.search(text)
+    if match:
+        text = match.group(0)
+    if not text.lower().startswith(("http://", "https://")):
+        return ""
+    text = text.rstrip(".,;")
+    try:
+        parsed = urllib.parse.urlparse(text)
+    except Exception:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    if any(bad in text.lower() for bad in ("traceback", "invalid ipv6", "api key", "secret")):
+        return ""
+    return text
+
+
+def _first_url_from_fields(row: dict, fields: tuple[str, ...]) -> str:
+    for field in fields:
+        url = _first_url(row.get(field))
+        if url:
+            return url
+    return ""
+
+
+def _source_label_parts(*values: object) -> str:
+    parts: list[str] = []
+    for value in values:
+        text = _str_val(value)
+        if not text or text.lower() in {"none", "null", "nan"}:
+            continue
+        text = text.replace("_", " ").strip()
+        if text.lower() in {"high", "medium", "low"}:
+            text = f"{text.lower()} confidence"
+        if text.lower() in {part.lower() for part in parts}:
+            continue
+        parts.append(text)
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def _manufacturer_url(row: dict) -> str:
+    explicit = _first_url_from_fields(row, ("manufacturer_url", "Manufacturer URL", "manufacturer_source_url"))
+    if explicit:
+        return explicit
+    domain = _str_val(row.get("manufacturer_domain_used") or row.get("Manufacturer Domain"))
+    if not domain:
+        return ""
+    domain = domain.strip().lower()
+    domain = re.sub(r"^https?://", "", domain).strip("/")
+    if "." not in domain or any(ch.isspace() for ch in domain):
+        return ""
+    return f"https://{domain}"
+
+
+def _build_source_notes_block(row: dict) -> str:
+    """Build a clean, user-facing source summary for Programa Notes."""
+    dimensions = _str_val(row.get("Dimensions"))
+    image_url = _str_val(row.get("Image URL"))
+
+    dimension_url = _first_url_from_fields(row, (
+        "Dimension Source URL",
+        "dimension_source_url",
+        "dimension_source",
+        "dimensions_source_url",
+    ))
+    image_source_url = _first_url_from_fields(row, (
+        "image_source_url",
+        "Image Source URL",
+        "selected_image_url",
+        "original_image_url",
+        "cloudinary_url",
+        "Image URL",
+    ))
+    product_page_url = _first_url_from_fields(row, (
+        "Product URL",
+        "selected_product_url",
+        "product_url",
+        "product_page_url",
+    ))
+    if product_page_url and (_product_url_rejection_reason(product_page_url, row) or _is_pdf_url(product_page_url)):
+        product_page_url = ""
+
+    spec_sheet_url = _first_url_from_fields(row, (
+        "spec_sheet_url",
+        "Spec Sheet URL",
+        "spec_pdf_url",
+        "Spec PDF URL",
+    ))
+    if not spec_sheet_url:
+        for field in ("Dimension Source URL", "dimension_source_url", "Product URL", "selected_product_url"):
+            candidate = _first_url(row.get(field))
+            if candidate and _is_pdf_url(candidate):
+                spec_sheet_url = candidate
+                break
+
+    manufacturer_url = _manufacturer_url(row)
+    likely_dimension_source = dimension_url or spec_sheet_url or product_page_url
+    likely_image_source = image_source_url or product_page_url
+
+    lines: list[str] = []
+    if has_complete_3d_dimensions(dimensions) and dimension_url:
+        lines.append(
+            "Dimensions source: "
+            f"{dimension_url}{_source_label_parts(row.get('Dimension Source Type'), row.get('Dimension Confidence') or row.get('dimension_confidence'))}"
+        )
+    elif not has_complete_3d_dimensions(dimensions) and likely_dimension_source:
+        lines.append(
+            "Dimensions missing — check source: "
+            f"{likely_dimension_source}{_source_label_parts(row.get('Dimension Source Type'), row.get('Dimension Confidence') or row.get('dimension_confidence'))}"
+        )
+
+    if _is_public_https_image_url(image_url) and image_source_url:
+        lines.append(
+            "Image source: "
+            f"{image_source_url}{_source_label_parts(row.get('image_confidence'))}"
+        )
+    elif not _is_public_https_image_url(image_url) and likely_image_source:
+        lines.append(
+            "Image missing — check source: "
+            f"{likely_image_source}{_source_label_parts(row.get('image_confidence'))}"
+        )
+
+    if product_page_url:
+        lines.append(
+            "Product page: "
+            f"{product_page_url}{_source_label_parts(row.get('selected_product_url_confidence') or row.get('product_url_confidence'))}"
+        )
+    if spec_sheet_url:
+        lines.append(f"Spec sheet: {spec_sheet_url}")
+    if manufacturer_url:
+        lines.append(f"Manufacturer: {manufacturer_url}")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        if line not in seen:
+            seen.add(line)
+            deduped.append(line)
+    if deduped:
+        return "Source links:\n" + "\n".join(deduped)
+    return "No verified source found during enrichment."
+
+
+def append_source_links_to_notes(row: dict) -> dict:
+    """Return row copy with a source-link Notes block appended for user recovery."""
+    updated = dict(row)
+    base_notes = _clean_notes(_str_val(updated.get("Notes")))
+    source_block = _build_source_notes_block(updated)
+    updated["Notes"] = f"{base_notes}\n\n{source_block}".strip() if base_notes else source_block
+    return updated
+
+
+def append_source_links_to_notes_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Append source-link notes for frontend preview rows without changing columns."""
+    df = df.copy()
+    if "Notes" not in df.columns:
+        df["Notes"] = ""
+    rows = [append_source_links_to_notes(row) for row in df.fillna("").to_dict("records")]
+    return pd.DataFrame(rows, columns=list(df.columns))
 
 
 def _to_row_list(rows) -> list[dict]:
@@ -557,11 +739,13 @@ def _quantity_value(value):
 
 def _row_to_programa_dict(row: dict) -> dict:
     """Map one internal intake row to Programa's import columns."""
+    raw_notes = _str_val(row.get("Notes"))
+    material = _str_val(row.get("Material")) or _extract_material_from_notes(raw_notes)
+    row = append_source_links_to_notes(row)
     dimensions = "" if _dimension_rejection_reason(row) else _str_val(row.get("Dimensions"))
     parts = extract_labeled_dimensions(dimensions)
     finish_color = _str_val(row.get("Finish / Color"))
     color = _str_val(row.get("Color"))
-    material = _str_val(row.get("Material")) or _extract_material_from_notes(_str_val(row.get("Notes")))
 
     return {
         "Section": normalize_section(row.get("Product Category") or row.get("Section")),
@@ -583,7 +767,7 @@ def _row_to_programa_dict(row: dict) -> dict:
         "Color": color,
         "Material": material,
         "Lead Time": _str_val(row.get("Lead Time")),
-        "Notes": _clean_notes(_str_val(row.get("Notes"))),
+        "Notes": _str_val(row.get("Notes")),
         "Location": _str_val(row.get("Room")),
     }
 
@@ -741,6 +925,20 @@ def export_programa_xlsx(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Programa Import")
+        ws = writer.book["Programa Import"]
+        headers = [cell.value for cell in ws[1]]
+        hyperlink_columns = {"Product URL", "Image URL", "Notes"}
+        for header in hyperlink_columns:
+            if header not in headers:
+                continue
+            col_idx = headers.index(header) + 1
+            for row_idx in range(2, ws.max_row + 1):
+                cell = ws.cell(row_idx, col_idx)
+                url = _first_url(cell.value)
+                if not url:
+                    continue
+                cell.hyperlink = url
+                cell.style = "Hyperlink"
     return buf.getvalue()
 
 

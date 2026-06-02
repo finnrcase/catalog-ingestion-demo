@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 import datetime
+from pathlib import Path
 
 from backend.main import app
 
@@ -62,6 +63,75 @@ def test_health_endpoint():
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_integrations_status_reports_openai_without_key(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    response = client.get("/integrations/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["openai"]["status"] == "Not Configured"
+    assert data["openai"]["configured"] is False
+    assert "model" in data["openai"]
+    assert "sk-" not in response.text
+
+
+def test_integrations_status_reports_openai_connected_without_exposing_key(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret-should-not-leak")
+
+    response = client.get("/integrations/status")
+
+    assert response.status_code == 200
+    text = response.text
+    data = response.json()
+    assert data["openai"]["status"] == "Connected"
+    assert data["openai"]["configured"] is True
+    assert "sk-test-secret-should-not-leak" not in text
+
+
+def test_settings_source_memory_endpoints(monkeypatch, tmp_path):
+    import src.source_memory as sm
+
+    monkeypatch.setattr(sm, "_SOURCE_MEMORY_ENABLED", True)
+    monkeypatch.setattr(sm, "_supabase_configured", lambda: False)
+    monkeypatch.setattr(sm, "_PRODUCT_SOURCE_PATH", Path(tmp_path / "stored_product_sources.json"))
+    monkeypatch.setattr(sm, "_PREFERRED_DOMAIN_PATH", Path(tmp_path / "preferred_source_domains.json"))
+
+    response = client.post(
+        "/settings/stored-sources",
+        json={
+            "brand": "Wolf",
+            "model_sku": "WWD30",
+            "product_page_url": "https://www.subzero-wolf.com/wolf/wwd30",
+            "dimensions": '30"W x 10"H x 23"D',
+            "image_url": "https://res.cloudinary.com/demo/wolf_wwd30.jpg",
+            "source_type": "manufacturer",
+            "confidence_score": 90,
+        },
+    )
+    assert response.status_code == 200
+    source = response.json()["source"]
+    assert source["normalized_brand"] == "wolf"
+
+    response = client.get("/settings/stored-sources?query=wwd30")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["storage_backend"] == "local_json"
+    assert len(data["sources"]) == 1
+
+    response = client.post(
+        "/settings/preferred-domains",
+        json={"domain": "https://www.subzero-wolf.com/products", "source_type": "manufacturer"},
+    )
+    assert response.status_code == 200
+    domain = response.json()["domain"]
+    assert domain["domain"] == "subzero-wolf.com"
+
+    response = client.get("/settings/preferred-domains?query=subzero")
+    assert response.status_code == 200
+    assert response.json()["domains"][0]["domain"] == "subzero-wolf.com"
 
 
 def test_upload_image_endpoint_returns_secure_url(monkeypatch):

@@ -20,6 +20,10 @@ def _isolate_caches(monkeypatch, tmp_path):
     # Prevent manufacturer domain discovery from touching shared runtime cache state.
     monkeypatch.setattr("src.product_enrichment.get_domain_for_brand", lambda brand: None)
     monkeypatch.setattr("src.product_enrichment.record_discovered_domain", lambda brand, domain: None)
+    monkeypatch.setattr("src.product_enrichment.lookup_product_source", lambda brand, model: None)
+    monkeypatch.setattr("src.product_enrichment.save_successful_source_from_row", lambda row, notes="": None)
+    monkeypatch.setattr("src.product_enrichment.increment_source_failure", lambda brand, model, source_url="", reason="": None)
+    monkeypatch.setattr("src.product_enrichment.storage_backend_name", lambda: "test")
     # Isolate ProductEnrichmentCache singleton — redirect _path so _save() never hits real file
     fresh_cache = ProductEnrichmentCache()
     fresh_cache._data = {}
@@ -733,6 +737,41 @@ def test_enrich_row_cached_blank_dimensions_force_fresh_product_url_extraction(m
     assert updated["cache_had_blank_dimensions"] is True
     assert updated["cache_had_blank_image"] is True
     assert updated["fresh_extraction_forced"] is True
+
+
+def test_enrich_row_stored_source_hit_skips_paid_search(monkeypatch):
+    stored_source = {
+        "brand": "Wolf",
+        "model_sku": "MDD30TS",
+        "product_page_url": "https://www.subzero-wolf.com/wolf/microwaves/mdd30ts",
+        "dimension_source_url": "https://www.subzero-wolf.com/specs/mdd30ts.pdf",
+        "image_url": "https://res.cloudinary.com/demo/image/upload/wolf_mdd30ts.jpg",
+        "dimensions": '30"W x 15"H x 17"D',
+        "width_in": "30",
+        "height_in": "15",
+        "depth_in": "17",
+        "source_domain": "subzero-wolf.com",
+        "source_type": "manufacturer",
+        "confidence": "high",
+        "confidence_score": 92,
+    }
+
+    monkeypatch.setattr("src.product_enrichment.lookup_product_source", lambda brand, model: stored_source)
+    monkeypatch.setattr("src.product_enrichment.save_successful_source_from_row", lambda row, notes="": stored_source)
+
+    with patch("src.product_enrichment.search_product_candidates") as mock_search, \
+         patch("src.product_enrichment._fetch_page_html") as mock_fetch:
+        updated, error, _ = enrich_row(_qualifying_row(), enrichment_mode="fast")
+
+    assert error is None
+    mock_search.assert_not_called()
+    mock_fetch.assert_not_called()
+    assert updated["Product URL"].endswith("/mdd30ts")
+    assert updated["Image URL"].startswith("https://res.cloudinary.com")
+    assert updated["Dimensions"] == '30"W x 15"H x 17"D'
+    assert updated["stored_source_hit"] is True
+    assert updated["cache_hit"] == "stored_source"
+    assert updated["duplicate_searches_avoided_from_cache"] == 1
 
 
 # ── recover_images_for_dataframe ──────────────────────────────────────────────

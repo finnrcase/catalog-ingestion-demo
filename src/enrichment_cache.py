@@ -34,9 +34,12 @@ _PRODUCT_CACHE_PATH = os.path.normpath(os.path.join(_DATA_DIR, "product_enrichme
 _CACHE_ENABLED: bool = os.getenv("ENRICHMENT_CACHE_ENABLED", "true").lower() != "false"
 
 _MODE_LIMITS: dict[str, dict] = {
-    "fast":     {"max_searches": 1, "max_urls": 3,  "retailer": False, "general_fallback": False},
-    "standard": {"max_searches": 4, "max_urls": 5,  "retailer": False, "general_fallback": True},
-    "deep":     {"max_searches": 8, "max_urls": 10, "retailer": True,  "general_fallback": True},
+    # Fetches are used to exploit already-located product pages/spec sheets.
+    # They are intentionally less restrictive than Brave searches because
+    # Programa readiness depends on fully parsing the verified source.
+    "fast":     {"max_searches": 1, "max_urls": 6,  "retailer": False, "general_fallback": False},
+    "standard": {"max_searches": 4, "max_urls": 8,  "retailer": False, "general_fallback": True},
+    "deep":     {"max_searches": 8, "max_urls": 14, "retailer": True,  "general_fallback": True},
 }
 
 VALID_MODES: frozenset[str] = frozenset(_MODE_LIMITS)

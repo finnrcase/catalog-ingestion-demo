@@ -162,6 +162,8 @@ def test_scotsman_notes_cleaned():
     assert "[Materials:" not in result["Notes"]
     assert "[Enrichment:" not in result["Notes"]
     assert "Verify delivery date." in result["Notes"]
+    assert "Source links:" in result["Notes"]
+    assert "Product page: https://scotsman-ice.com/product/scn60pa1su" in result["Notes"]
 
 def test_scotsman_location_from_room():
     from src.programa_export import _row_to_programa_dict
@@ -510,6 +512,60 @@ def test_build_scotsman_acceptance_case():
     assert df.iloc[0]["Material"] == "Stainless Steel"
 
 
+def test_export_notes_append_source_links_and_preserve_existing_notes():
+    row = {
+        **_make_rows([{}])[0],
+        "Notes": "Confirm qty 2 with supplier.",
+        "Dimensions": "",
+        "Image URL": "",
+        "Product URL": "https://wolf.com/products/wwd30",
+        "Dimension Source URL": "https://wolf.com/specs/wwd30-spec.pdf",
+        "Dimension Source Type": "manufacturer_pdf",
+        "Dimension Confidence": "medium",
+        "image_source_url": "https://wolf.com/products/wwd30",
+        "image_confidence": "medium",
+        "manufacturer_domain_used": "subzero-wolf.com",
+    }
+    df = build_programa_import_dataframe([row])
+    notes = df.iloc[0]["Notes"]
+    assert "Confirm qty 2 with supplier." in notes
+    assert "Dimensions missing — check source: https://wolf.com/specs/wwd30-spec.pdf" in notes
+    assert "(manufacturer pdf, medium confidence)" in notes
+    assert "Image missing — check source: https://wolf.com/products/wwd30" in notes
+    assert "Product page: https://wolf.com/products/wwd30" in notes
+    assert "Spec sheet: https://wolf.com/specs/wwd30-spec.pdf" in notes
+    assert "Manufacturer: https://subzero-wolf.com" in notes
+
+
+def test_export_notes_no_verified_source_when_all_sources_missing():
+    row = {
+        **_make_rows([{}])[0],
+        "Product URL": "",
+        "Image URL": "",
+        "Dimensions": "",
+        "Notes": "Manual review charge.",
+    }
+    df = build_programa_import_dataframe([row])
+    notes = df.iloc[0]["Notes"]
+    assert "Manual review charge." in notes
+    assert "No verified source found during enrichment." in notes
+
+
+def test_export_notes_replaces_existing_source_block_without_duplicate():
+    row = {
+        **_make_rows([{}])[0],
+        "Notes": "Original note.\n\nSource links:\nProduct page: https://old.example/product",
+        "Product URL": "https://new.example/product",
+        "Image URL": "",
+    }
+    df = build_programa_import_dataframe([row])
+    notes = df.iloc[0]["Notes"]
+    assert "Original note." in notes
+    assert "https://old.example/product" not in notes
+    assert notes.count("Source links:") == 1
+    assert "Product page: https://new.example/product" in notes
+
+
 def test_section_normalization_maps_legacy_categories_to_canonical_sections():
     assert normalize_section("Seating") == "Furniture"
     assert normalize_section("Stone/Tile") == "Flooring"
@@ -688,11 +744,13 @@ def test_export_csv_contains_header_row():
 
 
 def test_export_csv_one_row_per_product():
+    import csv as _csv
+
     rows = _make_rows([{}, {}])
     df = build_programa_import_dataframe(rows)
     text = export_programa_csv(df).decode("utf-8")
-    lines = [l for l in text.splitlines() if l.strip()]
-    assert len(lines) == 3  # header + 2 rows
+    parsed_rows = list(_csv.reader(text.splitlines()))
+    assert len(parsed_rows) == 3  # header + 2 rows
 
 
 # ── export_programa_xlsx ──────────────────────────────────────────────────────
@@ -720,6 +778,25 @@ def test_export_xlsx_no_merged_cells():
     df = build_programa_import_dataframe(_make_rows([{}]))
     wb = openpyxl.load_workbook(io.BytesIO(export_programa_xlsx(df)))
     assert len(wb.active.merged_cells.ranges) == 0
+
+
+def test_export_xlsx_notes_cell_hyperlinks_to_first_source_url():
+    import openpyxl
+
+    row = {
+        **_make_rows([{}])[0],
+        "Dimensions": "",
+        "Image URL": "",
+        "Dimension Source URL": "https://wolf.com/specs/wwd30-spec.pdf",
+        "Product URL": "https://wolf.com/products/wwd30",
+    }
+    df = build_programa_import_dataframe([row])
+    wb = openpyxl.load_workbook(io.BytesIO(export_programa_xlsx(df)))
+    ws = wb.active
+    headers = [ws.cell(1, c).value for c in range(1, len(PROGRAMA_COLUMNS) + 1)]
+    notes_cell = ws.cell(2, headers.index("Notes") + 1)
+    assert notes_cell.hyperlink is not None
+    assert notes_cell.hyperlink.target == "https://wolf.com/specs/wwd30-spec.pdf"
 
 
 # ── Golden test ───────────────────────────────────────────────────────────────

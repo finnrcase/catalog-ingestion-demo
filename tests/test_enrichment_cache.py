@@ -60,7 +60,7 @@ def test_budget_for_mode_standard_defaults():
     from src.enrichment_cache import budget_for_mode
     b = budget_for_mode("standard")
     assert b.max_searches == 4
-    assert b.max_urls == 5
+    assert b.max_urls == 8
     assert not b.allows_retailer
     assert b.allows_general_fallback
 
@@ -69,6 +69,7 @@ def test_budget_for_mode_fast():
     from src.enrichment_cache import budget_for_mode
     b = budget_for_mode("fast")
     assert b.max_searches == 1
+    assert b.max_urls == 6
     assert not b.allows_retailer
     assert not b.allows_general_fallback
 
@@ -77,6 +78,7 @@ def test_budget_for_mode_deep():
     from src.enrichment_cache import budget_for_mode
     b = budget_for_mode("deep")
     assert b.max_searches == 8
+    assert b.max_urls == 14
     assert b.allows_retailer
     assert b.allows_general_fallback
 

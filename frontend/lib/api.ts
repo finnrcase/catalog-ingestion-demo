@@ -1,8 +1,13 @@
 import type {
   IntakeResponse,
   IntakeRow,
+  IntegrationsStatus,
   ProgramaExportValidation,
+  PreferredDomainsResponse,
+  PreferredSourceDomain,
   SchemaResponse,
+  StoredProductSource,
+  StoredSourcesResponse,
   VendorCallRefreshResponse,
   VendorCallResponse,
   VendorCallStartResponse,
@@ -140,6 +145,119 @@ export async function fetchHealth(): Promise<{ status: string }> {
   return parseJson<{ status: string }>(await apiFetch(apiUrl("/health"), { cache: "no-store" }));
 }
 
+export async function fetchIntegrationsStatus(): Promise<IntegrationsStatus> {
+  return parseJson<IntegrationsStatus>(await apiFetch(apiUrl("/integrations/status"), { cache: "no-store" }));
+}
+
+function queryString(params: Record<string, string | number | undefined>) {
+  const search = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== "") search.set(key, String(value));
+  });
+  const text = search.toString();
+  return text ? `?${text}` : "";
+}
+
+export async function fetchStoredSources(input: {
+  query?: string;
+  sourceType?: string;
+  limit?: number;
+} = {}): Promise<StoredSourcesResponse> {
+  return parseJson<StoredSourcesResponse>(
+    await apiFetch(
+      apiUrl(`/settings/product-knowledge-base${queryString({ query: input.query, source_type: input.sourceType, limit: input.limit ?? 100 })}`),
+      { cache: "no-store" },
+    ),
+  );
+}
+
+export async function fetchProductKnowledgeBaseAudit() {
+  return parseJson<{
+    runtime_data_dir: string;
+    product_enrichment_cache_path: string;
+    manufacturer_domain_cache_path: string;
+    runtime_cache_persistent: boolean;
+    runtime_cache_persistence_note: string;
+    product_knowledge_base_backend: string;
+    supabase_configured: boolean;
+    required_env: string[];
+    tables: string[];
+  }>(
+    await apiFetch(apiUrl("/settings/product-knowledge-base/audit"), { cache: "no-store" }),
+  );
+}
+
+export async function saveStoredSource(input: StoredProductSource) {
+  return parseJson<{ status: string; storage_backend: string; source: StoredProductSource }>(
+    await apiFetch(apiUrl("/settings/product-knowledge-base"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function updateStoredSource(id: string, input: StoredProductSource) {
+  return parseJson<{ status: string; storage_backend: string; source: StoredProductSource }>(
+    await apiFetch(apiUrl(`/settings/product-knowledge-base/${encodeURIComponent(id)}`), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function deleteStoredSource(id: string) {
+  return parseJson<{ status: string; storage_backend: string }>(
+    await apiFetch(apiUrl(`/settings/product-knowledge-base/${encodeURIComponent(id)}`), { method: "DELETE" }),
+  );
+}
+
+export async function reverifyStoredSource(id: string) {
+  return parseJson<{ status: string; storage_backend: string; source: StoredProductSource }>(
+    await apiFetch(apiUrl(`/settings/product-knowledge-base/${encodeURIComponent(id)}/reverify`), { method: "POST" }),
+  );
+}
+
+export async function fetchPreferredDomains(input: {
+  query?: string;
+  sourceType?: string;
+  limit?: number;
+} = {}): Promise<PreferredDomainsResponse> {
+  return parseJson<PreferredDomainsResponse>(
+    await apiFetch(
+      apiUrl(`/settings/preferred-domains${queryString({ query: input.query, source_type: input.sourceType, limit: input.limit ?? 100 })}`),
+      { cache: "no-store" },
+    ),
+  );
+}
+
+export async function savePreferredDomain(input: PreferredSourceDomain) {
+  return parseJson<{ status: string; storage_backend: string; domain: PreferredSourceDomain }>(
+    await apiFetch(apiUrl("/settings/preferred-domains"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function updatePreferredDomain(id: string, input: PreferredSourceDomain) {
+  return parseJson<{ status: string; storage_backend: string; domain: PreferredSourceDomain }>(
+    await apiFetch(apiUrl(`/settings/preferred-domains/${encodeURIComponent(id)}`), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  );
+}
+
+export async function deletePreferredDomain(id: string) {
+  return parseJson<{ status: string; storage_backend: string }>(
+    await apiFetch(apiUrl(`/settings/preferred-domains/${encodeURIComponent(id)}`), { method: "DELETE" }),
+  );
+}
+
 export async function generateIntakeTable(input: {
   project: string;
   room: string;
@@ -214,6 +332,24 @@ export async function recoverMissingImages(input: {
         rows: input.rows,
         enrichment_mode: input.enrichmentMode,
         force_refresh: input.forceRefresh ?? false,
+      }),
+    }),
+  );
+}
+
+export async function furtherEnrichRows(input: {
+  rows: IntakeRow[];
+  enabled: boolean;
+  maxCostUsd: number;
+}): Promise<IntakeResponse> {
+  return parseJson<IntakeResponse>(
+    await apiFetch(apiUrl("/intake/further-enrich"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        rows: input.rows,
+        further_enrichment_enabled: input.enabled,
+        further_enrichment_budget_usd: input.maxCostUsd,
       }),
     }),
   );
