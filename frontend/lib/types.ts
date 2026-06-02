@@ -136,6 +136,9 @@ export type ProgramaExportValidation = {
   phone_email_header_contamination: { index: number; product_name: string; brand?: string; sku?: string; reason?: string }[];
   parsed_rows_count: number;
   export_rows_count: number;
+  readiness_score?: number;
+  readiness_status?: string;
+  readiness_missing_fields?: Record<string, number>;
 };
 
 export type VendorCallResponse = {

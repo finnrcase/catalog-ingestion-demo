@@ -6,6 +6,8 @@ import pytest
 from src.programa_export import (
     _clean_notes,
     _extract_material_from_notes,
+    build_programa_import_dataframe,
+    validate_for_export,
 )
 
 
@@ -119,7 +121,7 @@ def test_scotsman_model_blank():
 def test_scotsman_dimensions_direct():
     from src.programa_export import _row_to_programa_dict
     result = _row_to_programa_dict(_scotsman_row())
-    assert result["Dimensions"] == "14.875 in W x 22 in D x 33.375 in H"
+    assert result["Dimensions"] == '14.875"W x 33.375"H x 22"D'
 
 def test_scotsman_width_parsed():
     from src.programa_export import _row_to_programa_dict
@@ -432,6 +434,7 @@ def test_validate_result_keys():
         "pdf_product_urls", "blank_price_only_rows",
         "missing_model_manufacturer", "phone_email_header_contamination",
         "parsed_rows_count", "export_rows_count",
+        "readiness_score", "readiness_status", "readiness_missing_fields",
     }
 
 
@@ -530,11 +533,31 @@ def test_export_notes_append_source_links_and_preserve_existing_notes():
     notes = df.iloc[0]["Notes"]
     assert "Confirm qty 2 with supplier." in notes
     assert "Dimensions missing — check source: https://wolf.com/specs/wwd30-spec.pdf" in notes
-    assert "(manufacturer pdf, medium confidence)" in notes
+    assert "(Spec sheet PDF, medium confidence)" in notes
     assert "Image missing — check source: https://wolf.com/products/wwd30" in notes
     assert "Product page: https://wolf.com/products/wwd30" in notes
-    assert "Spec sheet: https://wolf.com/specs/wwd30-spec.pdf" in notes
+    assert "Spec sheet: https://wolf.com/specs/wwd30-spec.pdf (Spec sheet PDF)" in notes
     assert "Manufacturer: https://subzero-wolf.com" in notes
+
+
+def test_export_notes_labels_ajmadison_as_retailer_not_manufacturer():
+    row = {
+        **_make_rows([{}])[0],
+        "Brand": "Lynx",
+        "Model/SKU": "L42TR",
+        "Product URL": "https://www.ajmadison.com/cgi-bin/ajmadison/L42TRLP.html",
+        "Manufacturer URL": "https://www.ajmadison.com",
+        "manufacturer_domain_used": "ajmadison.com",
+        "Dimension Source URL": "https://www.ajmadison.com/cgi-bin/ajmadison/L42TRLP.html",
+        "Dimension Confidence": "medium",
+    }
+
+    df = build_programa_import_dataframe([row])
+    notes = df.iloc[0]["Notes"]
+
+    assert "Manufacturer: https://www.ajmadison.com" not in notes
+    assert "Retailer: https://www.ajmadison.com" in notes
+    assert "Product page: https://www.ajmadison.com/cgi-bin/ajmadison/L42TRLP.html (Retailer" in notes
 
 
 def test_export_notes_no_verified_source_when_all_sources_missing():
@@ -640,6 +663,32 @@ def test_build_preserves_same_sku_in_different_rooms():
     assert set(df["Location"]) == {"Kitchen", "Pantry"}
 
 
+def test_build_dedupes_spaced_model_variants_same_room():
+    rows = _make_rows([
+        {
+            "Brand": "Fisher Paykel",
+            "Model/SKU": "RB36S25MKIW N",
+            "Room": "Kitchen",
+            "Product Name": "Integrated Refrigerator",
+            "Image URL": "https://example.com/refrigerator.jpg",
+        },
+        {
+            "Brand": "Fisher & Paykel",
+            "Model/SKU": "RB36S25MKIWN",
+            "Room": "Kitchen",
+            "Product Name": "Integrated Refrigerator",
+            "Image URL": "",
+        },
+    ])
+
+    df = build_programa_import_dataframe(rows)
+    summary = validate_for_export(rows)
+
+    assert len(df) == 1
+    assert summary["duplicate_rows_removed"] == 1
+    assert df.iloc[0]["SKU"] == "RB36S25MKIWN"
+
+
 def test_build_rejects_implausible_appliance_dimensions():
     rows = _make_rows([
         {
@@ -656,6 +705,56 @@ def test_build_rejects_implausible_appliance_dimensions():
     assert df.iloc[0]["Dimensions"] == ""
     assert df.iloc[0]["Height (in)"] == ""
     assert summary["suspicious_dimensions_rejected"][0]["sku"] == "G7986SCVIK20"
+
+
+def test_export_dimensions_strip_length_from_main_programa_fields():
+    rows = _make_rows([
+        {
+            "Product Category": "Appliances",
+            "Brand": "Wolf",
+            "Model/SKU": "MD24TES",
+            "Dimensions": '24"W x 14"H x 23"D x 4"L',
+            "Notes": "Confirm install details.",
+        }
+    ])
+
+    df = build_programa_import_dataframe(rows)
+    notes = df.iloc[0]["Notes"]
+
+    assert df.iloc[0]["Dimensions"] == '24"W x 14"H x 23"D'
+    assert df.iloc[0]["Length (in)"] == ""
+    assert "Additional dimension noted: Length 4 kept out of Programa W x H x D field." in notes
+
+
+def test_validate_readiness_scores_required_fields_not_just_exportable_rows():
+    rows = _make_rows([
+        {
+            "Brand": "Scotsman",
+            "Model/SKU": "SCN60PA1SU",
+            "Supplier": "PC Richard",
+            "Room": "Kitchen",
+            "Dimensions": '15"W x 34"H x 24"D',
+            "Image URL": "https://example.com/scotsman.jpg",
+            "Product URL": "https://scotsman-ice.com/products/scn60pa1su",
+        },
+        {
+            "Brand": "Wolf",
+            "Model/SKU": "MD24TES",
+            "Supplier": "",
+            "Room": "",
+            "Dimensions": "",
+            "Image URL": "",
+            "Product URL": "",
+        },
+    ])
+
+    summary = validate_for_export(rows)
+
+    assert summary["export_count"] == 2
+    assert summary["readiness_score"] < 100
+    assert summary["readiness_status"] == "review_draft"
+    assert summary["readiness_missing_fields"]["dimensions"] == 1
+    assert summary["readiness_missing_fields"]["image"] == 1
 
 
 def test_build_blanks_sitemap_product_url_and_warns():

@@ -138,7 +138,7 @@ def test_row_from_line_price_only_becomes_unresolved_charge():
     assert row["Include"] is False
     assert row["Import Type"] == "unresolved_charge"
     assert row["Price"] == "$285.97"
-    assert row["Product Name"] == ""
+    assert row["Product Name"] == "Unresolved Charge - Row 5"
     assert row["Brand"] == ""
     assert row["Model/SKU"] == ""
 
@@ -277,6 +277,8 @@ def test_pc_richard_table_price_only_row_is_manual_review_not_product():
 
     assert len(charges) == 1
     assert charges[0]["Price"] == "$285.97"
+    assert charges[0]["Product Name"] == "Unresolved Charge - Row 5"
+    assert charges[0]["Model/SKU"] == ""
     assert len(products) == 1
     assert products[0]["Brand"] == "Scotsman"
     assert products[0]["Model/SKU"] == "SCN60PA1SU"

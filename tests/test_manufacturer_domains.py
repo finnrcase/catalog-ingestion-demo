@@ -60,3 +60,19 @@ def test_save_domain_cache_storage_failure_is_best_effort(monkeypatch, tmp_path)
     monkeypatch.setattr("pathlib.Path.mkdir", fail_mkdir)
 
     save_domain_cache({"wolf": {"domain": "subzero-wolf.com"}}, path=tmp_path / "data" / "cache.json")
+
+
+def test_invalid_cached_domain_is_removed(tmp_path):
+    path = tmp_path / "manufacturer_domain_cache.json"
+    path.write_text(
+        json.dumps({
+            "lynx": {"domain": "https://[bad", "source": "discovered"},
+            "wolf": {"domain": "subzero-wolf.com", "source": "discovered"},
+        }),
+        encoding="utf-8",
+    )
+
+    assert get_domain_for_brand("Lynx", path=path) is None
+    assert get_domain_for_brand("Wolf", path=path) == ("subzero-wolf.com", "discovered")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "lynx" not in data

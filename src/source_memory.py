@@ -8,6 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     import httpx
@@ -39,9 +40,16 @@ def normalize_domain(value: object) -> str:
     text = str(value or "").strip().lower()
     if not text:
         return ""
-    text = re.sub(r"^https?://", "", text)
-    text = text.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
-    return text[4:] if text.startswith("www.") else text
+    try:
+        parsed = urlparse(text if "://" in text else f"https://{text}")
+        host = (parsed.hostname or "").lower()
+    except Exception:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    if ":" not in host and not re.match(r"^[a-z0-9.-]+\.[a-z]{2,63}$", host, flags=re.IGNORECASE):
+        return ""
+    return host
 
 
 def domain_from_url(value: object) -> str:
@@ -49,11 +57,48 @@ def domain_from_url(value: object) -> str:
     if not text:
         return ""
     try:
-        from urllib.parse import urlparse
-
         return normalize_domain(urlparse(text).netloc)
     except Exception:
         return ""
+
+
+def _valid_fetch_url(value: object) -> bool:
+    text = str(value or "").strip()
+    if not text or any(ch.isspace() for ch in text):
+        return False
+    try:
+        parsed = urlparse(text)
+        host = parsed.hostname
+    except Exception:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or not host:
+        return False
+    if ":" not in host and not re.match(r"^[a-z0-9.-]+\.[a-z]{2,63}$", host, flags=re.IGNORECASE):
+        return False
+    return True
+
+
+_SOURCE_URL_FIELDS = (
+    "product_page_url",
+    "manufacturer_url",
+    "spec_sheet_url",
+    "dimension_source_url",
+    "image_source_url",
+    "image_url",
+)
+
+
+def _sanitize_source_urls(record: dict) -> dict:
+    cleaned = dict(record or {})
+    rejected: list[str] = []
+    for field in _SOURCE_URL_FIELDS:
+        value = cleaned.get(field)
+        if value and not _valid_fetch_url(value):
+            rejected.append(f"{field}={value}")
+            cleaned[field] = ""
+    if rejected:
+        cleaned["stored_source_rejected_reason"] = "invalid URL removed: " + "; ".join(rejected[:3])
+    return cleaned
 
 
 def _source_type_from_url(url: str, fallback: object = "") -> str:
@@ -220,6 +265,7 @@ def _supabase_first_by_params(table: str, params: dict) -> dict | None:
 def _usable_source(entry: dict) -> bool:
     if not entry:
         return False
+    entry = _sanitize_source_urls(entry)
     score = int(entry.get("confidence_score") or 0)
     if score < 60:
         return False
@@ -306,7 +352,7 @@ def _normalize_product_source_payload(record: dict) -> dict:
             payload.get("product_page_url") or payload.get("dimension_source_url") or payload.get("spec_sheet_url"),
             payload.get("source_type"),
         )
-    return payload
+    return _sanitize_source_urls(payload)
 
 
 def _merge_product_source_records(existing: dict | None, incoming: dict) -> dict:
@@ -419,7 +465,7 @@ def lookup_product_source(brand: str, model: str) -> dict | None:
         }
         rows = _supabase_request("GET", PRODUCT_SOURCE_TABLE, params=params, returning=True)
         if isinstance(rows, list) and rows and _usable_source(rows[0]):
-            return rows[0]
+            return _sanitize_source_urls(rows[0])
         legacy_params = {
             "select": "*",
             "normalized_brand": f"eq.{normalized_brand}",
@@ -429,14 +475,14 @@ def lookup_product_source(brand: str, model: str) -> dict | None:
         }
         rows = _supabase_request("GET", PRODUCT_SOURCE_TABLE, params=legacy_params, returning=True)
         if isinstance(rows, list) and rows and _usable_source(rows[0]):
-            return rows[0]
+            return _sanitize_source_urls(rows[0])
     rows = [
         row for row in _local_list(_PRODUCT_SOURCE_PATH)
         if row.get("normalized_brand") == normalized_brand
         and (row.get("normalized_model_sku") == normalized_model_sku or row.get("normalized_model") == normalized_model_sku)
     ]
     rows = _filter_sources(rows)
-    return rows[0] if rows and _usable_source(rows[0]) else None
+    return _sanitize_source_urls(rows[0]) if rows and _usable_source(rows[0]) else None
 
 
 def upsert_product_source(record: dict) -> dict:
@@ -619,6 +665,7 @@ def save_successful_source_from_row(row: dict, *, notes: str = "") -> dict | Non
 
 def apply_product_source_to_row(row: dict, source: dict) -> tuple[dict, list[str]]:
     updated = dict(row)
+    source = _sanitize_source_urls(source)
     filled: list[str] = []
 
     def fill(column: str, value: object) -> None:

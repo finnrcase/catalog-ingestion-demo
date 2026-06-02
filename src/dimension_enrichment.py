@@ -16,6 +16,7 @@ BRAND_DOMAIN_TABLE : dict[str, str]
 from __future__ import annotations
 
 import json as _json
+import logging as _logging
 import re
 import urllib.parse as _urlparse
 from dataclasses import dataclass, field
@@ -37,6 +38,8 @@ except ImportError:
 
 from src.dimensions import dimension_sanity_reason
 from src.enrichment_cache import ManufacturerDomainCache, SessionCache, SearchBudget
+
+_log = _logging.getLogger(__name__)
 
 
 def _brave_search_urls(
@@ -928,6 +931,62 @@ def _parse_pdf_for_dimensions(
 _PDF_EXTENSIONS = frozenset({".pdf"})
 _REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SCH-Intake/1.0)"}
 _REQUEST_TIMEOUT_S: int = 12
+_HOSTNAME_RE = re.compile(r"^[a-z0-9.-]+$", re.IGNORECASE)
+
+
+def _url_validation_error(url: object) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return "empty URL"
+    if any(ch.isspace() for ch in raw):
+        return "malformed URL: contains whitespace"
+    try:
+        parsed = _urlparse.urlparse(raw)
+        hostname = parsed.hostname  # raises ValueError for malformed IPv6 brackets
+    except ValueError as exc:
+        return f"Invalid IPv6 URL: {exc}"
+    except Exception as exc:
+        return f"malformed URL: {exc}"
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return f"malformed URL: unsupported scheme {parsed.scheme or '<missing>'}"
+    if not parsed.netloc or not hostname:
+        return "malformed URL: missing host"
+    host = hostname.strip().lower()
+    if ":" not in host and (not _HOSTNAME_RE.match(host) or "." not in host):
+        return f"malformed domain: {host}"
+    return ""
+
+
+def _record_invalid_url_debug(
+    debug: dict | None,
+    url: object,
+    *,
+    source: str,
+    step: str,
+    reason: str = "",
+    query: str = "",
+    fallback_attempted: bool = True,
+) -> None:
+    if debug is None:
+        return
+    raw = str(url or "").strip()
+    debug["invalid_url_error"] = reason or _url_validation_error(raw)
+    debug["invalid_url_generated"] = raw
+    debug["invalid_url_source"] = source
+    debug["invalid_url_step"] = step
+    debug["invalid_url_search_query"] = query
+    debug["invalid_url_fallback_attempted"] = "yes" if fallback_attempted else "no"
+    if not debug.get("skipped_reason"):
+        debug["skipped_reason"] = "invalid URL skipped before fetch"
+    _log.warning(
+        "Invalid dimension URL skipped step=%s source=%s query=%s url=%r reason=%s fallback=%s",
+        step,
+        source,
+        query,
+        raw,
+        debug["invalid_url_error"],
+        fallback_attempted,
+    )
 
 
 def _fetch_and_parse_url(
@@ -943,6 +1002,17 @@ def _fetch_and_parse_url(
     Both dimension values are None on fetch failure.
     """
     suffix = "page"
+    invalid_reason = _url_validation_error(url)
+    if invalid_reason:
+        _record_invalid_url_debug(
+            debug,
+            url,
+            source="dimension_source",
+            step="dimension_url_fetch",
+            reason=invalid_reason,
+            fallback_attempted=True,
+        )
+        return None, None, suffix
     if _urlparse.urlparse(url).path.lower().endswith(tuple(_PDF_EXTENSIONS)):
         suffix = "pdf"
 
@@ -979,6 +1049,8 @@ def _extract_spec_pdf_links(html: str, base_url: str, model: str = "") -> list[s
         if not raw_url:
             return
         resolved = _urlparse.urljoin(base_url, raw_url.strip())
+        if _url_validation_error(resolved):
+            return
         parsed = _urlparse.urlparse(resolved)
         haystack = f"{resolved} {label}".lower()
         if ".pdf" not in parsed.path.lower() and ".pdf" not in haystack:
@@ -1010,7 +1082,10 @@ def _extract_spec_pdf_links(html: str, base_url: str, model: str = "") -> list[s
 def _domain_matches(url: str, domain: str | None) -> bool:
     if not domain:
         return False
-    netloc = _urlparse.urlparse(url).netloc.lower()
+    try:
+        netloc = _urlparse.urlparse(url).netloc.lower()
+    except ValueError:
+        return False
     domain = domain.lower().lstrip(".")
     return bool(netloc == domain or netloc.endswith(f".{domain}"))
 
@@ -1190,6 +1265,14 @@ def find_dimensions(
         "spec_sheets_found": 0,
         "spec_sheets_parsed": 0,
         "image_only_success": False,
+        "invalid_url_error": "",
+        "invalid_url_generated": "",
+        "invalid_url_source": "",
+        "invalid_url_step": "",
+        "invalid_url_normalized_brand": re.sub(r"[^a-z0-9]+", "", brand.lower()),
+        "invalid_url_normalized_model": re.sub(r"[^a-z0-9]+", "", model.lower()),
+        "invalid_url_search_query": "",
+        "invalid_url_fallback_attempted": "",
     }
 
     if has_complete_3d_dimensions(current_dims):
@@ -1242,6 +1325,18 @@ def find_dimensions(
         local_debug = dict(debug)
         local_debug["page_fetch_attempted"] = True
         urls_checked.append(product_url)
+        invalid_reason = _url_validation_error(product_url)
+        if invalid_reason:
+            _record_invalid_url_debug(
+                local_debug,
+                product_url,
+                source="existing_product_url",
+                step="dimension_product_url_fetch",
+                reason=invalid_reason,
+                fallback_attempted=True,
+            )
+            debug.update(local_debug)
+            return None
         page_html = ""
         source_suffix = "page"
 
@@ -1377,6 +1472,18 @@ def find_dimensions(
             search_urls = _brave_search_urls(query, limit=5, brand=brand, session_cache=session_cache, budget=budget)
             debug["pages_found"] = int(debug.get("pages_found") or 0) + len(search_urls)
             for url in search_urls:
+                invalid_reason = _url_validation_error(url)
+                if invalid_reason:
+                    _record_invalid_url_debug(
+                        debug,
+                        url,
+                        source="brave_search_result",
+                        step="dimension_search_result_fetch",
+                        reason=invalid_reason,
+                        query=query,
+                        fallback_attempted=True,
+                    )
+                    continue
                 urls_checked.append(url)
                 if budget is not None and not budget.can_fetch():
                     debug["budget_blocked"] = True

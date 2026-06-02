@@ -52,7 +52,14 @@ import {
   validateRows,
 } from "@/lib/api";
 import { hasComplete3dDimensions } from "@/lib/dimensions";
-import type { IntakeResponse, IntakeRow, IntegrationsStatus, PreferredSourceDomain, StoredProductSource } from "@/lib/types";
+import type {
+  IntakeResponse,
+  IntakeRow,
+  IntegrationsStatus,
+  PreferredSourceDomain,
+  ProgramaExportValidation,
+  StoredProductSource,
+} from "@/lib/types";
 
 const reviewColumns = [
   "Include",
@@ -987,7 +994,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const [programaMessage, setProgramaMessage] = useState("");
   const [productImageUploads, setProductImageUploads] = useState<Record<number, string>>({});
   const [busy, setBusy] = useState<"generate" | "validate" | "furtherEnrichment" | "imageRecovery" | "vendorCall" | "export" | "photoBulk" | "programa" | "">("");
-  const [exportSummary, setExportSummary] = useState({
+  const [exportSummary, setExportSummary] = useState<ProgramaExportValidation>({
     skipped: [] as { index: number; product_name: string }[],
     missing_section: [] as { index: number; product_name: string }[],
     missing_dimensions: 0,
@@ -1012,6 +1019,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     phone_email_header_contamination: [] as { index: number; product_name: string; brand?: string; sku?: string; reason?: string }[],
     parsed_rows_count: 0,
     export_rows_count: 0,
+    readiness_score: 0,
+    readiness_status: "not_programa_ready",
+    readiness_missing_fields: {} as Record<string, number>,
   });
   const [errors, setErrors] = useState<string[]>([]);
   const [vendorCall, setVendorCall] = useState<{
@@ -1303,7 +1313,12 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     },
   ];
   const currentStageSummary = stageSummaries[activeMainWorkflowIndex];
-  const readinessScore = includedRows.length ? Math.round((exportSummary.export_count / includedRows.length) * 100) : 0;
+  const readinessScore =
+    typeof exportSummary.readiness_score === "number"
+      ? exportSummary.readiness_score
+      : includedRows.length
+        ? Math.round((exportSummary.export_count / includedRows.length) * 100)
+        : 0;
   const apiConnectionStatus = API_BASE ? apiStatus : "misconfigured";
   const apiConnectionText = API_BASE ? apiStatusText : "NEXT_PUBLIC_API_BASE_URL is missing or invalid.";
   const displayApiBase = API_BASE || "not configured";
@@ -1336,6 +1351,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         phone_email_header_contamination: [],
         parsed_rows_count: 0,
         export_rows_count: 0,
+        readiness_score: 0,
+        readiness_status: "not_programa_ready",
+        readiness_missing_fields: {},
       });
       return;
     }
@@ -1349,6 +1367,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           setExportSummary((current) => ({
             ...current,
             export_count: includedRows.filter((row) => rowText(row, "Product Name").trim()).length,
+            readiness_score: 0,
+            readiness_status: "not_programa_ready",
             skipped: includedRows
               .map((row, index) => ({ row, index }))
               .filter(({ row }) => !rowText(row, "Product Name").trim())
@@ -1693,6 +1713,20 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         reportLine("stored source used", rowText(row, "knowledge_base_source_used") || rowText(row, "stored_source_used")),
         reportLine("stored source updated", boolish(rowText(row, "knowledge_base_updated")) || boolish(rowText(row, "stored_source_updated")) ? "yes" : "no"),
         reportLine("source rejected reason", rowText(row, "knowledge_base_rejected_reason") || rowText(row, "stored_source_rejected_reason")),
+        rowText(row, "invalid_url_error")
+          ? [
+              "Invalid IPv6 URL / malformed URL",
+              reportLine("Generated URL", rowText(row, "invalid_url_generated")),
+              reportLine("Source", rowText(row, "invalid_url_source")),
+              reportLine("Product", `${rowText(row, "Brand")} ${rowText(row, "Model/SKU")}`.trim() || rowText(row, "Product Name")),
+              reportLine("Step", rowText(row, "invalid_url_step")),
+              reportLine("Search query", rowText(row, "invalid_url_search_query")),
+              reportLine("Normalized brand", rowText(row, "invalid_url_normalized_brand")),
+              reportLine("Normalized model", rowText(row, "invalid_url_normalized_model")),
+              reportLine("Fallback attempted", rowText(row, "invalid_url_fallback_attempted")),
+              reportLine("Error", rowText(row, "invalid_url_error")),
+            ].filter(Boolean).join("\n")
+          : "",
         reportLine("preferred domain used", rowText(row, "preferred_domain_used")),
         reportLine("selected source domain", reportDomain(selectedUrl)),
         reportLine("image found", imageFound ? "yes" : "no"),

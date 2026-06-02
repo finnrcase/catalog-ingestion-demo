@@ -696,6 +696,25 @@ def test_fetch_and_parse_url_returns_none_on_http_status_error():
     assert cutout_dims is None
 
 
+def test_fetch_and_parse_url_rejects_invalid_ipv6_before_httpx():
+    debug = {}
+    mock_httpx = MagicMock()
+    with patch("src.dimension_enrichment._httpx", mock_httpx):
+        product_dims, cutout_dims, source_type_suffix = _fetch_and_parse_url(
+            "https://[bad",
+            debug=debug,
+        )
+
+    assert product_dims is None
+    assert cutout_dims is None
+    assert source_type_suffix == "page"
+    assert not mock_httpx.get.called
+    assert "Invalid IPv6 URL" in debug["invalid_url_error"]
+    assert debug["invalid_url_generated"] == "https://[bad"
+    assert debug["invalid_url_step"] == "dimension_url_fetch"
+    assert debug["invalid_url_fallback_attempted"] == "yes"
+
+
 from src.dimension_enrichment import _assign_confidence
 
 

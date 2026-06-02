@@ -218,7 +218,14 @@ def _make_unresolved_charge_row(
     notes: str,
 ) -> dict:
     row = make_base_row(project=project, room=room, supplier=supplier, notes=notes)
+    row_match = re.match(r"^\s*(?:row\s*)?#?(?P<row>\d{1,3})\s*(?:[|.)\-:]\s*)?", str(line or ""), re.IGNORECASE)
     row["Include"] = False
+    row["Product Name"] = (
+        f"Unresolved Charge - Row {row_match.group('row')}"
+        if row_match and row_match.group("row")
+        else "Unresolved Charge"
+    )
+    row["Model/SKU"] = ""
     row["Price"] = _extract_price(line)
     row["Source Type"] = SOURCE_PDF
     row["Import Type"] = "unresolved_charge"

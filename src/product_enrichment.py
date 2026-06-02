@@ -183,6 +183,14 @@ _ENRICHMENT_DEBUG_FIELDS: list[str] = [
     "knowledge_base_updated",
     "knowledge_base_rejected_reason",
     "preferred_domain_used",
+    "invalid_url_error",
+    "invalid_url_generated",
+    "invalid_url_source",
+    "invalid_url_step",
+    "invalid_url_normalized_brand",
+    "invalid_url_normalized_model",
+    "invalid_url_search_query",
+    "invalid_url_fallback_attempted",
 ]
 
 MIN_USE_SCORE = 40   # below this: skip entirely, note in Notes
@@ -452,8 +460,30 @@ def _apply_enrichment(
     return updated
 
 
-def _fetch_page_html(url: str) -> str:
+def _fetch_page_html(
+    url: str,
+    *,
+    debug: dict | None = None,
+    source: str = "direct",
+    step: str = "page_fetch",
+    row: dict | None = None,
+    query: str = "",
+    fallback_attempted: bool = True,
+) -> str:
     """Fetch URL with httpx and return raw HTML. Empty string on error."""
+    invalid_reason = _url_validation_error(url)
+    if invalid_reason:
+        _stamp_invalid_url_debug(
+            debug,
+            url,
+            source=source,
+            step=step,
+            row=row,
+            query=query,
+            fallback_attempted=fallback_attempted,
+            reason=invalid_reason,
+        )
+        return ""
     try:
         resp = httpx.get(
             url,
@@ -467,13 +497,44 @@ def _fetch_page_html(url: str) -> str:
         return ""
 
 
+def _fetch_page_html_with_debug(url: str, **kwargs) -> str:
+    """Call _fetch_page_html with diagnostics while tolerating older test doubles."""
+    try:
+        return _fetch_page_html(url, **kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument" in str(exc):
+            return _fetch_page_html(url)
+        raise
+
+
 def _fetch_page_html_budgeted(
     url: str,
     *,
     session_cache: "_SessionCache | None" = None,
     budget: "_SearchBudget | None" = None,
     debug: dict | None = None,
+    source: str = "product_page",
+    step: str = "page_fetch",
+    row: dict | None = None,
+    query: str = "",
 ) -> str:
+    invalid_reason = _url_validation_error(url)
+    if invalid_reason:
+        if debug is not None:
+            debug["page_fetch_attempted"] = False
+            debug["page_fetch_success"] = False
+            debug["page_fetched"] = False
+        _stamp_invalid_url_debug(
+            debug,
+            url,
+            source=source,
+            step=step,
+            row=row,
+            query=query,
+            fallback_attempted=True,
+            reason=invalid_reason,
+        )
+        return ""
     if session_cache is not None and url in session_cache.urls:
         if debug is not None:
             debug["page_fetch_success"] = bool(session_cache.urls.get(url))
@@ -484,7 +545,14 @@ def _fetch_page_html_budgeted(
             debug["budget_blocked"] = True
             debug["skipped_reason"] = "budget blocked product page fetch"
         return ""
-    html = _fetch_page_html(url)
+    html = _fetch_page_html_with_debug(
+        url,
+        debug=debug,
+        source=source,
+        step=step,
+        row=row,
+        query=query,
+    )
     if budget is not None:
         budget.consume_fetch()
     if html and session_cache is not None:
@@ -647,6 +715,75 @@ def _is_absolute_https(url: str) -> bool:
     return bool(url) and isinstance(url, str) and url.lower().startswith("https://")
 
 
+_HOSTNAME_RE = re.compile(r"^[a-z0-9.-]+$", re.IGNORECASE)
+
+
+def _url_validation_error(url: object) -> str:
+    """Return a reason when a URL should not be fetched."""
+    raw = _str_val(url)
+    if not raw:
+        return "empty URL"
+    if any(ch.isspace() for ch in raw):
+        return "malformed URL: contains whitespace"
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        hostname = parsed.hostname  # may raise ValueError for malformed IPv6 brackets
+    except ValueError as exc:
+        return f"Invalid IPv6 URL: {exc}"
+    except Exception as exc:
+        return f"malformed URL: {exc}"
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return f"malformed URL: unsupported scheme {parsed.scheme or '<missing>'}"
+    if not parsed.netloc or not hostname:
+        return "malformed URL: missing host"
+    host = hostname.strip().lower()
+    if ":" not in host and (not _HOSTNAME_RE.match(host) or "." not in host):
+        return f"malformed domain: {host}"
+    return ""
+
+
+def _stamp_invalid_url_debug(
+    debug: dict | None,
+    url: object,
+    *,
+    source: str,
+    step: str,
+    row: dict | None = None,
+    query: str = "",
+    fallback_attempted: bool = True,
+    reason: str = "",
+) -> None:
+    """Record invalid URL diagnostics without surfacing raw errors to normal UI."""
+    if debug is None:
+        return
+    raw = _str_val(url)
+    reason = reason or _url_validation_error(raw)
+    row = row or {}
+    brand = _str_val(row.get("Brand"))
+    model = _str_val(row.get("Model/SKU") or row.get("SKU"))
+    debug["invalid_url_error"] = reason
+    debug["invalid_url_generated"] = raw
+    debug["invalid_url_source"] = source
+    debug["invalid_url_step"] = step
+    debug["invalid_url_normalized_brand"] = _norm_token(brand)
+    debug["invalid_url_normalized_model"] = _norm_token(model)
+    debug["invalid_url_search_query"] = query or _str_val(debug.get("search_query_used"))
+    debug["invalid_url_fallback_attempted"] = "yes" if fallback_attempted else "no"
+    if not _str_val(debug.get("skipped_reason")):
+        debug["skipped_reason"] = "invalid URL skipped before fetch"
+    _log.warning(
+        "Invalid enrichment URL skipped step=%s source=%s brand=%s model=%s query=%s url=%r reason=%s fallback=%s",
+        step,
+        source,
+        _norm_token(brand),
+        _norm_token(model),
+        debug["invalid_url_search_query"],
+        raw,
+        reason,
+        fallback_attempted,
+    )
+
+
 def _check_image_content_type(url: str) -> bool:
     """Confirm url points to an image via HEAD, falling back to a GET byte-range request.
 
@@ -655,6 +792,8 @@ def _check_image_content_type(url: str) -> bool:
     which is universally supported and still confirms the content-type without
     downloading the whole image.
     """
+    if _url_validation_error(url):
+        return False
     _ua = {"User-Agent": "Mozilla/5.0 (compatible; SCH-Intake/1.0)"}
     try:
         resp = httpx.head(url, headers=_ua, timeout=5, follow_redirects=True)
@@ -718,6 +857,9 @@ def _product_name_similarity_score(row_name: str, page_text: str) -> int:
 
 
 def _reject_weak_product_url(url: str) -> str:
+    invalid_reason = _url_validation_error(url)
+    if invalid_reason:
+        return invalid_reason
     parsed = urllib.parse.urlparse(url)
     path = parsed.path.strip("/").lower()
     if not path:
@@ -989,24 +1131,45 @@ def _try_image_from_url(
     """
     import logging as _logging
     _log = _logging.getLogger(__name__)
+    debug = _image_debug_defaults()
+    invalid_reason = _url_validation_error(product_url)
+    if invalid_reason:
+        debug["cloudinary_status"] = "not_attempted"
+        debug["cloudinary_error"] = "invalid product URL before image fetch"
+        debug["programa_image_ready"] = False
+        _stamp_invalid_url_debug(
+            debug,
+            product_url,
+            source="product_url",
+            step="image_page_fetch",
+            row=row or {},
+            fallback_attempted=True,
+            reason=invalid_reason,
+        )
+        return (None, debug) if return_debug else None
 
     raw_html = ""
     if session_cache is not None and product_url in session_cache.urls:
         raw_html = str(session_cache.urls.get(product_url) or "")
     if not raw_html:
         if budget is not None and not budget.can_fetch():
-            debug = _image_debug_defaults()
             debug["budget_blocked"] = True
             debug["cloudinary_error"] = "budget blocked image page fetch"
             return (None, debug) if return_debug else None
-        raw_html = _fetch_page_html(product_url)
+        raw_html = _fetch_page_html_with_debug(
+            product_url,
+            debug=debug,
+            source="product_url",
+            step="image_page_fetch",
+            row=row or {},
+        )
         if budget is not None:
             budget.consume_fetch()
         if raw_html and session_cache is not None:
             session_cache.urls[product_url] = raw_html
     if not raw_html:
         _log.info("[IMAGE PIPELINE] fetch failed url=%s", product_url[:80])
-        return (None, _image_debug_defaults()) if return_debug else None
+        return (None, debug) if return_debug else None
 
     final_url, debug = _extract_image_from_html(raw_html, product_url, row or {}, cache_key)
     if final_url:
@@ -1240,6 +1403,14 @@ def _dimension_debug_defaults(row: dict) -> dict:
         "knowledge_base_updated": False,
         "knowledge_base_rejected_reason": "",
         "preferred_domain_used": "",
+        "invalid_url_error": "",
+        "invalid_url_generated": "",
+        "invalid_url_source": "",
+        "invalid_url_step": "",
+        "invalid_url_normalized_brand": "",
+        "invalid_url_normalized_model": "",
+        "invalid_url_search_query": "",
+        "invalid_url_fallback_attempted": "",
     }
     debug.update(_image_debug_defaults())
     return debug
@@ -1324,6 +1495,12 @@ def _budget_fetches_used(value: object) -> int:
     return int(match.group(1)) if match else 0
 
 
+def _budget_fetches_remaining(budget: "_SearchBudget | None") -> int:
+    if budget is None:
+        return 999_999
+    return max(0, int(getattr(budget, "max_urls", 0)) - int(getattr(budget, "urls_used", 0)))
+
+
 def _hard_cost_cap_for_mode(mode: str) -> float:
     if _normalize_mode(mode) == "deep":
         return float(os.getenv("ENRICHMENT_DEEP_HARD_COST_USD", "1.00") or "1.00")
@@ -1368,25 +1545,42 @@ def _merge_duplicate_enrichment(original: dict, source: dict, source_index: int 
             updated[column] = source.get(column)
             filled.append(column)
 
+    def force_enrichment_value(column: str) -> None:
+        value = _str_val(source.get(column))
+        if value and _str_val(updated.get(column)) != value:
+            updated[column] = source.get(column)
+            filled.append(column)
+
     if _str_val(source.get("Dimensions")) and not has_complete_3d_dimensions(updated.get("Dimensions")):
         updated["Dimensions"] = source.get("Dimensions")
         filled.append("Dimensions")
-    for column in ("Width (in)", "Height (in)", "Depth (in)", "Length (in)"):
-        fill_if_blank(column)
+    elif _str_val(source.get("Dimensions")) and has_complete_3d_dimensions(source.get("Dimensions")):
+        # Same brand/model duplicate rows should share the same verified product
+        # dimensions, even when one row had stale partial data.
+        updated["Dimensions"] = source.get("Dimensions")
+    for column in ("Width (in)", "Height (in)", "Depth (in)"):
+        force_enrichment_value(column)
+    # Programa should not inherit length into the primary W/H/D handoff.
+    if _str_val(source.get("Length (in)")) and not _str_val(updated.get("Length (in)")):
+        updated["Length (in)"] = source.get("Length (in)")
 
     if _str_val(source.get("Image URL")) and _needs_image_recovery(updated):
         updated["Image URL"] = source.get("Image URL")
         filled.append("Image URL")
+    elif _str_val(source.get("Image URL")) and _str_val(updated.get("Image URL")) != _str_val(source.get("Image URL")):
+        updated["Image URL"] = source.get("Image URL")
+        filled.append("Image URL")
 
     product_url = _str_val(source.get("Product URL"))
-    if product_url and (not _str_val(updated.get("Product URL")) or _reject_weak_product_url(_str_val(updated.get("Product URL")))):
+    if product_url and (
+        not _str_val(updated.get("Product URL"))
+        or _reject_weak_product_url(_str_val(updated.get("Product URL")))
+        or _str_val(updated.get("Product URL")) != product_url
+    ):
         updated["Product URL"] = product_url
         filled.append("Product URL")
 
     for column in (
-        "Product Category",
-        "Finish / Color",
-        "Material",
         "Dimension Source URL",
         "Dimension Confidence",
         "Dimension Source Type",
@@ -1402,6 +1596,13 @@ def _merge_duplicate_enrichment(original: dict, source: dict, source_index: int 
         "selected_product_url",
         "selected_product_url_confidence",
         "selected_image_url",
+    ):
+        force_enrichment_value(column)
+
+    for column in (
+        "Product Category",
+        "Finish / Color",
+        "Material",
     ):
         fill_if_blank(column)
 
@@ -1515,7 +1716,16 @@ def _verify_candidate_url(
     title_hint: str = "",
     description_hint: str = "",
 ) -> tuple[str, dict]:
-    html = _fetch_page_html_budgeted(url, session_cache=session_cache, budget=budget, debug=debug)
+    html = _fetch_page_html_budgeted(
+        url,
+        session_cache=session_cache,
+        budget=budget,
+        debug=debug,
+        source="product_url_candidate",
+        step="candidate_page_fetch",
+        row=row,
+        query=_str_val(debug.get("search_query_used")),
+    )
     if not html:
         return "", {
             "confidence": "none",
@@ -1640,6 +1850,11 @@ def _try_verified_page_enrichment(
                 selected_html = html
                 selected_evidence = evidence
             if evidence.get("confidence") == "high" and evidence.get("official_domain"):
+                break
+            # Once we have a verified page, preserve room for parsing dimensions
+            # and linked spec PDFs instead of spending every fetch on alternates.
+            if selected_url and _budget_fetches_remaining(budget) <= 2:
+                debug["skipped_reason"] = debug.get("skipped_reason") or "reserved fetch budget for dimension/spec parsing"
                 break
         if budget is not None and not budget.can_fetch():
             debug["budget_blocked"] = True
@@ -1832,7 +2047,7 @@ def enrich_row(
                                 {
                                     **enrichment_debug,
                                     "skipped_reason": "full cache hit with product page refresh",
-                                    "enrichment_status": "complete",
+                                    "enrichment_status": _classify_enrichment_status(verified_updated),
                                     "enrichment_error": "",
                                 },
                             ), None, verified_dim_result
@@ -1842,7 +2057,7 @@ def enrich_row(
                         {
                             **enrichment_debug,
                             "skipped_reason": "full cache hit",
-                            "enrichment_status": "complete",
+                            "enrichment_status": _classify_enrichment_status(updated),
                             "enrichment_error": "",
                         },
                     ), None, None
@@ -1955,7 +2170,7 @@ def enrich_row(
             _append_stage(enrichment_debug, "ENRICHMENT_COMPLETE")
             return _stamp_dimension_debug(
                 verified_updated,
-                {**enrichment_debug, "enrichment_status": "complete", "enrichment_error": ""},
+                {**enrichment_debug, "enrichment_status": _classify_enrichment_status(verified_updated), "enrichment_error": ""},
             ), None, verified_dim_result
         if stored_source and _str_val(row.get("Product URL")) and not _str_val(enrichment_debug.get("selected_product_url")):
             try:
@@ -2047,16 +2262,39 @@ def enrich_row(
             )
         else:
             best = results[0]
-            parsed_domain = urllib.parse.urlparse(best.url).netloc
+            parsed_domain = ""
+            try:
+                parsed_domain = urllib.parse.urlparse(best.url).netloc
+            except ValueError as exc:
+                _stamp_invalid_url_debug(
+                    enrichment_debug,
+                    best.url,
+                    source="general_search_result",
+                    step="general_search_domain_parse",
+                    row=row,
+                    query=_str_val(enrichment_debug.get("search_query_used")),
+                    fallback_attempted=True,
+                    reason=f"Invalid IPv6 URL: {exc}",
+                )
             if parsed_domain and not domain_match:
                 record_discovered_domain(brand, parsed_domain)
-            raw_html = _fetch_page_html(best.url)
+            raw_html = _fetch_page_html_with_debug(
+                best.url,
+                debug=enrichment_debug,
+                source="general_search_result",
+                step="general_search_page_fetch",
+                row=row,
+                query=_str_val(enrichment_debug.get("search_query_used")),
+            )
             if raw_html and session_cache is not None:
                 session_cache.urls[best.url] = raw_html
             page_text = _html_to_text(raw_html)
 
             if not raw_html:
-                domain = urllib.parse.urlparse(best.url).netloc or best.url[:50]
+                try:
+                    domain = urllib.parse.urlparse(best.url).netloc or best.url[:50]
+                except ValueError:
+                    domain = best.url[:50]
                 updated = _mark_enrichment_failed(
                     row,
                     enrichment_debug,
@@ -2178,12 +2416,12 @@ def enrich_row(
             enrichment_debug["stored_source_rejected_reason"] = f"source memory save failed: {exc}"
             enrichment_debug["knowledge_base_rejected_reason"] = enrichment_debug["stored_source_rejected_reason"]
         return _stamp_dimension_debug(
-            updated,
-            _merge_preserved_debug(
                 updated,
-                {**enrichment_debug, "enrichment_status": "complete", "enrichment_error": ""},
-            ),
-        ), None, dim_result
+                _merge_preserved_debug(
+                    updated,
+                    {**enrichment_debug, "enrichment_status": _classify_enrichment_status(updated), "enrichment_error": ""},
+                ),
+            ), None, dim_result
     except Exception as exc:
         tb = traceback.format_exc()
         _log.exception("Enrichment failed for row brand=%s model=%s", _str_val(row.get("Brand")), _str_val(row.get("Model/SKU")))
@@ -2320,9 +2558,7 @@ def enrich_dataframe(
                         "row_index": int(rep_idx),
                         "product_name": _str_val(updated.get("Product Name")),
                         "model_searched": _str_val(updated.get("Model/SKU")),
-                        "domain_used": urllib.parse.urlparse(
-                            dim_result.source_url
-                        ).netloc or "",
+                        "domain_used": _domain_of(dim_result.source_url),
                         "queries_tried": list(dim_result.queries_tried),
                         "urls_checked": list(dim_result.urls_checked),
                         "evidence_text": dim_result.evidence_text,

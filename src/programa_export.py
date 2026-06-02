@@ -115,6 +115,19 @@ _URL_WEAK_PAGE_RE = re.compile(
     r"(^|/)(?:sitemap|product-sitemap|search|category|categories|collections?|browse|tag|blog|support)(?:/|$)",
     re.IGNORECASE,
 )
+_RETAILER_DOMAINS = frozenset({
+    "ajmadison.com",
+    "appliancesconnection.com",
+    "bestbuy.com",
+    "build.com",
+    "designerappliances.com",
+    "ferguson.com",
+    "homedepot.com",
+    "lowes.com",
+    "perigold.com",
+    "wayfair.com",
+})
+_MANUAL_ARCHIVE_RE = re.compile(r"\b(manual|archive|manuals|install|installation|guide|document)\b", re.IGNORECASE)
 
 _SECTION_ALIASES: dict[str, str] = {
     "": "General",
@@ -281,6 +294,29 @@ def _first_url(value: object) -> str:
     return text
 
 
+def _domain_from_url(value: object) -> str:
+    url = _first_url(value)
+    if not url:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return ""
+    host = (parsed.hostname or "").strip().lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _domain_matches(domain: str, expected: str) -> bool:
+    domain = str(domain or "").lower().lstrip(".")
+    expected = str(expected or "").lower().lstrip(".")
+    return bool(domain and expected and (domain == expected or domain.endswith(f".{expected}")))
+
+
+def _is_retailer_url(url: object) -> bool:
+    domain = _domain_from_url(url)
+    return any(_domain_matches(domain, retailer) for retailer in _RETAILER_DOMAINS)
+
+
 def _first_url_from_fields(row: dict, fields: tuple[str, ...]) -> str:
     for field in fields:
         url = _first_url(row.get(field))
@@ -289,13 +325,39 @@ def _first_url_from_fields(row: dict, fields: tuple[str, ...]) -> str:
     return ""
 
 
-def _source_label_parts(*values: object) -> str:
+def _source_kind_label(url: object, row: dict | None = None, source_hint: object = "") -> str:
+    """Classify a user-facing source label. Never call retailers manufacturers."""
+    row = row or {}
+    url_text = _str_val(url)
+    hint = _str_val(source_hint).replace("_", " ").lower()
+    if _is_pdf_url(url_text):
+        return "Manual/archive" if _MANUAL_ARCHIVE_RE.search(url_text) else "Spec sheet PDF"
+    if "manual" in hint or "archive" in hint or "installation" in hint:
+        return "Manual/archive"
+    if "spec" in hint or "pdf" in hint:
+        return "Spec sheet PDF"
+    if "retailer" in hint or _is_retailer_url(url_text):
+        return "Retailer"
+    manufacturer_domain = _str_val(row.get("manufacturer_domain_used") or row.get("Manufacturer Domain"))
+    if manufacturer_domain and _domain_matches(_domain_from_url(url_text), manufacturer_domain):
+        return "Manufacturer"
+    if "manufacturer" in hint:
+        return "Manufacturer"
+    return "Unknown"
+
+
+def _source_label_parts(url: object = "", row: dict | None = None, source_hint: object = "", *values: object) -> str:
     parts: list[str] = []
+    source_label = _source_kind_label(url, row, source_hint)
+    if source_label != "Unknown":
+        parts.append(source_label)
     for value in values:
         text = _str_val(value)
         if not text or text.lower() in {"none", "null", "nan"}:
             continue
         text = text.replace("_", " ").strip()
+        if text.lower() in {"manufacturer page", "manufacturer pdf", "retailer page", "retailer pdf"}:
+            continue
         if text.lower() in {"high", "medium", "low"}:
             text = f"{text.lower()} confidence"
         if text.lower() in {part.lower() for part in parts}:
@@ -316,6 +378,38 @@ def _manufacturer_url(row: dict) -> str:
     if "." not in domain or any(ch.isspace() for ch in domain):
         return ""
     return f"https://{domain}"
+
+
+def _append_dimension_context_note(notes: str, row: dict) -> str:
+    """Keep non-product/extra dimensions visible but outside Programa W/H/D."""
+    dimensions = _str_val(row.get("Dimensions"))
+    parts = extract_labeled_dimensions(dimensions)
+    additions: list[str] = []
+    if parts.get("length"):
+        additions.append(
+            f"Additional dimension noted: Length {parts['length']} kept out of Programa W x H x D field."
+        )
+    rejected = _str_val(row.get("rejected_dimensions_reason"))
+    if rejected:
+        additions.append(f"Dimensions rejected before export: {rejected}.")
+    if not additions:
+        return notes
+    existing = _str_val(notes)
+    for addition in additions:
+        if addition not in existing:
+            existing = f"{existing} {addition}".strip() if existing else addition
+    return existing
+
+
+def _programa_dimension_text(row: dict) -> str:
+    """Return main Programa dimensions as W x H x D only, never Length/Cutout."""
+    if _dimension_rejection_reason(row):
+        return ""
+    raw = _str_val(row.get("Dimensions"))
+    parts = extract_labeled_dimensions(raw)
+    if parts.get("width") and parts.get("height") and parts.get("depth"):
+        return f'{parts["width"]}"W x {parts["height"]}"H x {parts["depth"]}"D'
+    return raw
 
 
 def _build_source_notes_block(row: dict) -> str:
@@ -367,34 +461,35 @@ def _build_source_notes_block(row: dict) -> str:
     if has_complete_3d_dimensions(dimensions) and dimension_url:
         lines.append(
             "Dimensions source: "
-            f"{dimension_url}{_source_label_parts(row.get('Dimension Source Type'), row.get('Dimension Confidence') or row.get('dimension_confidence'))}"
+            f"{dimension_url}{_source_label_parts(dimension_url, row, row.get('Dimension Source Type'), row.get('Dimension Confidence') or row.get('dimension_confidence'))}"
         )
     elif not has_complete_3d_dimensions(dimensions) and likely_dimension_source:
         lines.append(
             "Dimensions missing — check source: "
-            f"{likely_dimension_source}{_source_label_parts(row.get('Dimension Source Type'), row.get('Dimension Confidence') or row.get('dimension_confidence'))}"
+            f"{likely_dimension_source}{_source_label_parts(likely_dimension_source, row, row.get('Dimension Source Type'), row.get('Dimension Confidence') or row.get('dimension_confidence'))}"
         )
 
     if _is_public_https_image_url(image_url) and image_source_url:
         lines.append(
             "Image source: "
-            f"{image_source_url}{_source_label_parts(row.get('image_confidence'))}"
+            f"{image_source_url}{_source_label_parts(image_source_url, row, 'image', row.get('image_confidence'))}"
         )
     elif not _is_public_https_image_url(image_url) and likely_image_source:
         lines.append(
             "Image missing — check source: "
-            f"{likely_image_source}{_source_label_parts(row.get('image_confidence'))}"
+            f"{likely_image_source}{_source_label_parts(likely_image_source, row, 'image', row.get('image_confidence'))}"
         )
 
     if product_page_url:
         lines.append(
             "Product page: "
-            f"{product_page_url}{_source_label_parts(row.get('selected_product_url_confidence') or row.get('product_url_confidence'))}"
+            f"{product_page_url}{_source_label_parts(product_page_url, row, 'product_page', row.get('selected_product_url_confidence') or row.get('product_url_confidence'))}"
         )
     if spec_sheet_url:
-        lines.append(f"Spec sheet: {spec_sheet_url}")
+        lines.append(f"Spec sheet: {spec_sheet_url}{_source_label_parts(spec_sheet_url, row, 'spec_sheet')}")
     if manufacturer_url:
-        lines.append(f"Manufacturer: {manufacturer_url}")
+        source_label = _source_kind_label(manufacturer_url, row, "manufacturer_url")
+        lines.append(f"{source_label}: {manufacturer_url}")
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -520,6 +615,34 @@ def _contamination_reason(row: dict) -> str:
     if _PHONE_RE.search(text) and not _product_identity_key(row):
         return "phone/header text detected"
     return ""
+
+
+def _has_product_source(row: dict) -> bool:
+    return bool(
+        _first_url_from_fields(row, (
+            "Product URL",
+            "selected_product_url",
+            "Dimension Source URL",
+            "dimension_source_url",
+            "spec_sheet_url",
+            "image_source_url",
+        ))
+    )
+
+
+def _readiness_row_score(row: dict) -> tuple[int, int, list[str]]:
+    """Score Programa readiness on fields SCH needs after export cleanup."""
+    checks: list[tuple[str, bool]] = [
+        ("dimensions", has_complete_3d_dimensions(_programa_dimension_text(row))),
+        ("image", _is_public_https_image_url(row.get("Image URL"))),
+        ("product URL/source", _has_product_source(row)),
+        ("SKU/model", bool(_str_val(row.get("Model/SKU") or row.get("SKU") or row.get("Model")))),
+        ("supplier", bool(_str_val(row.get("Supplier")))),
+        ("room/location", bool(_str_val(row.get("Room") or row.get("Location")))),
+    ]
+    passed = sum(1 for _name, ok in checks if ok)
+    missing = [name for name, ok in checks if not ok]
+    return passed, len(checks), missing
 
 
 def _room_key(row: dict) -> str:
@@ -737,12 +860,22 @@ def _quantity_value(value):
         return text
 
 
+def _canonical_sku_display(value: object) -> str:
+    """Normalize accidental SKU whitespace while preserving meaningful punctuation."""
+    text = _str_val(value)
+    if not text:
+        return ""
+    return re.sub(r"\s+", "", text)
+
+
 def _row_to_programa_dict(row: dict) -> dict:
     """Map one internal intake row to Programa's import columns."""
     raw_notes = _str_val(row.get("Notes"))
     material = _str_val(row.get("Material")) or _extract_material_from_notes(raw_notes)
+    row = dict(row)
+    row["Notes"] = _append_dimension_context_note(raw_notes, row)
     row = append_source_links_to_notes(row)
-    dimensions = "" if _dimension_rejection_reason(row) else _str_val(row.get("Dimensions"))
+    dimensions = _programa_dimension_text(row)
     parts = extract_labeled_dimensions(dimensions)
     finish_color = _str_val(row.get("Finish / Color"))
     color = _str_val(row.get("Color"))
@@ -751,13 +884,13 @@ def _row_to_programa_dict(row: dict) -> dict:
         "Section": normalize_section(row.get("Product Category") or row.get("Section")),
         "Product Name": _str_val(row.get("Product Name")),
         "Brand": _str_val(row.get("Brand")),
-        "SKU": _str_val(row.get("Model/SKU")),
+        "SKU": _canonical_sku_display(row.get("Model/SKU")),
         "Model": "",
         "Dimensions": dimensions,
         "Width (in)": _str_val(parts.get("width")),
         "Height (in)": _str_val(parts.get("height")),
         "Depth (in)": _str_val(parts.get("depth")),
-        "Length (in)": _str_val(parts.get("length")),
+        "Length (in)": "",
         "Quantity": _quantity_value(row.get("Quantity")),
         "Price": _str_val(row.get("Price")),
         "Supplier": _str_val(row.get("Supplier")),
@@ -794,6 +927,9 @@ def validate_for_export(rows) -> dict:
     image_url_present = 0
     image_url_total = 0
     export_count = 0
+    readiness_points = 0
+    readiness_total = 0
+    readiness_missing_fields: dict[str, int] = {}
     section_counts: dict[str, int] = {}
     section_equals_product_name: list[dict] = []
     section_too_long: list[dict] = []
@@ -847,7 +983,7 @@ def validate_for_export(rows) -> dict:
             section_equals_product_name.append({"index": i, "product_name": name, "section": raw_section})
         if len(raw_section) > 30:
             section_too_long.append({"index": i, "product_name": name, "section": raw_section})
-        if not has_complete_3d_dimensions(_str_val(row.get("Dimensions"))):
+        if not has_complete_3d_dimensions(_programa_dimension_text(row)):
             missing_dimensions += 1
         if not _str_val(row.get("Product URL")):
             missing_product_url += 1
@@ -855,6 +991,19 @@ def validate_for_export(rows) -> dict:
             missing_image_url += 1
         elif not _str_val(row.get("Image URL")):
             missing_image_url += 1
+        row_points, row_total, row_missing = _readiness_row_score(row)
+        readiness_points += row_points
+        readiness_total += row_total
+        for field_name in row_missing:
+            readiness_missing_fields[field_name] = readiness_missing_fields.get(field_name, 0) + 1
+
+    readiness_score = round((readiness_points / readiness_total) * 100) if readiness_total else 0
+    if readiness_score >= 90:
+        readiness_status = "ready"
+    elif readiness_score >= 50:
+        readiness_status = "review_draft"
+    else:
+        readiness_status = "not_programa_ready"
 
     return {
         "skipped": skipped,
@@ -881,6 +1030,9 @@ def validate_for_export(rows) -> dict:
         "phone_email_header_contamination": phone_email_header_contamination,
         "parsed_rows_count": len(source_rows),
         "export_rows_count": export_count,
+        "readiness_score": readiness_score,
+        "readiness_status": readiness_status,
+        "readiness_missing_fields": dict(sorted(readiness_missing_fields.items())),
     }
 
 

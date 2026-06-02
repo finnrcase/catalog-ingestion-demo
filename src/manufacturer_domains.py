@@ -58,7 +58,26 @@ def load_domain_cache(path: Path | None = None) -> dict:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        repaired: dict = {}
+        changed = False
+        for brand, entry in data.items():
+            if not isinstance(entry, dict):
+                changed = True
+                continue
+            try:
+                domain = clean_domain(entry.get("domain", ""))
+            except Exception:
+                _log.warning("Removing invalid manufacturer domain cache entry for %s: %r", brand, entry.get("domain"))
+                changed = True
+                continue
+            if domain != entry.get("domain"):
+                changed = True
+            repaired[brand] = {**entry, "domain": domain}
+        if changed:
+            save_domain_cache(repaired, path)
+        return repaired
     except Exception:
         _log.warning("Could not read manufacturer domain cache at %s", path, exc_info=True)
         return {}
@@ -117,13 +136,21 @@ def get_domain_for_brand(brand: str, path: Path | None = None) -> tuple[str, str
     cache = load_domain_cache(path)
     cached = cache.get(key)
     if isinstance(cached, dict) and cached.get("source") == "user" and cached.get("domain"):
-        return str(cached["domain"]), "user"
+        try:
+            return clean_domain(str(cached["domain"])), "user"
+        except ValueError:
+            cache.pop(key, None)
+            save_domain_cache(cache, path)
 
     hardcoded = HARDCODED_DOMAINS.get(key)
     if hardcoded:
         return hardcoded, "hardcoded"
 
     if isinstance(cached, dict) and cached.get("domain"):
-        return str(cached["domain"]), str(cached.get("source") or "cached")
+        try:
+            return clean_domain(str(cached["domain"])), str(cached.get("source") or "cached")
+        except ValueError:
+            cache.pop(key, None)
+            save_domain_cache(cache, path)
 
     return None

@@ -199,6 +199,29 @@ def test_product_cache_null_reason_stored_in_null_fields(product_cache):
     assert "image_url__reason" not in entry  # sidecar key is not stored as a top-level field
 
 
+def test_product_cache_removes_invalid_url_fields(product_cache):
+    product_cache._data = {
+        "fisherpaykel_rb36s25mkiwn": {
+            "product_url": "https://[bad",
+            "image_url": "https://cdn.example.com/product.jpg",
+            "dimension_confidence": "high",
+        }
+    }
+    product_cache._save()
+    product_cache._data = None
+
+    entry = product_cache.get("fisherpaykel_rb36s25mkiwn")
+
+    assert entry["product_url"] is None
+    assert entry["image_url"] == "https://cdn.example.com/product.jpg"
+    assert entry["null_fields"]["product_url"]["failure_reason"] == "invalid URL removed from cache"
+
+
+def test_mfr_cache_rejects_invalid_domain(mfr_cache):
+    mfr_cache.set("lynx", "https://[bad", source="discovered")
+    assert mfr_cache.get("lynx") is None
+
+
 # ── confidence_ok ──────────────────────────────────────────────────────────────
 
 def test_confidence_ok_dimension_field_uses_dimension_confidence():

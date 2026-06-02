@@ -562,6 +562,69 @@ def test_check_image_content_type_rejects_when_both_head_and_get_fail():
         assert _check_image_content_type("https://cdn.example.com/missing") is False
 
 
+def test_fetch_page_html_budgeted_rejects_invalid_ipv6_before_httpx():
+    from src.product_enrichment import _fetch_page_html_budgeted
+
+    debug = {"search_query_used": '"Fisher Paykel" "RB36S25MKIWN"'}
+    row = {"Brand": "Fisher & Paykel", "Model/SKU": "RB36S25MKIWN"}
+
+    with patch("src.product_enrichment.httpx.get") as mock_get:
+        html = _fetch_page_html_budgeted(
+            "https://[bad",
+            debug=debug,
+            source="product_enrichment_cache",
+            step="cached_product_url_fetch",
+            row=row,
+        )
+
+    assert html == ""
+    assert not mock_get.called
+    assert "Invalid IPv6 URL" in debug["invalid_url_error"]
+    assert debug["invalid_url_generated"] == "https://[bad"
+    assert debug["invalid_url_source"] == "product_enrichment_cache"
+    assert debug["invalid_url_step"] == "cached_product_url_fetch"
+    assert debug["invalid_url_normalized_model"] == "rb36s25mkiwn"
+    assert debug["invalid_url_fallback_attempted"] == "yes"
+
+
+def test_duplicate_enrichment_reuses_same_sources_and_dimensions():
+    from src.product_enrichment import _merge_duplicate_enrichment
+
+    original = {
+        "Brand": "Scotsman",
+        "Model/SKU": "SCN60PA1SU",
+        "Product Name": "Icemaker Bar",
+        "Room": "Bar",
+        "Dimensions": "",
+        "Image URL": "",
+        "Product URL": "",
+    }
+    source = {
+        "Brand": "Scotsman",
+        "Model/SKU": "SCN60PA1SU",
+        "Product Name": "Icemaker Kitchen",
+        "Room": "Kitchen",
+        "Dimensions": '15"W x 34"H x 24"D',
+        "Width (in)": "15",
+        "Height (in)": "34",
+        "Depth (in)": "24",
+        "Image URL": "https://res.cloudinary.com/demo/scotsman.jpg",
+        "Product URL": "https://scotsman-ice.com/products/scn60pa1su",
+        "Dimension Source URL": "https://scotsman-ice.com/specs/scn60pa1su.pdf",
+        "Dimension Confidence": "high",
+        "image_source_url": "https://scotsman-ice.com/products/scn60pa1su",
+    }
+
+    merged = _merge_duplicate_enrichment(original, source, 0)
+
+    assert merged["Room"] == "Bar"
+    assert merged["Dimensions"] == '15"W x 34"H x 24"D'
+    assert merged["Image URL"] == "https://res.cloudinary.com/demo/scotsman.jpg"
+    assert merged["Product URL"] == "https://scotsman-ice.com/products/scn60pa1su"
+    assert merged["Dimension Source URL"] == "https://scotsman-ice.com/specs/scn60pa1su.pdf"
+    assert merged["duplicate_model_skipped"] is True
+
+
 # ── extract_image_url — extended sources ──────────────────────────────────────
 
 def test_extract_image_url_twitter_image():

@@ -55,6 +55,30 @@ def test_product_source_saves_reloads_and_applies_to_row(monkeypatch, tmp_path):
     assert {"Product URL", "Image URL", "Dimensions"}.issubset(set(filled))
 
 
+def test_product_source_strips_invalid_urls_before_lookup(monkeypatch, tmp_path):
+    sm = _isolate_source_memory(monkeypatch, tmp_path)
+
+    saved = sm.upsert_product_source(
+        {
+            "brand": "Fisher & Paykel",
+            "model_sku": "RB36S25MKIWN",
+            "product_page_url": "https://[bad",
+            "dimension_source_url": "https://www.fisherpaykel.com/us/specs/rb36s25mkiwn.pdf",
+            "dimensions_text": '36"W x 84"H x 24"D',
+            "confidence_score": 90,
+            "success_count": 1,
+        }
+    )
+
+    assert saved["product_page_url"] == ""
+    source = sm.lookup_product_source("Fisher & Paykel", "RB36S25MKIWN")
+    assert source["product_page_url"] == ""
+    assert source["dimension_source_url"].endswith(".pdf")
+    row, filled = sm.apply_product_source_to_row({"Brand": "Fisher & Paykel", "Model/SKU": "RB36S25MKIWN"}, source)
+    assert "Product URL" not in filled
+    assert row["Dimension Source URL"].endswith(".pdf")
+
+
 def test_product_source_success_count_accumulates(monkeypatch, tmp_path):
     sm = _isolate_source_memory(monkeypatch, tmp_path)
 

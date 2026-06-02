@@ -22,6 +22,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
+from urllib.parse import urlparse
 
 from src.runtime_storage import record_storage_warning, runtime_data_path
 
@@ -84,6 +85,57 @@ def confidence_ok(entry: dict, field_name: str) -> bool:
     """True if the relevant confidence for this field is 'high' or 'medium'."""
     conf_key = "dimension_confidence" if field_name in _DIMENSION_FIELDS else "general_confidence"
     return entry.get(conf_key, "") in ("high", "medium")
+
+
+_HOSTNAME_RE = re.compile(r"^[a-z0-9.-]+$", re.IGNORECASE)
+_DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$",
+    re.IGNORECASE,
+)
+_URL_FIELDS: frozenset[str] = frozenset(
+    {
+        "product_url",
+        "verified_product_url",
+        "product_page_url",
+        "manufacturer_url",
+        "spec_sheet_url",
+        "dimension_source_url",
+        "image_source_url",
+        "image_url",
+        "cloudinary_url",
+        "original_image_url",
+    }
+)
+
+
+def _valid_domain(value: object) -> bool:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return False
+    try:
+        parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+        host = (parsed.hostname or "").lower()
+    except Exception:
+        return False
+    if host.startswith("www."):
+        host = host[4:]
+    return bool(_DOMAIN_RE.match(host))
+
+
+def _valid_fetch_url(value: object) -> bool:
+    raw = str(value or "").strip()
+    if not raw or any(ch.isspace() for ch in raw):
+        return False
+    try:
+        parsed = urlparse(raw)
+        host = parsed.hostname
+    except Exception:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or not host:
+        return False
+    if ":" not in host and (not _HOSTNAME_RE.match(host) or "." not in host):
+        return False
+    return True
 
 
 # ── SearchBudget ───────────────────────────────────────────────────────────────
@@ -168,10 +220,21 @@ class ManufacturerDomainCache:
 
     def get(self, brand_key: str) -> dict | None:
         self._load()
-        return self._data.get(brand_key)
+        entry = self._data.get(brand_key)
+        if not entry:
+            return None
+        if not _valid_domain(entry.get("domain")):
+            _log.warning("ManufacturerDomainCache: removing invalid domain for %s: %r", brand_key, entry.get("domain"))
+            self._data.pop(brand_key, None)
+            self._save()
+            return None
+        return entry
 
     def set(self, brand_key: str, domain: str, source: str = "discovered") -> None:
         self._load()
+        if not _valid_domain(domain):
+            _log.warning("ManufacturerDomainCache: rejected invalid domain for %s: %r", brand_key, domain)
+            return
         existing = self._data.get(brand_key)
         if existing and existing.get("source") == "hardcoded":
             return  # never overwrite hardcoded entries
@@ -232,7 +295,32 @@ class ProductEnrichmentCache:
 
     def get(self, key: str) -> dict | None:
         self._load()
-        return self._data.get(key)
+        entry = self._data.get(key)
+        if not isinstance(entry, dict):
+            return entry
+        cleaned = dict(entry)
+        changed = False
+        null_fields = dict(cleaned.get("null_fields") or {})
+        for field_name in _URL_FIELDS:
+            value = cleaned.get(field_name)
+            if value and not _valid_fetch_url(value):
+                _log.warning(
+                    "ProductEnrichmentCache: removing invalid URL field %s for %s: %r",
+                    field_name,
+                    key,
+                    value,
+                )
+                cleaned[field_name] = None
+                null_fields[field_name] = {
+                    "last_attempted": datetime.now().isoformat(timespec="seconds"),
+                    "failure_reason": "invalid URL removed from cache",
+                }
+                changed = True
+        if changed:
+            cleaned["null_fields"] = null_fields
+            self._data[key] = cleaned
+            self._save()
+        return cleaned
 
     def update(self, key: str, fields: dict) -> None:
         """Merge fields into existing entry. Only stores non-empty values or explicit None.
@@ -247,6 +335,14 @@ class ProductEnrichmentCache:
         for field_name, value in fields.items():
             if field_name.endswith("__reason"):
                 continue  # skip internal reason hints
+            if field_name in _URL_FIELDS and value not in (None, "") and not _valid_fetch_url(value):
+                null_fields = entry.setdefault("null_fields", {})
+                null_fields[field_name] = {
+                    "last_attempted": now,
+                    "failure_reason": fields.get(f"{field_name}__reason", "invalid URL rejected from cache"),
+                }
+                entry[field_name] = None
+                continue
             if value is None:
                 null_fields = entry.setdefault("null_fields", {})
                 null_fields[field_name] = {
