@@ -341,6 +341,7 @@ export async function furtherEnrichRows(input: {
   rows: IntakeRow[];
   enabled: boolean;
   maxCostUsd: number;
+  maxCostPerItemUsd?: number;
 }): Promise<IntakeResponse> {
   return parseJson<IntakeResponse>(
     await apiFetch(apiUrl("/intake/further-enrich"), {
@@ -350,6 +351,7 @@ export async function furtherEnrichRows(input: {
         rows: input.rows,
         further_enrichment_enabled: input.enabled,
         further_enrichment_budget_usd: input.maxCostUsd,
+        further_enrichment_max_cost_per_item_usd: input.maxCostPerItemUsd,
       }),
     }),
   );

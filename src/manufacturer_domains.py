@@ -16,6 +16,18 @@ CACHE_PATH = DATA_DIR / "manufacturer_domain_cache.json"
 
 HARDCODED_DOMAINS: dict[str, str] = {
     "scotsman": "scotsman-ice.com",
+    "sub zero": "subzero-wolf.com",
+    "sub-zero": "subzero-wolf.com",
+    "subzero": "subzero-wolf.com",
+    "wolf": "subzero-wolf.com",
+    "cove": "subzero-wolf.com",
+    "miele": "mieleusa.com",
+    "fisher paykel": "fisherpaykel.com",
+    "fisher and paykel": "fisherpaykel.com",
+    "bosch": "bosch-home.com",
+    "ge": "geappliances.com",
+    "ge profile": "geappliances.com",
+    "lynx": "lynxgrills.com",
 }
 
 _HOST_RE = re.compile(

@@ -72,7 +72,7 @@ def test_invalid_cached_domain_is_removed(tmp_path):
         encoding="utf-8",
     )
 
-    assert get_domain_for_brand("Lynx", path=path) is None
-    assert get_domain_for_brand("Wolf", path=path) == ("subzero-wolf.com", "discovered")
+    assert get_domain_for_brand("Lynx", path=path) == ("lynxgrills.com", "hardcoded")
+    assert get_domain_for_brand("Wolf", path=path) == ("subzero-wolf.com", "hardcoded")
     data = json.loads(path.read_text(encoding="utf-8"))
     assert "lynx" not in data

@@ -178,8 +178,9 @@ def test_build_sku_lookup_queries_prioritizes_exact_model_and_domain():
 
     queries = _build_sku_lookup_queries(row, "scotsman-ice.com")
 
-    assert queries[0] == 'site:scotsman-ice.com "SCN60PA1SU" dimensions'
-    assert queries[1] == 'site:scotsman-ice.com "SCN60PA1SU" specification'
+    assert queries[0] == 'site:scotsman-ice.com "SCN60PA1SU" dimensions specifications spec sheet product'
+    assert 'site:scotsman-ice.com "SCN60PA1SU" product' in queries
+    assert 'site:scotsman-ice.com "SCN60PA1SU" specification' in queries
     assert 'site:scotsman-ice.com "SCN60PA1SU" specifications' in queries
     assert 'site:scotsman-ice.com "SCN60PA1SU" installation guide' in queries
     assert 'site:scotsman-ice.com "SCN60PA1SU" spec sheet PDF' in queries
@@ -191,6 +192,24 @@ def test_build_sku_lookup_queries_prioritizes_exact_model_and_domain():
     assert '"Scotsman" "SCN60PA1SU" product page' in queries
     assert '"Scotsman" "SCN60PA1SU" "Panel Ready Icemaker"' in queries
     assert '"Scotsman" "Panel Ready Icemaker"' in queries
+
+
+def test_build_sku_lookup_queries_adds_slash_suffix_variants():
+    row = {
+        "Brand": "Sub-Zero",
+        "Model/SKU": "DEC3650RID/R",
+        "Product Name": "36 Integrated Column Refrigerator Internal Dispenser Panel Ready",
+        "Product Category": "Appliances",
+    }
+
+    queries = _build_sku_lookup_queries(row, "subzero-wolf.com")
+    joined = "\n".join(queries)
+
+    assert '"DEC3650RID/R"' in queries[0]
+    assert '"DEC3650RIDR"' in queries[0]
+    assert '"DEC3650RID"' in queries[0]
+    assert '"DEC3650R"' in queries[0]
+    assert "36 Integrated Column Refrigerator" in joined
 
 
 def test_score_verified_product_page_rejects_sitemap_without_sku():
@@ -1060,7 +1079,7 @@ def test_enrich_row_sku_search_selects_official_verified_page(monkeypatch):
 
     assert error is None
     mock_search.assert_called_once()
-    assert mock_search.call_args.args[0] == 'site:scotsman-ice.com "SCN60PA1SU" dimensions'
+    assert mock_search.call_args.args[0] == 'site:scotsman-ice.com "SCN60PA1SU" dimensions specifications spec sheet product'
     assert updated["Product URL"] == official.url
     assert updated["selected_product_url_confidence"] == "high"
     assert updated["manufacturer_domain_used"] == "scotsman-ice.com"
@@ -1267,7 +1286,9 @@ def test_enrich_dataframe_enriches_url_rows_with_brand_and_sku():
         "Review Required": False,
         "Suggested Action": "",
     }])
-    with patch("src.product_enrichment.search_product_candidates", return_value=[]) as mock_search, \
+    with patch("src.product_enrichment._product_cache.get", return_value=None), \
+         patch("src.product_enrichment.lookup_product_source", return_value=None), \
+         patch("src.product_enrichment.search_product_candidates", return_value=[]) as mock_search, \
          patch("src.product_enrichment._fetch_page_html", return_value=""):
         updated_df, errors, diagnostics = enrich_dataframe(df)
     assert mock_search.called

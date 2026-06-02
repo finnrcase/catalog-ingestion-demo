@@ -148,6 +148,7 @@ def _missing_fields(row: dict[str, Any]) -> list[str]:
 def _row_prompt_payload(index: int, row: dict[str, Any]) -> dict[str, Any]:
     return {
         "row_id": str(index),
+        "requested_focus": _str(row.get("deep_retry_focus") or row.get("requested_missing_fields") or "missing_fields"),
         "missing_fields": _missing_fields(row),
         "brand": _str(row.get("Brand")),
         "model_sku": _str(row.get("Model/SKU")),
@@ -234,6 +235,8 @@ def _build_prompt(rows: list[dict[str, Any]]) -> str:
     return (
         "You are helping SCH build Programa-ready product schedule rows. "
         "Research or reason only about the listed incomplete rows. Return JSON matching the schema. "
+        "Respect each row's requested_focus: for dimensions, prioritize verified W x H x D and source links; "
+        "for image, prioritize a verified product image URL and source page; for missing_fields, target only missing or low-confidence fields. "
         "Prioritize verified manufacturer/spec sources over retailers. Do not invent dimensions, image URLs, or source links. "
         "If a field cannot be verified from a reliable source, leave it null and set confidence to low or none. "
         "Never suggest replacing existing high-confidence fields. Use inches for width_in, height_in, depth_in when available.\n\n"
@@ -249,16 +252,25 @@ def estimate_further_enrichment_cost(rows: list[dict[str, Any]], *, max_output_t
     return (input_tokens / 1000 * input_rate) + (max_output_tokens / 1000 * output_rate)
 
 
-def _pack_rows_under_budget(candidates: list[dict[str, Any]], max_cost_usd: float) -> tuple[list[dict[str, Any]], float, int]:
+def _pack_rows_under_budget(
+    candidates: list[dict[str, Any]],
+    max_cost_usd: float,
+    max_cost_per_item_usd: float | None = None,
+) -> tuple[list[dict[str, Any]], float, int]:
     packed: list[dict[str, Any]] = []
     estimated = 0.0
+    per_item_cap = max_cost_per_item_usd if max_cost_per_item_usd and max_cost_per_item_usd > 0 else None
     for candidate in candidates:
         trial = [*packed, candidate]
         trial_cost = estimate_further_enrichment_cost(trial)
-        if trial_cost <= max_cost_usd or not packed:
+        trial_per_item = trial_cost / max(len(trial), 1)
+        per_item_ok = per_item_cap is None or trial_per_item <= per_item_cap
+        if trial_cost <= max_cost_usd and per_item_ok:
             packed = trial
             estimated = trial_cost
         else:
+            if not packed:
+                estimated = trial_cost
             break
     if estimated > max_cost_usd:
         return [], estimated, len(candidates)
@@ -424,6 +436,7 @@ def further_enrich_dataframe(
     *,
     enabled: bool,
     max_cost_usd: float = 0.25,
+    max_cost_per_item_usd: float | None = 0.05,
     openai_call: Any | None = None,
 ) -> FurtherEnrichmentResult:
     result_df = df.copy()
@@ -478,7 +491,12 @@ def further_enrich_dataframe(
             },
         )
 
-    packed_rows, estimated_cost, skipped_budget = _pack_rows_under_budget(candidate_rows, max_cost_usd)
+    max_cost_per_item_usd = max(0.0, min(float(max_cost_per_item_usd or 0), 1.0))
+    packed_rows, estimated_cost, skipped_budget = _pack_rows_under_budget(
+        candidate_rows,
+        max_cost_usd,
+        max_cost_per_item_usd=max_cost_per_item_usd,
+    )
     if not packed_rows:
         message = "Further enrichment skipped: estimated OpenAI cost would exceed the configured cap."
         for candidate in candidate_rows:
@@ -497,6 +515,7 @@ def further_enrich_dataframe(
                 "further_enrichment_rows_skipped_budget": len(candidate_rows),
                 "further_enrichment_cost_usd": 0.0,
                 "further_enrichment_estimated_cost_usd": estimated_cost,
+                "further_enrichment_max_cost_per_item_usd": max_cost_per_item_usd,
             },
         )
 
@@ -522,6 +541,7 @@ def further_enrich_dataframe(
                 "further_enrichment_rows_skipped_budget": skipped_budget,
                 "further_enrichment_cost_usd": 0.0,
                 "further_enrichment_estimated_cost_usd": estimated_cost,
+                "further_enrichment_max_cost_per_item_usd": max_cost_per_item_usd,
             },
         )
 
@@ -590,6 +610,7 @@ def further_enrich_dataframe(
             "further_enrichment_cost_usd": actual_cost,
             "further_enrichment_cost_per_row_usd": round(actual_cost / max(len(packed_rows), 1), 6),
             "further_enrichment_estimated_cost_usd": usage.get("estimated_cost_usd") or estimated_cost,
+            "further_enrichment_max_cost_per_item_usd": max_cost_per_item_usd,
             "further_enrichment_model": usage.get("model") or _model_name(),
             "ai_calls_used": 1 if packed_rows else 0,
         },

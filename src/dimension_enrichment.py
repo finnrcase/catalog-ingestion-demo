@@ -100,13 +100,20 @@ BRAND_DOMAIN_TABLE: dict[str, str] = {
     "miele": "mieleusa.com",
     "wolf": "subzero-wolf.com",
     "sub-zero": "subzero-wolf.com",
+    "sub zero": "subzero-wolf.com",
+    "subzero": "subzero-wolf.com",
+    "cove": "subzero-wolf.com",
     "thermador": "thermador.com",
     "dacor": "dacor.com",
     "samsung": "samsung.com",
     "ge": "geappliances.com",
+    "ge profile": "geappliances.com",
     "ge appliances": "geappliances.com",
     "bosch": "bosch-home.com",
     "fisher & paykel": "fisherpaykel.com",
+    "fisher paykel": "fisherpaykel.com",
+    "fisher and paykel": "fisherpaykel.com",
+    "lynx": "lynxgrills.com",
     "frigidaire": "frigidaire.com",
     "lg": "lg.com",
     "whirlpool": "whirlpool.com",
@@ -161,27 +168,49 @@ def _make_not_found_result(
 
 
 def _normalize_model_variants(model: str) -> list[str]:
-    """Return up to 4 model variants to try in order: exact, no-spaces, dashes, suffix-stripped."""
+    """Return SKU variants in order: exact, collapsed, slash/suffix, dash variants."""
     # Strip whitespace and non-printable characters
     model = "".join(c for c in model.strip() if c.isprintable())
     if not model:
         return []
-    seen: list[str] = [model]
+    seen: list[str] = []
+
+    def _add(value: str) -> None:
+        value = "".join(c for c in str(value or "").strip() if c.isprintable())
+        if value and value not in seen:
+            seen.append(value)
+
+    _add(model)
 
     no_spaces = re.sub(r"\s+", "", model)
-    if no_spaces not in seen:
-        seen.append(no_spaces)
+    _add(no_spaces)
+
+    no_slashes = re.sub(r"[/\\]+", "", no_spaces)
+    _add(no_slashes)
+
+    if "/" in no_spaces or "\\" in no_spaces:
+        slash_parts = re.split(r"[/\\]+", no_spaces)
+        base = slash_parts[0]
+        suffix = slash_parts[-1]
+        _add(base)
+        if base and suffix and len(suffix) <= 3:
+            _add(f"{base}{suffix}")
+            if base.upper().endswith("RID") and suffix.upper() in {"R", "L"}:
+                _add(f"{base[:-3]}{suffix}")
+            elif base.upper().endswith("ID") and len(suffix) == 1:
+                _add(base[:-2])
 
     with_dashes = re.sub(r"\s+", "-", model)
-    if with_dashes not in seen:
-        seen.append(with_dashes)
+    _add(with_dashes)
+
+    no_hyphens = re.sub(r"[-\s]+", "", model)
+    _add(no_hyphens)
 
     # Suffix strip: last dash/space token of 1–3 chars
     tokens = re.split(r"[-\s]+", model)
     if len(tokens) > 1 and 1 <= len(tokens[-1]) <= 3:
         without_suffix = model[: -len(tokens[-1])].rstrip(" -")
-        if without_suffix and without_suffix not in seen:
-            seen.append(without_suffix)
+        _add(without_suffix)
     elif len(tokens) == 1:
         # No delimiters: strip a trailing 1–3 alpha color-code suffix only when
         # the string has the simple form  <alpha><digits><alpha 1-3>
@@ -190,8 +219,7 @@ def _normalize_model_variants(model: str) -> list[str]:
         m = re.match(r"^([A-Za-z]+\d+)([A-Za-z]{1,3})$", model)
         if m:
             without_suffix = m.group(1)
-            if without_suffix and without_suffix not in seen:
-                seen.append(without_suffix)
+            _add(without_suffix)
 
     return seen
 
@@ -1107,9 +1135,7 @@ def _confidence_for_dimension(
         if is_manufacturer and exact_model_evidence:
             return "high"
         return "medium"
-    if part_count == 2:
-        return "medium"
-    if part_count == 1:
+    if part_count in {1, 2}:
         return "low"
     return "none"
 
@@ -1130,6 +1156,9 @@ def _build_dimension_result(
 
     parts = extract_labeled_dimensions(dimensions)
     evidence = dimensions
+    part_count = _dimension_part_count(dimensions)
+    if part_count < 3:
+        confidence = "low" if part_count else "none"
     sanity_reason = dimension_sanity_reason(dimensions, "Appliances" if is_appliance else "")
     if sanity_reason:
         confidence = "none"
@@ -1468,6 +1497,11 @@ def find_dimensions(
 
     def _try_queries(query_list: list[str], is_manufacturer: bool) -> DimensionResult | None:
         for query in query_list:
+            if budget is not None and not budget.can_search():
+                debug["budget_blocked"] = True
+                debug["dimensions_blocked_by_budget"] = True
+                debug["skipped_reason"] = "search budget exhausted before dimension retry"
+                break
             queries_tried.append(query)
             search_urls = _brave_search_urls(query, limit=5, brand=brand, session_cache=session_cache, budget=budget)
             debug["pages_found"] = int(debug.get("pages_found") or 0) + len(search_urls)
@@ -1522,9 +1556,7 @@ def find_dimensions(
                         is_manufacturer=is_manufacturer,
                     )
                 part_count = _dimension_part_count(product_dims)
-                if part_count == 2 and conf == "high":
-                    conf = "medium"
-                elif part_count == 1:
+                if part_count < 3:
                     conf = "low"
                 result = _build_dimension_result(
                     dimensions=product_dims,

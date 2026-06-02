@@ -107,6 +107,7 @@ class RowsPayload(BaseModel):
 class FurtherEnrichmentPayload(RowsPayload):
     further_enrichment_enabled: bool = False
     further_enrichment_budget_usd: float = 0.25
+    further_enrichment_max_cost_per_item_usd: float = 0.05
 
 
 class ProgramaPayload(RowsPayload):
@@ -368,6 +369,31 @@ def _enrichment_summary(df: pd.DataFrame, elapsed_ms: float) -> dict:
     )
     missing_dimensions = sum(1 for row in included if not has_complete_3d_dimensions(row.get("Dimensions")))
     missing_images = sum(1 for row in included if not _text_value(row.get("Image URL")))
+    partial_dimensions = sum(
+        1
+        for row in included
+        if _text_value(row.get("dimensions_status")).lower() == "partial"
+        or _text_value(row.get("partial_dimensions_found"))
+    )
+    budget_skipped = sum(
+        1
+        for row in included
+        if _text_value(row.get("budget_blocked")).lower() in {"true", "1", "yes"}
+        or "budget" in _text_value(row.get("skipped_reason")).lower()
+    )
+
+    attr_searches = df.attrs.get("brave_searches_used")
+    attr_fetches = df.attrs.get("page_fetches_used")
+    if attr_searches is not None:
+        try:
+            searches_used = int(attr_searches)
+        except (TypeError, ValueError):
+            pass
+    if attr_fetches is not None:
+        try:
+            fetches_used = int(attr_fetches)
+        except (TypeError, ValueError):
+            pass
 
     estimated_cost = searches_used * brave_cost
     cost_per_useful_field = estimated_cost / useful_fields_found if useful_fields_found else 0
@@ -382,6 +408,8 @@ def _enrichment_summary(df: pd.DataFrame, elapsed_ms: float) -> dict:
         "rows_enriched": rows_enriched,
         "rows_missing_dimensions": missing_dimensions,
         "rows_missing_images": missing_images,
+        "rows_partial_dimensions": partial_dimensions,
+        "rows_budget_skipped": budget_skipped,
         "average_confidence": round(sum(confidences) / len(confidences), 3) if confidences else 0,
         "brave_searches_used": searches_used,
         "page_fetches_used": fetches_used,
@@ -806,12 +834,14 @@ def further_enrich_intake(payload: FurtherEnrichmentPayload) -> IntakeResponse:
         rows=len(payload.rows),
         enabled=payload.further_enrichment_enabled,
         cap=payload.further_enrichment_budget_usd,
+        per_item_cap=payload.further_enrichment_max_cost_per_item_usd,
     )
     try:
         result = further_enrich_dataframe(
             pd.DataFrame(payload.rows),
             enabled=payload.further_enrichment_enabled,
             max_cost_usd=payload.further_enrichment_budget_usd,
+            max_cost_per_item_usd=payload.further_enrichment_max_cost_per_item_usd,
         )
         df = apply_confidence_checks(result.dataframe)
         df = append_source_links_to_notes_dataframe(df)

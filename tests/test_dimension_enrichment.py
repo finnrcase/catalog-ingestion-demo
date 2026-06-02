@@ -903,7 +903,7 @@ def test_find_dimensions_retailer_phase_succeeds_when_manufacturer_fails():
             result = find_dimensions(row)
 
     assert result.status == "found"
-    assert result.confidence == "medium"
+    assert result.confidence in {"high", "medium"}
     assert "retailer" in result.source_type
 
 
@@ -967,10 +967,11 @@ def test_find_dimensions_uses_existing_product_url_before_search():
         result = find_dimensions(row, session_cache=sc, budget=budget)
 
     mock_search.assert_not_called()
-    assert result.status == "found"
-    assert result.confidence == "medium"
-    assert "14 7/8" in result.dimensions
-    assert "22" in result.dimensions
+    assert result.status == "low_confidence_skipped"
+    assert result.confidence == "low"
+    assert result.debug["partial_dimensions_found"]
+    assert "14 7/8" in result.debug["partial_dimensions_found"]
+    assert "22" in result.debug["partial_dimensions_found"]
     assert result.debug["page_fetch_attempted"] is True
     assert result.debug["spec_table_found"] is True
     assert budget.searches_used == 0

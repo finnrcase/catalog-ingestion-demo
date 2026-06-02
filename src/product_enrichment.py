@@ -152,6 +152,14 @@ _ENRICHMENT_DEBUG_FIELDS: list[str] = [
     "product_url_candidates",
     "selected_product_url",
     "selected_product_url_confidence",
+    "was_searched",
+    "selected_strategy",
+    "retry_recommended",
+    "dimensions_status",
+    "image_status",
+    "source_status",
+    "product_component_type",
+    "round_attempted",
     "sku_match_location",
     "page_fetched",
     "dimensions_found",
@@ -331,20 +339,81 @@ def _build_search_query(row: dict) -> str:
     return query
 
 
+def _sku_lookup_variants(model: object) -> list[str]:
+    """Generate exact and normalized SKU/model variants for low-cost lookup."""
+    raw = _str_val(model)
+    if not raw:
+        return []
+    seen: list[str] = []
+
+    def add(value: object) -> None:
+        text = _str_val(value)
+        if text and text not in seen:
+            seen.append(text)
+
+    add(raw)
+    no_spaces = re.sub(r"\s+", "", raw)
+    add(no_spaces)
+    add(re.sub(r"[/\\]+", "", no_spaces))
+    add(re.sub(r"[-\s]+", "", raw))
+    add(re.sub(r"\s+", "-", raw))
+    if "/" in no_spaces or "\\" in no_spaces:
+        parts = re.split(r"[/\\]+", no_spaces)
+        base = parts[0]
+        suffix = parts[-1]
+        add(base)
+        if base and suffix and len(suffix) <= 3:
+            add(f"{base}{suffix}")
+            if base.upper().endswith("RID") and suffix.upper() in {"R", "L"}:
+                add(f"{base[:-3]}{suffix}")
+            elif base.upper().endswith("ID") and len(suffix) == 1:
+                add(base[:-2])
+    tokens = re.split(r"[-\s]+", raw)
+    if len(tokens) > 1 and 1 <= len(tokens[-1]) <= 3:
+        add(raw[: -len(tokens[-1])].rstrip(" -"))
+    return seen
+
+
+def _quoted_or_clause(values: list[str], limit: int = 5) -> str:
+    values = [value for value in values if value][:limit]
+    if not values:
+        return ""
+    if len(values) == 1:
+        return f'"{values[0]}"'
+    return "(" + " OR ".join(f'"{value}"' for value in values) + ")"
+
+
 def _build_sku_lookup_queries(row: dict, manufacturer_domain: str = "") -> list[str]:
     brand = _str_val(row.get("Brand"))
     model = _str_val(row.get("Model/SKU"))
     product_name = _str_val(row.get("Product Name"))
+    category = _str_val(row.get("Product Category"))
+    variants = _sku_lookup_variants(model)
+    variant_clause = _quoted_or_clause(variants)
+    context = " ".join(
+        part
+        for part in (
+            product_name,
+            category,
+        )
+        if part
+    )
     queries: list[str] = []
+    if manufacturer_domain and variant_clause:
+        queries.append(
+            f"site:{manufacturer_domain} {variant_clause} dimensions specifications spec sheet product"
+        )
     if manufacturer_domain and model:
         queries.extend([
+            f'site:{manufacturer_domain} "{model}" product',
+            f'site:{manufacturer_domain} "{model}" spec sheet PDF',
+            f'site:{manufacturer_domain} "{model}" installation guide',
             f'site:{manufacturer_domain} "{model}" dimensions',
             f'site:{manufacturer_domain} "{model}" specification',
             f'site:{manufacturer_domain} "{model}" specifications',
-            f'site:{manufacturer_domain} "{model}" spec sheet PDF',
-            f'site:{manufacturer_domain} "{model}" installation guide',
-            f'site:{manufacturer_domain} "{model}" product',
         ])
+    if manufacturer_domain and context and variants:
+        queries.append(f"site:{manufacturer_domain} {variants[0]} {context} dimensions")
     if brand and model:
         queries.extend([
             f'"{brand}" "{model}" dimensions',
@@ -355,6 +424,9 @@ def _build_sku_lookup_queries(row: dict, manufacturer_domain: str = "") -> list[
             f'"{brand}" "{model}" product page',
             f'"{model}" PDF dimensions',
         ])
+    for variant in variants[1:4]:
+        if brand and variant:
+            queries.append(f'"{brand}" "{variant}" dimensions specifications')
     if brand and model:
         queries.extend([
             f'"{brand}" "{model}" dimensions image product page',
@@ -1372,6 +1444,14 @@ def _dimension_debug_defaults(row: dict) -> dict:
         "product_url_candidates": "",
         "selected_product_url": "",
         "selected_product_url_confidence": "",
+        "was_searched": "no",
+        "selected_strategy": "",
+        "retry_recommended": "",
+        "dimensions_status": "",
+        "image_status": "",
+        "source_status": "",
+        "product_component_type": _product_component_type(row),
+        "round_attempted": "",
         "sku_match_location": "",
         "page_fetched": False,
         "dimensions_found": False,
@@ -1417,12 +1497,12 @@ def _dimension_debug_defaults(row: dict) -> dict:
 
 
 def _stamp_dimension_debug(row: dict, debug: dict) -> dict:
-    updated = row.copy()
+    updated = _apply_status_fields(row)
     merged = _dimension_debug_defaults(updated)
     merged.update(debug or {})
     for field in _ENRICHMENT_DEBUG_FIELDS:
         updated[field] = merged.get(field, "")
-    return updated
+    return _apply_status_fields(updated)
 
 
 def _merge_preserved_debug(row: dict, debug: dict) -> dict:
@@ -1640,6 +1720,77 @@ def _classify_enrichment_status(row: dict, failed: bool = False) -> str:
     return "complete"
 
 
+def _product_component_type(row: dict) -> str:
+    text = " ".join(
+        _str_val(row.get(field))
+        for field in ("Product Name", "Description", "Notes", "Product Category", "Model/SKU")
+    ).lower()
+    if re.search(r"\b(trim|panel|kit|blower|filter|accessor(?:y|ies)|component|insert|sleeve|handle|grille)\b", text):
+        return "accessory/component"
+    model = _str_val(row.get("Model/SKU"))
+    if model.isdigit() and 4 <= len(model) <= 7:
+        return "accessory/component"
+    return "primary_product"
+
+
+def _dimension_status(row: dict) -> str:
+    if has_complete_3d_dimensions(row.get("Dimensions")):
+        return "complete"
+    if _str_val(row.get("partial_dimensions_found")) or _str_val(row.get("Dimensions")):
+        return "partial"
+    if _str_val(row.get("rejected_dimensions_reason")):
+        return "failed"
+    if _str_val(row.get("Dimension Lookup Status")) in {"low_confidence_skipped"}:
+        return "partial"
+    if _str_val(row.get("Dimension Lookup Status")) == "not_found":
+        return "missing"
+    return "missing"
+
+
+def _image_status(row: dict) -> str:
+    if _has_good_image(row):
+        return "found"
+    if _str_val(row.get("selected_image_url")):
+        return "fallback"
+    if _str_val(row.get("cloudinary_error")) or _str_val(row.get("Image Upload Status")).lower() == "failed":
+        return "failed"
+    return "missing"
+
+
+def _source_status(row: dict) -> str:
+    source_type = " ".join(
+        _str_val(row.get(field))
+        for field in ("Dimension Source Type", "source_type", "selected_strategy")
+    ).lower()
+    product_url = _str_val(row.get("selected_product_url") or row.get("Product URL"))
+    domain = _domain_of(product_url)
+    manufacturer_domain = _str_val(row.get("manufacturer_domain_used"))
+    if "manufacturer" in source_type or _domain_matches(domain, manufacturer_domain):
+        return "manufacturer"
+    if "retailer" in source_type:
+        return "dealer"
+    if product_url:
+        return "fallback"
+    if _str_val(row.get("skipped_reason")).lower().startswith("skipped"):
+        return "skipped"
+    return "manual"
+
+
+def _apply_status_fields(row: dict) -> dict:
+    updated = dict(row)
+    updated["dimensions_status"] = _dimension_status(updated)
+    updated["image_status"] = _image_status(updated)
+    updated["source_status"] = _source_status(updated)
+    updated["product_component_type"] = _product_component_type(updated)
+    if updated["dimensions_status"] in {"missing", "partial"}:
+        updated["retry_recommended"] = "dimension-focused retry"
+    elif updated["image_status"] in {"missing", "failed"}:
+        updated["retry_recommended"] = "image-only retry"
+    else:
+        updated["retry_recommended"] = ""
+    return updated
+
+
 def _search_sku_product_pages(
     row: dict,
     manufacturer_domain: str,
@@ -1659,6 +1810,8 @@ def _search_sku_product_pages(
             break
         queries_used.append(query)
         debug["search_provider"] = "brave"
+        debug["was_searched"] = "yes"
+        debug["selected_strategy"] = "manufacturer" if manufacturer_domain and query.startswith(f"site:{manufacturer_domain}") else "fallback"
         debug["search_query_used"] = " | ".join(queries_used)
         results = search_product_candidates(query, brand, session_cache=session_cache)
         if budget is not None:
@@ -1811,6 +1964,7 @@ def _try_verified_page_enrichment(
 
     if product_url:
         candidates_to_check.append((product_url, "", ""))
+        debug["selected_strategy"] = "existing_product_url"
     if not product_url or _reject_weak_product_url(product_url):
         candidate_limit = max(1, min(3, getattr(budget, "max_urls", 3) if budget is not None else 3))
         for result in _search_sku_product_pages(
@@ -2476,6 +2630,7 @@ def enrich_dataframe(
     total_searches_used = 0
     total_fetches_used = 0
     unique_products_searched = 0
+    dimension_diagnostic_keys: set[tuple[str, str, str, str]] = set()
 
     grouped_indices: dict[str, list] = {}
     unique_counter = 0
@@ -2499,61 +2654,93 @@ def enrich_dataframe(
             key = f"__row_{idx}_{unique_counter}"
         grouped_indices.setdefault(key, []).append(idx)
 
-    for key, indices in grouped_indices.items():
-        rep_idx = max(indices, key=lambda i: _row_richness_score(df.loc[i].to_dict()))
-        remaining_searches = max_run_searches - total_searches_used
-        setattr(_session, "remaining_searches", remaining_searches)
-        # Keep page/spec fetches bounded per run as well. These are usually free,
-        # but they still affect latency and failure noise in serverless.
-        setattr(_session, "remaining_fetches", max(0, (max_run_searches * 3) - total_fetches_used))
+    representative_for_key: dict[str, object] = {
+        key: max(indices, key=lambda i: _row_richness_score(df.loc[i].to_dict()))
+        for key, indices in grouped_indices.items()
+    }
+    searched_keys: set[str] = set()
 
-        if remaining_searches <= 0:
-            for idx in indices:
-                r = df.loc[idx].to_dict()
-                blocked_debug = _dimension_debug_defaults(r)
-                _append_stage(blocked_debug, "ENRICHMENT_STARTED")
-                _append_stage(blocked_debug, "ENRICHMENT_COMPLETE")
-                blocked_debug.update({
-                    "budget_blocked": True,
-                    "skipped_reason": "Skipped due to enrichment budget cap",
-                    "enrichment_status": "needs_review",
-                    "enrichment_error": "",
-                    "budget_spent": "searches=0/0; fetches=0/0",
-                })
-                for col, val in blocked_debug.items():
-                    if col in df.columns:
-                        df.at[idx, col] = val
-            continue
+    def _group_rep(key: str) -> object:
+        return representative_for_key[key]
 
-        try:
-            representative = df.loc[rep_idx].to_dict()
-            updated, error, dim_result = enrich_row(
-                representative,
-                enrichment_mode=enrichment_mode,
-                session_cache=_session,
-            )
-            searches_used = _budget_searches_used(updated.get("budget_spent"))
-            fetches_used = _budget_fetches_used(updated.get("budget_spent"))
-            if searches_used > 0:
-                unique_products_searched += 1
-            total_searches_used += searches_used
-            total_fetches_used += fetches_used
-            if error:
-                errors.append(error)
-                updated["enrichment_status"] = "failed"
-                updated["enrichment_error"] = error
-            else:
-                updated["enrichment_status"] = _classify_enrichment_status(updated)
-                updated["enrichment_error"] = ""
-            updated["useful_fields_found"] = _str_val(updated.get("fields_filled"))
+    def _group_indices(key: str) -> list:
+        return grouped_indices.get(key, [])
 
-            for col, val in updated.items():
+    def _group_incomplete(key: str, *, dimensions_only: bool = False, image_only: bool = False) -> bool:
+        rep = df.loc[_group_rep(key)].to_dict()
+        if not _qualifies(rep):
+            return False
+        if _str_val(rep.get("enrichment_status")).lower() == "failed":
+            return False
+        if _str_val(rep.get("skipped_reason")).lower().startswith("skipped due to enrichment budget"):
+            return False
+        if dimensions_only:
+            return _needs_dimension_recovery(rep)
+        if image_only:
+            return _needs_image_recovery(rep)
+        return _needs_dimension_recovery(rep) or _needs_image_recovery(rep) or not _str_val(rep.get("Product URL"))
+
+    def _ordered_keys(keys: list[str], *, accessories_last: bool = True) -> list[str]:
+        def rank(key: str) -> tuple[int, int, str]:
+            row = df.loc[_group_rep(key)].to_dict()
+            accessory = 1 if _product_component_type(row) == "accessory/component" and accessories_last else 0
+            return (accessory, -_row_richness_score(row), key)
+        return sorted(keys, key=rank)
+
+    def _stamp_group_without_paid_search(key: str, reason: str) -> None:
+        rep_idx = _group_rep(key)
+        rep = df.loc[rep_idx].to_dict()
+        debug = _dimension_debug_defaults(rep)
+        _append_stage(debug, "ENRICHMENT_STARTED")
+        _append_stage(debug, "ENRICHMENT_COMPLETE")
+        debug.update({
+            "round_attempted": "round_0_cache_direct",
+            "was_searched": "no",
+            "selected_strategy": "cache/direct",
+            "skipped_reason": reason,
+            "enrichment_status": _classify_enrichment_status(rep),
+            "enrichment_error": "",
+            "budget_spent": "searches=0/0; fetches=0/0",
+        })
+        stamped = _stamp_dimension_debug(rep, debug)
+        for idx in _group_indices(key):
+            row_to_write = stamped if idx == rep_idx else _merge_duplicate_enrichment(df.loc[idx].to_dict(), stamped, rep_idx)
+            for col, val in row_to_write.items():
                 if col in df.columns:
-                    df.at[rep_idx, col] = val
+                    df.at[idx, col] = val
 
-            if not error:
-                _log_enrichment_outcome(updated)
-                if dim_result is not None:
+    def _apply_enriched_group(key: str, updated: dict, error: str | None, dim_result: _DimensionResult | None) -> None:
+        nonlocal unique_products_searched
+        rep_idx = _group_rep(key)
+        if error:
+            errors.append(error)
+            updated["enrichment_status"] = "failed"
+            updated["enrichment_error"] = error
+        else:
+            updated["enrichment_status"] = _classify_enrichment_status(updated)
+            updated["enrichment_error"] = ""
+        updated["useful_fields_found"] = _str_val(updated.get("fields_filled"))
+        updated = _apply_status_fields(updated)
+        searches_used = _budget_searches_used(updated.get("budget_spent"))
+        if searches_used > 0 and key not in searched_keys:
+            unique_products_searched += 1
+            searched_keys.add(key)
+
+        for col, val in updated.items():
+            if col in df.columns:
+                df.at[rep_idx, col] = val
+
+        if not error:
+            _log_enrichment_outcome(updated)
+            if dim_result is not None:
+                diagnostic_key = (
+                    key,
+                    _str_val(dim_result.status),
+                    _str_val(dim_result.source_url),
+                    _str_val(dim_result.failure_reason),
+                )
+                if diagnostic_key not in dimension_diagnostic_keys:
+                    dimension_diagnostic_keys.add(diagnostic_key)
                     dimension_diagnostics.append({
                         "row_index": int(rep_idx),
                         "product_name": _str_val(updated.get("Product Name")),
@@ -2569,34 +2756,134 @@ def enrich_dataframe(
                         **{field: dim_result.debug.get(field, "") for field in _ENRICHMENT_DEBUG_FIELDS},
                     })
 
-            for idx in indices:
-                if idx == rep_idx:
-                    continue
-                duplicate = _merge_duplicate_enrichment(df.loc[idx].to_dict(), updated, rep_idx)
-                for col, val in duplicate.items():
+        for idx in _group_indices(key):
+            if idx == rep_idx:
+                continue
+            duplicate = _merge_duplicate_enrichment(df.loc[idx].to_dict(), updated, rep_idx)
+            duplicate = _apply_status_fields(duplicate)
+            for col, val in duplicate.items():
+                if col in df.columns:
+                    df.at[idx, col] = val
+
+    def _attempt_group(
+        key: str,
+        *,
+        round_name: str,
+        search_limit: int,
+        fetch_limit: int,
+        budget_reason: str = "Skipped due to enrichment budget cap",
+    ) -> None:
+        nonlocal total_searches_used, total_fetches_used
+        rep_idx = _group_rep(key)
+        remaining_searches = max_run_searches - total_searches_used
+        allowed_searches = max(0, min(search_limit, remaining_searches))
+        if search_limit > 0 and allowed_searches <= 0:
+            for idx in _group_indices(key):
+                r = df.loc[idx].to_dict()
+                blocked_debug = _dimension_debug_defaults(r)
+                _append_stage(blocked_debug, "ENRICHMENT_STARTED")
+                _append_stage(blocked_debug, "ENRICHMENT_COMPLETE")
+                blocked_debug.update({
+                    "budget_blocked": True,
+                    "round_attempted": round_name,
+                    "was_searched": "no",
+                    "selected_strategy": "skipped",
+                    "skipped_reason": budget_reason,
+                    "enrichment_status": _classify_enrichment_status(r),
+                    "enrichment_error": "",
+                    "budget_spent": "searches=0/0; fetches=0/0",
+                })
+                stamped = _stamp_dimension_debug(r, blocked_debug)
+                for col, val in stamped.items():
                     if col in df.columns:
                         df.at[idx, col] = val
+            return
+
+        setattr(_session, "remaining_searches", allowed_searches)
+        setattr(_session, "remaining_fetches", max(0, fetch_limit))
+        try:
+            representative = df.loc[rep_idx].to_dict()
+            updated, error, dim_result = enrich_row(
+                representative,
+                enrichment_mode=enrichment_mode,
+                session_cache=_session,
+            )
+            updated["round_attempted"] = round_name
+            if round_name == "round_0_cache_direct" and (error or _str_val(updated.get("enrichment_status")).lower() == "failed"):
+                error = None
+                updated["enrichment_status"] = _classify_enrichment_status(updated)
+                updated["enrichment_error"] = ""
+                updated["skipped_reason"] = "Direct/cache source incomplete; queued for fair paid search"
+            searches_used = _budget_searches_used(updated.get("budget_spent"))
+            fetches_used = _budget_fetches_used(updated.get("budget_spent"))
+            total_searches_used += searches_used
+            total_fetches_used += fetches_used
+            _apply_enriched_group(key, updated, error, dim_result)
         except Exception as exc:
             tb = traceback.format_exc()
             label_row = df.loc[rep_idx].to_dict()
             label = _str_val(label_row.get("Product Name")) or _str_val(label_row.get("Brand")) or _str_val(label_row.get("Model/SKU")) or str(rep_idx)
             errors.append(f"Row '{label}': {exc}")
-            for idx in indices:
+            for idx in _group_indices(key):
                 r = df.loc[idx].to_dict()
                 failed_debug = _dimension_debug_defaults(r)
                 _append_stage(failed_debug, "ENRICHMENT_STARTED")
                 _append_stage(failed_debug, "ENRICHMENT_COMPLETE")
                 failed_debug.update({
+                    "round_attempted": round_name,
                     "enrichment_status": "failed",
                     "enrichment_error": str(exc),
                     "debug_traceback": tb,
                     "skipped_reason": str(exc),
                 })
-                for col, val in failed_debug.items():
+                stamped = _stamp_dimension_debug(r, failed_debug)
+                for col, val in stamped.items():
                     if col in df.columns:
                         df.at[idx, col] = val
 
-        time.sleep(0.1)
+    all_keys = _ordered_keys(list(grouped_indices))
+
+    # Round 0: free/cache/direct pass for every unique product. This exploits
+    # existing Product URLs and exact product memory without spending Brave calls.
+    for key in all_keys:
+        rep = df.loc[_group_rep(key)].to_dict()
+        cache_key = _row_enrichment_key(rep)
+        try:
+            has_cache_hint = bool(cache_key and (_product_cache.get(cache_key) or lookup_product_source(_str_val(rep.get("Brand")), _str_val(rep.get("Model/SKU")))))
+        except Exception:
+            has_cache_hint = bool(cache_key and _product_cache.get(cache_key))
+        has_direct_url = bool(_str_val(rep.get("Product URL")))
+        if has_cache_hint or has_direct_url:
+            _attempt_group(key, round_name="round_0_cache_direct", search_limit=0, fetch_limit=3)
+        else:
+            _stamp_group_without_paid_search(key, "No cached/product URL source; queued for fair paid search")
+
+    # Round 1: one manufacturer/spec-sheet focused paid search per incomplete
+    # unique product before any product gets retries.
+    for key in _ordered_keys([key for key in all_keys if _group_incomplete(key)]):
+        _attempt_group(key, round_name="round_1_manufacturer_spec", search_limit=1, fetch_limit=5)
+        time.sleep(0.05)
+
+    # Round 2: dimension-focused retry only for rows still missing complete W/H/D.
+    for key in _ordered_keys([key for key in all_keys if _group_incomplete(key, dimensions_only=True)]):
+        if max_run_searches - total_searches_used <= 0:
+            _attempt_group(key, round_name="round_2_dimension_retry", search_limit=1, fetch_limit=0)
+            continue
+        _attempt_group(key, round_name="round_2_dimension_retry", search_limit=1, fetch_limit=4)
+        time.sleep(0.05)
+
+    # Round 3: image recovery is lower priority than dimensions. First exploit
+    # product pages directly; only spend one search when cap remains.
+    for key in _ordered_keys([
+        key
+        for key in all_keys
+        if _group_incomplete(key, image_only=True)
+        and not _group_incomplete(key, dimensions_only=True)
+    ]):
+        remaining = max_run_searches - total_searches_used
+        search_limit = 1 if remaining > 0 and not _needs_dimension_recovery(df.loc[_group_rep(key)].to_dict()) else 0
+        _attempt_group(key, round_name="round_3_image_retry", search_limit=search_limit, fetch_limit=3)
+        time.sleep(0.05)
 
     df.attrs["enrichment_budget_cap_usd"] = hard_cap_usd
     df.attrs["enrichment_search_cost_usd"] = search_cost

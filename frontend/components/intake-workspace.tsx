@@ -10,6 +10,7 @@ import {
   Loader2,
   Phone,
   Settings,
+  Sparkles,
   Upload,
   X,
 } from "lucide-react";
@@ -142,6 +143,7 @@ type BuildInfo = {
 
 type WorkflowStage = "upload" | "parse" | "reviewParsed" | "enrich" | "reviewEnriched" | "export";
 type EnrichmentMode = "fast" | "standard" | "deep";
+type DeepRetryFocus = "missing_fields" | "dimensions" | "image";
 type ThemePreference = "system" | "dark" | "light";
 type AccentThemeId =
   | "orange"
@@ -245,7 +247,10 @@ const ENRICHMENT_BUDGET_STORAGE_KEY = "sch-intake-enrichment-budget-usd";
 const DEFAULT_ENRICHMENT_BUDGET_USD = 0.25;
 const FURTHER_ENRICHMENT_ENABLED_STORAGE_KEY = "sch-intake-further-enrichment-enabled";
 const FURTHER_ENRICHMENT_BUDGET_STORAGE_KEY = "sch-intake-further-enrichment-budget-usd";
+const FURTHER_ENRICHMENT_CONFIRM_STORAGE_KEY = "sch-intake-further-enrichment-require-confirmation";
+const FURTHER_ENRICHMENT_ITEM_BUDGET_STORAGE_KEY = "sch-intake-further-enrichment-item-budget-usd";
 const DEFAULT_FURTHER_ENRICHMENT_BUDGET_USD = 0.25;
+const DEFAULT_FURTHER_ENRICHMENT_ITEM_BUDGET_USD = 0.05;
 
 const themeOptions: { id: ThemePreference; label: string; description: string }[] = [
   { id: "light", label: "Light", description: "A warm, clean light workspace." },
@@ -428,7 +433,7 @@ const frontendRouteWiring = [
   {
     action: "Further enrichment",
     endpoint: "POST /intake/further-enrich",
-    body: "{ rows, further_enrichment_enabled, further_enrichment_budget_usd }",
+    body: "{ rows, further_enrichment_enabled, further_enrichment_budget_usd, further_enrichment_max_cost_per_item_usd }",
     response: "IntakeResponse + further_enrichment stage_timings",
   },
   {
@@ -926,6 +931,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const [enrichmentBudgetUsd, setEnrichmentBudgetUsd] = useState(DEFAULT_ENRICHMENT_BUDGET_USD);
   const [furtherEnrichmentEnabled, setFurtherEnrichmentEnabled] = useState(false);
   const [furtherEnrichmentBudgetUsd, setFurtherEnrichmentBudgetUsd] = useState(DEFAULT_FURTHER_ENRICHMENT_BUDGET_USD);
+  const [requireOpenAiSpendConfirmation, setRequireOpenAiSpendConfirmation] = useState(true);
+  const [furtherEnrichmentItemBudgetUsd, setFurtherEnrichmentItemBudgetUsd] = useState(DEFAULT_FURTHER_ENRICHMENT_ITEM_BUDGET_USD);
   const [debugMode, setDebugMode] = useState(false);
   const [themePreference, setThemePreference] = useState<ThemePreference>("dark");
   const [accentThemeId, setAccentThemeId] = useState<AccentThemeId>("orange");
@@ -993,7 +1000,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const [scheduleUrl, setScheduleUrl] = useState("");
   const [programaMessage, setProgramaMessage] = useState("");
   const [productImageUploads, setProductImageUploads] = useState<Record<number, string>>({});
-  const [busy, setBusy] = useState<"generate" | "validate" | "furtherEnrichment" | "imageRecovery" | "vendorCall" | "export" | "photoBulk" | "programa" | "">("");
+  const [busy, setBusy] = useState<"generate" | "validate" | "furtherEnrichment" | "imageRecovery" | "vendorCall" | "export" | "photoBulk" | "programa" | "rowRetry" | "">("");
   const [exportSummary, setExportSummary] = useState<ProgramaExportValidation>({
     skipped: [] as { index: number; product_name: string }[],
     missing_section: [] as { index: number; product_name: string }[],
@@ -1117,6 +1124,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       const storedBudget = Number.parseFloat(window.localStorage.getItem(ENRICHMENT_BUDGET_STORAGE_KEY) || "");
       const storedFurtherEnabled = window.localStorage.getItem(FURTHER_ENRICHMENT_ENABLED_STORAGE_KEY);
       const storedFurtherBudget = Number.parseFloat(window.localStorage.getItem(FURTHER_ENRICHMENT_BUDGET_STORAGE_KEY) || "");
+      const storedFurtherConfirmation = window.localStorage.getItem(FURTHER_ENRICHMENT_CONFIRM_STORAGE_KEY);
+      const storedFurtherItemBudget = Number.parseFloat(window.localStorage.getItem(FURTHER_ENRICHMENT_ITEM_BUDGET_STORAGE_KEY) || "");
       setDebugMode(storedDebugMode === "true");
       setThemePreference(isThemePreference(storedThemePreference) ? storedThemePreference : "dark");
       setAccentThemeId(getAccentTheme(storedAccentTheme).id);
@@ -1124,6 +1133,12 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       setEnrichmentBudgetUsd(Number.isFinite(storedBudget) ? clampBudgetUsd(storedBudget) : DEFAULT_ENRICHMENT_BUDGET_USD);
       setFurtherEnrichmentEnabled(storedFurtherEnabled === "true");
       setFurtherEnrichmentBudgetUsd(Number.isFinite(storedFurtherBudget) ? clampBudgetUsd(storedFurtherBudget) : DEFAULT_FURTHER_ENRICHMENT_BUDGET_USD);
+      setRequireOpenAiSpendConfirmation(storedFurtherConfirmation !== "false");
+      setFurtherEnrichmentItemBudgetUsd(
+        Number.isFinite(storedFurtherItemBudget)
+          ? clampBudgetUsd(storedFurtherItemBudget)
+          : DEFAULT_FURTHER_ENRICHMENT_ITEM_BUDGET_USD,
+      );
     } catch {
       setDebugMode(false);
       setThemePreference("dark");
@@ -1132,6 +1147,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       setEnrichmentBudgetUsd(DEFAULT_ENRICHMENT_BUDGET_USD);
       setFurtherEnrichmentEnabled(false);
       setFurtherEnrichmentBudgetUsd(DEFAULT_FURTHER_ENRICHMENT_BUDGET_USD);
+      setRequireOpenAiSpendConfirmation(true);
+      setFurtherEnrichmentItemBudgetUsd(DEFAULT_FURTHER_ENRICHMENT_ITEM_BUDGET_USD);
     }
     setSettingsHydrated(true);
   }, []);
@@ -1150,10 +1167,12 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     try {
       window.localStorage.setItem(FURTHER_ENRICHMENT_ENABLED_STORAGE_KEY, String(furtherEnrichmentEnabled));
       window.localStorage.setItem(FURTHER_ENRICHMENT_BUDGET_STORAGE_KEY, String(furtherEnrichmentBudgetUsd));
+      window.localStorage.setItem(FURTHER_ENRICHMENT_CONFIRM_STORAGE_KEY, String(requireOpenAiSpendConfirmation));
+      window.localStorage.setItem(FURTHER_ENRICHMENT_ITEM_BUDGET_STORAGE_KEY, String(furtherEnrichmentItemBudgetUsd));
     } catch {
       // Local persistence is best-effort only.
     }
-  }, [furtherEnrichmentBudgetUsd, furtherEnrichmentEnabled, settingsHydrated]);
+  }, [furtherEnrichmentBudgetUsd, furtherEnrichmentEnabled, furtherEnrichmentItemBudgetUsd, requireOpenAiSpendConfirmation, settingsHydrated]);
 
   useEffect(() => {
     if (!settingsHydrated) return;
@@ -1233,6 +1252,14 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const missingSkuCount = useMemo(() => countRows(includedRows, (row) => !hasSku(row)), [includedRows]);
   const missingDimensionsCount = useMemo(
     () => countRows(includedRows, (row) => !hasComplete3dDimensions(row.Dimensions)),
+    [includedRows],
+  );
+  const partialDimensionsCount = useMemo(
+    () => countRows(includedRows, (row) => rowText(row, "dimensions_status").toLowerCase() === "partial" || Boolean(rowText(row, "partial_dimensions_found"))),
+    [includedRows],
+  );
+  const budgetSkippedCount = useMemo(
+    () => countRows(includedRows, (row) => boolish(rowText(row, "budget_blocked")) || rowText(row, "skipped_reason").toLowerCase().includes("budget")),
     [includedRows],
   );
   const missingImageCount = useMemo(() => countRows(includedRows, (row) => !hasImage(row)), [includedRows]);
@@ -1450,6 +1477,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         forceRefreshEnrichment,
         furtherEnrichmentEnabled,
         furtherEnrichmentBudgetUsd,
+        requireOpenAiSpendConfirmation,
+        furtherEnrichmentItemBudgetUsd,
       },
       counts: {
         rows: rows.length,
@@ -1470,6 +1499,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         openaiStatus: integrationsStatus.openai?.status || "Not Configured",
         openaiModel: integrationsStatus.openai?.model || "Not reported",
         furtherEnrichmentEnabled,
+        requireOpenAiSpendConfirmation,
+        furtherEnrichmentItemBudgetUsd,
       },
       lastMessage: message ? sanitizedErrorMessage(message) : "",
       errors: errors.slice(0, 8).map(sanitizedErrorMessage),
@@ -1662,6 +1693,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     const costPerSearch = searchesUsed ? (stageNumber(response, "estimated_cost_usd") ?? 0) / searchesUsed : 0.006;
     const rowsMissingDimensions = stageNumber(response, "rows_missing_dimensions") ?? countRows(productRows, (row) => !hasComplete3dDimensions(row.Dimensions));
     const rowsMissingImages = stageNumber(response, "rows_missing_images") ?? countRows(productRows, (row) => !hasImage(row));
+    const rowsPartialDimensions = stageNumber(response, "rows_partial_dimensions") ?? countRows(productRows, (row) => rowText(row, "dimensions_status").toLowerCase() === "partial" || Boolean(rowText(row, "partial_dimensions_found")));
+    const rowsBudgetSkipped = stageNumber(response, "rows_budget_skipped") ?? countRows(productRows, (row) => boolish(rowText(row, "budget_blocked")) || rowText(row, "skipped_reason").toLowerCase().includes("budget"));
     const dimensionsFound = countRows(productRows, (row) => hasComplete3dDimensions(row.Dimensions));
     const imagesFound = countRows(productRows, hasImage);
     const knowledgeBaseHits = countRows(productRows, (row) => boolish(rowText(row, "knowledge_base_hit")) || boolish(rowText(row, "stored_source_hit")));
@@ -1697,6 +1730,10 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       const searchMatch = budgetText.match(/searches=(\d+)\//);
       const rowSearches = searchMatch ? Number.parseInt(searchMatch[1] || "0", 10) : 0;
       const rowCost = rowSearches * costPerSearch;
+      const wasSearched = rowText(row, "was_searched") || (queryText ? "yes" : "no");
+      const budgetBlocked = boolish(rowText(row, "budget_blocked")) || rowText(row, "skipped_reason").toLowerCase().includes("budget");
+      const dimensionsStatus = rowText(row, "dimensions_status") || (dimensionsFound ? "complete" : dimensionsText ? "partial" : "missing");
+      const imageStatus = rowText(row, "image_status") || (imageFound ? "found" : "missing");
 
       return [
         `Product ${groupIndex + 1}`,
@@ -1706,6 +1743,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         reportLine("brand", rowText(row, "Brand")),
         reportLine("model", rowText(row, "Model/SKU")),
         reportLine("product name", rowText(row, "Product Name")),
+        reportLine("was searched", wasSearched),
+        reportLine("selected strategy", rowText(row, "selected_strategy") || rowText(row, "source_status")),
         reportLine("search queries used", queryText),
         reportLine("sources checked", candidates.length ? candidates.join("\n  - ") : ""),
         reportLine("source selected", selectedUrl),
@@ -1729,6 +1768,12 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
           : "",
         reportLine("preferred domain used", rowText(row, "preferred_domain_used")),
         reportLine("selected source domain", reportDomain(selectedUrl)),
+        reportLine("dimensions status", dimensionsStatus),
+        reportLine("image status", imageStatus),
+        reportLine("source status", rowText(row, "source_status")),
+        reportLine("retry recommended", rowText(row, "retry_recommended")),
+        reportLine("budget blocked", budgetBlocked ? "yes" : "no"),
+        reportLine("accessory/component", rowText(row, "product_component_type").includes("accessory") ? "yes" : "no"),
         reportLine("image found", imageFound ? "yes" : "no"),
         reportLine("dimensions found", dimensionsFound ? "yes" : dimensionsText ? "partial/low confidence" : "no"),
         reportLine("extracted dimensions", dimensionsText),
@@ -1787,6 +1832,10 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       reportLine("budget cap", formatUsd(budgetCap)),
       reportLine("amount spent", spent),
       reportLine("final enrichment status", finalStatus),
+      reportLine("rows missing dimensions", String(rowsMissingDimensions)),
+      reportLine("rows missing images", String(rowsMissingImages)),
+      reportLine("rows partial dimensions", String(rowsPartialDimensions)),
+      reportLine("rows budget skipped", String(rowsBudgetSkipped)),
       "",
       "2. Parse diagnostics",
       reportLine("rows detected", reportRows.length),
@@ -1819,10 +1868,13 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       reportLine("dimensions found", dimensionsFound),
       reportLine("images found", imagesFound),
       reportLine("further enrichment enabled", furtherEnrichmentEnabled ? "yes" : "no"),
+      reportLine("OpenAI deep enrichment available", integrationsStatus.further_enrichment?.available ? "yes" : "no"),
+      reportLine("OpenAI spend confirmation required", requireOpenAiSpendConfirmation ? "yes" : "no"),
       reportLine("OpenAI used", furtherRowsSent > 0 ? "yes" : "no"),
       reportLine("OpenAI status", integrationsStatus.openai?.status || "Not Configured"),
       reportLine("OpenAI model", integrationsStatus.openai?.model || "Not reported"),
-      reportLine("further enrichment cap", formatUsd(furtherEnrichmentBudgetUsd)),
+      reportLine("OpenAI max spend per run", formatUsd(furtherEnrichmentBudgetUsd)),
+      reportLine("OpenAI max spend per item", formatUsd(furtherEnrichmentItemBudgetUsd)),
       reportLine("further enrichment rows considered", stageNumber(response, "further_enrichment_rows_considered") ?? 0),
       reportLine("Rows sent to OpenAI", furtherRowsSent),
       reportLine("further enrichment rows updated", stageNumber(response, "further_enrichment_rows_updated") ?? 0),
@@ -2528,49 +2580,122 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     }
   }
 
-  async function handleFurtherEnrichment() {
+  function withDeepRetryFocus(targetRows: IntakeRow[], focus: DeepRetryFocus) {
+    return targetRows.map((row) => ({
+      ...row,
+      deep_retry_focus: focus,
+      requested_missing_fields:
+        focus === "dimensions"
+          ? "dimensions"
+          : focus === "image"
+            ? "image"
+            : missingFieldsForRow(row).join(", ") || "missing_fields",
+    }));
+  }
+
+  async function runOpenAiDeepEnrichment({
+    targetRows,
+    label,
+    focus,
+    rowIndex,
+    maxCostUsd,
+  }: {
+    targetRows: IntakeRow[];
+    label: string;
+    focus: DeepRetryFocus;
+    rowIndex?: number;
+    maxCostUsd?: number;
+  }) {
     if (!furtherEnrichmentEnabled) {
-      setMessage("Further Enrichment is off. Enable it in Settings before running AI fallback research.");
+      setMessage("OpenAI Deep Enrichment is off. Enable it in Settings before running AI fallback research.");
       setSettingsOpen(true);
       return;
     }
-    setBusy("furtherEnrichment");
+
+    const candidateCount = targetRows.filter(needsFurtherEnrichment).length;
+    if (!candidateCount) {
+      setMessage("No incomplete or low-confidence rows need OpenAI deep enrichment.");
+      return;
+    }
+
+    const runCap = Math.max(0, Math.min(maxCostUsd ?? furtherEnrichmentBudgetUsd, furtherEnrichmentBudgetUsd));
+    const estimated = estimateFurtherCost(targetRows, runCap);
+    if (requireOpenAiSpendConfirmation) {
+      const confirmed = window.confirm(
+        [
+          `${label} will use OpenAI on ${candidateCount} incomplete row${candidateCount === 1 ? "" : "s"}.`,
+          `Estimated cost: ${formatUsd(estimated, 4)}`,
+          `Run cap: ${formatUsd(runCap)}`,
+          `Per-item cap: ${formatUsd(furtherEnrichmentItemBudgetUsd)}`,
+          "",
+          "Existing high-confidence fields will be preserved. Continue?",
+        ].join("\n"),
+      );
+      if (!confirmed) {
+        recordDebugTrace({
+          action: label,
+          stage: "cancelled",
+          endpoint: "/intake/further-enrich",
+          itemId: rowIndex === undefined ? undefined : String(rowIndex),
+          message: `User cancelled OpenAI spend confirmation. estimate=${formatUsd(estimated, 4)}`,
+        });
+        setMessage("OpenAI deep enrichment cancelled.");
+        return;
+      }
+    }
+
+    setBusy(rowIndex === undefined ? "furtherEnrichment" : "rowRetry");
     setMessage("");
-    setWorkflowStage("enrich");
-    setEnrichmentStatus("Further enrichment running on incomplete rows...");
-    setEstimatedCost(`${formatUsd(furtherEnrichmentEstimatedCost, 4)} estimated · capped at ${formatUsd(furtherEnrichmentBudgetUsd)}`);
-    const beforeImages = countRows(includedRows, hasImage);
-    const beforeDimensions = countRows(includedRows, (row) => hasComplete3dDimensions(row.Dimensions));
+    setWorkflowStage(rowIndex === undefined ? "enrich" : "reviewEnriched");
+    setEnrichmentStatus(`${label} running on ${candidateCount} incomplete row${candidateCount === 1 ? "" : "s"}...`);
+    setEstimatedCost(`${formatUsd(estimated, 4)} estimated OpenAI cost · capped at ${formatUsd(runCap)}`);
     setLastEndpoint(`${API_BASE || "not configured"}/intake/further-enrich`);
     recordDebugTrace({
-      action: "further enrich missing fields",
+      action: label,
       stage: "started",
       endpoint: "/intake/further-enrich",
-      message: `candidates=${furtherEnrichmentCandidateCount}; estimated=${formatUsd(furtherEnrichmentEstimatedCost, 4)}; cap=${formatUsd(furtherEnrichmentBudgetUsd)}`,
+      itemId: rowIndex === undefined ? undefined : String(rowIndex),
+      message: `focus=${focus}; candidates=${candidateCount}; estimated=${formatUsd(estimated, 4)}; runCap=${formatUsd(runCap)}; itemCap=${formatUsd(furtherEnrichmentItemBudgetUsd)}`,
     });
+
+    const beforeImages = countRows(includedRows, hasImage);
+    const beforeDimensions = countRows(includedRows, (row) => hasComplete3dDimensions(row.Dimensions));
+
     try {
+      const rowsForRequest = withDeepRetryFocus(targetRows, focus);
       const response = await furtherEnrichRows({
-        rows,
+        rows: rowsForRequest,
         enabled: furtherEnrichmentEnabled,
-        maxCostUsd: furtherEnrichmentBudgetUsd,
+        maxCostUsd: runCap,
+        maxCostPerItemUsd: furtherEnrichmentItemBudgetUsd,
       });
-      setRows(response.rows);
+      if (rowIndex === undefined) {
+        setRows(response.rows);
+      } else {
+        const replacement = response.rows[0];
+        if (replacement) {
+          setRows((current) => current.map((currentRow, index) => (index === rowIndex ? replacement : currentRow)));
+        }
+      }
+
       setErrors(response.errors);
-      const enrichedRows = response.rows.filter(isProductRow);
+      const nextRows = rowIndex === undefined ? response.rows : rows.map((currentRow, index) => (index === rowIndex ? response.rows[0] || currentRow : currentRow));
+      const enrichedRows = nextRows.filter(isProductRow);
       const afterImages = countRows(enrichedRows, hasImage);
       const afterDimensions = countRows(enrichedRows, (row) => hasComplete3dDimensions(row.Dimensions));
       const missingDimensionsAfter = countRows(enrichedRows, (row) => !hasComplete3dDimensions(row.Dimensions));
       const missingImagesAfter = countRows(enrichedRows, (row) => !hasImage(row));
       const rowsUpdated = Math.round(stageNumber(response, "further_enrichment_rows_updated") ?? 0);
       const fieldsFilled = Math.round(stageNumber(response, "further_enrichment_fields_filled") ?? 0);
-      const cap = stageNumber(response, "further_enrichment_estimated_cost_usd") ?? furtherEnrichmentEstimatedCost;
+      const estimatedReported = stageNumber(response, "further_enrichment_estimated_cost_usd") ?? estimated;
       const actualCost = stageNumber(response, "further_enrichment_cost_usd") ?? 0;
       const finalStatus =
         rowsUpdated > 0
-          ? `Further enrichment updated ${rowsUpdated} row${rowsUpdated === 1 ? "" : "s"}.`
+          ? `OpenAI deep enrichment updated ${rowsUpdated} row${rowsUpdated === 1 ? "" : "s"}.`
           : response.errors.length
-            ? "Further enrichment did not update rows."
-            : "Further enrichment found no safe high-confidence updates.";
+            ? "OpenAI deep enrichment did not update rows."
+            : "OpenAI deep enrichment found no verified safe updates.";
+
       setEnrichmentStats((current) => ({
         ...current,
         filledImages: Math.max(0, afterImages - beforeImages),
@@ -2579,15 +2704,15 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         missingDimensions: missingDimensionsAfter,
         missingImages: missingImagesAfter,
         usefulFieldsFound: fieldsFilled || current.usefulFieldsFound,
-        budgetCap: formatUsd(furtherEnrichmentBudgetUsd),
+        budgetCap: formatUsd(runCap),
       }));
-      setEstimatedCost(`${formatUsd(actualCost, 4)} spent · ${formatUsd(furtherEnrichmentBudgetUsd)} cap`);
+      setEstimatedCost(`${formatUsd(actualCost, 4)} OpenAI spent · ${formatUsd(runCap)} cap`);
       setEnrichmentStatus(finalStatus);
       setEnrichmentDebugReport(
         buildEnrichmentDebugReportText({
-          reportRows: response.rows,
+          reportRows: nextRows,
           response,
-          action: "Further Enrich Missing Fields",
+          action: label,
           finalStatus,
         }),
       );
@@ -2595,40 +2720,140 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       setWorkflowStage("reviewEnriched");
       setMessage(
         rowsUpdated > 0
-          ? `Further enrichment filled ${fieldsFilled} field${fieldsFilled === 1 ? "" : "s"} across ${rowsUpdated} row${rowsUpdated === 1 ? "" : "s"}.`
+          ? `OpenAI deep enrichment filled ${fieldsFilled} field${fieldsFilled === 1 ? "" : "s"} across ${rowsUpdated} row${rowsUpdated === 1 ? "" : "s"}.`
           : response.errors.length
             ? userFacingApiMessage(new Error(response.errors[0]), debugMode)
-            : "Further enrichment finished without safe writebacks. Existing high-confidence data was preserved.",
+            : "OpenAI deep enrichment finished without safe writebacks. Existing high-confidence data was preserved.",
       );
-      setLastSuccessfulStage(rowsUpdated > 0 ? "Further enrichment complete" : "Further enrichment reviewed");
+      setLastSuccessfulStage(rowsUpdated > 0 ? "OpenAI deep enrichment complete" : "OpenAI deep enrichment reviewed");
       recordDebugTrace({
-        action: "further enrich missing fields",
+        action: label,
         stage: response.errors.length && rowsUpdated === 0 ? "failed" : "success",
         endpoint: "/intake/further-enrich",
-        message: `rowsUpdated=${rowsUpdated}; fieldsFilled=${fieldsFilled}; cost=${formatUsd(actualCost, 4)}; estimated=${formatUsd(cap, 4)}; missingDimensions=${missingDimensionsAfter}; missingImages=${missingImagesAfter}`,
+        itemId: rowIndex === undefined ? undefined : String(rowIndex),
+        message: `focus=${focus}; rowsUpdated=${rowsUpdated}; fieldsFilled=${fieldsFilled}; cost=${formatUsd(actualCost, 4)}; estimated=${formatUsd(estimatedReported, 4)}; missingDimensions=${missingDimensionsAfter}; missingImages=${missingImagesAfter}`,
       });
     } catch (error) {
-      setEnrichmentStatus("Further enrichment failed.");
+      setEnrichmentStatus("OpenAI deep enrichment failed.");
       setWorkflowStage("reviewEnriched");
       setMessage(userFacingApiMessage(error, debugMode));
       setEnrichmentDebugReport(
         buildEnrichmentDebugReportText({
           reportRows: rows,
-          action: "Further Enrich Missing Fields",
-          finalStatus: "Further enrichment failed.",
+          action: label,
+          finalStatus: "OpenAI deep enrichment failed.",
           extraErrors: [sanitizedDebugText(formatApiError(error), 2000)],
         }),
       );
       setEnrichmentDebugReportStatus("");
       recordDebugTrace({
-        action: "further enrich missing fields",
+        action: label,
         stage: "failed",
         endpoint: "/intake/further-enrich",
+        itemId: rowIndex === undefined ? undefined : String(rowIndex),
         ...debugDetailsFromError(error),
       });
     } finally {
       setBusy("");
     }
+  }
+
+  async function handleRowRetry(rowIndex: number, retryType: "dimensions" | "image" | "deep" | "deepDimensions" | "deepImage") {
+    const row = rows[rowIndex];
+    if (!row) return;
+    if (retryType === "deep" || retryType === "deepDimensions" || retryType === "deepImage") {
+      const focus: DeepRetryFocus =
+        retryType === "deepDimensions" ? "dimensions" : retryType === "deepImage" ? "image" : "missing_fields";
+      const label =
+        retryType === "deepDimensions"
+          ? "Deep retry dimensions"
+          : retryType === "deepImage"
+            ? "Deep retry image"
+            : "Deep retry this item";
+      await runOpenAiDeepEnrichment({
+        targetRows: [row],
+        label,
+        focus,
+        rowIndex,
+        maxCostUsd: furtherEnrichmentItemBudgetUsd,
+      });
+      return;
+    }
+
+    const label =
+      retryType === "dimensions"
+        ? "Retry dimensions only"
+        : retryType === "image"
+          ? "Retry image only"
+          : "Retry missing data";
+    setBusy("rowRetry");
+    setMessage("");
+    setEnrichmentStatus(`${label} running...`);
+    recordDebugTrace({
+      action: label,
+      stage: "started",
+      endpoint: retryType === "image" ? "/intake/recover-images" : "/intake/enrich",
+      itemId: String(rowIndex),
+      message: `${rowText(row, "Brand")} ${rowText(row, "Model/SKU")}`.trim(),
+    });
+    try {
+      const response =
+        retryType === "image"
+          ? await recoverMissingImages({ rows: [row], enrichmentMode, forceRefresh: true })
+          : await enrichRows({
+              rows: [row],
+              useWebEnrichment: true,
+              enrichmentMode: "fast",
+              forceRefresh: true,
+              enrichmentBudgetUsd: Math.min(0.05, enrichmentBudgetUsd),
+            });
+      const replacement = response.rows[0];
+      if (replacement) {
+        setRows((current) => current.map((currentRow, index) => (index === rowIndex ? replacement : currentRow)));
+      }
+      setErrors(response.errors || []);
+      setWorkflowStage("reviewEnriched");
+      setEnrichmentStatus(`${label} complete.`);
+      setEstimatedCost(`${getEstimatedCost(response)} spent · row retry`);
+      setMessage(`${label} finished for ${rowText(row, "Brand")} ${rowText(row, "Model/SKU")}`.trim());
+      recordDebugTrace({
+        action: label,
+        stage: "success",
+        endpoint: retryType === "image" ? "/intake/recover-images" : "/intake/enrich",
+        itemId: String(rowIndex),
+        message: `cost=${getEstimatedCost(response)}`,
+      });
+    } catch (error) {
+      setMessage(userFacingApiMessage(error, debugMode));
+      setEnrichmentStatus(`${label} failed.`);
+      recordDebugTrace({
+        action: label,
+        stage: "failed",
+        endpoint: retryType === "image" ? "/intake/recover-images" : "/intake/enrich",
+        itemId: String(rowIndex),
+        ...debugDetailsFromError(error),
+      });
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function handleManualDimensions(rowIndex: number) {
+    const row = rows[rowIndex];
+    if (!row) return;
+    const current = rowText(row, "Dimensions");
+    const next = window.prompt('Enter dimensions as W x H x D, e.g. 24" W x 84" H x 24" D', current);
+    if (next === null) return;
+    updateRow(rowIndex, "Dimensions", next);
+    updateRow(rowIndex, "dimensions_status", hasComplete3dDimensions(next) ? "complete" : "partial");
+  }
+
+  async function handleFurtherEnrichment() {
+    await runOpenAiDeepEnrichment({
+      targetRows: rows,
+      label: "Deep Enrich All Missing",
+      focus: "missing_fields",
+    });
   }
 
   async function handleRecoverMissingImages() {
@@ -3230,7 +3455,16 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                 View parsed products
               </DisclosureButton>
               {parsedProductsOpen ? (
-                <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} debugMode={debugMode} />
+                <ProductTable
+                  rows={rows}
+                  categories={categories}
+                  sections={sections}
+                  updateRow={updateRow}
+                  openVendorCall={openVendorCall}
+                  debugMode={debugMode}
+                  onRowRetry={handleRowRetry}
+                  onManualDimensions={handleManualDimensions}
+                />
               ) : null}
               <div className="flex flex-col gap-3 rounded-2xl border border-linen bg-ivory/70 p-4 sm:flex-row sm:items-center sm:justify-between">
                 <div>
@@ -3323,22 +3557,21 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                       busy === "furtherEnrichment" ||
                       rows.length === 0 ||
                       !enrichmentHasRun ||
-                      !furtherEnrichmentEnabled ||
                       furtherEnrichmentCandidateCount === 0
                     }
                     onClick={handleFurtherEnrichment}
                     title={
                       furtherEnrichmentEnabled
-                        ? `Estimated ${formatUsd(furtherEnrichmentEstimatedCost, 4)} for ${furtherEnrichmentCandidateCount} incomplete row${furtherEnrichmentCandidateCount === 1 ? "" : "s"}`
-                        : "Enable Further Enrichment in Settings."
+                        ? `OpenAI estimate ${formatUsd(furtherEnrichmentEstimatedCost, 4)} for ${furtherEnrichmentCandidateCount} incomplete row${furtherEnrichmentCandidateCount === 1 ? "" : "s"}`
+                        : "Open Settings to enable OpenAI Deep Enrichment."
                     }
                   >
-                    {busy === "furtherEnrichment" ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
-                    Further Enrich Missing Fields
+                    {busy === "furtherEnrichment" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+                    Deep Enrich All Missing
                   </button>
                 </div>
                 <div className="mt-3 rounded-xl border border-linen bg-white/75 px-3 py-2 text-xs text-taupe">
-                  Further Enrichment: {furtherEnrichmentEnabled ? "enabled" : "off"} · {furtherEnrichmentCandidateCount} incomplete row{furtherEnrichmentCandidateCount === 1 ? "" : "s"} · estimated {formatUsd(furtherEnrichmentEstimatedCost, 4)} · cap {formatUsd(furtherEnrichmentBudgetUsd)}
+                  OpenAI Deep Enrichment: {furtherEnrichmentEnabled ? "enabled" : "off"} · {furtherEnrichmentCandidateCount} incomplete row{furtherEnrichmentCandidateCount === 1 ? "" : "s"} · estimated {formatUsd(furtherEnrichmentEstimatedCost, 4)} · run cap {formatUsd(furtherEnrichmentBudgetUsd)} · item cap {formatUsd(furtherEnrichmentItemBudgetUsd)}
                 </div>
               </div>
 
@@ -3392,11 +3625,64 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                   onDownload={downloadEnrichmentDebugReport}
                 />
               ) : null}
+              <div className="rounded-2xl border border-orangeBorder/70 bg-orangeSoft/40 p-4">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h3 className="text-sm font-semibold text-charcoal">OpenAI Deep Enrichment</h3>
+                      <StatusBadge value={furtherEnrichmentEnabled ? "Enabled" : "Off"} />
+                      <StatusBadge value={`OpenAI: ${integrationsStatus.openai?.status || "Not Configured"}`} />
+                    </div>
+                    <p className="mt-1 text-sm text-taupe">
+                      Optional fallback for rows still missing dimensions, images, product names, source validation, or low-confidence fields after cheap enrichment.
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-2 text-xs text-taupe">
+                      <span>{furtherEnrichmentCandidateCount} incomplete row{furtherEnrichmentCandidateCount === 1 ? "" : "s"}</span>
+                      <span>Estimated {formatUsd(furtherEnrichmentEstimatedCost, 4)}</span>
+                      <span>Run cap {formatUsd(furtherEnrichmentBudgetUsd)}</span>
+                      <span>Item cap {formatUsd(furtherEnrichmentItemBudgetUsd)}</span>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      className="btn-primary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-5 text-sm font-semibold disabled:cursor-not-allowed disabled:border-orangeBorder disabled:bg-orangeSoft disabled:text-bronze"
+                      disabled={
+                        (busy !== "" && busy !== "furtherEnrichment") ||
+                        busy === "furtherEnrichment" ||
+                        rows.length === 0 ||
+                        furtherEnrichmentCandidateCount === 0
+                      }
+                      onClick={handleFurtherEnrichment}
+                    >
+                      {busy === "furtherEnrichment" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+                      Deep Enrich All Missing
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold hover:bg-white"
+                      onClick={() => setSettingsOpen(true)}
+                    >
+                      <Settings className="h-4 w-4" />
+                      OpenAI Settings
+                    </button>
+                  </div>
+                </div>
+              </div>
               <DisclosureButton open={enrichedProductsOpen} onClick={() => setEnrichedProductsOpen((open) => !open)}>
                 View enriched products
               </DisclosureButton>
               {enrichedProductsOpen ? (
-                <ProductTable rows={rows} categories={categories} sections={sections} updateRow={updateRow} openVendorCall={openVendorCall} debugMode={debugMode} />
+                <ProductTable
+                  rows={rows}
+                  categories={categories}
+                  sections={sections}
+                  updateRow={updateRow}
+                  openVendorCall={openVendorCall}
+                  debugMode={debugMode}
+                  onRowRetry={handleRowRetry}
+                  onManualDimensions={handleManualDimensions}
+                />
               ) : null}
               <div className="flex flex-col gap-3 rounded-2xl border border-linen bg-ivory/70 p-4 sm:flex-row sm:items-center sm:justify-between">
                 <div>
@@ -3500,6 +3786,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
               exportSummary.pdf_product_urls.length ||
               exportSummary.suspicious_dimensions_rejected.length ||
               exportSummary.duplicate_rows_removed ||
+              partialDimensionsCount ||
+              budgetSkippedCount ||
               exportSummary.blank_price_only_rows?.length ||
               exportSummary.missing_model_manufacturer?.length ||
               exportSummary.phone_email_header_contamination?.length ? (
@@ -3509,6 +3797,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                   ) : null}
                   {exportSummary.missing_image_url ? <div>{exportSummary.missing_image_url} row(s) missing image URLs.</div> : null}
                   {exportSummary.missing_dimensions ? <div>{exportSummary.missing_dimensions} row(s) missing dimensions.</div> : null}
+                  {partialDimensionsCount ? <div>{partialDimensionsCount} row(s) have partial dimensions and are not Programa-ready.</div> : null}
+                  {budgetSkippedCount ? <div>{budgetSkippedCount} row(s) were skipped or blocked by the enrichment budget.</div> : null}
                   {exportSummary.blank_price_only_rows?.length ? (
                     <div>{exportSummary.blank_price_only_rows.length} blank/price-only quote row(s) held for manual review.</div>
                   ) : null}
@@ -3549,6 +3839,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             enrichmentBudgetUsd={enrichmentBudgetUsd}
             furtherEnrichmentEnabled={furtherEnrichmentEnabled}
             furtherEnrichmentBudgetUsd={furtherEnrichmentBudgetUsd}
+            requireOpenAiSpendConfirmation={requireOpenAiSpendConfirmation}
+            furtherEnrichmentItemBudgetUsd={furtherEnrichmentItemBudgetUsd}
             furtherEnrichmentCandidateCount={furtherEnrichmentCandidateCount}
             furtherEnrichmentEstimatedCost={furtherEnrichmentEstimatedCost}
             debugMode={debugMode}
@@ -3581,6 +3873,8 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             onEnrichmentBudgetUsdChange={setEnrichmentBudgetUsd}
             onFurtherEnrichmentEnabledChange={setFurtherEnrichmentEnabled}
             onFurtherEnrichmentBudgetUsdChange={setFurtherEnrichmentBudgetUsd}
+            onRequireOpenAiSpendConfirmationChange={setRequireOpenAiSpendConfirmation}
+            onFurtherEnrichmentItemBudgetUsdChange={setFurtherEnrichmentItemBudgetUsd}
             onDebugModeChange={setDebugMode}
             themePreference={themePreference}
             onThemePreferenceChange={setThemePreference}
@@ -3788,6 +4082,8 @@ function ProductTable({
   updateRow,
   openVendorCall,
   debugMode,
+  onRowRetry,
+  onManualDimensions,
 }: {
   rows: IntakeRow[];
   categories: string[];
@@ -3795,6 +4091,8 @@ function ProductTable({
   updateRow: (index: number, key: string, value: unknown) => void;
   openVendorCall: (row: IntakeRow, missingFields: string[]) => void;
   debugMode: boolean;
+  onRowRetry: (index: number, retryType: "dimensions" | "image" | "deep" | "deepDimensions" | "deepImage") => void;
+  onManualDimensions: (index: number) => void;
 }) {
   if (rows.length === 0) {
     return (
@@ -3845,6 +4143,8 @@ function ProductTable({
                       sections={sections}
                       onChange={(value) => updateRow(index, column, value)}
                       onVendorCall={(fields) => openVendorCall(row, fields)}
+                      onRowRetry={(retryType) => onRowRetry(index, retryType)}
+                      onManualDimensions={() => onManualDimensions(index)}
                     />
                   </td>
                 ))}
@@ -3901,6 +4201,47 @@ function RowDebugTrace({ row }: { row: IntakeRow }) {
       </div>
     </details>
   );
+}
+
+function rowStatusBadges(row: IntakeRow) {
+  const badges: string[] = [];
+  const dimensionStatus = rowText(row, "dimensions_status").toLowerCase();
+  const imageStatus = rowText(row, "image_status").toLowerCase();
+  const sourceStatus = rowText(row, "source_status").toLowerCase();
+  const componentType = rowText(row, "product_component_type").toLowerCase();
+  const budgetBlocked = boolish(rowText(row, "budget_blocked"));
+
+  if (hasComplete3dDimensions(row.Dimensions)) {
+    badges.push("Complete dimensions");
+  } else if (dimensionStatus === "partial" || rowText(row, "partial_dimensions_found")) {
+    badges.push("Partial dimensions");
+  } else {
+    badges.push("Missing dimensions");
+  }
+
+  if (hasImage(row)) {
+    badges.push("Image found");
+  } else if (imageStatus === "fallback") {
+    badges.push("Fallback image");
+  } else {
+    badges.push("Missing image");
+  }
+
+  if (budgetBlocked || rowText(row, "skipped_reason").toLowerCase().includes("budget")) {
+    badges.push("Skipped due to budget");
+  }
+  if (componentType.includes("accessory")) {
+    badges.push("Accessory/component");
+  }
+  if (sourceStatus === "manufacturer") {
+    badges.push("Manufacturer source");
+  } else if (sourceStatus === "dealer") {
+    badges.push("Dealer source");
+  }
+  if (rowText(row, "enrichment_status").toLowerCase().includes("review")) {
+    badges.push("Needs review");
+  }
+  return Array.from(new Set(badges));
 }
 
 function ReviewValue({ value }: { value: string }) {
@@ -3979,6 +4320,8 @@ function SettingsDialog({
   enrichmentBudgetUsd,
   furtherEnrichmentEnabled,
   furtherEnrichmentBudgetUsd,
+  requireOpenAiSpendConfirmation,
+  furtherEnrichmentItemBudgetUsd,
   furtherEnrichmentCandidateCount,
   furtherEnrichmentEstimatedCost,
   debugMode,
@@ -4011,6 +4354,8 @@ function SettingsDialog({
   onEnrichmentBudgetUsdChange,
   onFurtherEnrichmentEnabledChange,
   onFurtherEnrichmentBudgetUsdChange,
+  onRequireOpenAiSpendConfirmationChange,
+  onFurtherEnrichmentItemBudgetUsdChange,
   onDebugModeChange,
   themePreference,
   onThemePreferenceChange,
@@ -4049,6 +4394,8 @@ function SettingsDialog({
   enrichmentBudgetUsd: number;
   furtherEnrichmentEnabled: boolean;
   furtherEnrichmentBudgetUsd: number;
+  requireOpenAiSpendConfirmation: boolean;
+  furtherEnrichmentItemBudgetUsd: number;
   furtherEnrichmentCandidateCount: number;
   furtherEnrichmentEstimatedCost: number;
   debugMode: boolean;
@@ -4087,6 +4434,8 @@ function SettingsDialog({
   onEnrichmentBudgetUsdChange: (value: number) => void;
   onFurtherEnrichmentEnabledChange: (value: boolean) => void;
   onFurtherEnrichmentBudgetUsdChange: (value: number) => void;
+  onRequireOpenAiSpendConfirmationChange: (value: boolean) => void;
+  onFurtherEnrichmentItemBudgetUsdChange: (value: number) => void;
   onDebugModeChange: (value: boolean) => void;
   themePreference: ThemePreference;
   onThemePreferenceChange: (value: ThemePreference) => void;
@@ -4350,8 +4699,9 @@ function SettingsDialog({
             </div>
             <dl className="mt-3 grid gap-2 text-xs text-taupe">
               <SettingsDetail label="Model used" value={openAiModel} />
-              <SettingsDetail label="Further Enrichment" value={furtherEnrichmentEnabled ? "Enabled" : "Disabled"} />
-              <SettingsDetail label="Cost cap" value={formatUsd(furtherEnrichmentBudgetUsd)} />
+              <SettingsDetail label="Deep Enrichment" value={furtherEnrichmentEnabled ? "Enabled" : "Disabled"} />
+              <SettingsDetail label="Max spend per run" value={formatUsd(furtherEnrichmentBudgetUsd)} />
+              <SettingsDetail label="Max spend per item" value={formatUsd(furtherEnrichmentItemBudgetUsd)} />
             </dl>
           </div>
         </div>
@@ -4401,7 +4751,7 @@ function SettingsDialog({
           <div className="mt-4 rounded-xl border border-linen bg-white/75 p-3">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
-                <h4 className="text-sm font-semibold text-charcoal">Further Enrichment</h4>
+                <h4 className="text-sm font-semibold text-charcoal">OpenAI Deep Enrichment</h4>
                 <p className="mt-1 text-sm leading-5 text-taupe">
                   Use AI reasoning to research missing product details after standard enrichment fails. Higher accuracy, slower, and may cost more.
                 </p>
@@ -4415,9 +4765,18 @@ function SettingsDialog({
                 onChange={(event) => onFurtherEnrichmentEnabledChange(event.target.checked)}
                 className="mt-1 h-4 w-4 accent-bronze"
               />
-              Enable Further Enrichment for rows with missing dimensions, missing images, or low confidence.
+              Enable OpenAI deep enrichment for rows with missing dimensions, missing images, missing product URLs, or low confidence.
             </label>
-            <Field label="Max cost cap for further enrichment">
+            <label className="mt-3 flex items-start gap-3 text-sm text-taupe">
+              <input
+                type="checkbox"
+                checked={requireOpenAiSpendConfirmation}
+                onChange={(event) => onRequireOpenAiSpendConfirmationChange(event.target.checked)}
+                className="mt-1 h-4 w-4 accent-bronze"
+              />
+              Require confirmation before OpenAI spend.
+            </label>
+            <Field label="Max OpenAI spend per run">
               <input
                 type="number"
                 min="0"
@@ -4428,9 +4787,21 @@ function SettingsDialog({
                 onChange={(event) => onFurtherEnrichmentBudgetUsdChange(clampBudgetUsd(Number.parseFloat(event.target.value)))}
               />
             </Field>
+            <Field label="Max OpenAI spend per item">
+              <input
+                type="number"
+                min="0"
+                max="1"
+                step="0.01"
+                className="input-surface mt-3 h-10 w-full rounded-xl px-3 text-sm text-charcoal"
+                value={furtherEnrichmentItemBudgetUsd}
+                onChange={(event) => onFurtherEnrichmentItemBudgetUsdChange(clampBudgetUsd(Number.parseFloat(event.target.value)))}
+              />
+            </Field>
             <dl className="mt-3 grid gap-2 text-xs text-taupe">
               <SettingsDetail label="Rows currently eligible" value={String(furtherEnrichmentCandidateCount)} />
               <SettingsDetail label="Estimated next run" value={formatUsd(furtherEnrichmentEstimatedCost, 4)} />
+              <SettingsDetail label="Confirmation" value={requireOpenAiSpendConfirmation ? "Required before spend" : "Not required"} />
               <SettingsDetail label="Writeback rule" value="Only blank/low-confidence fields; high-confidence values are preserved." />
             </dl>
           </div>
@@ -5182,6 +5553,8 @@ function Cell({
   sections,
   onChange,
   onVendorCall,
+  onRowRetry,
+  onManualDimensions,
 }: {
   row: IntakeRow;
   column: string;
@@ -5189,6 +5562,8 @@ function Cell({
   sections: string[];
   onChange: (value: unknown) => void;
   onVendorCall: (missingFields: string[]) => void;
+  onRowRetry: (retryType: "dimensions" | "image" | "deep" | "deepDimensions" | "deepImage") => void;
+  onManualDimensions: () => void;
 }) {
   if (column === "Include" || column === "Review Required") {
     return (
@@ -5212,9 +5587,73 @@ function Cell({
 
   if (column === "Status") {
     const value = rowText(row, column) || "Needs Review";
+    const badges = rowStatusBadges(row);
+    const needsDimensions = !hasComplete3dDimensions(row.Dimensions);
+    const needsImage = !hasImage(row);
     return (
-      <div className="grid gap-1.5">
+      <div className="grid min-w-56 gap-2">
         <StatusBadge value={value} />
+        <div className="flex max-w-64 flex-wrap gap-1.5">
+          {badges.map((badge) => (
+            <StatusBadge key={badge} value={badge} />
+          ))}
+        </div>
+        <div className="grid gap-1.5">
+          {needsDimensions ? (
+            <button
+              type="button"
+              className="btn-secondary h-8 rounded-lg px-2 text-xs font-semibold hover:bg-white"
+              onClick={() => onRowRetry("dimensions")}
+            >
+              Retry dimensions only
+            </button>
+          ) : null}
+          {needsDimensions ? (
+            <button
+              type="button"
+              className="btn-secondary h-8 rounded-lg px-2 text-xs font-semibold hover:bg-white"
+              onClick={() => onRowRetry("deepDimensions")}
+            >
+              Deep retry dimensions
+            </button>
+          ) : null}
+          {needsImage ? (
+            <button
+              type="button"
+              className="btn-secondary h-8 rounded-lg px-2 text-xs font-semibold hover:bg-white"
+              onClick={() => onRowRetry("image")}
+            >
+              Retry image only
+            </button>
+          ) : null}
+          {needsImage ? (
+            <button
+              type="button"
+              className="btn-secondary h-8 rounded-lg px-2 text-xs font-semibold hover:bg-white"
+              onClick={() => onRowRetry("deepImage")}
+            >
+              Deep retry image
+            </button>
+          ) : null}
+          {needsDimensions || needsImage || confidenceIsLow(row) ? (
+            <button
+              type="button"
+              className="btn-secondary h-8 rounded-lg px-2 text-xs font-semibold hover:bg-white"
+              onClick={() => onRowRetry("deep")}
+            >
+              Deep retry this item
+            </button>
+          ) : null}
+          {needsDimensions ? (
+            <button
+              type="button"
+              className="btn-secondary h-8 rounded-lg px-2 text-xs font-semibold hover:bg-white"
+              onClick={onManualDimensions}
+            >
+              Manually enter dimensions
+            </button>
+          ) : null}
+        </div>
         <input
           className="input-surface h-9 w-40 rounded-xl px-2 text-sm"
           value={value}
