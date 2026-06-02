@@ -38,6 +38,7 @@ except ImportError:
 
 from src.dimensions import dimension_sanity_reason
 from src.enrichment_cache import ManufacturerDomainCache, SessionCache, SearchBudget
+from src.url_utils import safe_urljoin, validate_http_url
 
 _log = _logging.getLogger(__name__)
 
@@ -959,30 +960,10 @@ def _parse_pdf_for_dimensions(
 _PDF_EXTENSIONS = frozenset({".pdf"})
 _REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SCH-Intake/1.0)"}
 _REQUEST_TIMEOUT_S: int = 12
-_HOSTNAME_RE = re.compile(r"^[a-z0-9.-]+$", re.IGNORECASE)
 
 
 def _url_validation_error(url: object) -> str:
-    raw = str(url or "").strip()
-    if not raw:
-        return "empty URL"
-    if any(ch.isspace() for ch in raw):
-        return "malformed URL: contains whitespace"
-    try:
-        parsed = _urlparse.urlparse(raw)
-        hostname = parsed.hostname  # raises ValueError for malformed IPv6 brackets
-    except ValueError as exc:
-        return f"Invalid IPv6 URL: {exc}"
-    except Exception as exc:
-        return f"malformed URL: {exc}"
-    if parsed.scheme.lower() not in {"http", "https"}:
-        return f"malformed URL: unsupported scheme {parsed.scheme or '<missing>'}"
-    if not parsed.netloc or not hostname:
-        return "malformed URL: missing host"
-    host = hostname.strip().lower()
-    if ":" not in host and (not _HOSTNAME_RE.match(host) or "." not in host):
-        return f"malformed domain: {host}"
-    return ""
+    return validate_http_url(url)
 
 
 def _record_invalid_url_debug(
@@ -1076,8 +1057,8 @@ def _extract_spec_pdf_links(html: str, base_url: str, model: str = "") -> list[s
     def _add(raw_url: str, label: str = "") -> None:
         if not raw_url:
             return
-        resolved = _urlparse.urljoin(base_url, raw_url.strip())
-        if _url_validation_error(resolved):
+        resolved, join_error = safe_urljoin(base_url, raw_url.strip(), source="dimension_spec_pdf_link")
+        if join_error:
             return
         parsed = _urlparse.urlparse(resolved)
         haystack = f"{resolved} {label}".lower()

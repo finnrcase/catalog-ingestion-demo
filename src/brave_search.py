@@ -22,6 +22,8 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from src.url_utils import is_valid_http_url
+
 load_dotenv()
 
 BRAVE_API_KEY: str = os.getenv("BRAVE_API_KEY", "")
@@ -117,7 +119,7 @@ def search_product_candidates(query: str, brand: str = "", session_cache=None) -
                 domain_score=_score_domain(r.get("url", ""), brand),
             )
             for r in raw
-            if r.get("url")
+            if r.get("url") and is_valid_http_url(r.get("url"))
         ]
         results.sort(key=lambda r: r.domain_score, reverse=True)
         results = results[:5]

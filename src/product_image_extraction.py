@@ -8,6 +8,8 @@ from typing import Callable
 
 from bs4 import BeautifulSoup
 
+from src.url_utils import safe_urljoin, validate_http_url
+
 
 _BAD_IMAGE_TERMS = (
     "logo",
@@ -106,12 +108,14 @@ def _absolute_image_url(value: object, page_url: str = "") -> str:
     if not raw or raw.startswith("data:"):
         return ""
     raw = raw.replace("\\/", "/").replace("&amp;", "&").strip()
-    if raw.startswith("//"):
+    if page_url:
+        raw, join_error = safe_urljoin(page_url, raw, source="product_image_candidate")
+        if join_error:
+            return ""
+    elif raw.startswith("//"):
         raw = "https:" + raw
-    elif raw.startswith("/") and page_url:
-        raw = urllib.parse.urljoin(page_url, raw)
-    elif page_url:
-        raw = urllib.parse.urljoin(page_url, raw)
+    if validate_http_url(raw):
+        return ""
     parsed = urllib.parse.urlparse(raw)
     if parsed.scheme != "https" or not parsed.netloc:
         return ""

@@ -34,10 +34,11 @@ PROGRAMA_BROWSER_PROFILE Profile path (default: runtime storage browser profile)
 import os
 import re
 import hashlib
+import logging
 import time
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -51,10 +52,19 @@ from src.automation_logs import (
 from src.dimensions import extract_labeled_dimensions
 from src.notes import remove_notes_row_prefix
 from src.runtime_storage import runtime_data_path
+from src.url_utils import normalize_base_url, safe_urljoin, validate_http_url
 
 load_dotenv()
 
-PROGRAMA_URL = os.environ.get("PROGRAMA_URL", "https://app.programa.design/").rstrip("/") + "/"
+_log = logging.getLogger(__name__)
+
+_programa_base, _programa_base_error = normalize_base_url(
+    os.environ.get("PROGRAMA_URL", "https://app.programa.design/"),
+    env_var_name="PROGRAMA_URL",
+)
+PROGRAMA_URL = f"{_programa_base}/" if _programa_base else "https://app.programa.design/"
+if _programa_base_error:
+    _log.warning("Invalid PROGRAMA_URL configuration; using default. error=%s", _programa_base_error)
 
 PROFILE_DIR = Path(
     os.getenv("PROGRAMA_BROWSER_PROFILE", str(runtime_data_path("browser_profiles", "programa_assistant")))
@@ -2945,7 +2955,10 @@ def _normalise_image_url(url: str, base_url: str = "") -> str:
     value = str(url or "").strip()
     if not value:
         return ""
-    return urljoin(base_url, value)
+    resolved, error = safe_urljoin(base_url, value, source="programa_image_candidate")
+    if error:
+        return ""
+    return resolved
 
 
 def _image_url_is_usable(url: str) -> bool:
@@ -3050,6 +3063,9 @@ def _find_product_image_url(product: dict) -> tuple[str, str]:
     product_url = str(product.get("product_url") or product.get("Product URL") or "").strip()
     if not product_url:
         return "", "no product_url available"
+    invalid_product_url = validate_http_url(product_url)
+    if invalid_product_url:
+        return "", f"invalid product_url skipped: {invalid_product_url}"
 
     try:
         response = requests.get(
@@ -3108,6 +3124,10 @@ def download_product_image(product: dict) -> str | None:
         product["image_upload_status"] = f"skipped: {source}"
         return None
     print(f"[IMAGE] {source}: {image_url}")
+    invalid_image_url = validate_http_url(image_url)
+    if invalid_image_url:
+        product["image_upload_status"] = f"skipped: invalid image URL ({invalid_image_url})"
+        return None
 
     try:
         response = requests.get(
@@ -3515,6 +3535,9 @@ def _find_and_download_product_image(row: dict) -> str | None:
     # If we already have a product URL, try to extract image from that page
     if product_url:
         try:
+            invalid_product_url = validate_http_url(product_url)
+            if invalid_product_url:
+                raise ValueError(invalid_product_url)
             resp = requests.get(product_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
             img_url, source = _discover_image_url_from_html(resp.text, product_url)
             if img_url and _image_url_is_usable(img_url):
@@ -3555,6 +3578,9 @@ def _find_and_download_product_image(row: dict) -> str | None:
     for result in results[:5]:
         url = result.url
         if any(d in url for d in SKIP_IMAGE_DOMAINS):
+            continue
+        invalid_result_url = validate_http_url(url)
+        if invalid_result_url:
             continue
         try:
             resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})

@@ -3,6 +3,8 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 
+import { API_BASE, API_BASE_ERROR, RAW_API_BASE, joinUrl } from "@/lib/api";
+
 const DEBUG_MODE_STORAGE_KEY = "sch-intake-debug-mode";
 const THEME_STORAGE_KEY = "sch-intake-theme";
 const ACCENT_THEME_STORAGE_KEY = "sch-intake-accent-theme";
@@ -37,7 +39,9 @@ const fallbackBuildInfo = {
   commit:
     (process.env.NEXT_PUBLIC_APP_COMMIT_SHA || process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA)
       ?.slice(0, 12) || "local",
-  apiBase: process.env.NEXT_PUBLIC_API_BASE_URL || "not configured",
+  apiBase: API_BASE || "not configured",
+  rawApiBase: RAW_API_BASE || "not configured",
+  apiBaseError: API_BASE_ERROR,
   repo: process.env.NEXT_PUBLIC_APP_REPO || "catalog-ingestion-demo",
   branch: process.env.NEXT_PUBLIC_APP_BRANCH || "not exposed",
   builtAt: process.env.NEXT_PUBLIC_APP_BUILD_TIMESTAMP || "not exposed",
@@ -137,7 +141,14 @@ export default function SettingsPage() {
       setApiStatus("misconfigured");
       return;
     }
-    fetch(`${apiBase.replace(/\/$/, "")}/health`, { cache: "no-store" })
+    let healthUrl = "";
+    try {
+      healthUrl = joinUrl(apiBase, "/health");
+    } catch {
+      setApiStatus("misconfigured");
+      return;
+    }
+    fetch(healthUrl, { cache: "no-store" })
       .then((response) => setApiStatus(response.ok ? "connected" : "offline"))
       .catch(() => setApiStatus("offline"));
   }, []);
@@ -304,6 +315,16 @@ export default function SettingsPage() {
                   <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">NEXT_PUBLIC_API_BASE_URL</dt>
                   <dd className="mt-1 break-all font-mono text-charcoal">{fallbackBuildInfo.apiBase}</dd>
                 </div>
+                <div>
+                  <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">Raw API base env</dt>
+                  <dd className="mt-1 break-all font-mono text-charcoal">{fallbackBuildInfo.rawApiBase}</dd>
+                </div>
+                {fallbackBuildInfo.apiBaseError ? (
+                  <div>
+                    <dt className="font-semibold uppercase tracking-[0.1em] text-charcoal/50">API base error</dt>
+                    <dd className="mt-1 break-words font-mono text-clay">{fallbackBuildInfo.apiBaseError}</dd>
+                  </div>
+                ) : null}
               </dl>
             </details>
           ) : null}

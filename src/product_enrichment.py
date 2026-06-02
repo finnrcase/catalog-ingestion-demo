@@ -47,6 +47,7 @@ from src.source_memory import (
     save_successful_source_from_row,
     storage_backend_name,
 )
+from src.url_utils import validate_http_url
 
 try:
     import html2text as _html2text
@@ -787,31 +788,9 @@ def _is_absolute_https(url: str) -> bool:
     return bool(url) and isinstance(url, str) and url.lower().startswith("https://")
 
 
-_HOSTNAME_RE = re.compile(r"^[a-z0-9.-]+$", re.IGNORECASE)
-
-
 def _url_validation_error(url: object) -> str:
     """Return a reason when a URL should not be fetched."""
-    raw = _str_val(url)
-    if not raw:
-        return "empty URL"
-    if any(ch.isspace() for ch in raw):
-        return "malformed URL: contains whitespace"
-    try:
-        parsed = urllib.parse.urlparse(raw)
-        hostname = parsed.hostname  # may raise ValueError for malformed IPv6 brackets
-    except ValueError as exc:
-        return f"Invalid IPv6 URL: {exc}"
-    except Exception as exc:
-        return f"malformed URL: {exc}"
-    if parsed.scheme.lower() not in {"http", "https"}:
-        return f"malformed URL: unsupported scheme {parsed.scheme or '<missing>'}"
-    if not parsed.netloc or not hostname:
-        return "malformed URL: missing host"
-    host = hostname.strip().lower()
-    if ":" not in host and (not _HOSTNAME_RE.match(host) or "." not in host):
-        return f"malformed domain: {host}"
-    return ""
+    return validate_http_url(url)
 
 
 def _stamp_invalid_url_debug(

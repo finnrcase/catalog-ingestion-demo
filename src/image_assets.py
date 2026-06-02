@@ -25,6 +25,8 @@ from pathlib import Path
 import httpx
 from PIL import Image, ImageOps
 
+from src.url_utils import validate_http_url
+
 _log = logging.getLogger(__name__)
 
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
@@ -46,6 +48,9 @@ def build_image_filename(
 
 def _download_bytes(url: str) -> tuple[bytes, str]:
     """Fetch url and return (body_bytes, normalised_content_type). Raises on HTTP error."""
+    invalid_reason = validate_http_url(url)
+    if invalid_reason:
+        raise ValueError(invalid_reason)
     resp = httpx.get(
         url,
         headers={"User-Agent": "Mozilla/5.0 (compatible; SCH-Intake/1.0)"},

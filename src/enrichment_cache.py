@@ -25,6 +25,7 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from src.runtime_storage import record_storage_warning, runtime_data_path
+from src.url_utils import validate_http_url
 
 _log = logging.getLogger(__name__)
 
@@ -87,7 +88,6 @@ def confidence_ok(entry: dict, field_name: str) -> bool:
     return entry.get(conf_key, "") in ("high", "medium")
 
 
-_HOSTNAME_RE = re.compile(r"^[a-z0-9.-]+$", re.IGNORECASE)
 _DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?!-)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$",
     re.IGNORECASE,
@@ -123,19 +123,7 @@ def _valid_domain(value: object) -> bool:
 
 
 def _valid_fetch_url(value: object) -> bool:
-    raw = str(value or "").strip()
-    if not raw or any(ch.isspace() for ch in raw):
-        return False
-    try:
-        parsed = urlparse(raw)
-        host = parsed.hostname
-    except Exception:
-        return False
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or not host:
-        return False
-    if ":" not in host and (not _HOSTNAME_RE.match(host) or "." not in host):
-        return False
-    return True
+    return not validate_http_url(value)
 
 
 # ── SearchBudget ───────────────────────────────────────────────────────────────

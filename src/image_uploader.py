@@ -5,6 +5,8 @@ import logging
 import os
 
 import requests
+
+from src.url_utils import validate_http_url
 from dotenv import load_dotenv
 from PIL import Image, ImageOps
 
@@ -39,6 +41,8 @@ def is_public_https_image_url(url: str | None) -> bool:
 def public_https_url_is_accessible(url: str | None) -> bool:
     """Best-effort public accessibility check for a hosted image URL."""
     if not is_public_https_image_url(url):
+        return False
+    if validate_http_url(url):
         return False
     try:
         response = requests.head(str(url), allow_redirects=True, timeout=10)

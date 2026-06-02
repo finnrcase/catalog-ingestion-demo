@@ -16,28 +16,7 @@ import type {
 
 export const RAW_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "";
 const BACKEND_UNAVAILABLE = "Backend is offline or not configured.";
-
-function resolveApiBase(rawUrl: string) {
-  if (!rawUrl || rawUrl === "undefined" || rawUrl === "null") return "";
-  try {
-    const parsed = new URL(rawUrl);
-    if (!["http:", "https:"].includes(parsed.protocol)) return "";
-    return parsed.href.replace(/\/$/, "");
-  } catch {
-    return "";
-  }
-}
-
-export const API_BASE = resolveApiBase(RAW_API_BASE);
-
-if (typeof window !== "undefined") {
-  console.info(`[API BASE URL] ${API_BASE || "not configured"}`);
-}
-
-export function apiUrl(path: string) {
-  if (!API_BASE) throw new Error(BACKEND_UNAVAILABLE);
-  return `${API_BASE}${path}`;
-}
+const API_BASE_ENV_VAR = "NEXT_PUBLIC_API_BASE_URL";
 
 type ApiDebugDetails = {
   apiBase: string;
@@ -55,6 +34,125 @@ export class ApiRequestError extends Error {
     this.name = "ApiRequestError";
     this.details = details;
   }
+}
+
+type NormalizedUrlResult = {
+  url: string;
+  error: string;
+};
+
+function stripWrappingQuotes(value: string) {
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function stripAccidentalEnvAssignment(rawUrl: string, envVarName: string) {
+  let value = stripWrappingQuotes(rawUrl);
+  const prefixes = [envVarName, "NEXT_PUBLIC_API_BASE_URL", "API_BASE_URL", "BACKEND_URL"];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const prefixName of prefixes) {
+      const prefix = `${prefixName}=`;
+      if (value.startsWith(prefix)) {
+        value = stripWrappingQuotes(value.slice(prefix.length));
+        changed = true;
+      }
+    }
+  }
+  return value;
+}
+
+function logUrlConfigError(message: string, details: Record<string, string>) {
+  if (typeof window === "undefined") return;
+  console.error(`[URL CONFIG ERROR] ${message}`, details);
+}
+
+export function normalizeBaseUrl(rawUrl: string, envVarName = API_BASE_ENV_VAR): NormalizedUrlResult {
+  if (!rawUrl || rawUrl === "undefined" || rawUrl === "null") {
+    return { url: "", error: `${envVarName} is missing.` };
+  }
+  const candidate = stripAccidentalEnvAssignment(rawUrl, envVarName).replace(/\/+$/, "");
+  if (!candidate) return { url: "", error: `${envVarName} is empty after normalization.` };
+  try {
+    const parsed = new URL(candidate);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return { url: "", error: `${envVarName} must use http or https, got ${parsed.protocol || "missing protocol"}.` };
+    }
+    if (!parsed.hostname) {
+      return { url: "", error: `${envVarName} is missing a hostname.` };
+    }
+    return { url: parsed.href.replace(/\/+$/, ""), error: "" };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "Invalid URL";
+    const message = `${envVarName} is not a valid base URL: ${reason}`;
+    logUrlConfigError(message, { envVarName, rawValue: rawUrl, normalizedCandidate: candidate });
+    return { url: "", error: message };
+  }
+}
+
+const resolvedApiBase = normalizeBaseUrl(RAW_API_BASE, API_BASE_ENV_VAR);
+export const API_BASE = resolvedApiBase.url;
+export const API_BASE_ERROR = resolvedApiBase.error;
+
+if (typeof window !== "undefined") {
+  if (API_BASE) {
+    console.info(`[API BASE URL] ${API_BASE}`);
+  } else {
+    logUrlConfigError(API_BASE_ERROR || `${API_BASE_ENV_VAR} is not configured.`, {
+      envVarName: API_BASE_ENV_VAR,
+      rawValue: RAW_API_BASE || "not configured",
+    });
+  }
+}
+
+export function joinUrl(baseUrl: string, path: string, envVarName = API_BASE_ENV_VAR) {
+  const normalized = normalizeBaseUrl(baseUrl, envVarName);
+  if (!normalized.url) {
+    const message = normalized.error || BACKEND_UNAVAILABLE;
+    logUrlConfigError(message, { envVarName, rawValue: baseUrl || "not configured", path });
+    throw new ApiRequestError(message, {
+      apiBase: baseUrl || "not configured",
+      endpoint: path,
+      kind: "config",
+    });
+  }
+  const cleanPath = String(path || "").replace(/^\/+/, "");
+  const constructed = cleanPath ? `${normalized.url}/${cleanPath}` : normalized.url;
+  try {
+    return new URL(constructed).href;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "Invalid URL";
+    const message = `Could not construct backend URL from ${envVarName}: ${reason}`;
+    logUrlConfigError(message, {
+      envVarName,
+      baseUrl: normalized.url,
+      path,
+      constructed,
+    });
+    throw new ApiRequestError(message, {
+      apiBase: normalized.url,
+      endpoint: constructed,
+      kind: "config",
+    });
+  }
+}
+
+export function apiUrl(path: string) {
+  if (!API_BASE) {
+    throw new ApiRequestError(API_BASE_ERROR || BACKEND_UNAVAILABLE, {
+      apiBase: RAW_API_BASE || "not configured",
+      endpoint: path,
+      kind: "config",
+    });
+  }
+  return joinUrl(API_BASE, path, API_BASE_ENV_VAR);
 }
 
 async function apiFetch(input: RequestInfo | URL, init?: RequestInit) {

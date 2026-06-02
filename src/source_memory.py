@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - httpx is present in supported envs
 
 from src.dimensions import extract_labeled_dimensions, has_complete_3d_dimensions
 from src.runtime_storage import record_storage_warning, runtime_data_path, write_json_best_effort
+from src.url_utils import normalize_base_url, validate_http_url
 
 _log = logging.getLogger(__name__)
 
@@ -64,18 +65,7 @@ def domain_from_url(value: object) -> str:
 
 def _valid_fetch_url(value: object) -> bool:
     text = str(value or "").strip()
-    if not text or any(ch.isspace() for ch in text):
-        return False
-    try:
-        parsed = urlparse(text)
-        host = parsed.hostname
-    except Exception:
-        return False
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or not host:
-        return False
-    if ":" not in host and not re.match(r"^[a-z0-9.-]+\.[a-z]{2,63}$", host, flags=re.IGNORECASE):
-        return False
-    return True
+    return not validate_http_url(text)
 
 
 _SOURCE_URL_FIELDS = (
@@ -159,7 +149,8 @@ def _write_json_file(path: Path, rows: list[dict]) -> None:
 
 
 def _supabase_configured() -> bool:
-    return bool(os.getenv("SUPABASE_URL") and _supabase_key() and httpx is not None)
+    base, _error = _supabase_base_url()
+    return bool(base and _supabase_key() and httpx is not None)
 
 
 def _supabase_key() -> str:
@@ -185,19 +176,29 @@ def _supabase_headers(*, returning: bool = False) -> dict[str, str]:
     }
 
 
+def _supabase_base_url() -> tuple[str, str]:
+    return normalize_base_url(os.getenv("SUPABASE_URL", ""), env_var_name="SUPABASE_URL")
+
+
 def _supabase_url(table: str) -> str:
-    base = str(os.getenv("SUPABASE_URL") or "").rstrip("/")
+    base, error = _supabase_base_url()
+    if error:
+        _log.warning("Invalid SUPABASE_URL configuration; source memory will fall back to local storage. error=%s", error)
+        return ""
     return f"{base}/rest/v1/{table}"
 
 
 def _supabase_request(method: str, table: str, *, params: dict | None = None, json_body: Any = None, returning: bool = False):
     if not _supabase_configured():
         return None
+    url = _supabase_url(table)
+    if not url:
+        return None
     try:
         with httpx.Client(timeout=12) as client:
             response = client.request(
                 method,
-                _supabase_url(table),
+                url,
                 params=params or {},
                 json=json_body,
                 headers=_supabase_headers(returning=returning),
