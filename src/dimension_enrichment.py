@@ -36,6 +36,7 @@ try:
 except ImportError:
     _brave_candidates = None
 
+from src.brand_sources import domains_for_brand
 from src.dimensions import dimension_sanity_reason
 from src.enrichment_cache import ManufacturerDomainCache, SessionCache, SearchBudget
 from src.url_utils import safe_urljoin, validate_http_url
@@ -274,7 +275,7 @@ def _generate_queries(
     Return search queries in priority order: manufacturer site-targeted (phase 1),
     general brand (phase 2), final fallbacks (phase 4).
     Retailer queries (phase 3) are generated separately by _generate_retailer_queries.
-    Bounded to <= 9 queries (deduplication may reduce further).
+    Bounded to a small set (deduplication may reduce further).
     """
     queries: list[str] = []
     seen: set[str] = set()
@@ -284,16 +285,25 @@ def _generate_queries(
             seen.add(q)
             queries.append(q)
 
-    # Phase 1 — manufacturer site-targeted
-    if domain:
-        _add(f'site:{domain} "{model}" dimensions')
-        _add(f'site:{domain} "{model}" specifications')
-        _add(f'site:{domain} "{model}" spec sheet')
-        _add(f'site:{domain} "{model}" installation guide')
+    # Phase 1 — manufacturer site-targeted. Official brand domains always
+    # precede any discovered/retailer-like fallback domain.
+    source_domains = domains_for_brand(brand, domain)
+    if source_domains:
+        primary = source_domains[0]
+        _add(f'site:{primary} "{model}" dimensions')
+        _add(f'site:{primary} "{model}" specifications')
+        _add(f'site:{primary} "{model}" spec sheet')
+        _add(f'site:{primary} "{model}" installation guide')
+        _add(f'site:{primary} "{model}" "Width" "Height" "Depth"')
+        for extra_domain in source_domains[1:3]:
+            _add(f'site:{extra_domain} "{model}" dimensions')
+            _add(f'site:{extra_domain} "{model}" spec sheet PDF')
 
     # Phase 2 — general brand queries
     _add(f'"{brand}" "{model}" "dimensions"')
     _add(f'"{brand}" "{model}" "specifications"')
+    _add(f'"{brand}" "{model}" spec sheet PDF')
+    _add(f'"{brand}" "{model}" installation guide PDF')
 
     # Phase 4 — final fallbacks
     if product_name:
@@ -354,6 +364,20 @@ _REJECTED_DIMENSION_CONTEXT = re.compile(
     r"\b(shipping|package|packaged|carton|box|cutout|rough[- ]?in|opening)\b",
     re.IGNORECASE,
 )
+
+
+def _snippet_around(text: str, needle: str, radius: int = 260) -> str:
+    if not text:
+        return ""
+    pos = text.find(needle) if needle else -1
+    if pos < 0 and needle:
+        pos = text.lower().find(needle.lower())
+    if pos < 0:
+        match = re.search(r"\b(dimensions?|width|height|depth|overall|product dimensions?)\b", text, re.IGNORECASE)
+        pos = match.start() if match else 0
+    start = max(0, pos - radius)
+    end = min(len(text), pos + len(needle or "") + radius)
+    return re.sub(r"\s+", " ", text[start:end]).strip()
 
 
 def _fraction_to_decimal(s: str) -> str:
@@ -669,6 +693,8 @@ def _parse_html_for_dimensions(
         debug.setdefault("dimension_parse_method", "")
         debug.setdefault("partial_dimensions_found", "")
         debug.setdefault("rejected_dimensions_reason", "")
+        debug.setdefault("dimension_raw_text", "")
+        debug.setdefault("dimension_raw_snippet", "")
 
     def _get_page_text() -> str:
         nonlocal page_text
@@ -845,6 +871,9 @@ def _parse_html_for_dimensions(
         debug["dimension_candidates_seen"] = candidates_seen[:8]
         if product_dims and 0 < _dimension_part_count(product_dims) < 3:
             debug["partial_dimensions_found"] = product_dims
+        if product_dims and not debug.get("dimension_raw_snippet"):
+            debug["dimension_raw_snippet"] = _snippet_around(_get_page_text(), product_dims)
+            debug["dimension_raw_text"] = product_dims
 
     return product_dims, cutout_dims
 
@@ -880,12 +909,17 @@ def _parse_text_pages_for_dimensions(
                 if part_count > best_partial_count:
                     best_partial_dims = candidate
                     best_partial_count = part_count
+                    if debug is not None:
+                        debug["dimension_raw_snippet"] = _snippet_around(page_text, candidate)
+                        debug["dimension_raw_text"] = candidate
                 # Keep scanning pages. A one/two-axis partial is useful, but it
                 # is not a Programa-ready dimension result.
                 continue
             product_dims = candidate
             if debug is not None:
                 debug["dimension_parse_method"] = debug.get("dimension_parse_method") or "pdf_text"
+                debug["dimension_raw_snippet"] = _snippet_around(page_text, candidate)
+                debug["dimension_raw_text"] = candidate
             # Look for cutout on same page if appliance
             if is_appliance:
                 cutout_candidates = _find_dimension_candidates(
@@ -1150,6 +1184,7 @@ def _build_dimension_result(
     debug["dimension_source_url"] = source_url
     debug["dimension_confidence"] = confidence
     debug["dimensions_extracted"] = dimensions
+    debug["dimension_raw_text"] = debug.get("dimension_raw_text") or dimensions
     if 0 < _dimension_part_count(dimensions) < 3:
         debug["partial_dimensions_found"] = dimensions
     return DimensionResult(
@@ -1261,6 +1296,8 @@ def find_dimensions(
         "dimension_source": "",
         "dimension_source_url": "",
         "dimension_parse_method": "",
+        "dimension_raw_text": "",
+        "dimension_raw_snippet": "",
         "partial_dimensions_found": "",
         "rejected_dimensions_reason": "",
         "final_dimensions": current_dims,

@@ -211,7 +211,20 @@ def test_generate_queries_bounded():
         product_name="Highline Toilet",
         sku="K-3999",
     )
-    assert len(queries) <= 9
+    assert len(queries) <= 13
+
+
+def test_generate_queries_prioritizes_brand_source_aliases():
+    queries = _generate_queries(
+        brand="Wolf",
+        model="WWD30",
+        domain="subzero-wolf.com",
+    )
+
+    assert queries[0] == 'site:subzero-wolf.com "WWD30" dimensions'
+    assert 'site:ca.subzero-wolf.com "WWD30" dimensions' in queries
+    assert 'site:ca.subzero-wolf.com "WWD30" spec sheet PDF' in queries
+    assert queries.index('site:subzero-wolf.com "WWD30" dimensions') < queries.index('"Wolf" "WWD30" "dimensions"')
 
 
 def test_generate_retailer_queries():

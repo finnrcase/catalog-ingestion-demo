@@ -212,6 +212,59 @@ def test_build_sku_lookup_queries_adds_slash_suffix_variants():
     assert "36 Integrated Column Refrigerator" in joined
 
 
+def test_build_sku_lookup_queries_prioritizes_wolf_official_aliases():
+    row = {
+        "Brand": "Wolf",
+        "Model/SKU": "WWD30",
+        "Product Name": "30 Inch Warming Drawer",
+        "Product Category": "Appliances",
+    }
+
+    queries = _build_sku_lookup_queries(row, "subzero-wolf.com")
+
+    assert queries[0].startswith('site:subzero-wolf.com "WWD30"')
+    assert 'site:ca.subzero-wolf.com "WWD30" dimensions' in queries
+    assert 'site:ca.subzero-wolf.com "WWD30" spec sheet PDF' in queries
+    assert not any(query.startswith("site:ajmadison.com") for query in queries)
+
+
+def test_sku_product_search_does_not_spend_budget_on_cached_query(monkeypatch):
+    import src.product_enrichment as pe
+    from src.brave_search import SearchResult
+    from src.enrichment_cache import SearchBudget, SessionCache
+
+    row = {"Brand": "Scotsman", "Model/SKU": "SCN60PA1SU", "Product Name": "Icemaker"}
+    first_query = _build_sku_lookup_queries(row, "scotsman-ice.com")[0]
+    session = SessionCache()
+    session.queries[first_query] = [
+        SearchResult("Cached low value", "https://retailer.example.com/scn60pa1su", "", 40)
+    ]
+    budget = SearchBudget(max_searches=1, max_urls=5)
+    live_calls = []
+
+    def fake_search(query, brand="", session_cache=None):
+        if session_cache is not None and query in session_cache.queries:
+            return session_cache.queries[query]
+        live_calls.append(query)
+        return [SearchResult("Official", "https://scotsman-ice.com/products/SCN60PA1SU", "", 100)]
+
+    monkeypatch.setattr(pe, "search_product_candidates", fake_search)
+    debug = {}
+
+    results = pe._search_sku_product_pages(
+        row,
+        "scotsman-ice.com",
+        session_cache=session,
+        budget=budget,
+        debug=debug,
+    )
+
+    assert budget.searches_used == 1
+    assert live_calls
+    assert live_calls[0] != first_query
+    assert any(result.url == "https://scotsman-ice.com/products/SCN60PA1SU" for result in results)
+
+
 def test_score_verified_product_page_rejects_sitemap_without_sku():
     row = {"Brand": "Scotsman", "Model/SKU": "SCN60PA1SU", "Product Name": "Icemaker"}
 
@@ -978,7 +1031,7 @@ def test_enrich_row_existing_product_url_is_verified_before_search(monkeypatch):
     assert updated["Material"] == "Stainless steel"
     assert updated["sku_used_for_lookup"] == "MDD30TS"
     assert updated["selected_product_url"] == "https://wolfappliance.com/products/MDD30TS"
-    assert updated["selected_product_url_confidence"] == "medium"
+    assert updated["selected_product_url_confidence"] == "high"
     assert "Image URL" in updated["fields_filled"]
 
 

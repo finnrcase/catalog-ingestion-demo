@@ -27,6 +27,14 @@ def test_score_domain_brand_and_preferred():
     assert score >= 90
 
 
+def test_score_domain_manufacturer_beats_aj_madison_for_known_brand():
+    official = bs._score_domain("https://www.subzero-wolf.com/wolf/warming-drawers/WWD30", "Wolf")
+    retailer = bs._score_domain("https://www.ajmadison.com/cgi-bin/ajmadison/WWD30.html", "Wolf")
+
+    assert official > retailer
+    assert retailer < 80
+
+
 def test_search_product_candidates_missing_key(monkeypatch):
     monkeypatch.setattr(bs, "BRAVE_API_KEY", "")
     results = bs.search_product_candidates("Wolf MDD30TS specifications", "Wolf")

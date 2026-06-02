@@ -26,6 +26,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+from src.brand_sources import brand_source_score, domains_for_brand, is_low_priority_domain
 from src.brave_search import BRAVE_API_KEY, search_product_candidates
 from src.category_ai import _normalise_category
 from src.dimension_enrichment import DimensionResult as _DimensionResult, find_dimensions as _find_dimensions
@@ -128,6 +129,8 @@ _ENRICHMENT_DEBUG_FIELDS: list[str] = [
     "dimension_source",
     "dimension_source_url",
     "dimension_parse_method",
+    "dimension_raw_text",
+    "dimension_raw_snippet",
     "partial_dimensions_found",
     "rejected_dimensions_reason",
     "final_dimensions",
@@ -168,6 +171,12 @@ _ENRICHMENT_DEBUG_FIELDS: list[str] = [
     "selected_image_url",
     "fields_filled",
     "budget_spent",
+    "budget_stop_reason",
+    "total_budget_remaining",
+    "search_budget_remaining",
+    "openai_budget_remaining",
+    "reason_row_skipped",
+    "budget_skip_threshold",
     "pages_found",
     "pages_fully_parsed",
     "dimensions_successfully_extracted",
@@ -400,28 +409,40 @@ def _build_sku_lookup_queries(row: dict, manufacturer_domain: str = "") -> list[
         if part
     )
     queries: list[str] = []
-    if manufacturer_domain and variant_clause:
+    source_domains = domains_for_brand(brand, manufacturer_domain)
+    primary_domain = source_domains[0] if source_domains else ""
+    if primary_domain and variant_clause:
         queries.append(
-            f"site:{manufacturer_domain} {variant_clause} dimensions specifications spec sheet product"
+            f"site:{primary_domain} {variant_clause} dimensions specifications spec sheet product"
         )
-    if manufacturer_domain and model:
+    if primary_domain and model:
         queries.extend([
-            f'site:{manufacturer_domain} "{model}" product',
-            f'site:{manufacturer_domain} "{model}" spec sheet PDF',
-            f'site:{manufacturer_domain} "{model}" installation guide',
-            f'site:{manufacturer_domain} "{model}" dimensions',
-            f'site:{manufacturer_domain} "{model}" specification',
-            f'site:{manufacturer_domain} "{model}" specifications',
+            f'site:{primary_domain} "{model}" product',
+            f'site:{primary_domain} "{model}" spec sheet PDF',
+            f'site:{primary_domain} "{model}" installation guide',
+            f'site:{primary_domain} "{model}" installation guide PDF',
+            f'site:{primary_domain} "{model}" dimensions',
+            f'site:{primary_domain} "{model}" specification',
+            f'site:{primary_domain} "{model}" specifications',
+            f'site:{primary_domain} "{model}" "Width" "Height" "Depth"',
         ])
-    if manufacturer_domain and context and variants:
-        queries.append(f"site:{manufacturer_domain} {variants[0]} {context} dimensions")
+    for extra_domain in source_domains[1:3]:
+        if model:
+            queries.extend([
+                f'site:{extra_domain} "{model}" dimensions',
+                f'site:{extra_domain} "{model}" spec sheet PDF',
+            ])
+    if primary_domain and context and variants:
+        queries.append(f"site:{primary_domain} {variants[0]} {context} dimensions")
     if brand and model:
         queries.extend([
             f'"{brand}" "{model}" dimensions',
             f'"{brand}" "{model}" specification',
             f'"{brand}" "{model}" specifications',
             f'"{brand}" "{model}" spec sheet PDF',
+            f'"{brand}" "{model}" spec sheet pdf',
             f'"{brand}" "{model}" installation guide',
+            f'"{brand}" "{model}" installation guide pdf',
             f'"{brand}" "{model}" product page',
             f'"{model}" PDF dimensions',
         ])
@@ -938,6 +959,7 @@ def _score_verified_product_page(
     brand = _str_val(row.get("Brand"))
     model = _str_val(row.get("Model/SKU"))
     page_domain = _domain_of(url)
+    official_domains = domains_for_brand(brand, manufacturer_domain)
     weak_reason = _reject_weak_product_url(url)
     if weak_reason:
         return {
@@ -955,7 +977,7 @@ def _score_verified_product_page(
     brand_norm = _norm_token(brand)
     brand_text = _norm_token(" ".join([url, title, description, html[:80_000]]))
     matched_brand = bool(brand_norm and brand_norm in brand_text)
-    official = _domain_matches(page_domain, manufacturer_domain)
+    official = any(_domain_matches(page_domain, official_domain) for official_domain in official_domains)
 
     if brand and not matched_brand and not official:
         return {
@@ -1406,6 +1428,8 @@ def _dimension_debug_defaults(row: dict) -> dict:
         "dimension_source": "",
         "dimension_source_url": "",
         "dimension_parse_method": "",
+        "dimension_raw_text": "",
+        "dimension_raw_snippet": "",
         "partial_dimensions_found": "",
         "rejected_dimensions_reason": "",
         "final_dimensions": dims_before,
@@ -1438,6 +1462,12 @@ def _dimension_debug_defaults(row: dict) -> dict:
         "selected_image_url": "",
         "fields_filled": "",
         "budget_spent": "",
+        "budget_stop_reason": "",
+        "total_budget_remaining": "",
+        "search_budget_remaining": "",
+        "openai_budget_remaining": "",
+        "reason_row_skipped": "",
+        "budget_skip_threshold": "",
         "pages_found": 0,
         "pages_fully_parsed": 0,
         "dimensions_successfully_extracted": False,
@@ -1780,20 +1810,26 @@ def _search_sku_product_pages(
 ) -> list:
     brand = _str_val(row.get("Brand"))
     model = _str_val(row.get("Model/SKU"))
+    official_domains = domains_for_brand(brand, manufacturer_domain)
     candidates = []
     queries_used: list[str] = []
     for query in _build_sku_lookup_queries(row, manufacturer_domain):
-        if budget is not None and not budget.can_search():
+        query_cached = session_cache is not None and query in session_cache.queries
+        if budget is not None and not budget.can_search() and not query_cached:
             debug["budget_blocked"] = True
             debug["budget_stop_reason"] = "SKU product search budget exhausted"
             break
         queries_used.append(query)
         debug["search_provider"] = "brave"
         debug["was_searched"] = "yes"
-        debug["selected_strategy"] = "manufacturer" if manufacturer_domain and query.startswith(f"site:{manufacturer_domain}") else "fallback"
+        debug["selected_strategy"] = (
+            "manufacturer"
+            if any(query.startswith(f"site:{domain}") for domain in official_domains)
+            else "fallback"
+        )
         debug["search_query_used"] = " | ".join(queries_used)
         results = search_product_candidates(query, brand, session_cache=session_cache)
-        if budget is not None:
+        if budget is not None and not query_cached:
             budget.consume_search()
         candidates.extend(results or [])
         # Keep walking the SKU-specific fallbacks until the per-row search
@@ -1811,22 +1847,25 @@ def _search_sku_product_pages(
 
     model_norm = _norm_token(model)
 
-    def _candidate_rank(result) -> tuple[int, int, int, int, int]:
+    def _candidate_rank(result) -> tuple[int, int, int, int, int, int, int]:
         url = _str_val(getattr(result, "url", ""))
         title = _str_val(getattr(result, "title", ""))
         description = _str_val(getattr(result, "description", ""))
         haystack = " ".join([url, title, description]).lower()
         domain = _domain_of(url)
         sku_hit = 1 if model_norm and model_norm in _norm_token(" ".join([url, title, description])) else 0
-        official_hit = 1 if _domain_matches(domain, manufacturer_domain) else 0
+        official_hit = 1 if any(_domain_matches(domain, official) for official in official_domains) else 0
         spec_hit = 1 if any(token in haystack for token in ("dimension", "specification", "spec-sheet", "spec sheet", "installation", ".pdf")) else 0
         weak_penalty = -1 if _reject_weak_product_url(url) else 0
+        low_priority_penalty = -1 if is_low_priority_domain(domain) else 0
         return (
             sku_hit,
             official_hit,
             spec_hit,
+            brand_source_score(domain, brand, manufacturer_domain),
             int(getattr(result, "domain_score", 0) or 0),
             weak_penalty,
+            low_priority_penalty,
         )
 
     deduped.sort(key=_candidate_rank, reverse=True)
@@ -2651,8 +2690,6 @@ def enrich_dataframe(
             return False
         if _str_val(rep.get("enrichment_status")).lower() == "failed":
             return False
-        if _str_val(rep.get("skipped_reason")).lower().startswith("skipped due to enrichment budget"):
-            return False
         if dimensions_only:
             return _needs_dimension_recovery(rep)
         if image_only:
@@ -2756,6 +2793,7 @@ def enrich_dataframe(
         rep_idx = _group_rep(key)
         remaining_searches = max_run_searches - total_searches_used
         allowed_searches = max(0, min(search_limit, remaining_searches))
+        remaining_cost = max(0.0, hard_cap_usd - (total_searches_used * search_cost))
         if search_limit > 0 and allowed_searches <= 0:
             for idx in _group_indices(key):
                 r = df.loc[idx].to_dict()
@@ -2768,9 +2806,18 @@ def enrich_dataframe(
                     "was_searched": "no",
                     "selected_strategy": "skipped",
                     "skipped_reason": budget_reason,
+                    "reason_row_skipped": budget_reason,
                     "enrichment_status": _classify_enrichment_status(r),
                     "enrichment_error": "",
                     "budget_spent": "searches=0/0; fetches=0/0",
+                    "budget_stop_reason": (
+                        f"required_searches={search_limit}; remaining_searches={remaining_searches}; "
+                        f"spent=${total_searches_used * search_cost:.4f}; cap=${hard_cap_usd:.4f}"
+                    ),
+                    "total_budget_remaining": f"{remaining_cost:.4f}",
+                    "search_budget_remaining": str(max(0, remaining_searches)),
+                    "openai_budget_remaining": "not_applicable_standard_enrichment",
+                    "budget_skip_threshold": f"allowed_searches={allowed_searches}; required_searches={search_limit}",
                 })
                 stamped = _stamp_dimension_debug(r, blocked_debug)
                 for col, val in stamped.items():
@@ -2797,6 +2844,9 @@ def enrich_dataframe(
             fetches_used = _budget_fetches_used(updated.get("budget_spent"))
             total_searches_used += searches_used
             total_fetches_used += fetches_used
+            updated["total_budget_remaining"] = f"{max(0.0, hard_cap_usd - (total_searches_used * search_cost)):.4f}"
+            updated["search_budget_remaining"] = str(max(0, max_run_searches - total_searches_used))
+            updated["openai_budget_remaining"] = "not_applicable_standard_enrichment"
             _apply_enriched_group(key, updated, error, dim_result)
         except Exception as exc:
             tb = traceback.format_exc()

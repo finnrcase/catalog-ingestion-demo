@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from src.brand_sources import brand_source_score, is_low_priority_domain
 from src.url_utils import is_valid_http_url
 
 load_dotenv()
@@ -36,7 +37,9 @@ _PREFERRED_DOMAINS: frozenset = frozenset({
     "visualcomfort.com", "circalighting.com", "hudsonvalleylighting.com",
     "scotsman-ice.com", "thermador.com", "jennair.com", "vikingrange.com",
     "bertazzoni.com", "ilve.com", "lacanche.com", "dacor.com",
-    "monogram.com", "bosch-home.com", "gaggenau.com",
+    "monogram.com", "bosch-home.com", "gaggenau.com", "geappliances.com",
+    "fisherpaykel.com", "lynxgrills.com", "ca.subzero-wolf.com",
+    "subzero.com",
 })
 
 _SKIP_DOMAINS: frozenset = frozenset({
@@ -77,10 +80,13 @@ def _score_domain(url: str, brand: str) -> int:
         return 0
 
     score = 50
+    score += brand_source_score(domain, brand)
     if brand_slug and brand_slug in domain.replace("-", "").replace(".", ""):
         score += 40
     if any(_domain_matches(domain, pref) for pref in _PREFERRED_DOMAINS):
         score += 20
+    if is_low_priority_domain(domain):
+        score -= 25
     return min(100, max(0, score))
 
 
