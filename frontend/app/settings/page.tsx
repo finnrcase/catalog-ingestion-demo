@@ -29,9 +29,24 @@ type AccentThemeId = (typeof accentThemes)[number]["id"];
 type ThemePreference = "system" | "dark" | "light";
 type UiMode = "explanation" | "simple";
 
+const lightAccentTokens: Record<AccentThemeId, { soft: string; ring: string; text: string }> = {
+  orange: { soft: "#fff0e4", ring: "#fed7aa", text: "#c2410c" },
+  sage: { soft: "#edf4ee", ring: "#c9d8ce", text: "#496050" },
+  blue: { soft: "#edf4f8", ring: "#c8d8e3", text: "#315b75" },
+  plum: { soft: "#f5eef2", ring: "#dbc5d2", text: "#684354" },
+  mustard: { soft: "#f8f0dc", ring: "#dfc887", text: "#7a5618" },
+  terracotta: { soft: "#f7ece6", ring: "#ddb4a2", text: "#824633" },
+  slateBlue: { soft: "#eef1f6", ring: "#c5ccd8", text: "#445169" },
+  sand: { soft: "#f4efe5", ring: "#d8c9ad", text: "#6f5c42" },
+  forest: { soft: "#edf3ee", ring: "#bdcebf", text: "#344f3e" },
+  ocean: { soft: "#e9f4f5", ring: "#b5d7db", text: "#28636a" },
+  clay: { soft: "#f6ece8", ring: "#d8aea1", text: "#7f493b" },
+  rosewood: { soft: "#f5ecee", ring: "#d6b5ba", text: "#704248" },
+};
+
 const themeOptions: { id: ThemePreference; label: string; description: string }[] = [
-  { id: "light", label: "Light", description: "Warm premium light workspace." },
-  { id: "dark", label: "Dark", description: "Current SCH dark workspace." },
+  { id: "light", label: "Light Mode", description: "Warm premium light workspace." },
+  { id: "dark", label: "Dark Mode", description: "Current SCH dark workspace." },
   { id: "system", label: "System", description: "Follow browser or OS preference." },
 ];
 
@@ -63,21 +78,27 @@ function hexToRgbTriplet(hex: string) {
 function applyAccent(themeId: AccentThemeId) {
   const theme = accentThemes.find((item) => item.id === themeId) || accentThemes[0];
   const root = document.documentElement;
+  const lightTokens = lightAccentTokens[theme.id];
+  const lightMode = root.dataset.theme !== "dark";
+  const soft = lightMode ? lightTokens.soft : theme.soft;
+  const ring = lightMode ? lightTokens.ring : theme.ring;
+  const text = lightMode ? lightTokens.text : theme.text;
   root.style.setProperty("--accent", theme.accent);
   root.style.setProperty("--accent-rgb", hexToRgbTriplet(theme.accent));
   root.style.setProperty("--accent-hover", theme.accent);
   root.style.setProperty("--accent-hover-rgb", hexToRgbTriplet(theme.accent));
-  root.style.setProperty("--accent-soft", theme.soft);
-  root.style.setProperty("--accent-soft-rgb", hexToRgbTriplet(theme.soft));
-  root.style.setProperty("--accent-ring", theme.ring);
-  root.style.setProperty("--accent-ring-rgb", hexToRgbTriplet(theme.ring));
+  root.style.setProperty("--accent-soft", soft);
+  root.style.setProperty("--accent-soft-rgb", hexToRgbTriplet(soft));
+  root.style.setProperty("--accent-ring", ring);
+  root.style.setProperty("--accent-ring-rgb", hexToRgbTriplet(ring));
   root.style.setProperty("--accent-foreground", theme.foreground);
-  root.style.setProperty("--accent-text", theme.text);
+  root.style.setProperty("--accent-text", text);
 }
 
 function resolveThemePreference(preference: ThemePreference) {
   if (preference !== "system") return preference;
-  return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  if (!window.matchMedia) return "light";
+  return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
 }
 
 function applyThemePreference(preference: ThemePreference) {
@@ -87,7 +108,7 @@ function applyThemePreference(preference: ThemePreference) {
 
 export default function SettingsPage() {
   const [debugMode, setDebugMode] = useState(false);
-  const [themePreference, setThemePreference] = useState<ThemePreference>("dark");
+  const [themePreference, setThemePreference] = useState<ThemePreference>("light");
   const [accentThemeId, setAccentThemeId] = useState<AccentThemeId>("orange");
   const [uiMode, setUiMode] = useState<UiMode>("explanation");
   const [apiStatus, setApiStatus] = useState("checking");
@@ -99,7 +120,7 @@ export default function SettingsPage() {
     const storedAccent = window.localStorage.getItem(ACCENT_THEME_STORAGE_KEY) as AccentThemeId | null;
     const storedUiMode = window.localStorage.getItem(UI_MODE_STORAGE_KEY);
     setDebugMode(storedDebug);
-    const nextTheme = storedTheme === "system" || storedTheme === "light" || storedTheme === "dark" ? storedTheme : "dark";
+    const nextTheme = storedTheme === "system" || storedTheme === "light" || storedTheme === "dark" ? storedTheme : "light";
     setThemePreference(nextTheme);
     applyThemePreference(nextTheme);
     setUiMode(storedUiMode === "simple" ? "simple" : "explanation");
@@ -118,13 +139,17 @@ export default function SettingsPage() {
   useEffect(() => {
     window.localStorage.setItem(THEME_STORAGE_KEY, themePreference);
     applyThemePreference(themePreference);
+    applyAccent(accentThemeId);
     if (themePreference !== "system") return;
     const media = window.matchMedia?.("(prefers-color-scheme: light)");
     if (!media) return;
-    const handleChange = () => applyThemePreference("system");
+    const handleChange = () => {
+      applyThemePreference("system");
+      applyAccent(accentThemeId);
+    };
     media.addEventListener?.("change", handleChange);
     return () => media.removeEventListener?.("change", handleChange);
-  }, [themePreference]);
+  }, [accentThemeId, themePreference]);
 
   useEffect(() => {
     window.localStorage.setItem(ACCENT_THEME_STORAGE_KEY, accentThemeId);

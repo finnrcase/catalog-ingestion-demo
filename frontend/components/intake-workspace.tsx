@@ -253,8 +253,8 @@ const DEFAULT_FURTHER_ENRICHMENT_BUDGET_USD = 0.25;
 const DEFAULT_FURTHER_ENRICHMENT_ITEM_BUDGET_USD = 0.05;
 
 const themeOptions: { id: ThemePreference; label: string; description: string }[] = [
-  { id: "light", label: "Light", description: "A warm, clean light workspace." },
-  { id: "dark", label: "Dark", description: "The current SCH dark workspace." },
+  { id: "light", label: "Light Mode", description: "A warm, clean light workspace." },
+  { id: "dark", label: "Dark Mode", description: "The current SCH dark workspace." },
   { id: "system", label: "System", description: "Follow your browser or OS preference." },
 ];
 
@@ -380,6 +380,21 @@ const accentThemes: AccentTheme[] = [
     text: "#c79da3",
   },
 ];
+
+const lightAccentTokens: Record<AccentThemeId, { soft: string; ring: string; text: string }> = {
+  orange: { soft: "#fff0e4", ring: "#fed7aa", text: "#c2410c" },
+  sage: { soft: "#edf4ee", ring: "#c9d8ce", text: "#496050" },
+  blue: { soft: "#edf4f8", ring: "#c8d8e3", text: "#315b75" },
+  plum: { soft: "#f5eef2", ring: "#dbc5d2", text: "#684354" },
+  mustard: { soft: "#f8f0dc", ring: "#dfc887", text: "#7a5618" },
+  terracotta: { soft: "#f7ece6", ring: "#ddb4a2", text: "#824633" },
+  slateBlue: { soft: "#eef1f6", ring: "#c5ccd8", text: "#445169" },
+  sand: { soft: "#f4efe5", ring: "#d8c9ad", text: "#6f5c42" },
+  forest: { soft: "#edf3ee", ring: "#bdcebf", text: "#344f3e" },
+  ocean: { soft: "#e9f4f5", ring: "#b5d7db", text: "#28636a" },
+  clay: { soft: "#f6ece8", ring: "#d8aea1", text: "#7f493b" },
+  rosewood: { soft: "#f5ecee", ring: "#d6b5ba", text: "#704248" },
+};
 
 const frontendRouteWiring = [
   {
@@ -572,7 +587,7 @@ function isThemePreference(value: string | null): value is ThemePreference {
 
 function resolveThemePreference(preference: ThemePreference) {
   if (preference !== "system") return preference;
-  if (typeof window === "undefined" || !window.matchMedia) return "dark";
+  if (typeof window === "undefined" || !window.matchMedia) return "light";
   return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
 }
 
@@ -586,16 +601,21 @@ function applyThemePreference(preference: ThemePreference) {
 function applyAccentTheme(theme: AccentTheme) {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
+  const lightTokens = lightAccentTokens[theme.id];
+  const lightMode = root.dataset.theme !== "dark";
+  const soft = lightMode ? lightTokens.soft : theme.soft;
+  const ring = lightMode ? lightTokens.ring : theme.ring;
+  const text = lightMode ? lightTokens.text : theme.text;
   root.style.setProperty("--accent", theme.accent);
   root.style.setProperty("--accent-rgb", hexToRgbTriplet(theme.accent));
   root.style.setProperty("--accent-hover", theme.hover);
   root.style.setProperty("--accent-hover-rgb", hexToRgbTriplet(theme.hover));
-  root.style.setProperty("--accent-soft", theme.soft);
-  root.style.setProperty("--accent-soft-rgb", hexToRgbTriplet(theme.soft));
-  root.style.setProperty("--accent-ring", theme.ring);
-  root.style.setProperty("--accent-ring-rgb", hexToRgbTriplet(theme.ring));
+  root.style.setProperty("--accent-soft", soft);
+  root.style.setProperty("--accent-soft-rgb", hexToRgbTriplet(soft));
+  root.style.setProperty("--accent-ring", ring);
+  root.style.setProperty("--accent-ring-rgb", hexToRgbTriplet(ring));
   root.style.setProperty("--accent-foreground", theme.foreground);
-  root.style.setProperty("--accent-text", theme.text);
+  root.style.setProperty("--accent-text", text);
 }
 
 function safeEndpointPath(value: string | undefined) {
@@ -934,7 +954,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   const [requireOpenAiSpendConfirmation, setRequireOpenAiSpendConfirmation] = useState(true);
   const [furtherEnrichmentItemBudgetUsd, setFurtherEnrichmentItemBudgetUsd] = useState(DEFAULT_FURTHER_ENRICHMENT_ITEM_BUDGET_USD);
   const [debugMode, setDebugMode] = useState(false);
-  const [themePreference, setThemePreference] = useState<ThemePreference>("dark");
+  const [themePreference, setThemePreference] = useState<ThemePreference>("light");
   const [accentThemeId, setAccentThemeId] = useState<AccentThemeId>("orange");
   const [uiMode, setUiMode] = useState<UiMode>("explanation");
   const [settingsHydrated, setSettingsHydrated] = useState(false);
@@ -1127,7 +1147,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       const storedFurtherConfirmation = window.localStorage.getItem(FURTHER_ENRICHMENT_CONFIRM_STORAGE_KEY);
       const storedFurtherItemBudget = Number.parseFloat(window.localStorage.getItem(FURTHER_ENRICHMENT_ITEM_BUDGET_STORAGE_KEY) || "");
       setDebugMode(storedDebugMode === "true");
-      setThemePreference(isThemePreference(storedThemePreference) ? storedThemePreference : "dark");
+      setThemePreference(isThemePreference(storedThemePreference) ? storedThemePreference : "light");
       setAccentThemeId(getAccentTheme(storedAccentTheme).id);
       setUiMode(storedUiMode === "simple" ? "simple" : "explanation");
       setEnrichmentBudgetUsd(Number.isFinite(storedBudget) ? clampBudgetUsd(storedBudget) : DEFAULT_ENRICHMENT_BUDGET_USD);
@@ -1141,7 +1161,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       );
     } catch {
       setDebugMode(false);
-      setThemePreference("dark");
+      setThemePreference("light");
       setAccentThemeId("orange");
       setUiMode("explanation");
       setEnrichmentBudgetUsd(DEFAULT_ENRICHMENT_BUDGET_USD);
@@ -1177,6 +1197,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   useEffect(() => {
     if (!settingsHydrated) return;
     applyThemePreference(themePreference);
+    applyAccentTheme(getAccentTheme(accentThemeId));
     try {
       window.localStorage.setItem(THEME_STORAGE_KEY, themePreference);
     } catch {
@@ -1184,10 +1205,13 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     }
     if (themePreference !== "system" || typeof window === "undefined" || !window.matchMedia) return;
     const media = window.matchMedia("(prefers-color-scheme: light)");
-    const handleSystemThemeChange = () => applyThemePreference("system");
+    const handleSystemThemeChange = () => {
+      applyThemePreference("system");
+      applyAccentTheme(getAccentTheme(accentThemeId));
+    };
     media.addEventListener?.("change", handleSystemThemeChange);
     return () => media.removeEventListener?.("change", handleSystemThemeChange);
-  }, [themePreference, settingsHydrated]);
+  }, [accentThemeId, themePreference, settingsHydrated]);
 
   useEffect(() => {
     if (!settingsHydrated) return;
