@@ -277,6 +277,9 @@ export async function fetchProductKnowledgeBaseAudit() {
     runtime_cache_persistent: boolean;
     runtime_cache_persistence_note: string;
     product_knowledge_base_backend: string;
+    status?: string;
+    storedSources?: number;
+    preferredDomains?: number;
     supabase_configured: boolean;
     required_env: string[];
     tables: string[];

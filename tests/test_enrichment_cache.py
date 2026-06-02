@@ -29,13 +29,14 @@ def test_normalize_mode_valid():
     assert normalize_mode("fast") == "fast"
     assert normalize_mode("standard") == "standard"
     assert normalize_mode("deep") == "deep"
+    assert normalize_mode("Max Accuracy") == "max_accuracy"
 
 
 def test_normalize_mode_invalid_falls_back_to_standard():
     from src.enrichment_cache import normalize_mode
     assert normalize_mode("turbo") == "standard"
     assert normalize_mode("") == "standard"
-    assert normalize_mode("FAST") == "standard"  # case-sensitive
+    assert normalize_mode("FAST") == "fast"
 
 
 # ── SearchBudget ───────────────────────────────────────────────────────────────
@@ -79,6 +80,15 @@ def test_budget_for_mode_deep():
     b = budget_for_mode("deep")
     assert b.max_searches == 8
     assert b.max_urls == 14
+    assert b.allows_retailer
+    assert b.allows_general_fallback
+
+
+def test_budget_for_mode_max_accuracy():
+    from src.enrichment_cache import budget_for_mode
+    b = budget_for_mode("max_accuracy")
+    assert b.max_searches == 20
+    assert b.max_urls == 32
     assert b.allows_retailer
     assert b.allows_general_fallback
 

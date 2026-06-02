@@ -120,6 +120,8 @@ export type ProgramaExportValidation = {
   image_url_present: number;
   image_url_total: number;
   export_count: number;
+  programa_ready_count?: number;
+  needs_enrichment?: { index: number; product_name: string; reason: string }[];
   unique_sections: string[];
   section_counts: Record<string, number>;
   section_equals_product_name: { index: number; product_name: string; section: string }[];

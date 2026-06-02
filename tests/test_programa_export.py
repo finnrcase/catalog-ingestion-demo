@@ -426,7 +426,7 @@ def test_validate_result_keys():
     assert set(result.keys()) == {
         "skipped", "missing_section", "missing_dimensions",
         "missing_product_url", "missing_image_url", "image_url_present",
-        "image_url_total", "export_count",
+        "image_url_total", "export_count", "programa_ready_count", "needs_enrichment",
         "unique_sections", "section_counts", "section_equals_product_name",
         "section_too_long", "too_many_unique_sections", "canonical_sections",
         "duplicates_removed", "duplicate_rows_removed",
@@ -752,7 +752,8 @@ def test_validate_readiness_scores_required_fields_not_just_exportable_rows():
 
     assert summary["export_count"] == 2
     assert summary["readiness_score"] < 100
-    assert summary["readiness_status"] == "review_draft"
+    assert summary["programa_ready_count"] == 1
+    assert summary["readiness_status"] == "Needs enrichment"
     assert summary["readiness_missing_fields"]["dimensions"] == 1
     assert summary["readiness_missing_fields"]["image"] == 1
 

@@ -41,7 +41,8 @@ _MODE_LIMITS: dict[str, dict] = {
     # Programa readiness depends on fully parsing the verified source.
     "fast":     {"max_searches": 1, "max_urls": 6,  "retailer": False, "general_fallback": False},
     "standard": {"max_searches": 4, "max_urls": 8,  "retailer": False, "general_fallback": True},
-    "deep":     {"max_searches": 8, "max_urls": 14, "retailer": True,  "general_fallback": True},
+    "deep":     {"max_searches": 8,  "max_urls": 14, "retailer": True,  "general_fallback": True},
+    "max_accuracy": {"max_searches": 20, "max_urls": 32, "retailer": True, "general_fallback": True},
 }
 
 VALID_MODES: frozenset[str] = frozenset(_MODE_LIMITS)
@@ -66,7 +67,10 @@ def normalize_key(brand: str, model: str) -> str:
 
 def normalize_mode(mode: str) -> str:
     """Return mode unchanged if valid, else 'standard'."""
-    return mode if mode in VALID_MODES else "standard"
+    normalized = str(mode or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"max", "accuracy", "maxaccuracy"}:
+        normalized = "max_accuracy"
+    return normalized if normalized in VALID_MODES else "standard"
 
 
 def budget_for_mode(mode: str) -> "SearchBudget":

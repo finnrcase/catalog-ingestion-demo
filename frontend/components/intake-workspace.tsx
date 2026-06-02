@@ -971,6 +971,9 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     runtime_cache_persistence_note?: string;
     product_enrichment_cache_path?: string;
     product_knowledge_base_backend?: string;
+    status?: string;
+    storedSources?: number;
+    preferredDomains?: number;
     tables?: string[];
   }>({});
   const [storedSources, setStoredSources] = useState<StoredProductSource[]>([]);
@@ -1243,6 +1246,11 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   }, [uiMode, settingsHydrated]);
 
   useEffect(() => {
+    if (!settingsHydrated) return;
+    void loadSourceMemory();
+  }, [settingsHydrated]);
+
+  useEffect(() => {
     if (!settingsOpen) return;
     void loadSourceMemory();
   }, [settingsOpen, sourceSearch, sourceTypeFilter, domainSearch, domainTypeFilter]);
@@ -1263,7 +1271,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
   }, [bulkImagePreviews]);
 
   const includedRows = useMemo(() => rows.filter(isProductRow), [rows]);
-  const readyRows = exportSummary.export_count;
+  const readyRows = exportSummary.programa_ready_count ?? exportSummary.export_count;
   const missingInputRows = useMemo(
     () => includedRows.filter((row) => missingFieldsForRow(row).length > 0),
     [includedRows],
@@ -1283,7 +1291,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     [includedRows],
   );
   const budgetSkippedCount = useMemo(
-    () => countRows(includedRows, (row) => boolish(rowText(row, "budget_blocked")) || rowText(row, "skipped_reason").toLowerCase().includes("budget")),
+    () => countRows(includedRows, (row) => boolish(rowText(row, "skip_threshold_hit")) || boolish(rowText(row, "further_enrichment_skip_threshold_hit"))),
     [includedRows],
   );
   const missingImageCount = useMemo(() => countRows(includedRows, (row) => !hasImage(row)), [includedRows]);
@@ -1368,7 +1376,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     typeof exportSummary.readiness_score === "number"
       ? exportSummary.readiness_score
       : includedRows.length
-        ? Math.round((exportSummary.export_count / includedRows.length) * 100)
+        ? Math.round((readyRows / includedRows.length) * 100)
         : 0;
   const apiConnectionStatus = API_BASE ? apiStatus : "misconfigured";
   const apiConnectionText = API_BASE ? apiStatusText : "NEXT_PUBLIC_API_BASE_URL is missing or invalid.";
@@ -1510,7 +1518,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
         missingSku: missingSkuCount,
         missingDimensions: missingDimensionsCount,
         missingImages: missingImageCount,
-        exportReady: exportSummary.export_count,
+        exportReady: exportSummary.programa_ready_count ?? exportSummary.export_count,
       },
       sourceMemory: {
         backend: sourceMemoryBackend,
@@ -1539,19 +1547,32 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     }
     setSourceMemoryStatus("Loading stored sources...");
     try {
-      const [sourceResponse, domainResponse, auditResponse] = await Promise.all([
+      const [sourceResult, domainResult, auditResult] = await Promise.allSettled([
         fetchStoredSources({ query: sourceSearch, sourceType: sourceTypeFilter, limit: 100 }),
         fetchPreferredDomains({ query: domainSearch, sourceType: domainTypeFilter, limit: 100 }),
         fetchProductKnowledgeBaseAudit(),
       ]);
+      const sourceResponse = sourceResult.status === "fulfilled" ? sourceResult.value : { storage_backend: "unknown", sources: [] };
+      const domainResponse = domainResult.status === "fulfilled" ? domainResult.value : { storage_backend: "unknown", domains: [] };
+      const auditResponse = (auditResult.status === "fulfilled" ? auditResult.value : {}) as {
+        product_knowledge_base_backend?: string;
+        [key: string]: unknown;
+      };
       setStoredSources(sourceResponse.sources || []);
       setPreferredDomains(domainResponse.domains || []);
       setSourceMemoryAudit(auditResponse || {});
       setSourceMemoryBackend(auditResponse.product_knowledge_base_backend || sourceResponse.storage_backend || domainResponse.storage_backend || "unknown");
-      setSourceMemoryStatus(`Loaded ${sourceResponse.sources?.length || 0} sources and ${domainResponse.domains?.length || 0} domains.`);
+      const sourceCount = sourceResponse.sources?.length || Number(auditResponse.storedSources || 0) || 0;
+      const domainCount = domainResponse.domains?.length || Number(auditResponse.preferredDomains || 0) || 0;
+      const failed = [sourceResult, domainResult, auditResult].filter((result) => result.status === "rejected").length;
+      setSourceMemoryStatus(
+        failed
+          ? `Partially loaded ${sourceCount} sources and ${domainCount} domains; ${failed} request${failed === 1 ? "" : "s"} failed.`
+          : `Loaded ${sourceCount} sources and ${domainCount} domains.`
+      );
       recordDebugTrace({
         action: "load source memory",
-        stage: "success",
+        stage: failed ? "warning" : "success",
         endpoint: "/settings/product-knowledge-base",
         message: `${sourceResponse.storage_backend || "unknown"} backend`,
       });
@@ -1718,7 +1739,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
     const rowsMissingDimensions = stageNumber(response, "rows_missing_dimensions") ?? countRows(productRows, (row) => !hasComplete3dDimensions(row.Dimensions));
     const rowsMissingImages = stageNumber(response, "rows_missing_images") ?? countRows(productRows, (row) => !hasImage(row));
     const rowsPartialDimensions = stageNumber(response, "rows_partial_dimensions") ?? countRows(productRows, (row) => rowText(row, "dimensions_status").toLowerCase() === "partial" || Boolean(rowText(row, "partial_dimensions_found")));
-    const rowsBudgetSkipped = stageNumber(response, "rows_budget_skipped") ?? countRows(productRows, (row) => boolish(rowText(row, "budget_blocked")) || rowText(row, "skipped_reason").toLowerCase().includes("budget"));
+    const rowsBudgetSkipped = stageNumber(response, "rows_budget_skipped") ?? countRows(productRows, (row) => boolish(rowText(row, "skip_threshold_hit")) || boolish(rowText(row, "further_enrichment_skip_threshold_hit")));
     const dimensionsFound = countRows(productRows, (row) => hasComplete3dDimensions(row.Dimensions));
     const imagesFound = countRows(productRows, hasImage);
     const knowledgeBaseHits = countRows(productRows, (row) => boolish(rowText(row, "knowledge_base_hit")) || boolish(rowText(row, "stored_source_hit")));
@@ -1755,7 +1776,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
       const rowSearches = searchMatch ? Number.parseInt(searchMatch[1] || "0", 10) : 0;
       const rowCost = rowSearches * costPerSearch;
       const wasSearched = rowText(row, "was_searched") || (queryText ? "yes" : "no");
-      const budgetBlocked = boolish(rowText(row, "budget_blocked")) || rowText(row, "skipped_reason").toLowerCase().includes("budget");
+      const budgetBlocked = boolish(rowText(row, "skip_threshold_hit")) || boolish(rowText(row, "further_enrichment_skip_threshold_hit"));
       const dimensionsStatus = rowText(row, "dimensions_status") || (dimensionsFound ? "complete" : dimensionsText ? "partial" : "missing");
       const imageStatus = rowText(row, "image_status") || (imageFound ? "found" : "missing");
 
@@ -3733,7 +3754,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             <div className="grid gap-4">
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <SummaryCard label="Programa readiness" value={`${readinessScore}%`} tone={readinessScore >= 90 ? "ok" : readinessScore ? "warning" : "neutral"} />
-                <SummaryCard label="Export-ready rows" value={exportSummary.export_count} tone={exportSummary.export_count ? "ok" : "warning"} />
+                <SummaryCard label="Programa-ready rows" value={readyRows} tone={readyRows ? "ok" : "warning"} />
                 <SummaryCard label="Missing fields" value={missingInputRows.length} tone={missingInputRows.length ? "warning" : "ok"} />
                 <SummaryCard label="Images ready" value={`${exportSummary.image_url_present}/${exportSummary.image_url_total}`} />
               </div>
@@ -3782,7 +3803,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                   {programaSendEnabled ? (
                     <button
                       className="btn-secondary inline-flex h-11 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold text-taupe hover:bg-ivory disabled:cursor-not-allowed disabled:bg-ivory disabled:text-taupe/60"
-                      disabled={busy === "programa" || exportSummary.export_count === 0 || !scheduleUrl.trim()}
+                      disabled={busy === "programa" || readyRows === 0 || !scheduleUrl.trim()}
                       onClick={handleSendToPrograma}
                       title="Send approved rows to Programa"
                     >
@@ -3793,7 +3814,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
-                <StatusBadge value={`${exportSummary.export_count} export-ready`} />
+                <StatusBadge value={`${readyRows} Programa-ready`} />
                 <StatusBadge value={`Images ${exportSummary.image_url_present}/${exportSummary.image_url_total}`} />
                 <StatusBadge value={`${exportSummary.missing_section.length} missing section`} />
                 {exportSummary.parsed_rows_count ? (
@@ -3874,7 +3895,7 @@ export function IntakeWorkspace({ buildInfo = fallbackBuildInfo }: { buildInfo?:
             bulkImagesCount={bulkImages.length}
             photoBulkSummary={photoBulkSummary}
             programaSendEnabled={programaSendEnabled}
-            exportReadyCount={exportSummary.export_count}
+            exportReadyCount={readyRows}
             imageReadyCount={exportSummary.image_url_present}
             imageTotalCount={exportSummary.image_url_total}
             sourceMemoryStatus={sourceMemoryStatus}
@@ -4251,7 +4272,7 @@ function rowStatusBadges(row: IntakeRow) {
     badges.push("Missing image");
   }
 
-  if (budgetBlocked || rowText(row, "skipped_reason").toLowerCase().includes("budget")) {
+  if (budgetBlocked || boolish(rowText(row, "skip_threshold_hit")) || boolish(rowText(row, "further_enrichment_skip_threshold_hit"))) {
     badges.push("Skipped due to budget");
   }
   if (componentType.includes("accessory")) {

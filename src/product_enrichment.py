@@ -145,6 +145,7 @@ _ENRICHMENT_DEBUG_FIELDS: list[str] = [
     "cloudinary_url",
     "image_confidence",
     "image_source_url",
+    "image_failure_reason",
     "image_candidate_diagnostics",
     "cloudinary_status",
     "cloudinary_error",
@@ -176,6 +177,8 @@ _ENRICHMENT_DEBUG_FIELDS: list[str] = [
     "search_budget_remaining",
     "openai_budget_remaining",
     "reason_row_skipped",
+    "skip_reason",
+    "skip_threshold_hit",
     "budget_skip_threshold",
     "pages_found",
     "pages_fully_parsed",
@@ -1060,6 +1063,7 @@ def _image_debug_defaults() -> dict:
         "cloudinary_url": "",
         "image_confidence": "",
         "image_source_url": "",
+        "image_failure_reason": "",
         "image_candidate_diagnostics": "",
         "cloudinary_status": "",
         "cloudinary_error": "",
@@ -1139,6 +1143,7 @@ def _extract_image_from_html(
     if not candidates:
         debug["cloudinary_status"] = "not_attempted"
         debug["cloudinary_error"] = "No image candidates found on verified product page."
+        debug["image_failure_reason"] = debug["cloudinary_error"]
         if cache_key:
             existing_entry = _product_cache.get(cache_key) or {}
             if not existing_entry.get("image_url"):
@@ -1153,6 +1158,7 @@ def _extract_image_from_html(
     if selected is None:
         debug["cloudinary_status"] = "not_attempted"
         debug["cloudinary_error"] = "No HIGH/MEDIUM image candidate passed validation."
+        debug["image_failure_reason"] = debug["cloudinary_error"]
         if cache_key:
             existing_entry = _product_cache.get(cache_key) or {}
             if not existing_entry.get("image_url"):
@@ -1161,6 +1167,7 @@ def _extract_image_from_html(
 
     debug["original_image_url"] = selected.url
     debug["image_confidence"] = selected.confidence
+    debug["image_failure_reason"] = ""
 
     cloudinary_url, upload_debug = _upload_candidate_image(selected, row)
     debug.update(upload_debug)
@@ -1209,6 +1216,7 @@ def _try_image_from_url(
     if invalid_reason:
         debug["cloudinary_status"] = "not_attempted"
         debug["cloudinary_error"] = "invalid product URL before image fetch"
+        debug["image_failure_reason"] = debug["cloudinary_error"]
         debug["programa_image_ready"] = False
         _stamp_invalid_url_debug(
             debug,
@@ -1228,6 +1236,7 @@ def _try_image_from_url(
         if budget is not None and not budget.can_fetch():
             debug["budget_blocked"] = True
             debug["cloudinary_error"] = "budget blocked image page fetch"
+            debug["image_failure_reason"] = debug["cloudinary_error"]
             return (None, debug) if return_debug else None
         raw_html = _fetch_page_html_with_debug(
             product_url,
@@ -1242,6 +1251,7 @@ def _try_image_from_url(
             session_cache.urls[product_url] = raw_html
     if not raw_html:
         _log.info("[IMAGE PIPELINE] fetch failed url=%s", product_url[:80])
+        debug["image_failure_reason"] = debug.get("image_failure_reason") or "image source page fetch failed"
         return (None, debug) if return_debug else None
 
     final_url, debug = _extract_image_from_html(raw_html, product_url, row or {}, cache_key)
@@ -1258,6 +1268,99 @@ def _unpack_image_result(result) -> tuple[str | None, dict]:
         debug = result[1] if len(result) > 1 and isinstance(result[1], dict) else {}
         return image_url, debug
     return result, {}
+
+
+def _build_image_recovery_queries(row: dict, manufacturer_domain: str = "") -> list[str]:
+    brand = _str_val(row.get("Brand"))
+    model = _str_val(row.get("Model/SKU"))
+    product_name = _str_val(row.get("Product Name"))
+    domains = domains_for_brand(brand, manufacturer_domain)
+    queries: list[str] = []
+    if brand and model:
+        queries.extend([
+            f'"{brand}" "{model}" product image',
+            f'"{brand}" "{model}" appliance image',
+            f'"{brand}" "{model}" official product page',
+        ])
+        for domain in domains[:2]:
+            queries.extend([
+                f'site:{domain} "{model}" image',
+                f'site:{domain} "{model}" product',
+            ])
+    if brand and model and product_name:
+        queries.append(f'"{brand}" "{model}" "{product_name}" image')
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for query in queries:
+        if query and query not in seen:
+            seen.add(query)
+            deduped.append(query)
+    return deduped
+
+
+def _try_image_recovery_searches(
+    row: dict,
+    *,
+    cache_key: str = "",
+    manufacturer_domain: str = "",
+    session_cache: "_SessionCache | None" = None,
+    budget: "_SearchBudget | None" = None,
+) -> tuple[str | None, dict]:
+    brand = _str_val(row.get("Brand"))
+    debug = _image_debug_defaults()
+    queries_used: list[str] = []
+    urls_checked: list[str] = []
+    candidates_debug: list[dict] = []
+    for query in _build_image_recovery_queries(row, manufacturer_domain):
+        query_cached = session_cache is not None and query in session_cache.queries
+        if budget is not None and not budget.can_search() and not query_cached:
+            debug["budget_blocked"] = True
+            debug["image_failure_reason"] = "image search budget exhausted"
+            break
+        queries_used.append(query)
+        results = search_product_candidates(query, brand, session_cache=session_cache)
+        if budget is not None and not query_cached:
+            budget.consume_search()
+        for result in results:
+            url = _str_val(getattr(result, "url", ""))
+            if not url or url in urls_checked:
+                continue
+            urls_checked.append(url)
+            image_url, image_debug = _unpack_image_result(
+                _try_image_from_url(
+                    url,
+                    cache_key,
+                    session_cache=session_cache,
+                    budget=budget,
+                    row=row,
+                    return_debug=True,
+                )
+            )
+            candidates_debug.append({
+                "page_url": url,
+                "title": _str_val(getattr(result, "title", "")),
+                "domain_score": int(getattr(result, "domain_score", 0) or 0),
+                "image_url": image_url or "",
+                "image_confidence": image_debug.get("image_confidence", ""),
+                "failure_reason": image_debug.get("image_failure_reason") or image_debug.get("cloudinary_error", ""),
+            })
+            if image_url:
+                image_debug["image_source_url"] = image_debug.get("image_source_url") or url
+                image_debug["search_query_used"] = " | ".join(queries_used)
+                image_debug["product_url_candidates"] = json.dumps(candidates_debug[:5], ensure_ascii=True)
+                image_debug["budget_spent"] = _budget_summary(budget)
+                return image_url, image_debug
+            if budget is not None and not budget.can_fetch():
+                debug["budget_blocked"] = True
+                debug["image_failure_reason"] = "image page fetch budget exhausted"
+                break
+        if budget is not None and (not budget.can_search() or not budget.can_fetch()):
+            break
+    debug["search_query_used"] = " | ".join(queries_used)
+    debug["product_url_candidates"] = json.dumps(candidates_debug[:5], ensure_ascii=True)
+    debug["budget_spent"] = _budget_summary(budget)
+    debug["image_failure_reason"] = debug.get("image_failure_reason") or "no validated product image found"
+    return None, debug
 
 
 def _cache_has_blank_dimension(cache_entry: dict | None) -> bool:
@@ -1467,6 +1570,8 @@ def _dimension_debug_defaults(row: dict) -> dict:
         "search_budget_remaining": "",
         "openai_budget_remaining": "",
         "reason_row_skipped": "",
+        "skip_reason": "",
+        "skip_threshold_hit": False,
         "budget_skip_threshold": "",
         "pages_found": 0,
         "pages_fully_parsed": 0,
@@ -1591,6 +1696,8 @@ def _budget_fetches_remaining(budget: "_SearchBudget | None") -> int:
 
 
 def _hard_cost_cap_for_mode(mode: str) -> float:
+    if _normalize_mode(mode) == "max_accuracy":
+        return float(os.getenv("ENRICHMENT_MAX_ACCURACY_HARD_COST_USD", "5.00") or "5.00")
     if _normalize_mode(mode) == "deep":
         return float(os.getenv("ENRICHMENT_DEEP_HARD_COST_USD", "1.00") or "1.00")
     return float(os.getenv("ENRICHMENT_HARD_COST_USD", "0.25") or "0.25")
@@ -2406,6 +2513,21 @@ def enrich_row(
                     if _needs_dimension_recovery(row):
                         enrichment_debug["image_only_success"] = True
 
+        if _needs_image_recovery(row) and mode in {"deep", "max_accuracy"} and brand and model_sku:
+            img, image_debug = _try_image_recovery_searches(
+                row,
+                cache_key=cache_key,
+                manufacturer_domain=manufacturer_domain,
+                session_cache=session_cache,
+                budget=budget,
+            )
+            enrichment_debug.update(image_debug)
+            if img:
+                row = {**row, **image_debug, "Image URL": img}
+                enrichment_debug["selected_image_url"] = img
+                if _needs_dimension_recovery(row):
+                    enrichment_debug["image_only_success"] = True
+
         # Fast mode: if manufacturer domain is known, skip general Brave search
         # (dimension lookup will handle targeted search via the known domain)
         needs_general_fields = any(
@@ -2807,6 +2929,8 @@ def enrich_dataframe(
                     "selected_strategy": "skipped",
                     "skipped_reason": budget_reason,
                     "reason_row_skipped": budget_reason,
+                    "skip_reason": budget_reason,
+                    "skip_threshold_hit": True,
                     "enrichment_status": _classify_enrichment_status(r),
                     "enrichment_error": "",
                     "budget_spent": "searches=0/0; fetches=0/0",
@@ -2901,17 +3025,24 @@ def enrich_dataframe(
         _attempt_group(key, round_name="round_2_dimension_retry", search_limit=1, fetch_limit=4)
         time.sleep(0.05)
 
-    # Round 3: image recovery is lower priority than dimensions. First exploit
-    # product pages directly; only spend one search when cap remains.
+    # Round 3: dedicated image recovery for rows still missing images. Deep and
+    # Max Accuracy keep going even when dimensions are also still incomplete.
     for key in _ordered_keys([
         key
         for key in all_keys
         if _group_incomplete(key, image_only=True)
-        and not _group_incomplete(key, dimensions_only=True)
     ]):
         remaining = max_run_searches - total_searches_used
-        search_limit = 1 if remaining > 0 and not _needs_dimension_recovery(df.loc[_group_rep(key)].to_dict()) else 0
-        _attempt_group(key, round_name="round_3_image_retry", search_limit=search_limit, fetch_limit=3)
+        if mode == "max_accuracy":
+            search_limit = min(3, remaining)
+            fetch_limit = 8
+        elif mode == "deep":
+            search_limit = min(2, remaining)
+            fetch_limit = 5
+        else:
+            search_limit = 1
+            fetch_limit = 3
+        _attempt_group(key, round_name="round_3_image_retry", search_limit=search_limit, fetch_limit=fetch_limit)
         time.sleep(0.05)
 
     df.attrs["enrichment_budget_cap_usd"] = hard_cap_usd
@@ -2925,13 +3056,14 @@ def enrich_dataframe(
 
 def recover_images_for_dataframe(
     df: pd.DataFrame,
+    enrichment_mode: str = "standard",
 ) -> tuple[pd.DataFrame, list[dict]]:
     """
     Targeted image recovery pass — runs only on rows that are missing Image URL.
 
     For each row without an image, attempts in order:
       1. Fetch the Product URL and extract an image via the standard pipeline.
-      2. (Future) Brand/SKU-targeted image search as fallback.
+      2. Brand/SKU-targeted image/product-page search as fallback.
 
     Returns (updated_df, diagnostics) where diagnostics is a list of per-row dicts:
       {row_index, product_name, status ("found"|"not_found"), source, image_url}
@@ -2948,6 +3080,8 @@ def recover_images_for_dataframe(
         else:
             df[field] = df[field].astype(object)
     diagnostics: list[dict] = []
+    session_cache = _SessionCache()
+    budget = _budget_for_mode(enrichment_mode)
 
     for idx, row in df.iterrows():
         if _str_val(row.get("Image URL")):
@@ -2958,6 +3092,12 @@ def recover_images_for_dataframe(
         brand = _str_val(r.get("Brand"))
         model_sku = _str_val(r.get("Model/SKU"))
         cache_key = _normalize_key(brand, model_sku) if brand and model_sku else ""
+        manufacturer_domain = ""
+        domain_match = get_domain_for_brand(brand) if brand else None
+        if domain_match:
+            manufacturer_domain = domain_match[0]
+        if not manufacturer_domain:
+            manufacturer_domain = preferred_domain_hint(brand, _str_val(r.get("Product Category")))
 
         image_url: str | None = None
         source = "none"
@@ -2970,6 +3110,8 @@ def recover_images_for_dataframe(
                 _try_image_from_url(
                     product_url,
                     cache_key,
+                    session_cache=session_cache,
+                    budget=budget,
                     row=r,
                     return_debug=True,
                 )
@@ -2978,6 +3120,18 @@ def recover_images_for_dataframe(
                 source = "product_url"
         else:
             image_debug = _image_debug_defaults()
+
+        if not image_url and brand and model_sku:
+            _log.info("[RECOVER] row=%s trying image-specific search brand=%s model=%s", idx, brand, model_sku)
+            image_url, image_debug = _try_image_recovery_searches(
+                r,
+                cache_key=cache_key,
+                manufacturer_domain=manufacturer_domain,
+                session_cache=session_cache,
+                budget=budget,
+            )
+            if image_url:
+                source = "image_search"
 
         diagnostics.append({
             "row_index": int(idx),
@@ -2988,6 +3142,10 @@ def recover_images_for_dataframe(
             "status": "found" if image_url else "not_found",
             "source": source,
             "image_url": image_url or "",
+            "image_source_url": image_debug.get("image_source_url", ""),
+            "image_confidence": image_debug.get("image_confidence", ""),
+            "image_failure_reason": image_debug.get("image_failure_reason") or image_debug.get("cloudinary_error", ""),
+            "budget_spent": _budget_summary(budget),
             **{k: image_debug.get(k, "") for k in _image_debug_defaults()},
         })
 
@@ -2996,6 +3154,20 @@ def recover_images_for_dataframe(
             for field, value in image_debug.items():
                 if field in df.columns:
                     df.at[idx, field] = value
+            if image_debug.get("image_source_url") and "image_source_url" in df.columns:
+                df.at[idx, "image_source_url"] = image_debug["image_source_url"]
+            try:
+                saved = save_successful_source_from_row({**r, **image_debug, "Image URL": image_url}, notes="Dedicated image recovery result.")
+                if saved:
+                    for field, value in {
+                        "stored_source_updated": True,
+                        "knowledge_base_updated": True,
+                        "knowledge_base_source_used": saved.get("image_source_url") or saved.get("product_page_url") or "",
+                    }.items():
+                        if field in df.columns:
+                            df.at[idx, field] = value
+            except Exception:
+                pass
 
         time.sleep(0.3)
 

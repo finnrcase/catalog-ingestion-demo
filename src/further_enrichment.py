@@ -21,6 +21,8 @@ DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_INPUT_COST_PER_1K = 0.00015
 DEFAULT_OUTPUT_COST_PER_1K = 0.00060
 DEFAULT_MAX_OUTPUT_TOKENS = 2200
+MAX_PROMPT_STRING_CHARS = 1800
+MAX_PROMPT_LIST_ITEMS = 8
 
 
 @dataclass
@@ -34,6 +36,31 @@ class FurtherEnrichmentResult:
 def _str(value: object) -> str:
     text = str(value or "").strip()
     return "" if text.lower() in {"nan", "none", "null"} else text
+
+
+def _safe_prompt_text(value: object, max_chars: int = MAX_PROMPT_STRING_CHARS) -> str:
+    """Compact scraped/evidence text before it is JSON-encoded into prompts."""
+    text = _str(value)
+    if not text:
+        return ""
+    text = BeautifulSoup(text, "html.parser").get_text(" ") if "<" in text and ">" in text else text
+    text = "".join(ch if ch in "\n\t" or ord(ch) >= 32 else " " for ch in text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max_chars]
+
+
+def _sanitize_for_prompt(value: Any, *, depth: int = 0) -> Any:
+    if depth > 5:
+        return _safe_prompt_text(value, 300)
+    if isinstance(value, dict):
+        return {str(k): _sanitize_for_prompt(v, depth=depth + 1) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_prompt(item, depth=depth + 1) for item in value[:MAX_PROMPT_LIST_ITEMS]]
+    if isinstance(value, str):
+        return _safe_prompt_text(value)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return _safe_prompt_text(value)
 
 
 def _float_env(name: str, default: float) -> float:
@@ -194,7 +221,7 @@ _EVIDENCE_KEYWORDS = re.compile(
 
 
 def _snippet_from_text(text: str, row: dict[str, Any], max_chars: int = 1100) -> str:
-    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    text = _safe_prompt_text(text, max_chars=max(max_chars * 3, max_chars))
     if not text:
         return ""
     brand = _str(row.get("Brand"))
@@ -213,7 +240,7 @@ def _snippet_from_text(text: str, row: dict[str, Any], max_chars: int = 1100) ->
     pos = min(positions) if positions else 0
     start = max(0, pos - 250)
     end = min(len(text), start + max_chars)
-    return text[start:end].strip()
+    return _safe_prompt_text(text[start:end], max_chars=max_chars)
 
 
 def _parse_pdf_text(pdf_bytes: bytes, max_pages: int = 8) -> str:
@@ -290,7 +317,7 @@ def _row_prompt_payload(index: int, row: dict[str, Any], *, include_evidence: bo
         source_evidence, evidence_errors, candidate_images = _fetch_source_evidence(row)
     else:
         source_evidence, evidence_errors, candidate_images = [], [], []
-    return {
+    payload = {
         "row_id": str(index),
         "requested_focus": _str(row.get("deep_retry_focus") or row.get("requested_missing_fields") or "missing_fields"),
         "missing_fields": _missing_fields(row),
@@ -313,6 +340,7 @@ def _row_prompt_payload(index: int, row: dict[str, Any], *, include_evidence: bo
         "evidence_fetch_errors": evidence_errors,
         "existing_partial_dimensions": _str(row.get("partial_dimensions_found") or row.get("dimensions_extracted")),
     }
+    return _sanitize_for_prompt(payload)
 
 
 def _response_schema() -> dict[str, Any]:
@@ -397,7 +425,7 @@ def _response_schema() -> dict[str, Any]:
 
 
 def _build_prompt(rows: list[dict[str, Any]]) -> str:
-    payload = {"rows": rows}
+    payload = {"rows": [_sanitize_for_prompt(row) for row in rows]}
     return (
         "You are helping SCH build Programa-ready product schedule rows from fetched evidence. "
         "Do not browse the web. Use only the provided source_evidence text snippets, candidate_source_urls, "
@@ -449,6 +477,95 @@ def _pack_rows_under_budget(
     return packed, estimated, max(0, len(candidates) - len(packed))
 
 
+def _strip_json_fences(text: str) -> str:
+    text = _str(text)
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    start_obj = text.find("{")
+    start_arr = text.find("[")
+    starts = [pos for pos in (start_obj, start_arr) if pos >= 0]
+    if starts:
+        start = min(starts)
+        end = max(text.rfind("}"), text.rfind("]"))
+        if end > start:
+            text = text[start : end + 1]
+    return text
+
+
+def _coerce_openai_shape(parsed: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if isinstance(parsed, dict) and isinstance(parsed.get("rows"), list):
+        return parsed
+    if isinstance(parsed, list):
+        return {"rows": parsed}
+    if isinstance(parsed, dict):
+        row_id = _str(rows[0].get("row_id")) if rows else "0"
+        return {"rows": [{**parsed, "row_id": _str(parsed.get("row_id")) or row_id}]}
+    return {"rows": []}
+
+
+def _repair_json_text(text: str) -> str:
+    repaired = _strip_json_fences(text)
+    repaired = repaired.replace("\ufeff", "")
+    repaired = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", repaired)
+    # Quote bare NaN/Infinity constants that Python's strict JSON parser rejects.
+    repaired = re.sub(r"\b(?:NaN|Infinity|-Infinity)\b", "null", repaired)
+    opens = repaired.count("{") - repaired.count("}")
+    if opens > 0:
+        repaired += "}" * opens
+    opens = repaired.count("[") - repaired.count("]")
+    if opens > 0:
+        repaired += "]" * opens
+    return repaired
+
+
+def _parse_openai_content(content: str, rows: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, str]]:
+    cleaned = _strip_json_fences(content)
+    try:
+        return _coerce_openai_shape(json.loads(cleaned), rows), {"parse_status": "strict_json", "parse_error": ""}
+    except Exception as strict_exc:
+        repaired = _repair_json_text(cleaned)
+        try:
+            return _coerce_openai_shape(json.loads(repaired), rows), {
+                "parse_status": "json_repaired",
+                "parse_error": str(strict_exc)[:500],
+            }
+        except Exception as repair_exc:
+            # Last-ditch recovery for the common shape: one object in rows got
+            # truncated after a string. Recovering one field is better than
+            # dropping every row in a quote.
+            row_id = _str(rows[0].get("row_id")) if rows else "0"
+            recovered: dict[str, Any] = {"row_id": row_id, "safe_to_write": False, "confidence": "none", "reason": "OpenAI JSON response could not be parsed safely."}
+            for key in ("image_url", "image_source_url", "dimension_source_url", "product_page_url", "spec_sheet_url"):
+                match = re.search(rf'"{re.escape(key)}"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', cleaned)
+                if match:
+                    try:
+                        recovered[key] = json.loads(f'"{match.group(1)}"')
+                    except Exception:
+                        recovered[key] = match.group(1)
+            for key in ("width_in", "height_in", "depth_in"):
+                match = re.search(rf'"{re.escape(key)}"\s*:\s*([0-9.]+)', cleaned)
+                if match:
+                    recovered[key] = match.group(1)
+            return {"rows": [recovered]}, {
+                "parse_status": "partial_recovery",
+                "parse_error": f"{strict_exc}; repair failed: {repair_exc}"[:500],
+            }
+
+
+def _fields_recovered(result: dict[str, Any]) -> list[str]:
+    fields: list[str] = []
+    if _str(result.get("dimensions")) or all(_str(result.get(k)) for k in ("width_in", "height_in", "depth_in")):
+        fields.append("dimensions")
+    for key, label in (
+        ("image_url", "image"),
+        ("product_page_url", "product_page_url"),
+        ("spec_sheet_url", "spec_sheet_url"),
+        ("normalized_title", "normalized_title"),
+    ):
+        if _str(result.get(key)):
+            fields.append(label)
+    return fields
+
+
 def _call_openai(rows: list[dict[str, Any]], *, max_cost_usd: float) -> tuple[dict[str, Any], dict[str, Any]]:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -459,31 +576,43 @@ def _call_openai(rows: list[dict[str, Any]], *, max_cost_usd: float) -> tuple[di
     if estimate > max_cost_usd:
         raise RuntimeError(f"Estimated OpenAI cost {estimate:.4f} exceeds further enrichment cap {max_cost_usd:.4f}.")
 
+    prompt = _build_prompt(rows)
+    body = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Return only valid structured JSON. Be conservative. "
+                    "Missing data is better than unsupported product data."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+        "max_tokens": max_output_tokens,
+        "response_format": {"type": "json_schema", "json_schema": _response_schema()},
+    }
+    timeout = float(os.getenv("OPENAI_FURTHER_TIMEOUT_SECONDS", "60") or 60)
     response = httpx.post(
         OPENAI_CHAT_COMPLETIONS_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "Return only valid structured JSON. Be conservative. "
-                        "Missing data is better than unsupported product data."
-                    ),
-                },
-                {"role": "user", "content": _build_prompt(rows)},
-            ],
-            "temperature": 0.1,
-            "max_tokens": max_output_tokens,
-            "response_format": {"type": "json_schema", "json_schema": _response_schema()},
-        },
-        timeout=float(os.getenv("OPENAI_FURTHER_TIMEOUT_SECONDS", "60") or 60),
+        json=body,
+        timeout=timeout,
     )
+    if response.status_code >= 400 and "json_schema" in response.text.lower():
+        fallback_body = dict(body)
+        fallback_body["response_format"] = {"type": "json_object"}
+        response = httpx.post(
+            OPENAI_CHAT_COMPLETIONS_URL,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=fallback_body,
+            timeout=timeout,
+        )
     response.raise_for_status()
     payload = response.json()
     content = payload.get("choices", [{}])[0].get("message", {}).get("content") or "{}"
-    parsed = json.loads(content)
+    parsed, parse_debug = _parse_openai_content(content, rows)
     usage = payload.get("usage") or {}
     input_tokens = float(usage.get("prompt_tokens") or 0)
     output_tokens = float(usage.get("completion_tokens") or 0)
@@ -497,6 +626,8 @@ def _call_openai(rows: list[dict[str, Any]], *, max_cost_usd: float) -> tuple[di
         "actual_cost_usd": actual_cost or estimate,
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
+        "request_size_bytes": len(prompt.encode("utf-8")),
+        **parse_debug,
     }
 
 
@@ -679,6 +810,14 @@ def further_enrich_dataframe(
         "further_enrichment_cost_estimate",
         "further_enrichment_model",
         "further_enrichment_reason",
+        "further_enrichment_row_id",
+        "further_enrichment_request_size",
+        "further_enrichment_parse_status",
+        "further_enrichment_parse_error",
+        "further_enrichment_fields_recovered",
+        "further_enrichment_skip_reason",
+        "further_enrichment_skip_threshold_hit",
+        "openai_budget_remaining",
         "dimension_raw_text",
         "dimension_type",
         "dimension_source_url",
@@ -745,92 +884,109 @@ def further_enrich_dataframe(
         )
 
     max_cost_per_item_usd = max(0.0, min(float(max_cost_per_item_usd or 0), 1.0))
-    packed_rows: list[dict[str, Any]] = []
-    estimated_cost = 0.0
     per_item_cap = max_cost_per_item_usd if max_cost_per_item_usd and max_cost_per_item_usd > 0 else None
+    total_fields = 0
+    updated_rows = 0
+    rows_sent = 0
     skipped_budget = 0
-    for index, row in candidate_pairs:
-        payload = _row_prompt_payload(index, row, include_evidence=True)
-        trial = [*packed_rows, payload]
-        trial_cost = estimate_further_enrichment_cost(trial)
-        trial_per_item = trial_cost / max(len(trial), 1)
-        if trial_cost <= max_cost_usd and (per_item_cap is None or trial_per_item <= per_item_cap):
-            packed_rows = trial
-            estimated_cost = trial_cost
-            continue
-        skipped_budget = len(candidate_pairs) - len(packed_rows)
-        if not packed_rows:
-            estimated_cost = trial_cost
-        break
-    if not packed_rows:
-        message = "Further enrichment skipped: estimated OpenAI cost would exceed the configured cap."
-        for index, _row in candidate_pairs:
+    estimated_total = 0.0
+    actual_cost = 0.0
+    ai_calls_used = 0
+    call = openai_call or _call_openai
+
+    for pair_pos, (index, row) in enumerate(candidate_pairs):
+        candidate = _row_prompt_payload(index, row, include_evidence=True)
+        row_id = _str(candidate["row_id"])
+        request_size = len(_build_prompt([candidate]).encode("utf-8"))
+        estimate = estimate_further_enrichment_cost([candidate])
+        remaining = max(0.0, max_cost_usd - actual_cost)
+        result_df.at[index, "further_enrichment_row_id"] = row_id
+        result_df.at[index, "further_enrichment_request_size"] = str(request_size)
+        result_df.at[index, "openai_budget_remaining"] = f"{remaining:.4f}"
+        result_df.at[index, "further_enrichment_skip_threshold_hit"] = "false"
+
+        if estimate > remaining:
+            skipped_budget += 1
+            reason = "OpenAI budget exhausted before this row."
             result_df.at[index, "further_enrichment_used"] = "false"
             result_df.at[index, "further_enrichment_status"] = "skipped_budget_cap"
-            result_df.at[index, "further_enrichment_error"] = message
-        return FurtherEnrichmentResult(
-            result_df,
-            [message],
-            [{"status": "skipped_budget_cap", "estimated_cost_usd": estimated_cost, "candidate_rows": len(candidate_pairs)}],
-            {
-                "further_enrichment_enabled": True,
-                "further_enrichment_rows_considered": len(candidate_pairs),
-                "further_enrichment_rows_sent": 0,
-                "further_enrichment_rows_skipped_budget": len(candidate_pairs),
-                "further_enrichment_cost_usd": 0.0,
-                "further_enrichment_estimated_cost_usd": estimated_cost,
-                "further_enrichment_max_cost_per_item_usd": max_cost_per_item_usd,
-            },
-        )
+            result_df.at[index, "further_enrichment_error"] = reason
+            result_df.at[index, "further_enrichment_skip_reason"] = reason
+            result_df.at[index, "further_enrichment_skip_threshold_hit"] = "true"
+            continue
+        if per_item_cap is not None and estimate > per_item_cap:
+            skipped_budget += 1
+            reason = f"Estimated per-item OpenAI cost {estimate:.4f} exceeds cap {per_item_cap:.4f}."
+            result_df.at[index, "further_enrichment_used"] = "false"
+            result_df.at[index, "further_enrichment_status"] = "skipped_per_item_budget_cap"
+            result_df.at[index, "further_enrichment_error"] = reason
+            result_df.at[index, "further_enrichment_skip_reason"] = reason
+            result_df.at[index, "further_enrichment_skip_threshold_hit"] = "true"
+            continue
 
-    try:
-        call = openai_call or _call_openai
-        payload, usage = call(packed_rows, max_cost_usd=max_cost_usd)
-    except Exception as exc:
-        message = f"Further enrichment skipped: {exc}"
-        errors.append(message)
-        for candidate in packed_rows:
-            index = int(candidate["row_id"])
+        try:
+            payload, usage = call([candidate], max_cost_usd=remaining)
+        except Exception as exc:
+            message = f"Further enrichment row {row_id} failed: {exc}"
+            errors.append(message)
             result_df.at[index, "further_enrichment_used"] = "false"
             result_df.at[index, "further_enrichment_status"] = "openai_unavailable"
             result_df.at[index, "further_enrichment_error"] = message
-        return FurtherEnrichmentResult(
-            result_df,
-            errors,
-            [{"status": "openai_unavailable", "error": message, "rows_sent": len(packed_rows)}],
-            {
-                "further_enrichment_enabled": True,
-                "further_enrichment_rows_considered": len(candidate_pairs),
-                "further_enrichment_rows_sent": len(packed_rows),
-                "further_enrichment_rows_skipped_budget": skipped_budget,
-                "further_enrichment_cost_usd": 0.0,
-                "further_enrichment_estimated_cost_usd": estimated_cost,
-                "further_enrichment_max_cost_per_item_usd": max_cost_per_item_usd,
-            },
-        )
+            result_df.at[index, "further_enrichment_parse_status"] = "not_parsed"
+            result_df.at[index, "further_enrichment_parse_error"] = str(exc)[:500]
+            diagnostics.append({
+                "status": "row_failed",
+                "row_id": row_id,
+                "request_size": request_size,
+                "parse_status": "not_parsed",
+                "parse_error": str(exc)[:500],
+                "fields_recovered": [],
+            })
+            if "OPENAI_API_KEY" in str(exc) or "401" in str(exc) or "403" in str(exc):
+                for remaining_index, _remaining_row in candidate_pairs[pair_pos + 1:]:
+                    result_df.at[remaining_index, "further_enrichment_used"] = "false"
+                    result_df.at[remaining_index, "further_enrichment_status"] = "openai_unavailable"
+                    result_df.at[remaining_index, "further_enrichment_error"] = f"Further enrichment skipped: {exc}"
+                break
+            continue
 
-    rows_by_id = {
-        _str(item.get("row_id")): item
-        for item in payload.get("rows", [])
-        if isinstance(item, dict)
-    }
-    total_fields = 0
-    updated_rows = 0
-    actual_cost = float(usage.get("actual_cost_usd") or estimated_cost or 0)
-    per_row_cost = actual_cost / max(len(packed_rows), 1)
-    for candidate in packed_rows:
-        row_id = _str(candidate["row_id"])
-        index = int(row_id)
+        rows_sent += 1
+        ai_calls_used += 1
+        estimated_total += float(usage.get("estimated_cost_usd") or estimate or 0)
+        row_cost = float(usage.get("actual_cost_usd") or estimate or 0)
+        actual_cost += row_cost
+        rows_by_id = {
+            _str(item.get("row_id")): item
+            for item in payload.get("rows", [])
+            if isinstance(item, dict)
+        }
         ai_result = rows_by_id.get(row_id)
+        parse_status = _str(usage.get("parse_status")) or "unknown"
+        parse_error = _str(usage.get("parse_error"))
+        result_df.at[index, "further_enrichment_parse_status"] = parse_status
+        result_df.at[index, "further_enrichment_parse_error"] = parse_error
+        result_df.at[index, "openai_budget_remaining"] = f"{max(0.0, max_cost_usd - actual_cost):.4f}"
         if not ai_result:
             result_df.at[index, "further_enrichment_status"] = "no_ai_result"
             result_df.at[index, "further_enrichment_error"] = "OpenAI did not return a result for this row."
             continue
-        updated_row, filled = _apply_result(dict(result_df.loc[index].fillna("")), ai_result, per_row_cost)
+        recovered = _fields_recovered(ai_result)
+        result_df.at[index, "further_enrichment_fields_recovered"] = ", ".join(recovered)
+        updated_row, filled = _apply_result(dict(result_df.loc[index].fillna("")), ai_result, row_cost)
         for key, value in updated_row.items():
             if key not in result_df.columns:
                 result_df[key] = ""
             result_df.at[index, key] = value
+        diagnostics.append({
+            "status": "row_complete",
+            "row_id": row_id,
+            "request_size": request_size,
+            "parse_status": parse_status,
+            "parse_error": parse_error,
+            "fields_recovered": recovered,
+            "fields_written": filled,
+            "actual_cost_usd": row_cost,
+        })
         if filled:
             updated_rows += 1
             total_fields += len(filled)
@@ -842,24 +998,18 @@ def further_enrich_dataframe(
             except Exception as exc:  # best effort only
                 result_df.at[index, "further_enrichment_error"] = f"Knowledge base save failed: {exc}"
 
-    packed_ids = {_str(candidate.get("row_id")) for candidate in packed_rows}
-    for index, _row in candidate_pairs:
-        if str(index) in packed_ids:
-            continue
-        result_df.at[index, "further_enrichment_status"] = "skipped_budget_cap"
-        result_df.at[index, "further_enrichment_error"] = "Skipped because further enrichment cap was reached."
-
     diagnostics.append(
         {
             "status": "complete",
             "rows_considered": len(candidate_pairs),
-            "rows_sent": len(packed_rows),
+            "rows_sent": rows_sent,
             "rows_updated": updated_rows,
             "fields_filled": total_fields,
             "rows_skipped_budget": skipped_budget,
-            "model": usage.get("model") or _model_name(),
-            "estimated_cost_usd": usage.get("estimated_cost_usd") or estimated_cost,
+            "model": _model_name(),
+            "estimated_cost_usd": estimated_total,
             "actual_cost_usd": actual_cost,
+            "openai_budget_remaining": max(0.0, max_cost_usd - actual_cost),
         }
     )
     return FurtherEnrichmentResult(
@@ -869,15 +1019,16 @@ def further_enrich_dataframe(
         {
             "further_enrichment_enabled": True,
             "further_enrichment_rows_considered": len(candidate_pairs),
-            "further_enrichment_rows_sent": len(packed_rows),
+            "further_enrichment_rows_sent": rows_sent,
             "further_enrichment_rows_updated": updated_rows,
             "further_enrichment_fields_filled": total_fields,
             "further_enrichment_rows_skipped_budget": skipped_budget,
             "further_enrichment_cost_usd": actual_cost,
-            "further_enrichment_cost_per_row_usd": round(actual_cost / max(len(packed_rows), 1), 6),
-            "further_enrichment_estimated_cost_usd": usage.get("estimated_cost_usd") or estimated_cost,
+            "further_enrichment_cost_per_row_usd": round(actual_cost / max(rows_sent, 1), 6),
+            "further_enrichment_estimated_cost_usd": estimated_total,
             "further_enrichment_max_cost_per_item_usd": max_cost_per_item_usd,
-            "further_enrichment_model": usage.get("model") or _model_name(),
-            "ai_calls_used": 1 if packed_rows else 0,
+            "further_enrichment_model": _model_name(),
+            "openai_budget_remaining": round(max(0.0, max_cost_usd - actual_cost), 6),
+            "ai_calls_used": ai_calls_used,
         },
     )

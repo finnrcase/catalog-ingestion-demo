@@ -927,12 +927,14 @@ def validate_for_export(rows) -> dict:
     image_url_present = 0
     image_url_total = 0
     export_count = 0
+    programa_ready_count = 0
     readiness_points = 0
     readiness_total = 0
     readiness_missing_fields: dict[str, int] = {}
     section_counts: dict[str, int] = {}
     section_equals_product_name: list[dict] = []
     section_too_long: list[dict] = []
+    needs_enrichment: list[dict] = []
 
     for original_index, source_row in enumerate(source_rows):
         if _is_unresolved_charge(source_row):
@@ -983,14 +985,25 @@ def validate_for_export(rows) -> dict:
             section_equals_product_name.append({"index": i, "product_name": name, "section": raw_section})
         if len(raw_section) > 30:
             section_too_long.append({"index": i, "product_name": name, "section": raw_section})
-        if not has_complete_3d_dimensions(_programa_dimension_text(row)):
+        row_missing_dimensions = not has_complete_3d_dimensions(_programa_dimension_text(row))
+        row_missing_image = not _is_public_https_image_url(row.get("Image URL"))
+        if row_missing_dimensions:
             missing_dimensions += 1
         if not _str_val(row.get("Product URL")):
             missing_product_url += 1
-        if _str_val(row.get("Image URL")) and not _is_public_https_image_url(row.get("Image URL")):
+        if _str_val(row.get("Image URL")) and row_missing_image:
             missing_image_url += 1
         elif not _str_val(row.get("Image URL")):
             missing_image_url += 1
+        if not _is_photo_only(row) and (row_missing_dimensions or row_missing_image):
+            reason_parts = []
+            if row_missing_dimensions:
+                reason_parts.append("missing full W x H x D dimensions")
+            if row_missing_image:
+                reason_parts.append("missing or invalid Image URL")
+            needs_enrichment.append({"index": i, "product_name": name, "reason": "; ".join(reason_parts)})
+        else:
+            programa_ready_count += 1
         row_points, row_total, row_missing = _readiness_row_score(row)
         readiness_points += row_points
         readiness_total += row_total
@@ -998,12 +1011,16 @@ def validate_for_export(rows) -> dict:
             readiness_missing_fields[field_name] = readiness_missing_fields.get(field_name, 0) + 1
 
     readiness_score = round((readiness_points / readiness_total) * 100) if readiness_total else 0
-    if readiness_score >= 90:
-        readiness_status = "ready"
-    elif readiness_score >= 50:
-        readiness_status = "review_draft"
+    if not included:
+        readiness_status = "Manual review"
+    elif missing_dimensions or missing_image_url:
+        readiness_status = "Needs enrichment"
+    elif programa_ready_count == len(included) and (missing_product_url or missing_section):
+        readiness_status = "Ready with warnings"
+    elif programa_ready_count == len(included):
+        readiness_status = "Ready"
     else:
-        readiness_status = "not_programa_ready"
+        readiness_status = "Manual review"
 
     return {
         "skipped": skipped,
@@ -1014,6 +1031,8 @@ def validate_for_export(rows) -> dict:
         "image_url_present": image_url_present,
         "image_url_total": image_url_total,
         "export_count": export_count,
+        "programa_ready_count": programa_ready_count,
+        "needs_enrichment": needs_enrichment,
         "unique_sections": sorted(section_counts),
         "section_counts": dict(sorted(section_counts.items())),
         "section_equals_product_name": section_equals_product_name,

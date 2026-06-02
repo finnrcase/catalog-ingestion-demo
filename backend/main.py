@@ -375,12 +375,18 @@ def _enrichment_summary(df: pd.DataFrame, elapsed_ms: float) -> dict:
         if _text_value(row.get("dimensions_status")).lower() == "partial"
         or _text_value(row.get("partial_dimensions_found"))
     )
-    budget_skipped = sum(
-        1
-        for row in included
-        if _text_value(row.get("budget_blocked")).lower() in {"true", "1", "yes"}
-        or "budget" in _text_value(row.get("skipped_reason")).lower()
-    )
+    def _hard_budget_skipped(row: dict) -> bool:
+        status = _text_value(row.get("further_enrichment_status") or row.get("enrichment_status")).lower()
+        skip_threshold_hit = _text_value(row.get("skip_threshold_hit") or row.get("further_enrichment_skip_threshold_hit")).lower()
+        reason = _text_value(row.get("skip_reason") or row.get("reason_row_skipped") or row.get("further_enrichment_skip_reason")).lower()
+        return (
+            status in {"skipped_budget_cap", "skipped_per_item_budget_cap"}
+            or skip_threshold_hit in {"true", "1", "yes"}
+            or "budget cap" in reason
+            or "budget exhausted before" in reason
+        )
+
+    budget_skipped = sum(1 for row in included if _hard_budget_skipped(row))
 
     attr_searches = df.attrs.get("brave_searches_used")
     attr_fetches = df.attrs.get("page_fetches_used")
@@ -414,6 +420,9 @@ def _enrichment_summary(df: pd.DataFrame, elapsed_ms: float) -> dict:
         "brave_searches_used": searches_used,
         "page_fetches_used": fetches_used,
         "budget_cap_usd": round(float(budget_cap), 4),
+        "total_budget_remaining": round(max(0.0, float(budget_cap) - estimated_cost), 4),
+        "search_budget_remaining": max(0, int(float(budget_cap) / brave_cost) - searches_used) if brave_cost else 0,
+        "openai_budget_remaining": df.attrs.get("openai_budget_remaining", "not_applicable_standard_enrichment"),
         "unique_products_searched": unique_products_searched,
         "duplicate_rows_skipped_for_enrichment": duplicate_rows_skipped,
         "cache_hits": cache_hits,
@@ -488,6 +497,8 @@ def get_product_knowledge_base(query: str = "", source_type: str = "", limit: in
 @app.get("/settings/product-knowledge-base/audit")
 def product_knowledge_base_audit() -> dict:
     configured_data_dir = os.getenv("SCH_DATA_DIR") or os.getenv("DATA_DIR") or ""
+    stored_sources = list_product_sources(limit=500)
+    preferred_domains = list_preferred_domains(limit=500)
     return {
         "runtime_data_dir": str(runtime_data_path()),
         "product_enrichment_cache_path": str(runtime_data_path("product_enrichment_cache.json")),
@@ -499,6 +510,9 @@ def product_knowledge_base_audit() -> dict:
             else "Runtime cache defaults to /tmp/sch-data and may disappear across deploys, restarts, or serverless instance changes."
         ),
         "product_knowledge_base_backend": storage_backend_name(),
+        "status": "Loaded",
+        "storedSources": len(stored_sources),
+        "preferredDomains": len(preferred_domains),
         "supabase_configured": storage_backend_name() == "supabase",
         "required_env": ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "SOURCE_MEMORY_ENABLED"],
         "tables": ["stored_product_sources", "preferred_source_domains"],
@@ -915,7 +929,7 @@ def recover_images(payload: RowsPayload) -> IntakeResponse:
     """
     start = time.perf_counter()
     _log_stage("SEARCHING_IMAGES", rows=len(payload.rows))
-    df, diagnostics = recover_images_for_dataframe(pd.DataFrame(payload.rows))
+    df, diagnostics = recover_images_for_dataframe(pd.DataFrame(payload.rows), enrichment_mode=payload.enrichment_mode)
     df = apply_confidence_checks(df)
     df = append_source_links_to_notes_dataframe(df)
     _log_stage("ENRICHMENT_COMPLETE", rows=len(df), image_recovery_ms=_elapsed_ms(start))
